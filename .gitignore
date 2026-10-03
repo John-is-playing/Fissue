@@ -15,6 +15,15 @@ data/
 *.sqlite
 *.sqlite3
 
+# demo/textkit 是**独立仓库**（自带 .git），供推送到 GitHub 当测试夹具用。
+# 外层仓库只保留它的"定义"（fixtures/ 与 scripts/），不嵌套整个仓库，
+# 否则 git 会把它当作 embedded repository 处理，产生难以察觉的 submodule 陷阱。
+demo/textkit/
+
+# demo 产物
+demo/**/__pycache__/
+demo/**/.pytest_cache/
+
 # Python
 __pycache__/
 *.py[cod]
