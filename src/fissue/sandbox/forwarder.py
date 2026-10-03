@@ -105,7 +105,12 @@ class Workspace:
                 fh.truncate(size_mb * 1024 * 1024)
             subprocess.run(["mkfs.ext4", "-q", "-F", str(image)], check=True, capture_output=True)
             device = subprocess.run(
-                ["losetup", "--find", "--show", str(image)], check=True, capture_output=True, text=True
+                ["losetup", "--find", "--show", str(image)],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             ).stdout.strip()
             if not device:
                 raise SandboxError("losetup 未返回设备名")

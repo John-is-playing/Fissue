@@ -366,3 +366,170 @@ def test_decorate_body_ensures_ai_marker(fixer_ctx, sample_issue) -> None:
     assert "Fissue" in decorated and "未通过" in decorated
     # 已含 Fissue 时不再重复追加
     assert creator._decorate_body("含 Fissue 的正文", sample_issue, spec, f2p_ok=True).count("Fissue") == 1
+
+
+# ---------------------------------------------------------------------------
+# Agent 循环：验证器通过即收工（不空转到轮次上限）
+# ---------------------------------------------------------------------------
+
+
+class _ScriptLLM:
+    """按脚本逐步应答的 LLM，用于驱动 Agent 循环。"""
+
+    def __init__(self, steps: list[dict]) -> None:
+        self.steps = list(steps)
+        self.calls = 0
+
+    async def chat_json(self, messages, *, purpose: str = "", **kwargs):
+        from fissue.ai.client import Usage
+
+        self.calls += 1
+        data = self.steps.pop(0) if self.steps else {}
+        return data, Usage(purpose="agent", model="scripted", prompt_tokens=10,
+                           completion_tokens=5, cost_usd=0.0)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _StubRunner:
+    """固定的验证器执行结果。"""
+
+    def __init__(self, outcome) -> None:
+        from fissue.models import VerifierOutcome
+
+        self.outcome = outcome or VerifierOutcome.PASS
+        self.runs = 0
+
+    async def run_once(self, **kwargs):
+        from fissue.models import VerifierOutcome, VerifierRun
+
+        self.runs += 1
+        passed = self.outcome is VerifierOutcome.PASS
+        return VerifierRun(
+            item_key=kwargs.get("item_key", "k"),
+            stage="agent",
+            outcome=self.outcome,
+            exit_code=0 if passed else 1,
+            stdout="ok" if passed else "boom",
+        )
+
+
+def _agent_with(settings, steps, outcome=None):
+    from fissue.models import VerifierOutcome
+
+    llm = _ScriptLLM(steps)
+    runner = _StubRunner(outcome or VerifierOutcome.PASS)
+    return FixAgent(llm, None, runner, settings), llm, runner  # type: ignore[arg-type]
+
+
+_SPEC = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
+
+
+async def test_agent_stops_when_write_makes_verifier_pass(settings, workspace, sample_issue) -> None:
+    """write 之后验证器通过 → 立即 SUCCESS，不空转到轮次上限。
+
+    回归：demo 实测 #1 —— 模型 11 次写入 + 11 次验证器**全部 pass**，却因
+    write/run 分支从不检查结果、只等模型额外回一次 done，一路空转到 12 轮上限，
+    最后报出与事实相反的「仍未通过验证器」。
+    """
+    agent, llm, runner = _agent_with(settings, [
+        {"action": "write", "files": {"app.py": "def f():\n    return 2\n"}},
+        {"action": "write", "files": {"app.py": "def f():\n    return 3\n"}},   # 不该被消费
+    ])
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=12,
+    )
+    assert attempt.outcome is FixOutcome.SUCCESS
+    assert attempt.rounds == 1
+    assert llm.calls == 1                      # 只问了一轮，没有空转
+    assert runner.runs == 1
+
+
+async def test_agent_stops_when_run_passes(settings, workspace, sample_issue) -> None:
+    """run 之后验证器通过 → 同样立即 SUCCESS。"""
+    agent, llm, _ = _agent_with(settings, [{"action": "run"}, {"action": "run"}])
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=12,
+    )
+    assert attempt.outcome is FixOutcome.SUCCESS
+    assert llm.calls == 1
+
+
+async def test_agent_keeps_looping_while_verifier_fails(settings, workspace, sample_issue) -> None:
+    """验证器未通过时继续循环，耗尽轮次才算失败（不能误判成功）。"""
+    from fissue.models import VerifierOutcome
+
+    agent, llm, runner = _agent_with(
+        settings,
+        [{"action": "write", "files": {"app.py": "def f():\n    return 9\n"}}] * 3,
+        outcome=VerifierOutcome.FAIL,
+    )
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=3,
+    )
+    assert attempt.outcome is FixOutcome.FAILED
+    assert llm.calls == 3
+    assert runner.runs == 3
+    assert "仍未通过验证器" in (attempt.error or "")
+
+
+async def test_agent_requires_done_when_no_verifier_run(settings, workspace, sample_issue) -> None:
+    """模型只读不写、没跑过验证器 → 不得判成功。"""
+    agent, _llm, runner = _agent_with(settings, [{"action": "read", "paths": ["app.py"]}] * 2)
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=2,
+    )
+    assert attempt.outcome is FixOutcome.FAILED
+    assert runner.runs == 0
+
+
+# ---------------------------------------------------------------------------
+# 编码：git 输出必须显式按 UTF-8 解码
+# ---------------------------------------------------------------------------
+
+
+def test_git_decodes_output_as_utf8_explicitly(settings, workspace, monkeypatch) -> None:
+    """``_git`` 必须显式传 encoding="utf-8"。
+
+    回归：Windows 中文环境默认按 GBK 解码子进程输出，git 的中文会变成乱码
+    （demo 实测补丁里 '空字符串应返回 0' 变成 '绌哄瓧绗︿覆搴旇繑鍥� 0'）。
+    该问题只在 PowerShell（cp936）下复现，Git Bash 里因 PYTHONUTF8=1 看不出来，
+    所以这里直接锁「显式指定编码」这个契约，与运行环境的 locale 无关。
+    """
+    seen: dict = {}
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    workspace._git(["git", "rev-parse", "HEAD"])
+    assert seen.get("encoding") == "utf-8"
+
+
+def test_git_roundtrips_chinese_text(settings, workspace) -> None:
+    """中文经 git 输出往返后不损坏。"""
+    workspace._git(["git", "config", "user.email", "t@t"])
+    (workspace.root / "cn.txt").write_text("空字符串应返回 0\n", encoding="utf-8")
+    workspace._git(["git", "add", "-A"])
+    workspace._git(["git", "commit", "-qm", "修复：空字符串应返回 0"])
+    out = workspace._git(["git", "log", "-1", "--format=%s"]).stdout
+    assert "空字符串应返回 0" in out
+    assert "绌哄瓧绗" not in out
+
+
+def test_save_patch_preserves_chinese(fixer_ctx, repo, sample_issue) -> None:
+    """补丁里的中文必须以 UTF-8 原样落盘（不是乱码）。"""
+    _register(repo, sample_issue)
+    creator = PRCreator(fixer_ctx)
+    diff = 'diff --git a/x b/x\n+    """空字符串应返回 0"""\n'
+    path = creator._save_patch(sample_issue, diff)
+    text = Path(path).read_text(encoding="utf-8")
+    assert "空字符串应返回 0" in text
+    assert "绌哄瓧绗" not in text

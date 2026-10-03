@@ -151,16 +151,22 @@ class FixAgent:
                     last_output = f"写入被拒绝：{err}"
                     continue
                 trace.written_files.extend(written)
-                # 写完立刻跑一次验证器，拿到反馈给下一轮
+                # 写完立刻跑一次验证器；**通过即收工**，不必等模型再回 done
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
+                finished = self._success_if_passed(attempt, trace, workspace, round_index)
+                if finished is not None:
+                    return finished
                 continue
 
             if action == "run":
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
+                finished = self._success_if_passed(attempt, trace, workspace, round_index)
+                if finished is not None:
+                    return finished
                 continue
 
             if action == "give_up":
@@ -190,7 +196,12 @@ class FixAgent:
         # 轮次耗尽
         attempt.outcome = FixOutcome.FAILED
         attempt.rounds = trace.rounds
-        attempt.error = f"达到最大轮次（{rounds_limit}）仍未通过验证器"
+        if self._last_passed(trace):
+            # 验证器最后一跑是过的，只是模型没回 done 就耗尽了轮次。
+            # 这不是「修复失败」——不可报「仍未通过验证器」误导人工复核。
+            attempt.error = f"达到最大轮次（{rounds_limit}），验证器已通过但模型未给出 done"
+        else:
+            attempt.error = f"达到最大轮次（{rounds_limit}）仍未通过验证器"
         trace.summary = attempt.error
         return self._finalize(attempt, trace, workspace)
 
@@ -368,6 +379,27 @@ class FixAgent:
             return False
         last = trace.test_outputs[-1]
         return last.startswith("[exit=0") or "outcome=pass" in last[:60]
+
+    def _success_if_passed(
+        self,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        workspace: RepoWorkspace,
+        round_index: int,
+    ) -> tuple[FixAttempt, AgentTrace] | None:
+        """验证器刚跑过且通过 → 立即收工（否则要等模型额外回一次 done）。
+
+        为什么不等 done：模型在 write/run 之后常继续反复写同一个文件（它只被告知
+        「第 N/12 轮」，没人告诉它已经过了），一路撞到轮次上限，最后报出与事实相反的
+        「仍未通过验证器」。demo 实测 #1 就是 11 次验证器全 pass 却报失败。
+        验证器才是权威判据，且提 PR 前还有一道完整 F2P 复核兜底。
+        """
+        if not self._last_passed(trace):
+            return None
+        trace.summary = "验证器通过"
+        attempt.outcome = FixOutcome.SUCCESS
+        attempt.rounds = round_index
+        return self._finalize(attempt, trace, workspace)
 
     # -- 收尾 -------------------------------------------------------------
 

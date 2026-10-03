@@ -155,8 +155,16 @@ PR_BRANCHES = [
 def run_git(*args: str, cwd: Path = REPO_DIR) -> subprocess.CompletedProcess:
     """执行 git 命令（不打印敏感信息）。"""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    # 显式 utf-8：Windows 默认按 GBK 解码，git 的中文输出会变成乱码
     return subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True, env=env, timeout=300
+        ["git", *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+        timeout=300,
     )
 
 

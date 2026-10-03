@@ -50,6 +50,8 @@ class DockerRuntime:
                 [self._docker_bin, "info", "--format", "{{.ServerVersion}}"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -63,13 +65,22 @@ class DockerRuntime:
         if self._docker_bin is None:
             return False
         inspect = subprocess.run(
-            [self._docker_bin, "image", "inspect", image], capture_output=True, text=True
+            [self._docker_bin, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if inspect.returncode == 0:
             return True
         log.info("镜像 %s 不存在，尝试拉取…", image)
         pull = subprocess.run(
-            [self._docker_bin, "pull", image], capture_output=True, text=True, timeout=600
+            [self._docker_bin, "pull", image],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=600,
         )
         if pull.returncode != 0:
             log.error("拉取镜像失败：%s", pull.stderr.strip()[:300])
@@ -251,6 +262,7 @@ class DockerRuntime:
                 args,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
                 errors="replace",
                 timeout=timeout_seconds,
                 cwd=cwd,
