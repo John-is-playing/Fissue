@@ -125,12 +125,17 @@ class VerifierGenerator:
         repo_context: str,
         mode: str | None = None,
         test_hint: str | None = None,
+        linked_context: str | None = None,
     ) -> GeneratedVerifier:
         """生成验证器（单轮）。"""
         effective_mode = mode or self.cfg.mode
         data, usage = await self.client.chat_json(
             prompts.verifier_prompt(
-                item, repo_context=repo_context, mode=effective_mode, test_hint=test_hint
+                item,
+                repo_context=repo_context,
+                mode=effective_mode,
+                test_hint=test_hint,
+                linked_context=linked_context,
             ),
             purpose="verifier",
             default={},
@@ -152,10 +157,15 @@ class VerifierGenerator:
         failure_output: str,
         round_index: int,
         test_hint: str | None = None,
+        linked_context: str | None = None,
     ) -> GeneratedVerifier:
         """验证器行为不对时，带着证据让模型修正。"""
         messages = prompts.verifier_prompt(
-            item, repo_context=repo_context, mode=self.cfg.mode, test_hint=test_hint
+            item,
+            repo_context=repo_context,
+            mode=self.cfg.mode,
+            test_hint=test_hint,
+            linked_context=linked_context,
         )
         messages.append(
             {

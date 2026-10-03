@@ -114,6 +114,12 @@ class FlushProcessor:
             report.verdicts[key] = verdict
             priority = c.get("priority") if isinstance(c.get("priority"), Priority) else Priority.NONE
 
+            if queue_kind == QueueName.VERIFY.value:
+                # 派发优先级**以规则结论为准**，LLM 的 priority 仅作参考。
+                # 否则模型随手给个 tier2 就能绕过 fix_policy 的阈值与 only_issues，
+                # 把高难度条目也派去自动修复，并与评测阶段算出的优先级对不上。
+                priority = self._rule_priority(key, payload, fallback=priority)
+
             labels = self._decide_labels(queue_kind, verdict, c)
             if labels:
                 ok, err = await self._safe_label(payload, labels)
@@ -141,6 +147,44 @@ class FlushProcessor:
                     self.ctx.repo.set_item_status(key, ItemStatus.NEEDS_MANUAL)
 
         return report
+
+    # -- 优先级 -----------------------------------------------------------
+
+    def _rule_priority(
+        self, key: str, payload: dict[str, Any], *, fallback: Priority = Priority.NONE
+    ) -> Priority:
+        """按 ``fix_policy`` 规则重算派发优先级（权威来源）。
+
+        评测阶段算出的优先级就是 ``compute_priority`` 的结论，这里用同一把尺子，
+        保证「报告里的优先级」与「实际派发去修什么」完全一致。取不到评测结论时
+        才退回 LLM 给的参考值。
+        """
+        ev = self.ctx.repo.latest_evaluation(key)
+        if ev is None:
+            return fallback
+
+        item_type = None
+        item = None
+        try:
+            item = self.ctx.repo.get_item(key)
+        except Exception as exc:  # pragma: no cover - 仅防御
+            log.warning("读取条目失败 %s：%s", key, exc)
+        if item is not None:
+            item_type = item.item_type
+        else:
+            try:
+                item_type = ItemType(payload.get("item_type") or "issue")
+            except ValueError:
+                item_type = None
+
+        from ..ai.evaluator import compute_priority
+
+        rule = compute_priority(
+            ev, category=ev.category, policy=self.settings.fix_policy, item_type=item_type
+        )
+        if rule is not fallback:
+            log.debug("派发优先级以规则为准 %s：模型 %s → 规则 %s", key, fallback.value, rule.value)
+        return rule
 
     # -- 标签 -------------------------------------------------------------
 

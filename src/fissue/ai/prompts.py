@@ -238,6 +238,8 @@ def evaluation_prompt(
 - `action`：建议动作，取值之一 fix_now | triage | answer | backlog | close | needs_info
 - `summary`：一到两句话的结论，给维护者看
 - `spam`：反刷子信号，字段 is_spam / is_duplicate / is_ai_generated / duplicate_of(数组) / reasons(数组)
+  - `is_duplicate=true` 时，`duplicate_of` **必须**是重复对象的**编号数组**（如 `[2]`、`[2, 7]`），
+    **不要**写标题、也不要只把编号写进 reasons 文字里；找不到编号才留空数组。
 
 {render_item(item)}
 {dup_hint}
@@ -305,8 +307,14 @@ def verifier_prompt(
     repo_context: str,
     mode: str = "hybrid",
     test_hint: str | None = None,
+    linked_context: str | None = None,
 ) -> list[dict[str, str]]:
-    """为 Issue/PR 生成验证器（可执行测试优先，无法自动化则清单）。"""
+    """为 Issue/PR 生成验证器（可执行测试优先，无法自动化则清单）。
+
+    ``linked_context``：关联 Issue 的正文。PR 作者往往只在正文里复述自己修的那**一个**
+    场景，而该问题完整的复现用例/期望输出写在被修的 Issue 里——不喂这段材料，验证器
+    只会覆盖 PR 自己提到的场景，从而放过「只修一半」的修复。
+    """
     mode_rule = {
         "executable": '必须生成可执行测试（kind="executable"）。若确实无法自动化，仍选 executable 并尽量给出最接近的检查命令。',
         "checklist": '请生成自然语言验证清单（kind="checklist"），不写代码。',
@@ -322,13 +330,21 @@ def verifier_prompt(
 4. `command` 是在仓库根目录执行的运行命令，例如 `python -m pytest tests/test_xxx.py -q`。
 5. **禁止**依赖网络、禁止修改被测项目源码、禁止使用私有数据。
 6. 测试必须**精确指向问题根因**：修复前必定失败；不能写成恒真或恒假的测试。
-7. 若已有测试框架，优先复用（如项目用 pytest 就写 pytest 用例）。
+7. **逐条覆盖正文里列出的每一个复现用例与期望输出**：凡是正文中明确给出的输入/期望
+   对（复现步骤、期望输出、验收标准、示例表格里的每一行），都必须各写一条断言。
+   只挑其中一两个同类场景会导致验证器放过「只修了一半」的修复。
+8. 若正文给出了多个语义不同的场景（例如「连续空白」与「空白+连字符混排」），
+   它们必须**都有断言**——不要因为它们看起来相似就合并成一条。
+9. 写完后自查一遍：把正文里的每个期望输出逐一对照，确认每一条都有对应断言，
+   且断言是**能被未修复代码区分开**的（否则 base 阶段会直接通过）。
+10. 若已有测试框架，优先复用（如项目用 pytest 就写 pytest 用例）。
 
 仓库上下文：
 {repo_context}
 
 问题描述：
 {render_item(item, include_comments=True)}
+{(chr(10) + '被本 PR 修复的原 Issue（复现用例与期望输出以它为准，必须逐条覆盖）：' + chr(10) + _truncate(linked_context.strip(), 6000)) if linked_context and linked_context.strip() else ''}
 {("运行测试的方式提示：" + test_hint) if test_hint else ""}
 
 只输出 JSON：

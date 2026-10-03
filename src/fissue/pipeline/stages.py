@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -148,11 +149,13 @@ class EvalStage:
         """并发评测一批条目。"""
         result = BatchResult(repo=items[0].repo if items else "")
         sem = asyncio.Semaphore(max(1, concurrency))
+        pool = self._similar_pool(items)
 
         async def one(item: RawItem) -> StageResult:
             async with sem:
                 try:
-                    evaluation = await self.run(item, deep=deep)
+                    similar = _similar_to(item, pool) if pool else None
+                    evaluation = await self.run(item, deep=deep, similar=similar)
                     return StageResult(
                         key=item.key,
                         category=evaluation.category,
@@ -167,6 +170,25 @@ class EvalStage:
             result.add(r)
         log.info(result.summary)
         return result
+
+    def _similar_pool(self, batch: Sequence[RawItem]) -> list[RawItem]:
+        """本批条目 + 同仓库已入库条目，作为重复检测的候选池。
+
+        包含同批条目，否则「同一批里的两条重复提交」永远互相看不见
+        （而 DESIGN.md 正是要靠批量上下文来识别成批重复）。
+        """
+        pool = list(batch)
+        slug = batch[0].repo if batch else ""
+        if not slug:
+            return pool
+        try:
+            existing = self.ctx.repo.list_items(repo_slug=slug, limit=200)
+        except Exception as exc:
+            log.warning("加载相似条目候选失败（本次跳过重复检测）：%s", exc)
+            return pool
+        seen = {i.key for i in pool}
+        pool.extend(e for e in existing if e.key not in seen)
+        return pool
 
 
 # ---------------------------------------------------------------------------
@@ -334,15 +356,9 @@ class PRVerifyStage:
 
             ws = await self.ctx.clone_workspace(repo_cfg)
 
-            # 在沙盒/本地把 PR 的改动合并进工作副本
-            merged, merge_note = await self._merge_pr(ws, item, repo_cfg)
-            result.notes.append(merge_note)
-            if not merged:
-                self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
-                result.status = ItemStatus.NEEDS_MANUAL
-                result.skipped_reason = f"无法合并 PR：{merge_note}"
-                return result
-
+            # base 阶段必须跑在**未修复**的代码上（此刻工作区是 main）。
+            # 若先合并 PR 再跑 base，验证器会在“已修复”的代码上通过，被误判为
+            # 「验证器不可靠」——那样任何正确的 PR 都无法被推荐合并。
             repo_context = self._repo_context(ws, repo_cfg)
             verifier_id, spec, base_result = await self.ctx.verifier.generate_and_validate(
                 item=item,
@@ -350,6 +366,7 @@ class PRVerifyStage:
                 repo_context=repo_context,
                 generator=self.ctx.generator,
                 test_hint=repo_cfg.test_hint,
+                linked_context=self._linked_issue_context(item, repo_cfg),
             )
             result.verifier_kind = spec.kind
             result.verifier_result = base_result
@@ -360,7 +377,25 @@ class PRVerifyStage:
                 result.notes.append("清单型验证器：转人工复核")
                 return result
 
-            # 把「合并后通过」作为 fix 阶段结论记录
+            if not _base_reproduced(spec, base_result):
+                # 未修复代码上就通过 → 该验证器证明不了这个 PR 修的是什么。
+                # 再合并 PR 跑 fix 只会得到“必然通过”的假结论，故直接转人工。
+                self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
+                result.status = ItemStatus.NEEDS_MANUAL
+                result.skipped_reason = base_result.conclusion
+                result.notes.append("PR 合并验证转人工：" + base_result.conclusion)
+                return result
+
+            # base 已确认复现 → 现在才把 PR 的改动合并进工作副本
+            merged, merge_note = await self._merge_pr(ws, item, repo_cfg)
+            result.notes.append(merge_note)
+            if not merged:
+                self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
+                result.status = ItemStatus.NEEDS_MANUAL
+                result.skipped_reason = f"无法合并 PR：{merge_note}"
+                return result
+
+            # 在**已合并**的工作区上跑 fix 阶段，构成完整 F2P
             finished = await self.ctx.verifier.verify_fix(
                 VerifyContext(
                     workspace=ws,
@@ -472,6 +507,31 @@ class PRVerifyStage:
             readme=ws.readme(),
         )
 
+    def _linked_issue_context(self, item: RawItem, repo_cfg) -> str:
+        """取回被本 PR 修复的原 Issue 正文。
+
+        PR 作者往往只在正文里复述自己修的那**一个**场景，而问题完整的复现用例写在
+        原 Issue 里（例如 PR #7 只说 ``Hello   World``，而 issue #2 还列了
+        ``Hello - World``、``a  -  b``）。不喂这段材料，验证器只会覆盖 PR 自己
+        提到的场景，从而把「只修一半」的修复判成通过。
+        """
+        if not item.linked_issues:
+            return ""
+        parts: list[str] = []
+        for number in item.linked_issues[:5]:
+            try:
+                linked = self.ctx.repo.get_item(f"{item.platform.value}:{repo_cfg.slug}#{number}")
+            except Exception as exc:  # pragma: no cover - 仅防御
+                log.debug("读取关联 Issue 失败 %s#%s：%s", repo_cfg.slug, number, exc)
+                continue
+            if linked is None:
+                continue
+            parts.append(f"### Issue #{linked.number}：{linked.title}\n{linked.body}")
+        if not parts:
+            return ""
+        log.debug("已注入 %d 条关联 Issue 正文供验证器生成 %s", len(parts), item.key)
+        return "\n\n".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # 编排入口
@@ -547,6 +607,84 @@ class Pipeline:
 
         log.info(combined.summary)
         return combined
+
+
+# 标题相似度预筛用：过泛的词命中也不算强信号
+_TITLE_STOPWORDS = frozenset({
+    "the", "and", "for", "not", "but", "with", "you", "are", "can", "does", "issue",
+    "bug", "fix", "error", "test", "add", "use", "new", "get", "set", "url", "api",
+})
+_TITLE_TOKEN = re.compile(r"[0-9a-z_]+|[\u4e00-\u9fff]")
+
+
+def _title_tokens(title: str) -> set[str]:
+    """把标题切成用于相似度比较的 token（ASCII 词 + 中文单字）。"""
+    out: set[str] = set()
+    for tok in _TITLE_TOKEN.findall((title or "").lower()):
+        if tok[0].isascii():
+            if len(tok) >= 3 and tok not in _TITLE_STOPWORDS:
+                out.add(tok)
+        else:
+            out.add(tok)
+    return out
+
+
+def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> list[dict[str, Any]]:
+    """挑出标题上最可能重复的条目，作为**候选**交给 LLM 判断。
+
+    只与**同类型、更早**的条目比较：
+
+    * 同类型：Issue 的重复对象是别的 Issue，**不是「修它的那个 PR」**——否则
+      #1 会被判成 #6（修 #1 的 PR）的重复，纯属假阳性。
+    * 更早：重复关系单向指向更早的那条。否则两条互为候选、互相标记重复，
+      而其中更早的往往才是该保留的正主。
+
+    这是**面向召回**的预筛（宁可多给几条，绝不代替判断）：提示词已明确要求
+    「只是标题相似，需结合内容判断，不要仅凭标题就判定重复」。共享有辨识度的
+    ASCII 词（如 ``slugify``）是最强的词面重复信号，故直接抬到阈值以上。
+    """
+    base = _title_tokens(item.title)
+    if not base:
+        return []
+    scored: list[tuple[float, RawItem]] = []
+    for other in pool:
+        if other.key == item.key:
+            continue
+        if other.item_type is not item.item_type or other.number >= item.number:
+            continue
+        toks = _title_tokens(other.title)
+        if not toks:
+            continue
+        inter, union = base & toks, base | toks
+        score = len(inter) / len(union) if union else 0.0
+        if any(t.isascii() and t in toks for t in base):
+            score = max(score, 0.5)
+        if score >= 0.25:
+            scored.append((score, other))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [
+        {
+            "key": o.key,
+            "number": o.number,
+            "title": o.title,
+            "state": o.state,
+            "similarity": round(s, 2),
+        }
+        for s, o in scored[:limit]
+    ]
+
+
+def _base_reproduced(spec: Any, base_result: VerifierResult) -> bool:
+    """base 阶段是否确认了「问题可复现」。
+
+    与 ``judge_f2p`` 的判定保持一致：ERROR/TIMEOUT 视为结论不可信；
+    ``expect_fail_on_base`` 为真时 base 必须**失败**（exit≠0）才算复现。
+    """
+    base = base_result.base_run
+    if base is None or base.outcome in (VerifierOutcome.ERROR, VerifierOutcome.TIMEOUT):
+        return False
+    expect_fail = getattr(spec, "expect_fail_on_base", True)
+    return (base.outcome is VerifierOutcome.FAIL) if expect_fail else True
 
 
 def _run_output(run: Any) -> str:

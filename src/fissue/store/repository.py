@@ -571,19 +571,49 @@ class Repository:
         item_id: int | None = None,
         payload: dict | None = None,
     ) -> int:
-        """入队（同队列同条目的 pending 去重）。"""
+        """入队（同一队列同一条目只保留**一行**，重复入队即复用并重置）。
+
+        为什么不是「只复用 pending/running」：唯一约束 ``(queue,item_key,status)``
+        把终态也算进去了，所以「同一队列同一条目」只能存在**一个** ``done`` 行。
+        若重跑时新插一行 pending，它稍后转 ``done`` 就会撞上上一轮遗留的 ``done``，
+        抛 ``UNIQUE constraint failed``（重跑验证必崩）。这里改为复用同一行并重置，
+        顺带收敛库里可能已存在的重复行——历史留痕在 ``verifier_runs`` /
+        ``batch_conclusions`` 里，队列只承载「当前状态」。
+        """
         with self.db.session() as s:
-            existing = s.scalar(
-                select(QueueEntryRow).where(
-                    and_(
-                        QueueEntryRow.queue == queue.value,
-                        QueueEntryRow.item_key == item_key,
-                        QueueEntryRow.status.in_(["pending", "running"]),
+            rows = list(
+                s.scalars(
+                    select(QueueEntryRow)
+                    .where(
+                        and_(
+                            QueueEntryRow.queue == queue.value,
+                            QueueEntryRow.item_key == item_key,
+                        )
                     )
+                    .order_by(QueueEntryRow.id)
                 )
             )
-            if existing is not None:
-                return int(existing.id)
+            if rows:
+                keep, extras = rows[0], rows[1:]
+                for extra in extras:
+                    s.delete(extra)
+                if extras:
+                    # 必须先**真正删掉**多余行再改 keep 的状态：SQLAlchemy 的工作单元
+                    # 先执行 UPDATE 后执行 DELETE，否则新状态会撞上尚未删除的旧行。
+                    s.flush()
+                keep.status = "pending"
+                keep.item_id = item_id if item_id is not None else keep.item_id
+                keep.payload = payload or {}
+                keep.result = {}
+                keep.error = None
+                keep.attempts = 0
+                keep.started_at = None
+                keep.finished_at = None
+                keep.flushed_at = None
+                keep.enqueued_at = _now()
+                s.flush()
+                return int(keep.id)
+
             row = QueueEntryRow(
                 queue=queue.value,
                 item_key=item_key,

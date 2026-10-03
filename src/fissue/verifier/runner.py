@@ -322,14 +322,17 @@ class VerifierRunner:
         repo_context: str,
         generator: VerifierGenerator,
         test_hint: str | None = None,
+        linked_context: str | None = None,
     ) -> tuple[int | None, VerifierSpec, VerifierResult]:
         """生成验证器 → 跑 base → 不可靠则修正，最多 max_rounds 轮。
+
+        ``linked_context``：被本 PR 修复的原 Issue 正文（见 ``verifier_prompt``）。
 
         返回 ``(verifier_id, 最终 spec, base 阶段结果)``。
         """
         max_rounds = max(1, self.settings.verifier.max_rounds)
         generated: GeneratedVerifier = await generator.generate(
-            item, repo_context=repo_context, test_hint=test_hint
+            item, repo_context=repo_context, test_hint=test_hint, linked_context=linked_context
         )
         spec = generated.spec
         best_result: VerifierResult | None = None
@@ -377,6 +380,7 @@ class VerifierRunner:
                 failure_output=evidence,
                 round_index=round_index + 1,
                 test_hint=test_hint,
+                linked_context=linked_context,
             )
             spec = refined.spec
 

@@ -176,8 +176,12 @@ class RepoWorkspace:
         """把补丁应用到工作区（``git apply``）。"""
         if not patch.strip():
             return False, "补丁为空"
-        with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False, encoding="utf-8") as fh:
-            fh.write(patch)
+        # 必须以**二进制**写入：文本模式在 Windows 上会把 \n 转成 \r\n，
+        # 于是 patch 里每行都多一个 CR，`git apply` 的上下文行匹配不上，
+        # 报 "patch does not apply"（平台的 diff 本身是纯 LF）。
+        data = patch.encode("utf-8").replace(b"\r\n", b"\n")
+        with tempfile.NamedTemporaryFile("wb", suffix=".patch", delete=False) as fh:
+            fh.write(data)
             patch_file = fh.name
         try:
             args = ["git", "apply", "--whitespace=nowarn"]

@@ -41,6 +41,9 @@ DIMENSIONS = ("authenticity", "importance", "feasibility", "pr_quality", "diffic
 # 纯 ASCII 关键词（可含空格/连字符/下划线）
 _ASCII_KEYWORD = _re.compile(r"^[a-z0-9][a-z0-9 _.-]*$")
 
+# reasons 文本里的条目引用（如「与 Issue #2 完全重合」）→ 回填 duplicate_of
+_DUP_REF = _re.compile(r"[#＃]\s*(\d+)")
+
 
 def keyword_hit(keyword: str, lowered_text: str) -> bool:
     """判断关键词是否命中。
@@ -133,22 +136,43 @@ def parse_spam(raw: Any) -> SpamSignal:
     dup_of = raw.get("duplicate_of") or []
     if not isinstance(dup_of, list):
         dup_of = [dup_of]
-    nums: list[int] = []
-    for d in dup_of:
-        try:
-            nums.append(int(d))
-        except (TypeError, ValueError):
-            continue
     reasons = raw.get("reasons") or []
     if isinstance(reasons, str):
         reasons = [reasons]
+    parsed_nums: list[int] = []
+    for d in dup_of:
+        try:
+            parsed_nums.append(int(d))
+        except (TypeError, ValueError):
+            continue
     return SpamSignal(
         is_spam=bool(raw.get("is_spam")),
-        is_duplicate=bool(raw.get("is_duplicate")),
+        # 填了 duplicate_of 就说明是重复，两个字段不该互相矛盾
+        is_duplicate=bool(raw.get("is_duplicate")) or bool(parsed_nums),
         is_ai_generated=bool(raw.get("is_ai_generated")),
-        duplicate_of=nums,
+        duplicate_of=parsed_nums,
         reasons=[str(r)[:300] for r in reasons if r],
     )
+
+
+def backfill_duplicate_of(spam: SpamSignal, *, exclude: int | None = None) -> SpamSignal:
+    """``is_duplicate`` 为真但 ``duplicate_of`` 为空时，从 reasons 文本回填编号。
+
+    模型常把重复对象写成 reasons 里的文字（如「与 Issue #2 完全重合」）却忘了
+    填数组字段，导致结构化字段恒为空、导出与看板跳不到具体条目。``exclude``
+    传条目自身编号，避免把自己算成重复对象。
+    """
+    if not spam.is_duplicate or spam.duplicate_of:
+        return spam
+    nums: list[int] = []
+    for reason in spam.reasons:
+        for found in _DUP_REF.findall(reason):
+            n = int(found)
+            if n != exclude and n not in nums:
+                nums.append(n)
+    if nums:
+        spam.duplicate_of = nums[:10]
+    return spam
 
 
 def parse_category(value: Any) -> Category:
@@ -225,14 +249,18 @@ def compute_priority(
     *,
     category: Category,
     policy: FixPolicyConfig,
+    item_type: ItemType | None = None,
     verified: bool = False,
 ) -> Priority:
     """按 Q1 的规则算自动修复优先级。
 
     tier1 = 难度低 + 重要性高；tier2 = 难度低 + 重要性低；其余 none。
-    ``only_issues`` 为真时（默认）只有 Issue 才自动修复。
+    ``policy.only_issues`` 为真时（默认）只有 Issue 才自动修复；PR 一律 none，
+    否则报告里会给出误导性的 ``fix_now``（实际不会被自动修复）。
     """
     if category is not Category.BUG:
+        return Priority.NONE
+    if policy.only_issues and item_type is not None and item_type is not ItemType.ISSUE:
         return Priority.NONE
     difficulty = evaluation.difficulty
     importance = evaluation.importance
@@ -349,8 +377,13 @@ class Evaluator:
 
         evaluation = parse_evaluation(data, model=usage.model, usage=usage)
         evaluation.category = category  # 以分类阶段结论为准
+        # 模型常把重复对象只写进 reasons 文字，导致 duplicate_of 恒为空、跳不到条目
+        evaluation.spam = backfill_duplicate_of(evaluation.spam, exclude=item.number)
         evaluation.priority = compute_priority(
-            evaluation, category=category, policy=self.settings.fix_policy
+            evaluation,
+            category=category,
+            policy=self.settings.fix_policy,
+            item_type=item.item_type,
         )
         evaluation = apply_rule_adjustments(evaluation, item, cfg=self.cfg)
 
