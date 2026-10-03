@@ -444,6 +444,15 @@ class Repository:
             item.priority = evaluation.priority.value
             if item.status in (ItemStatus.NEW.value,):
                 item.status = ItemStatus.EVALUATED.value
+            elif (
+                item.status == ItemStatus.FIX_QUEUED.value
+                and evaluation.priority is Priority.NONE
+            ):
+                # 重评后不再够格自动修复（如新判定为疑似重复、难度超阈值），
+                # 若状态仍停在 fix_queued 就会与 priority=none 自相矛盾，
+                # 报告/看板显示可疑。收敛为需人工，避免留下不一致的流转痕迹。
+                # 只动 fix_queued：fixing / pr_created 表示修复已开工，不回退。
+                item.status = ItemStatus.NEEDS_MANUAL.value
             s.flush()
             return int(row.id)
 

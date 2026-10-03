@@ -143,6 +143,42 @@ def test_save_evaluation_unknown_item_raises(repo: Repository) -> None:
         repo.save_evaluation("github:psf/requests#999", Evaluation())
 
 
+def test_reeval_downgrade_clears_fix_queued(repo: Repository) -> None:
+    """重评后优先级降为 none，停留在 fix_queued 的条目应收敛为 needs_manual。
+
+    回归：#5 首次 flush 时被置 fix_queued，之后重评判定为疑似重复（priority=none），
+    但 save_evaluation 只处理 NEW→EVALUATED，于是状态停在 fix_queued，
+    与 priority=none 自相矛盾（报告/看板显示可疑）。
+    """
+    _seed(repo, number=31)
+    key = "github:psf/requests#31"
+    repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+
+    repo.save_evaluation(key, Evaluation(priority=Priority.NONE, model="stub"))
+    row = repo.get_item_row(key)
+    assert row.status == ItemStatus.NEEDS_MANUAL.value
+    assert row.priority == Priority.NONE.value
+
+
+def test_reeval_keeps_qualified_fix_queued(repo: Repository) -> None:
+    """仍够格自动修复时，fix_queued 保持不动。"""
+    _seed(repo, number=32)
+    key = "github/psf/requests#32".replace("github/", "github:")   # github:psf/requests#32
+    repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=Priority.TIER2)
+    repo.save_evaluation(key, Evaluation(priority=Priority.TIER2, model="stub"))
+    assert repo.get_item_row(key).status == ItemStatus.FIX_QUEUED.value
+
+
+def test_reeval_does_not_rewind_in_progress_fix(repo: Repository) -> None:
+    """已开工的修复不回退：fixing / pr_created 的优先级变化不动其状态。"""
+    _seed(repo, number=33)
+    key = "github:psf/requests#33"
+    for status in (ItemStatus.FIXING, ItemStatus.PR_CREATED):
+        repo.set_item_status(key, status, priority=Priority.TIER1)
+        repo.save_evaluation(key, Evaluation(priority=Priority.NONE, model="stub"))
+        assert repo.get_item_row(key).status == status.value
+
+
 # ---------------------------------------------------------------------------
 # 验证器
 # ---------------------------------------------------------------------------
