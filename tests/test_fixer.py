@@ -284,6 +284,121 @@ async def test_fix_item_skips_when_attempt_exists(fixer_ctx, repo, sample_issue)
     assert "重复" in attempt.error
 
 
+async def test_fix_item_retries_after_needs_manual(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """NEEDS_MANUAL 不该把条目永久封禁，允许重试。
+
+    回归：_has_open_attempt 曾把 NEEDS_MANUAL 也当作「已存在修复尝试」，
+    于是 #1 一条陈旧的失败记录（来源还是「Agent 空转到轮次上限」那个 bug）
+    就成了永久路障，之后每次 fix 都被 skip。
+
+    这里把 clone_workspace 换成哨兵异常：只为证明流程**越过了闸门**，
+    绝不去真的 clone 远端（子进程不受测试网络守卫保护，会挂死）。
+    """
+    from fissue.models import FixAttempt
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key, VerifierSpec(kind=VerifierKind.EXECUTABLE, command="pytest"))
+    repo.save_fix_attempt(FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.NEEDS_MANUAL,
+                                     error="达到最大轮次（12）仍未通过验证器"))
+
+    async def _stop(repo_cfg, **kwargs):
+        raise RuntimeError("已越过闸门（哨兵）")
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _stop)
+
+    fixer = AutoFixer(fixer_ctx)
+    assert fixer._has_open_attempt(sample_issue.key) is False        # 不该被拦住
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key))
+    # 没有被 skip，而是走到了克隆那一步 —— 证明确实在重试
+    assert attempt.outcome is not FixOutcome.SKIPPED
+    assert "重复" not in (attempt.error or "")
+    assert "已越过闸门" in (attempt.error or "")
+
+
+def test_has_open_attempt_only_blocks_success(repo, sample_issue) -> None:
+    """只有 SUCCESS 才算「已提过 PR」；其余终态一律放行重试。"""
+    from fissue.models import FixAttempt
+
+    _register(repo, sample_issue)
+    fixer = AutoFixer.__new__(AutoFixer)
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.repo = repo
+    fixer.ctx = ctx
+
+    for outcome, blocked in [
+        (FixOutcome.NEEDS_MANUAL, False),
+        (FixOutcome.FAILED, False),
+        (FixOutcome.SKIPPED, False),
+    ]:
+        repo.db.drop_all()
+        repo.db.create_all()
+        _register(repo, sample_issue)
+        repo.save_fix_attempt(FixAttempt(item_key=sample_issue.key, outcome=outcome))
+        assert fixer._has_open_attempt(sample_issue.key) is blocked, outcome
+
+    repo.save_fix_attempt(FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS, pr_url="u"))
+    assert fixer._has_open_attempt(sample_issue.key) is True
+
+
+# ---------------------------------------------------------------------------
+# 修复报告统计（FixReport）
+# ---------------------------------------------------------------------------
+
+
+def test_fix_report_does_not_count_dry_run_as_failure() -> None:
+    """dry-run 下「未提 PR」是设计如此，补丁已产出即算成功，不得计入失败。
+
+    回归：报告把非 SUCCESS 一律算失败，于是 demo 实跑 dry-run 输出
+    「成功 0，失败 2」——而其中 #2 的修复其实是完整的（验证器全过、补丁正确）。
+    """
+    from fissue.fixer.autofix import FixReport
+    from fissue.models import FixAttempt
+
+    def att(outcome, pr=None, patch=None):
+        return FixAttempt(item_key="k", outcome=outcome, pr_url=pr, patch_path=patch)
+
+    # dry-run：修复成功但只产补丁不提 PR → 计入成功
+    r = FixReport()
+    r.attempted = 2
+    r.record(att(FixOutcome.NEEDS_MANUAL, patch="/p.patch"), dry_run=True)
+    r.record(att(FixOutcome.SKIPPED), dry_run=True)
+    assert r.succeeded == 1
+    assert r.skipped == 1
+    assert r.failed == 0
+    assert "成功 1" in r.summary and "失败 0" in r.summary
+
+    # 非 dry-run：NEEDS_MANUAL 是真失败，不冒充成功
+    r2 = FixReport()
+    r2.attempted = 1
+    r2.record(att(FixOutcome.NEEDS_MANUAL, patch="/p.patch"), dry_run=False)
+    assert r2.succeeded == 0
+    assert r2.needs_manual == 1
+    assert r2.failed == 0
+
+
+def test_fix_report_counts_all_outcomes_separately() -> None:
+    """四类终态各自计数，不再把 skipped / needs_manual 混进 failed。"""
+    from fissue.fixer.autofix import FixReport
+    from fissue.models import FixAttempt
+
+    r = FixReport()
+    r.attempted = 4
+    r.record(FixAttempt(item_key="a", outcome=FixOutcome.SUCCESS, pr_url="http://x/1"))
+    r.record(FixAttempt(item_key="b", outcome=FixOutcome.NEEDS_MANUAL, error="F2P 未通过"))
+    r.record(FixAttempt(item_key="c", outcome=FixOutcome.SKIPPED, error="优先级不足"))
+    r.record(FixAttempt(item_key="d", outcome=FixOutcome.FAILED, error="异常"))
+    assert (r.succeeded, r.needs_manual, r.skipped, r.failed) == (1, 1, 1, 1)
+    for frag in ("成功 1", "需人工 1", "跳过 1", "失败 1"):
+        assert frag in r.summary
+
+
 # ---------------------------------------------------------------------------
 # 失败降级报告
 # ---------------------------------------------------------------------------

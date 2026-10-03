@@ -48,17 +48,43 @@ log = get_logger(__name__)
 
 @dataclass
 class FixReport:
-    """一批修复的结果。"""
+    """一批修复的结果。
+
+    分开计数，避免把「没成功」「策略跳过」「dry-run」统统塞进「失败」——
+    那会让报告里的数字完全不可信（dry-run 下成功必然被报成失败，因为 dry-run
+    本来就不提 PR）。
+    """
 
     attempted: int = 0
     succeeded: int = 0
+    needs_manual: int = 0
+    skipped: int = 0
     failed: int = 0
     prs: list[tuple[str, str]] = field(default_factory=list)      # (item_key, pr_url)
     attempts: list[FixAttempt] = field(default_factory=list)
 
+    def record(self, attempt: FixAttempt, *, dry_run: bool = False) -> None:
+        """按 outcome 归类一次尝试。"""
+        if attempt.outcome is FixOutcome.SUCCESS:
+            self.succeeded += 1
+        elif attempt.outcome is FixOutcome.SKIPPED:
+            self.skipped += 1
+        elif attempt.outcome is FixOutcome.NEEDS_MANUAL:
+            # dry-run 下「未提 PR」是**设计如此**：补丁已产出即说明修复本身成功
+            # （genuine 失败走 _handle_failure，产出的是 report_path 而非 patch_path）
+            if dry_run and attempt.patch_path:
+                self.succeeded += 1
+            else:
+                self.needs_manual += 1
+        else:
+            self.failed += 1
+
     @property
     def summary(self) -> str:
-        return f"修复尝试 {self.attempted}，成功 {self.succeeded}，失败 {self.failed}，产出 PR {len(self.prs)}"
+        return (
+            f"修复尝试 {self.attempted}，成功 {self.succeeded}，需人工 {self.needs_manual}，"
+            f"跳过 {self.skipped}，失败 {self.failed}，产出 PR {len(self.prs)}"
+        )
 
 
 class PRCreator:
@@ -428,12 +454,9 @@ class AutoFixer:
             attempt = await self.fix_item(item, dry_run=dry_run, max_rounds=max_rounds)
             report.attempted += 1
             report.attempts.append(attempt)
-            if attempt.outcome is FixOutcome.SUCCESS:
-                report.succeeded += 1
-                if attempt.pr_url:
-                    report.prs.append((item.key, attempt.pr_url))
-            else:
-                report.failed += 1
+            report.record(attempt, dry_run=dry_run)
+            if attempt.outcome is FixOutcome.SUCCESS and attempt.pr_url:
+                report.prs.append((item.key, attempt.pr_url))
         log.info(report.summary)
         return report
 
@@ -524,10 +547,14 @@ class AutoFixer:
         return attempt
 
     def _has_open_attempt(self, item_key: str) -> bool:
-        for a in self.ctx.repo.fix_attempts(item_key):
-            if a.outcome in (FixOutcome.SUCCESS, FixOutcome.NEEDS_MANUAL):
-                return True
-        return False
+        """是否已有**成功**的修复尝试（有则不再重复提 PR）。
+
+        只拦 SUCCESS：它才意味着「已经提过 PR」，重复跑会撞已有分支/PR。
+        NEEDS_MANUAL / FAILED 表示这轮**没成功**，拦它们等于把一次失败当永久封禁——
+        修复失败的原因可能出在验证器质量或模型能力上，允许多次尝试、每轮留 trace
+        记录，比一失败就拉黑更合理。真正的成本控制在预算闸门（BudgetGuard）那边。
+        """
+        return any(a.outcome is FixOutcome.SUCCESS for a in self.ctx.repo.fix_attempts(item_key))
 
     def _repo_config(self, item: RawItem) -> RepoConfig:
         try:
