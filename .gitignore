@@ -1,0 +1,31 @@
+# 环境与密钥
+.env
+config.yaml
+
+# 数据与产物
+data/
+*.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 本地数据库（SQLite 试用库，含抓取数据，不入版本库）
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+.tmphelp
+.atomcode

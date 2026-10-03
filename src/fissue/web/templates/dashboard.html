@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fissue · 仪表盘</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel2: #1e222b; --line: #2a2f3a;
+    --fg: #e6e8ee; --muted: #98a0b3; --accent: #5b9dff;
+    --bug: #ff6b6b; --feature: #7dd3a0; --unknown: #98a0b3;
+    --t1: #ffb454; --t2: #7dd3a0; --none: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.55 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 19px; letter-spacing: .5px; }
+  header .ver { color: var(--muted); font-size: 12px; }
+  .wrap { padding: 20px 24px 60px; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 12px 16px; min-width: 130px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 20px; font-weight: 600; margin-top: 2px; }
+  form.filters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 16px; }
+  select, input, button { background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+          border-radius: 7px; padding: 7px 10px; font-size: 13px; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: #1d4ed8; border-color: #1d4ed8; }
+  button.danger { background: #7f1d1d; border-color: #7f1d1d; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+          border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  th, td { padding: 9px 11px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { background: var(--panel2); color: var(--muted); font-weight: 500; font-size: 12px;
+       position: sticky; top: 0; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #1b1f27; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px;
+         border: 1px solid var(--line); color: var(--muted); margin-right: 4px; }
+  .bug { color: var(--bug); border-color: #4b1f22; background: #2a1518; }
+  .feature { color: var(--feature); border-color: #1f4b33; background: #14291f; }
+  .unknown { color: var(--unknown); }
+  .tier1 { color: var(--t1); border-color: #4b3a1f; background: #2a2216; }
+  .tier2 { color: var(--t2); border-color: #1f4b33; background: #14291f; }
+  .none { color: var(--none); }
+  .score { font-variant-numeric: tabular-nums; }
+  .bar { display: inline-block; height: 6px; border-radius: 3px; background: var(--accent);
+         vertical-align: middle; margin-left: 6px; }
+  .muted { color: var(--muted); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .banner { background: #2a2216; border: 1px solid #4b3a1f; color: #ffd08a;
+            padding: 8px 12px; border-radius: 8px; margin-bottom: 14px; font-size: 13px; }
+  pre { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+        padding: 10px; overflow: auto; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Fissue</h1>
+  <span class="ver">Issue/PR AI 评测 · 沙盒验证 · 自动修复</span>
+  <span class="muted" style="margin-left:auto">
+    {{ summary.total }} 条 · BUG {{ summary.by_category.get('bug', 0) }} ·
+    FEATURE {{ summary.by_category.get('feature', 0) }}
+  </span>
+</header>
+
+<div class="wrap">
+
+  {% if read_only %}
+  <div class="banner">当前为只读模式（web.read_only = true）——操作按钮已禁用。</div>
+  {% endif %}
+
+  <div class="cards">
+    <div class="card"><div class="k">条目总数</div><div class="v">{{ summary.total }}</div></div>
+    <div class="card"><div class="k">Issue</div><div class="v">{{ summary.by_type.get('issue', 0) }}</div></div>
+    <div class="card"><div class="k">PR</div><div class="v">{{ summary.by_type.get('pr', 0) }}</div></div>
+    <div class="card"><div class="k">tier1（优先修）</div><div class="v">{{ summary.by_priority.get('tier1', 0) }}</div></div>
+    <div class="card"><div class="k">tier2</div><div class="v">{{ summary.by_priority.get('tier2', 0) }}</div></div>
+    {% for dim, val in summary.avg_scores.items() %}
+    <div class="card"><div class="k">平均 {{ dim }}</div><div class="v">{{ val }}</div></div>
+    {% endfor %}
+  </div>
+
+  <form class="filters" method="get">
+    <select name="repo_slug">
+      <option value="">全部仓库</option>
+      {% for r in repos %}
+      <option value="{{ r }}" {% if filters.repo_slug == r %}selected{% endif %}>{{ r }}</option>
+      {% endfor %}
+    </select>
+    <select name="item_type">
+      <option value="">全部类型</option>
+      <option value="issue" {% if filters.item_type == 'issue' %}selected{% endif %}>Issue</option>
+      <option value="pr" {% if filters.item_type == 'pr' %}selected{% endif %}>PR</option>
+    </select>
+    <select name="category">
+      <option value="">全部分类</option>
+      {% for c in ['bug', 'feature', 'unknown'] %}
+      <option value="{{ c }}" {% if filters.category == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    <select name="priority">
+      <option value="">全部优先级</option>
+      {% for p in ['tier1', 'tier2', 'none'] %}
+      <option value="{{ p }}" {% if filters.priority == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+    <select name="status">
+      <option value="">全部状态</option>
+      {% for s in ['new','evaluated','verifier_ready','queued','verified','labeled','fix_queued','fixing','pr_created','needs_manual','skipped','failed'] %}
+      <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    <input type="number" name="limit" value="{{ filters.limit }}" min="1" max="500" style="width:90px">
+    <button type="submit">筛选</button>
+    {% if not read_only %}
+    <button type="button" onclick="act('scan', {})">扫描新增</button>
+    <button type="button" onclick="act('evaluate', {limit:20})">评测未评测</button>
+    <button type="button" onclick="act('verify', {limit:10})">验证</button>
+    <button type="button" onclick="act('flush', {force:true})">Flush 队列</button>
+    <button type="button" onclick="act('fix', {dry_run:true, limit:5})">试跑修复（dry-run）</button>
+    {% endif %}
+  </form>
+
+  {% if rows %}
+  <table>
+    <thead>
+      <tr>
+        <th style="width:70px">编号</th>
+        <th>标题</th>
+        <th style="width:64px">分类</th>
+        <th style="width:76px">真/重/难</th>
+        <th style="width:64px">优先级</th>
+        <th style="width:96px">状态</th>
+        <th>结论</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in rows %}
+      <tr>
+        <td>
+          <span class="tag">{{ row.type }}</span><br>
+          <a href="{{ row.url }}" target="_blank" rel="noopener">#{{ row.number }}</a>
+        </td>
+        <td>
+          <a href="/item/{{ row.key | urlencode }}">{{ row.title }}</a><br>
+          <span class="muted">{{ row.repo }} · {{ row.author }}</span>
+          {% for l in row.labels %}<span class="tag">{{ l }}</span>{% endfor %}
+        </td>
+        <td>
+          {% set cat = row.evaluation.category if row.evaluation else 'unknown' %}
+          <span class="tag {{ cat }}">{{ cat }}</span>
+        </td>
+        <td class="score">
+          {% if row.evaluation %}
+            {% set sc = row.evaluation.scores %}
+            {{ sc.get('authenticity', '-') }}/{{ sc.get('importance', '-') }}/{{ sc.get('difficulty', '-') }}
+          {% else %}<span class="muted">未评测</span>{% endif %}
+        </td>
+        <td>
+          {% set pr = row.evaluation.priority if row.evaluation else 'none' %}
+          <span class="tag {{ pr }}">{{ pr }}</span>
+        </td>
+        <td><span class="tag">{{ row.evaluation and '已评测' or '待评测' }}</span></td>
+        <td>
+          {% if row.evaluation %}
+            {{ row.evaluation.summary[:120] }}
+            {% if row.evaluation.spam and (row.evaluation.spam.is_spam or row.evaluation.spam.is_duplicate) %}
+              <br><span class="tag bug">⚠️ 疑似{{ '刷量' if row.evaluation.spam.is_spam else '' }}{{ '重复' if row.evaluation.spam.is_duplicate else '' }}</span>
+            {% endif %}
+          {% else %}<span class="muted">—</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">
+    还没有数据。先在命令行执行：
+    <pre>fissue db init
+fissue fetch --repo owner/name --platform github
+fissue eval --all</pre>
+  </div>
+  {% endif %}
+</div>
+
+<script>
+async function act(name, body) {
+  const prefix = {{ settings.api.prefix | tojson }};
+  try {
+    const res = await fetch(prefix + '/actions/' + name, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {})
+    });
+    const data = await res.json();
+    alert(res.ok ? (name + ' 完成：\n' + JSON.stringify(data, null, 2).slice(0, 1500))
+                 : ('失败：' + (data.detail || JSON.stringify(data))));
+    if (res.ok) location.reload();
+  } catch (e) {
+    alert('请求失败：' + e);
+  }
+}
+</script>
+</body>
+</html>

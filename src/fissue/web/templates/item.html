@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ data.key }} · Fissue</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
+    --fg:#e6e8ee; --muted:#98a0b3; --accent:#5b9dff;
+    --bug:#ff6b6b; --feature:#7dd3a0; --unknown:#98a0b3;
+    --t1:#ffb454; --t2:#7dd3a0; --none:#6b7280; --ok:#7dd3a0; --bad:#ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  a { color:var(--accent); text-decoration:none; } a:hover{ text-decoration:underline; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line);
+           display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:17px; }
+  .wrap { padding:20px 24px 70px; max-width:1100px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:16px 18px; margin-bottom:16px; }
+  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--muted); font-weight:600;
+              text-transform:uppercase; letter-spacing:.6px; }
+  .kv { display:grid; grid-template-columns:120px 1fr; gap:6px 14px; }
+  .kv .k { color:var(--muted); }
+  .tag { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
+         border:1px solid var(--line); color:var(--muted); margin:0 4px 4px 0; }
+  .bug{color:var(--bug);border-color:#4b1f22;background:#2a1518}
+  .feature{color:var(--feature);border-color:#1f4b33;background:#14291f}
+  .tier1{color:var(--t1);border-color:#4b3a1f;background:#2a2216}
+  .tier2{color:var(--t2);border-color:#1f4b33;background:#14291f}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .muted{color:var(--muted)}
+  table { width:100%; border-collapse:collapse; }
+  th,td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  pre { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+        padding:10px; overflow:auto; font-size:12px; max-height:420px; }
+  .score-row { margin:8px 0; }
+  .score-row .label { display:inline-block; width:120px; color:var(--muted); }
+  .bar { display:inline-block; height:8px; border-radius:4px; background:var(--accent);
+         vertical-align:middle; }
+  button { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+           border-radius:7px; padding:7px 12px; cursor:pointer; font-size:13px; }
+  button:hover { border-color:var(--accent); }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+</style>
+</head>
+<body>
+<header>
+  <a href="/">← 返回</a>
+  <h1>{{ data.title }}</h1>
+  <span class="muted">{{ data.repo }} #{{ data.number }}</span>
+  <a href="{{ data.url }}" target="_blank" rel="noopener" style="margin-left:auto">在平台打开 ↗</a>
+</header>
+
+<div class="wrap">
+
+{% if not read_only %}
+<div class="actions">
+  <button onclick="act('approve-fix')">批准自动修复（提交 PR）</button>
+  <button onclick="act('approve-merge')">确认可合并（打标签）</button>
+  <button onclick="act('evaluate', {keys:[{{ data.key | tojson }}], deep:true})">重新深度评测</button>
+  <button onclick="act('verify', {keys:[{{ data.key | tojson }}]})">重新验证</button>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>基本信息</h2>
+  <div class="kv">
+    <div class="k">类型</div><div><span class="tag">{{ data.type }}</span> <span class="tag {{ data.evaluation.category if data.evaluation else 'unknown' }}">{{ data.evaluation.category if data.evaluation else '未分类' }}</span></div>
+    <div class="k">状态</div><div>{{ data.state }}{% if data.type == 'pr' %} · 已合并：{{ '是' if data.merge.merged else '否' }}{% if data.merge.draft %} · 草稿{% endif %}{% endif %}</div>
+    <div class="k">作者</div><div>{{ data.author }}（{{ data.author_kind }}）</div>
+    <div class="k">标签</div><div>{% for l in data.labels %}<span class="tag">{{ l }}</span>{% endfor %}{% if not data.labels %}<span class="muted">无</span>{% endif %}</div>
+    <div class="k">创建 / 更新</div><div>{{ data.created_at or '-' }} / {{ data.updated_at or '-' }}</div>
+    {% if data.linked_issues %}<div class="k">关联 Issue</div><div>{% for n in data.linked_issues %}<span class="tag">#{{ n }}</span>{% endfor %}</div>{% endif %}
+    {% if data.type == 'pr' %}
+    <div class="k">分支</div><div>{{ data.merge.head_branch }} → {{ data.merge.base_branch }}</div>
+    <div class="k">变更</div><div>+{{ data.merge.additions }}/-{{ data.merge.deletions }}（{{ data.merge.changed_files }} 个文件）</div>
+    {% endif %}
+  </div>
+</div>
+
+{% if evaluation %}
+<div class="panel">
+  <h2>AI 评测</h2>
+  {% for name, dim in evaluation.scores.as_dict().items() %}
+  <div class="score-row">
+    <span class="label">{{ name }}</span>
+    <b>{{ dim }}</b>
+    <span class="bar" style="width: {{ dim * 1.6 }}px"></span>
+  </div>
+  {% endfor %}
+  {% for name in ['authenticity','importance','feasibility','difficulty','pr_quality'] %}
+    {% set dim = evaluation.scores.get(name) %}
+    {% if dim %}
+      <div style="margin:10px 0 6px"><b>{{ name }}</b> <span class="muted">{{ dim.score }} / 100（置信度 {{ '%.2f' % dim.confidence }}）</span></div>
+      <div class="muted">{{ dim.reason }}</div>
+      {% if dim.evidence %}<ul class="muted" style="margin:4px 0 0 18px">{% for e in dim.evidence %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+    {% endif %}
+  {% endfor %}
+  <div style="margin-top:12px">
+    <span class="tag">动作：{{ evaluation.action.value }}</span>
+    <span class="tag {{ evaluation.priority.value }}">优先级：{{ evaluation.priority.value }}</span>
+    {% for l in evaluation.labels_suggested %}<span class="tag">{{ l }}</span>{% endfor %}
+  </div>
+  {% if evaluation.spam.suspicious %}
+  <div style="margin-top:10px" class="bad">⚠️ 疑似
+    {{ '刷量' if evaluation.spam.is_spam else '' }}{{ '重复' if evaluation.spam.is_duplicate else '' }}{{ 'AI 生成' if evaluation.spam.is_ai_generated else '' }}
+    {% if evaluation.spam.reasons %}<div class="muted">{{ evaluation.spam.reasons | join('；') }}</div>{% endif %}
+  </div>
+  {% endif %}
+  <div style="margin-top:12px"><b>结论：</b>{{ evaluation.summary }}</div>
+  <div class="muted" style="margin-top:6px">
+    模型 {{ evaluation.model }} · tokens {{ evaluation.prompt_tokens }}/{{ evaluation.completion_tokens }} ·
+    约 ${{ '%.5f' % evaluation.cost_usd }}
+  </div>
+</div>
+{% else %}
+<div class="panel"><h2>AI 评测</h2><div class="muted">尚未评测。执行 <code>fissue eval --repo {{ data.repo }} --all</code>。</div></div>
+{% endif %}
+
+{% if conclusion %}
+<div class="panel">
+  <h2>批量结论</h2>
+  <div><span class="tag">{{ conclusion.verdict }}</span> <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
+       {% for l in conclusion.labels %}<span class="tag">{{ l }}</span>{% endfor %}</div>
+  <div style="margin-top:8px">{{ conclusion.reason }}</div>
+  <div class="muted">置信度 {{ '%.2f' % conclusion.confidence }}</div>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>验证器</h2>
+  {% if verifier %}
+  <div class="kv">
+    <div class="k">形态</div><div>{{ verifier.kind.value }}（{{ verifier.language }}）</div>
+    <div class="k">名称</div><div>{{ verifier.name }}</div>
+    <div class="k">运行命令</div><div><code>{{ verifier.command or '（清单型，无命令）' }}</code></div>
+    <div class="k">F2P 要求</div><div>base 必失败：{{ verifier.expect_fail_on_base }} · 修复后必通过：{{ verifier.expect_pass_on_fix }}</div>
+  </div>
+  {% if verifier.files %}
+  <div style="margin-top:10px"><b>验证器文件</b><ul class="muted">{% for p in verifier.files %}<li>{{ p }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  {% if verifier.checklist %}
+  <div style="margin-top:10px"><b>验证清单</b><ol class="muted">{% for c in verifier.checklist %}<li>{{ c }}</li>{% endfor %}</ol></div>
+  {% endif %}
+  {% if verifier.notes %}<div style="margin-top:10px"><b>说明</b><div class="muted">{{ verifier.notes }}</div></div>{% endif %}
+  {% else %}
+  <div class="muted">尚未生成验证器。</div>
+  {% endif %}
+</div>
+
+{% if runs %}
+<div class="panel">
+  <h2>验证执行记录</h2>
+  <table>
+    <thead><tr><th>阶段</th><th>结果</th><th>退出码</th><th>耗时</th><th>时间</th></tr></thead>
+    <tbody>
+    {% for r in runs %}
+      <tr>
+        <td>{{ r.stage }}</td>
+        <td class="{{ 'ok' if r.outcome.value == 'pass' else 'bad' }}">{{ r.outcome.value }}</td>
+        <td>{{ r.exit_code }}</td>
+        <td>{{ '%.1f' % r.duration_seconds }}s</td>
+        <td class="muted">{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+{% if fixes %}
+<div class="panel">
+  <h2>自动修复记录</h2>
+  <table>
+    <thead><tr><th>结果</th><th>轮次</th><th>分支</th><th>PR</th><th>说明</th></tr></thead>
+    <tbody>
+    {% for f in fixes %}
+      <tr>
+        <td class="{{ 'ok' if f.outcome.value == 'success' else 'bad' }}">{{ f.outcome.value }}</td>
+        <td>{{ f.rounds }}</td>
+        <td>{{ f.branch or '-' }}</td>
+        <td>{% if f.pr_url %}<a href="{{ f.pr_url }}" target="_blank" rel="noopener">#{{ f.pr_number }}</a>{% else %}-{% endif %}</td>
+        <td class="muted">{{ (f.error or f.report_path or '')[:100] }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+</div>
+
+<script>
+async function act(name, body) {
+  const prefix = {{ settings.api.prefix if settings else '/api/v1' | tojson }};
+  const url = prefix + '/actions/' + name + '?key=' + encodeURIComponent({{ data.key | tojson }});
+  if (!confirm('确认执行 ' + name + '？')) return;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {})
+    });
+    const data = await res.json();
+    alert(res.ok ? (name + ' 完成：\n' + JSON.stringify(data, null, 2).slice(0, 1200))
+                 : ('失败：' + (data.detail || JSON.stringify(data))));
+    if (res.ok) location.reload();
+  } catch (e) { alert('请求失败：' + e); }
+}
+</script>
+</body>
+</html>

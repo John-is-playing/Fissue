@@ -1,0 +1,217 @@
+# ============================================================================
+# Fissue 配置示例 —— 复制为 config.yaml 后按需修改
+# 原则：非敏感配置在此文件；密钥/连接串走 .env（env 优先级更高）
+# ============================================================================
+
+app:
+  name: fissue
+  log_level: info            # debug | info | warning | error
+  data_dir: ./data           # 本地数据目录（克隆缓存、报告、patch 产物）
+  timezone: Asia/Shanghai
+
+# ---------------------------------------------------------------------------
+# 数据库：主存储 PostgreSQL，支持导出 JSON / Markdown
+# ---------------------------------------------------------------------------
+database:
+  url: postgresql+psycopg://fissue:fissue@localhost:5432/fissue   # 可被 FISSUE_DATABASE_URL 覆盖
+  echo: false
+  pool_size: 5
+
+# ---------------------------------------------------------------------------
+# AI 大模型：任意 OpenAI 兼容端点
+# ---------------------------------------------------------------------------
+llm:
+  base_url: https://api.deepseek.com/v1
+  model: deepseek-chat
+  fallback_model: deepseek-chat
+  temperature: 0.2
+  max_tokens: 8192
+  timeout_seconds: 120
+  max_retries: 4
+  # 并发与预算控制（Q17）
+  concurrency: 4
+  budget:
+    daily_tokens_per_repo: 2000000      # 单仓库每日 token 上限，超出暂停该仓库
+    daily_usd_per_repo: 5.0             # 单仓库每日花费上限（按 price 表估算）
+    hard_stop: true                     # true=超预算即停；false=仅告警
+  pricing:                              # 用于成本估算（美元 / 1K token）
+    input_per_1k: 0.00014
+    output_per_1k: 0.00028
+
+# ---------------------------------------------------------------------------
+# 仓库列表（Q6: 允许多仓库，首期先跑单仓库——只留一条即可）
+# ---------------------------------------------------------------------------
+repos:
+  - platform: github                    # github | gitee | atomgit | gitlab
+    owner: psf
+    name: requests
+    base_branch: main                   # 留空则自动探测默认分支
+    # GitLab 自建实例填写自定义域名
+    # api_base: https://gitlab.example.com
+    enabled: true
+    # 只抓取哪些类型：issue / pr
+    collect: [issue, pr]
+    labels_include: []                  # 只处理带这些标签的（空=不过滤）
+    labels_exclude: [wontfix, duplicate]
+    assignee: null
+    since_days: 30                      # 只抓最近 N 天的（首次全量可置 0 = 不限）
+    # 单仓库级的测试命令提示（留空则由 LLM 读仓库自行判断，Q15/Q16）
+    test_hint: null
+
+# ---------------------------------------------------------------------------
+# 分类规则：把 Issue/PR 判为 BUG 还是 FEATURE（Q1 的两条流水线由此分流）
+# ---------------------------------------------------------------------------
+classification:
+  # AI 判定为主，关键词为辅；keyword_rules 用于快速预筛，节省成本
+  use_keywords_first: true
+  bug_keywords: [bug, error, crash, fail, exception, regression, 报错, 崩溃, 异常, 失败, 修复, 无法]
+  feature_keywords: [feature, enhancement, proposal, support, request, 建议, 新增, 支持, 需求, 优化]
+  # 两者都命中或都不命中时，交由 AI 决定
+  fallback_to_llm: true
+
+# ---------------------------------------------------------------------------
+# 评估（Q3: 四维评分 + 标签建议 + 反刷子）
+# ---------------------------------------------------------------------------
+evaluation:
+  dimensions:
+    - authenticity        # 真实性
+    - importance          # 重要性
+    - feasibility         # 可行性
+    - pr_quality          # PR 质量（仅 PR）
+  score_range: [0, 100]
+  # 阈值（0-100）：决定自动修复与告警
+  thresholds:
+    importance_high: 70               # 重要性 >= 此值视为高
+    difficulty_low: 40                # 修复难度 <= 此值视为低
+    authenticity_min: 40              # 真实性低于此值 → 疑似误报/刷子
+    alert_importance: 80              # >= 此值触发告警（Q4C）
+  anti_spam: true                     # 反刷子/误报识别
+
+# ---------------------------------------------------------------------------
+# 验证器（Q7）
+# ---------------------------------------------------------------------------
+verifier:
+  mode: hybrid                        # executable | checklist | hybrid
+  require_f2p: true                   # F2P：修复前必失败、修复后必通过
+  max_rounds: 3                       # 生成验证器后自校正的最大轮次
+  allow_checklist_fallback: true      # 无测试框架时降级为自然语言清单（Q16）
+
+# ---------------------------------------------------------------------------
+# 沙盒（Q8）
+# ---------------------------------------------------------------------------
+sandbox:
+  enabled: true
+  image: fissue/sandbox-base:latest   # 基础镜像（含 python/node/go/java 运行时）
+  runtime: docker                     # docker | local（local 仅供本机开发，隔离弱）
+  network: none                       # none=禁网（默认，最安全）
+  read_only_root: true                # 根文件系统只读
+  user: "1000:1000"                   # 非 root
+  mounts:
+    # 只挂载隔离的虚拟磁盘（loop 设备 / 独立卷），绝不挂载宿主目录
+    type: volume                      # volume | loopback
+    size_mb: 2048
+  limits:
+    cpus: 2.0
+    memory_mb: 2048
+    pids: 256
+    timeout_seconds: 600             # 单次验证最长时长
+  # 特殊转发组件：宿主机 agent 与沙盒容器之间的受控通道，避免污染宿主
+  forwarder:
+    enabled: true
+    socket: /var/run/fissue-runner.sock
+    protocol: unix
+  keep_artifacts: true                # 保留容器日志以便出报告
+
+# ---------------------------------------------------------------------------
+# 队列与批量触发（Q9: 数量阈值 + 空闲超时 + 手动触发）
+# ---------------------------------------------------------------------------
+queues:
+  verify_queue:                       # Issue-BUG 的验证队列
+    flush_size: 10
+    idle_flush_seconds: 300
+  fix_queue:                          # PR 的修复/合并队列（BUG 与 FEATURE 各一套）
+    flush_size: 10
+    idle_flush_seconds: 300
+  manual_flush_enabled: true          # CLI / API 可手动 flush
+  max_attempts: 3
+
+# ---------------------------------------------------------------------------
+# 自动修复（Q10: Agent 循环；Q11: fork 提 PR；Q12: 失败标人工）
+# ---------------------------------------------------------------------------
+auto_fix:
+  enabled: true
+  agent_max_rounds: 12                # Agent 循环最大轮次
+  allow_file_write: true
+  run_tests_in_loop: true
+  # 允许修改的文件范围（glob），敏感文件默认排除
+  protected_paths: [".github/**", ".gitlab/**", "LICENSE", "**/*.lock"]
+  max_changed_files: 20
+  max_diff_lines: 800
+  on_failure: report_manual           # 标记「需人工」并生成报告（Q12:B）
+  # 提 PR 策略（Q11: A=fork 提 PR）
+  pr_strategy:
+    mode: fork                        # fork | direct | patch_only
+    branch_prefix: fissue/fix-
+    label: ai-generated               # 自动打的 AI 标签
+    extra_labels: [fissue]
+    draft: false
+    auto_submit: true                 # Q13:C 全自动提交，靠 AI 标签标识
+
+# ---------------------------------------------------------------------------
+# Issue-BUG 自动修复准入（Q1 的优先级规则）
+# ---------------------------------------------------------------------------
+fix_policy:
+  # 优先级 1：难度低 + 重要性高 → 修复
+  tier1:
+    max_difficulty: 40
+    min_importance: 70
+  # 优先级 2：难度低 + 重要性低 → 修复
+  tier2:
+    max_difficulty: 40
+    min_importance: 0
+  # 其余不修复，仅打标签等开发者
+  only_issues: true                   # 仅对 Issue 自动修复；PR 交开发者手动合并
+
+# ---------------------------------------------------------------------------
+# 调度与通知（Q4）
+# ---------------------------------------------------------------------------
+schedule:
+  enabled: true
+  # 增量扫描（首次全量，之后只处理有更新的条目）
+  incremental: true
+  scan_interval_seconds: 3600         # 每小时扫描一次
+  queue_flush_interval_seconds: 60    # 队列检查间隔（配合 idle 超时）
+  full_rescan_days: 30                # 每隔 N 天做一次全量兜底
+
+notify:
+  enabled: true
+  # 阈值告警：importance >= thresholds.alert_importance 才推送
+  channels:
+    - type: webhook                   # webhook | email | wecom | dingtalk | feishu | console
+      enabled: true
+      url: https://example.com/fissue-hook
+      secret: ""                      # 可选签名密钥
+    - type: console
+      enabled: true
+  events: [scan_done, eval_done, verify_done, fix_done, pr_created, budget_exceeded, needs_manual]
+
+# ---------------------------------------------------------------------------
+# Web / REST API（Q14: 只读 + 操作）
+# ---------------------------------------------------------------------------
+web:
+  host: 127.0.0.1
+  port: 8000
+  read_only: false                    # false = 允许重评 / flush / 批准提 PR / 批准合并
+  allow_repo_management: false        # 仓库与密钥管理界面（Q14:C），默认关闭
+
+api:
+  enabled: true
+  prefix: /api/v1
+  auth_required: false                # 设为 true 需在 .env 配置 FISSUE_API_TOKEN
+
+# ---------------------------------------------------------------------------
+# 导出（Q2: 支持导出 JSON / Markdown）
+# ---------------------------------------------------------------------------
+export:
+  default_format: json                # json | markdown
+  output_dir: ./data/exports

@@ -1,0 +1,66 @@
+[project]
+name = "fissue"
+version = "0.1.0"
+description = "Fissue - 从 GitHub/Gitee/AtomGit/GitLab 检索 Issue/PR，用 AI 大模型评测真实性/重要性/可行性/PR 质量，并在沙盒中自动验证与修复"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Fissue" }]
+keywords = ["issue", "pull-request", "llm", "ai", "triage", "github", "gitee", "gitlab", "atomgit"]
+
+dependencies = [
+    "httpx>=0.27",
+    # 让 TLS 走操作系统信任库：企业代理 / 抓包工具做的 HTTPS 中间人，
+    # 其根证书在系统信任库里但不在 certifi 里，装了它就能正常访问。
+    "truststore>=0.9",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "alembic>=1.13",
+    "typer>=0.12",
+    "rich>=13.7",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "apscheduler>=3.10",
+    "tenacity>=8.2",
+    "docker>=7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.1",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[project.scripts]
+fissue = "fissue.cli.main:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fissue"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
