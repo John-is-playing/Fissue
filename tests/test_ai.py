@@ -235,6 +235,39 @@ def test_compute_priority_respects_only_issues() -> None:
     ) is Priority.TIER1
 
 
+def test_compute_priority_blocks_suspicious_items() -> None:
+    """疑似重复/刷量的条目不得进入自动修复（DESIGN 的策略闸门）。
+
+    否则会自动为一条「已识别的重复 Issue」生成第二份补丁——例如 demo 里
+    #5 被判为 #2 的重复后，仍被排进修复队列。
+    """
+    from fissue.models import DimensionScore, Evaluation, Scores, SpamSignal
+
+    def ev(diff: int, imp: int, **kw) -> Evaluation:
+        return Evaluation(
+            scores=Scores(difficulty=DimensionScore(score=diff), importance=DimensionScore(score=imp)),
+            **kw,
+        )
+
+    policy = FixPolicyConfig()
+    # 难度低 + 重要性高，正常本该 tier1
+    assert compute_priority(
+        ev(20, 90), category=Category.BUG, policy=policy, item_type=ItemType.ISSUE
+    ) is Priority.TIER1
+
+    # 判为重复 → 不修
+    assert compute_priority(
+        ev(20, 90, spam=SpamSignal(is_duplicate=True, duplicate_of=[2])),
+        category=Category.BUG, policy=policy, item_type=ItemType.ISSUE,
+    ) is Priority.NONE
+
+    # 判为刷量 → 不修
+    assert compute_priority(
+        ev(20, 90, spam=SpamSignal(is_spam=True)),
+        category=Category.BUG, policy=policy, item_type=ItemType.ISSUE,
+    ) is Priority.NONE
+
+
 def test_rule_adjustments_block_low_authenticity(settings, sample_issue: RawItem) -> None:
     from fissue.models import Action, DimensionScore, Evaluation, Scores
 

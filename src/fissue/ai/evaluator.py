@@ -257,8 +257,12 @@ def compute_priority(
     tier1 = 难度低 + 重要性高；tier2 = 难度低 + 重要性低；其余 none。
     ``policy.only_issues`` 为真时（默认）只有 Issue 才自动修复；PR 一律 none，
     否则报告里会给出误导性的 ``fix_now``（实际不会被自动修复）。
+    疑似重复/刷量的条目同样不修——DESIGN 的策略闸门要求「排除疑似刷量/重复」，
+    否则会自动为一条重复 Issue 生成第二份补丁。
     """
     if category is not Category.BUG:
+        return Priority.NONE
+    if evaluation.spam.suspicious:
         return Priority.NONE
     if policy.only_issues and item_type is not None and item_type is not ItemType.ISSUE:
         return Priority.NONE
