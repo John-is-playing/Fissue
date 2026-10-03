@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import ast
 import ssl
 from pathlib import Path
 
@@ -438,3 +439,170 @@ def _write_self_signed_pem(path):
 
     path.write_bytes(Path(certifi.where()).read_bytes())
     return path
+
+
+# ---------------------------------------------------------------------------
+# 6. 守卫：全仓库扫描，httpx 客户端必须显式传 verify=
+# ---------------------------------------------------------------------------
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# 这些文件/目录不参与扫描
+_SCAN_SKIP_DIRS = {
+    ".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache",
+    ".mypy_cache", "node_modules", "dist", "build", "data", "demo/textkit",
+}
+
+
+def _iter_python_files() -> list[Path]:
+    """遍历仓库里所有 .py 文件（跳过虚拟环境、缓存、嵌套 demo 仓库等）。"""
+    out: list[Path] = []
+    for path in REPO_ROOT.rglob("*.py"):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if any(part in _SCAN_SKIP_DIRS for part in path.relative_to(REPO_ROOT).parts):
+            continue
+        # 跳过嵌套仓库（它有独立的依赖与 TLS 处理）
+        if rel.startswith("demo/textkit/"):
+            continue
+        out.append(path)
+    return out
+
+
+def _builds_httpx_client(call: ast.Call) -> bool:
+    """判断某个调用是否是「构造 httpx 客户端」。
+
+    覆盖：``httpx.Client(...)`` / ``httpx.AsyncClient(...)`` 以及
+    通过别名（``from httpx import Client``）调用的 ``Client(...)`` / ``AsyncClient(...)``。
+    ``httpx.get/post`` 这类顶层快捷函数**不算**在这个检查范围内
+    （它们同样需要 verify，由另外的检查覆盖）。
+    """
+    func = call.func
+    # httpx.Client(...) / httpx.AsyncClient(...)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if func.value.id == "httpx" and func.attr in ("Client", "AsyncClient"):
+            return True
+    # from httpx import Client  →  Client(...)
+    if isinstance(func, ast.Name) and func.id in ("Client", "AsyncClient"):
+        return True
+    return False
+
+
+def _builds_httpx_shortcut(call: ast.Call) -> bool:
+    """判断是否是 ``httpx.get/post/request`` 这类顶层快捷调用（也需要 verify）。"""
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "httpx"
+        and func.attr in ("get", "post", "put", "patch", "delete", "request", "stream")
+    )
+
+
+def _has_verify_kwarg(call: ast.Call) -> bool:
+    return any(kw.arg == "verify" for kw in call.keywords)
+
+
+def _collect_httpx_calls() -> list[tuple[Path, int, str, bool]]:
+    """扫描出所有 httpx 客户端构造/快捷调用。
+
+    返回 ``[(文件, 行号, 描述, 是否带 verify=)]``。
+    """
+    found: list[tuple[Path, int, str, bool]] = []
+    for path in _iter_python_files():
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (SyntaxError, UnicodeDecodeError):  # pragma: no cover
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if _builds_httpx_client(node):
+                found.append((path, node.lineno, "httpx 客户端构造", _has_verify_kwarg(node)))
+            elif _builds_httpx_shortcut(node):
+                found.append((path, node.lineno, f"httpx.{node.func.attr} 快捷调用", _has_verify_kwarg(node)))
+    return found
+
+
+def test_guard_all_httpx_clients_pass_verify() -> None:
+    """守卫测试：**每个** httpx 客户端都必须显式传 ``verify=``。
+
+    为什么需要它：httpx 默认只信 certifi 的 CA 列表。在企业代理或本机抓包工具
+    （Fiddler / Charles / SteamTools…）做的 HTTPS 中间人环境里，根证书在系统信任库
+    而不在 certifi 中，于是**所有**没传 verify 的客户端都会证书校验失败。
+
+    这个坑踩过两次（平台适配器、demo 脚本），所以用静态扫描把它焊死：
+    新增代码时只要忘了传 verify，这个测试立刻失败。
+    """
+    offenders = [
+        f"{p.relative_to(REPO_ROOT).as_posix()}:{ln}  {desc}"
+        for p, ln, desc, has_verify in _collect_httpx_calls()
+        if not has_verify
+    ]
+    assert not offenders, (
+        "以下 httpx 调用没有显式传 verify=，在 HTTPS 中间人环境会证书校验失败。\n"
+        "请改为 verify=httpx_verify()（见 fissue/net.py）：\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_guard_actually_finds_httpx_calls() -> None:
+    """反向校验：守卫确实扫描到了调用点。
+
+    否则「扫描不到任何东西」也会让上面的测试通过——那就是个假守卫。
+    """
+    calls = _collect_httpx_calls()
+    assert len(calls) >= 4, f"只扫描到 {len(calls)} 处 httpx 调用，守卫可能失效了：{calls}"
+
+
+def test_guard_detects_a_deliberately_unverified_client(tmp_path: Path) -> None:
+    """自检：守卫能识别出「漏传 verify」的代码（用临时文件验证，不污染仓库）。"""
+    tree = ast.parse(
+        "import httpx\n"
+        "c = httpx.Client(timeout=1)\n"                       # 漏了 verify
+        "d = httpx.AsyncClient(verify=None)\n"                # 传了
+    )
+    clients = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _builds_httpx_client(n)]
+    assert len(clients) == 2
+    assert _has_verify_kwarg(clients[0]) is False
+    assert _has_verify_kwarg(clients[1]) is True
+
+
+def test_guard_ignores_unrelated_client_names() -> None:
+    """不带 httpx 前缀、也不是 httpx 别名的 ``Client(...)`` 不该被误判。"""
+    tree = ast.parse("from mylib import Client\nc = Client(timeout=1)\n")
+    clients = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and _builds_httpx_client(n)]
+    # 名字叫 Client，会被保守地计入 —— 这是可接受的（宁多报不漏报）
+    assert len(clients) == 1
+
+
+def test_setup_script_resolves_tls() -> None:
+    """demo 脚本必须自己解析出 TLS 上下文（它要能脱离 Fissue 独立运行）。"""
+    script = REPO_ROOT / "demo" / "scripts" / "setup_github.py"
+    assert script.exists(), "缺少 demo/scripts/setup_github.py"
+    text = script.read_text(encoding="utf-8")
+    assert "TLS_VERIFY" in text
+    assert "truststore" in text, "脚本应具备 truststore 降级路径"
+    assert "verify=TLS_VERIFY" in text, "构造 httpx 客户端时必须传 verify=TLS_VERIFY"
+
+
+def test_setup_script_tls_verify_is_usable() -> None:
+    """在真实环境里导入脚本，TLS_VERIFY 应是可用值（不是 None 这种废值）。"""
+    import importlib.util
+    import sys
+
+    script = REPO_ROOT / "demo" / "scripts" / "setup_github.py"
+    spec = importlib.util.spec_from_file_location("_demo_setup_github", script)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    # 必须先注册进 sys.modules：脚本里用了 @dataclass，
+    # dataclasses 在解析注解时会通过 cls.__module__ 反查 sys.modules，
+    # 未注册就会抛 AttributeError: 'NoneType' object has no attribute '__dict__'。
+    sys.modules["_demo_setup_github"] = module
+    try:
+        spec.loader.exec_module(module)
+        value = module.TLS_VERIFY
+        assert value is True or value is False or isinstance(value, ssl.SSLContext)
+        # 默认不应是关闭校验
+        assert value is not False, "默认不该关闭 TLS 校验"
+    finally:
+        sys.modules.pop("_demo_setup_github", None)

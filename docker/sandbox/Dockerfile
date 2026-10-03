@@ -14,6 +14,20 @@
 
 FROM python:3.12-slim-bookworm
 
+# ---------------------------------------------------------------------------
+# 国内镜像加速（可用 --build-arg 覆盖）
+#
+# 默认 deb.debian.org / pypi.org 在国内极慢，apt-get update 实测 280s 仍未完成。
+# 换成下面这些镜像后可在数十秒内完成。
+#
+# 注意：镜像需**从容器内**可达（Docker Desktop 会经内置代理转发），二者并不一致。
+# 实测本机容器内：aliyun / ustc / tencent 通，清华(tuna) 在 apt 与 pip 上均被
+# 403 拦截（宿主机 curl 却正常），故不设为默认。
+# ---------------------------------------------------------------------------
+ARG APT_MIRROR=mirrors.aliyun.com
+ARG PIP_INDEX=https://mirrors.aliyun.com/pypi/simple/
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -24,7 +38,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ---------------------------------------------------------------------------
 # 系统依赖：构建工具 + 常用测试运行时
 # ---------------------------------------------------------------------------
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg git make build-essential \
         libpq-dev libffi-dev libssl-dev \
         nodejs npm \
@@ -37,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---------------------------------------------------------------------------
 # Python 测试栈（项目自带依赖仍由项目自己声明，这里只装通用工具）
 # ---------------------------------------------------------------------------
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir -i "${PIP_INDEX}" \
         pytest pytest-asyncio pytest-cov pytest-xdist \
         tox nox \
         coverage
@@ -45,7 +61,8 @@ RUN pip install --no-cache-dir \
 # ---------------------------------------------------------------------------
 # Node 测试栈
 # ---------------------------------------------------------------------------
-RUN npm install -g --no-fund --no-audit \
+RUN npm config set registry "${NPM_REGISTRY}" \
+    && npm install -g --no-fund --no-audit \
         jest mocha vitest typescript ts-node \
     && npm cache clean --force
 

@@ -6,6 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 from fissue.models import (
     AuthorKind,
@@ -208,6 +209,65 @@ def test_enqueue_dedup_and_claim(repo: Repository) -> None:
     repo.finish_queue_entry(row.id, status="done", result={"ok": True})
     assert repo.queue_pending_count(QueueName.VERIFY) == 0
     assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
+
+
+def test_enqueue_reuse_after_done_does_not_crash(repo: Repository) -> None:
+    """同一队列同一条目在终态后重新入队，必须复用原行而不是新插一行。
+
+    回归：唯一约束 (queue,item_key,status) 把终态也算进去，若重跑时新插一行
+    pending，等它转 done 就会撞上上一轮遗留的 done，抛
+    ``UNIQUE constraint failed: queue_entries.queue, queue_entries.item_key, queue_entries.status``
+    ——表现为「重跑验证必崩」。
+    """
+    _seed(repo, number=21)
+    key = "github:psf/requests#21"
+
+    first = repo.enqueue(QueueName.FIX_BUG, key, payload={"run": 1})
+    row = repo.claim_next(QueueName.FIX_BUG)
+    repo.finish_queue_entry(row.id, status="done", result={"merge_recommended": False})
+
+    # 重跑：同一条目再次入队
+    second = repo.enqueue(QueueName.FIX_BUG, key, payload={"run": 2})
+    assert second == first                        # 复用同一行
+    row2 = repo.claim_next(QueueName.FIX_BUG)
+    assert row2 is not None
+    repo.finish_queue_entry(row2.id, status="done", result={"merge_recommended": True})
+
+    # 每一轮都能正常收尾；队列里只有这一行
+    rows = repo.queue_unflushed(QueueName.FIX_BUG)
+    assert len(rows) == 1
+    assert rows[0].result["merge_recommended"] is True
+
+
+def test_enqueue_collapses_legacy_done_plus_pending(repo: Repository) -> None:
+    """存量脏数据（同一队列同一条目的 done + pending 并存）在再次入队时收敛为一行。
+
+    这正是旧 ``enqueue`` 只复用 pending/running 时留下的现场：上一轮的 ``done``
+    还留着，重跑又插了一行 ``pending``。注意两行 status 不同，所以唯一约束**允许**
+    它们共存——也正因如此，那一行 pending 一旦转 done 就会撞上旧的 done。
+    """
+    from fissue.store.tables import QueueEntryRow
+
+    _seed(repo, number=22)
+    key = "github:psf/requests#22"
+
+    with repo.db.session() as s:
+        s.add(QueueEntryRow(queue=QueueName.VERIFY.value, item_key=key,
+                            status="done", payload={}, result={"round": 1}))
+    with repo.db.session() as s:
+        s.add(QueueEntryRow(queue=QueueName.VERIFY.value, item_key=key,
+                            status="pending", payload={}, result={}))
+
+    entry_id = repo.enqueue(QueueName.VERIFY, key, payload={"round": 2})
+    with repo.db.session() as s:
+        rows = list(s.scalars(
+            select(QueueEntryRow).where(QueueEntryRow.item_key == key).order_by(QueueEntryRow.id)
+        ))
+    assert len(rows) == 1                         # done + pending 被收敛为一行
+    assert rows[0].id == entry_id                 # 复用最早那行
+    assert rows[0].status == "pending"            # 且重置为待处理
+    assert rows[0].payload == {"round": 2}
+    assert rows[0].result == {}                   # 旧结论清空，避免与新结论混淆
 
 
 def test_claim_respects_max_attempts(repo: Repository) -> None:

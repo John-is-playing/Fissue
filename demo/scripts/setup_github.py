@@ -45,10 +45,64 @@ except ImportError:  # pragma: no cover
     print("需要 httpx：pip install httpx", file=sys.stderr)
     raise SystemExit(1)
 
-API = "https://api.github.com"
+API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
 DEMO_ROOT = Path(__file__).resolve().parents[1]   # demo/
 REPO_DIR = DEMO_ROOT / "textkit"
 FIXTURES = DEMO_ROOT / "fixtures"
+
+
+def _resolve_tls_verify() -> Any:
+    """决定 httpx 的 ``verify`` 参数。
+
+    必须处理 TLS 中间人场景：企业网关 / 抓包工具（Fiddler、Charles、SteamTools…）
+    会用自己的根证书重签 HTTPS。该证书在**系统信任库里**（浏览器正常），
+    但不在 certifi 里，于是 httpx 默认会 ``CERTIFICATE_VERIFY_FAILED``。
+
+    三级降级（脚本可能脱离 Fissue 单独运行，所以不能只依赖 fissue.net）：
+        1. 复用 ``fissue.net`` 的上下文（与主程序行为一致）
+        2. 直接尝试 ``truststore`` 接入操作系统信任库
+        3. 退回 httpx 默认（certifi）
+    环境变量：``FISSUE_CA_BUNDLE`` 指定 CA 文件，``FISSUE_INSECURE_SKIP_VERIFY=1`` 关闭校验。
+    """
+    # 显式关闭校验（仅排查）
+    if str(os.environ.get("FISSUE_INSECURE_SKIP_VERIFY", "")).strip().lower() in (
+        "1", "true", "yes", "on", "y"
+    ):
+        print("⚠️  已通过 FISSUE_INSECURE_SKIP_VERIFY 关闭 TLS 校验（仅限本地排查）", file=sys.stderr)
+        return False
+
+    # 显式指定 CA
+    bundle = os.environ.get("FISSUE_CA_BUNDLE", "").strip()
+    if bundle and Path(bundle).exists():
+        import ssl
+
+        return ssl.create_default_context(cafile=bundle)
+
+    # 1) 复用主程序的实现
+    try:
+        sys.path.insert(0, str(DEMO_ROOT.parent / "src"))
+        from fissue.net import httpx_verify  # type: ignore
+
+        return httpx_verify()
+    except Exception:
+        pass
+
+    # 2) 直接上 truststore
+    try:
+        import ssl
+
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        pass
+
+    # 3) 退回 certifi
+    return True
+
+
+# 脚本可能脱离 Fissue 运行，这里静默决定一次
+TLS_VERIFY = _resolve_tls_verify()
 
 # 两个 PR 分支 → 关联的 Issue 编号占位（运行时替换）
 PR_BRANCHES = [
@@ -164,6 +218,9 @@ class GitHub:
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": "fissue-demo-setup",
             },
+            # 必须显式传入：httpx 默认只信 certifi，
+            # 在 HTTPS 中间人环境（企业代理 / 抓包工具）下会证书校验失败。
+            verify=TLS_VERIFY,
         )
 
     def close(self) -> None:
@@ -285,7 +342,23 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="只打印计划，不实际写入")
     parser.add_argument("--no-prs", action="store_true", help="只建 Issue，不建 PR")
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN", ""), help="GitHub token")
+    parser.add_argument(
+        "--api",
+        default=None,
+        help="API 基地址（默认 https://api.github.com；测试时可指向本地 mock）",
+    )
+    parser.add_argument(
+        "--remote-base",
+        default=None,
+        help="推送用的远端基地址（默认 https://github.com；测试时可指向本地裸仓库）",
+    )
     args = parser.parse_args()
+
+    # 允许通过命令行覆盖 API 基地址（模块级 API 常量已被各方法引用，这里同步更新）
+    if args.api:
+        global API  # noqa: PLW0603
+        API = args.api.rstrip("/")
+    remote_base = (args.remote_base or "https://github.com").rstrip("/")
 
     token = args.token or os.environ.get("GITHUB_TOKEN", "")
     if not token and not args.dry_run:
@@ -330,11 +403,16 @@ def main() -> int:
 
         # ---- 2) 推送 main ----------------------------------------------
         print("\n[2/4] 推送 main 分支")
-        remote_url = f"https://{token}@github.com/{repo}.git" if token else f"https://github.com/{repo}.git"
+        plain_url = f"{remote_base}/{repo}.git"
+        # token 只内嵌在本次推送用的 URL 里，不写进 git 配置
+        if token and "github.com" in remote_base:
+            remote_url = f"https://{token}@github.com/{repo}.git"
+        else:
+            remote_url = plain_url
         run_git("remote", "remove", "origin")
-        run_git("remote", "add", "origin", f"https://github.com/{repo}.git")
+        run_git("remote", "add", "origin", plain_url)
         if args.dry_run:
-            print("      [dry-run] git push origin main")
+            print(f"      [dry-run] git push origin main -> {plain_url}")
         else:
             push_branch(remote_url, "main")
             print("      ✓ main 已推送")
@@ -401,9 +479,9 @@ def main() -> int:
         if args.dry_run:
             print("干跑完成——以上是计划，未做任何写入。去掉 --dry-run 即可真正执行。")
         else:
-            print(f"✅ 完成！仓库地址：https://github.com/{repo}")
-            print(f"   Issues：https://github.com/{repo}/issues")
-            print(f"   Pulls ：https://github.com/{repo}/pulls")
+            print(f"✅ 完成！仓库地址：{remote_base}/{repo}")
+            print(f"   Issues：{remote_base}/{repo}/issues")
+            print(f"   Pulls ：{remote_base}/{repo}/pulls")
             print("\n接下来让 Fissue 去测它：")
             print("   # 在 Fissue 的 config.yaml 里登记这个仓库，然后：")
             print(f"   fissue fetch --repo {repo} --limit 50")

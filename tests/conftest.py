@@ -2,12 +2,17 @@
 
 原则：所有单测**不打网络、不碰 Docker、不写用户目录**——
 LLM 用打桩客户端，平台适配器用 respx 拦截，数据库用临时 SQLite。
+
+其中「不打网络」由一个 autouse 的**全局网络守卫**强制保证（见下方
+``_block_real_network``）：任何试图建立真实 socket 连接的代码都会立刻拿到
+一个清晰的 ``RuntimeError``，而不是悄悄地连上外网再等超时。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
 import tempfile
 from pathlib import Path
@@ -36,6 +41,63 @@ from fissue.models import (  # noqa: E402
 )
 from fissue.store.db import Database  # noqa: E402
 from fissue.store.repository import Repository  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# 全局网络守卫
+# ---------------------------------------------------------------------------
+
+# 允许的真实连接目标（测试内部用的本地服务）。默认空——测试不该需要外网。
+_ALLOWED_HOSTS: set[str] = {"127.0.0.1", "localhost", "::1"}
+
+_REAL_CONNECT = socket.socket.connect
+_REAL_CREATE_CONNECTION = socket.create_connection
+
+
+class RealNetworkAccessError(RuntimeError):
+    """测试里出现了真实网络访问——应该改用 respx / 打桩。"""
+
+
+def _host_of(address: Any) -> str:
+    if isinstance(address, tuple) and address:
+        return str(address[0])
+    return str(address)
+
+
+def _guard_connect(self: socket.socket, address: Any) -> Any:  # noqa: ANN401
+    """拦截真实 socket 连接。
+
+    respx 在 httpx 的 transport 层拦截，**不会**走到这里，所以被 mock 的
+    请求不受影响；只有「忘了 mock」的真实外连才会触发。
+    """
+    if _host_of(address) in _ALLOWED_HOSTS:
+        return _REAL_CONNECT(self, address)
+    raise RealNetworkAccessError(
+        f"测试试图连接真实网络：{address}\n"
+        "单测必须离线：HTTP 请用 respx.mock 拦截，LLM 请用 StubLLM，"
+        "或用 monkeypatch 打桩对应方法。"
+    )
+
+
+def _guard_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+    if _host_of(address) in _ALLOWED_HOSTS:
+        return _REAL_CREATE_CONNECTION(address, *args, **kwargs)
+    raise RealNetworkAccessError(f"测试试图连接真实网络：{address}")
+
+
+@pytest.fixture(autouse=True)
+def _block_real_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """autouse：阻断测试期间的真实网络连接。
+
+    为什么需要它：曾经有个测试没 mock 打标签逻辑，本地因证书问题**快速失败**
+    而侥幸通过；等 TLS 修好后它真的连上了 GitHub，触发 4 轮重试退避，
+    把整个测试套件从 25 秒拖到 5 分钟以上（表现为"超时"）。
+
+    有了这个守卫，同类问题会在第一次外连时立刻以清晰的报错暴露，
+    而不是伪装成"跑得慢"。
+    """
+    monkeypatch.setattr(socket.socket, "connect", _guard_connect)
+    monkeypatch.setattr(socket, "create_connection", _guard_create_connection)
 
 
 @pytest.fixture

@@ -116,6 +116,38 @@ def test_parse_spam_normalizes() -> None:
     assert spam.suspicious is True
 
 
+def test_parse_spam_infers_duplicate_from_numbers() -> None:
+    """填了 duplicate_of 却忘了 is_duplicate，两个字段不该互相矛盾。"""
+    spam = parse_spam({"duplicate_of": [2], "reasons": ["与 #2 重合"]})
+    assert spam.is_duplicate is True
+    assert spam.duplicate_of == [2]
+
+
+def test_backfill_duplicate_of_from_reasons() -> None:
+    """is_duplicate 为真但数组为空时，从 reasons 文本回填编号。"""
+    from fissue.ai.evaluator import backfill_duplicate_of
+
+    spam = parse_spam({
+        "is_duplicate": True,
+        "duplicate_of": [],
+        "reasons": ["核心问题描述与 Issue #2 完全重合", "另见 #7"],
+    })
+    out = backfill_duplicate_of(spam, exclude=5)      # 自身是 #5
+    assert out.duplicate_of == [2, 7]
+
+    # 不误把自己算成重复对象
+    self_ref = parse_spam({"is_duplicate": True, "reasons": ["与 #5 相同"]})
+    assert backfill_duplicate_of(self_ref, exclude=5).duplicate_of == []
+
+    # 已填了数组就不覆盖
+    keep = parse_spam({"is_duplicate": True, "duplicate_of": [3], "reasons": ["与 #2 重合"]})
+    assert backfill_duplicate_of(keep, exclude=9).duplicate_of == [3]
+
+    # 不是重复就别乱填
+    not_dup = parse_spam({"is_duplicate": False, "reasons": ["提到 #2"]})
+    assert backfill_duplicate_of(not_dup, exclude=9).duplicate_of == []
+
+
 def test_parse_evaluation_end_to_end() -> None:
     ev = parse_evaluation(
         {
@@ -180,6 +212,27 @@ def test_compute_priority_tiers() -> None:
     assert compute_priority(ev(80, 90), category=Category.BUG, policy=policy) is Priority.NONE
     # FEATURE 永不自动修复
     assert compute_priority(ev(20, 90), category=Category.FEATURE, policy=policy) is Priority.NONE
+
+
+def test_compute_priority_respects_only_issues() -> None:
+    """PR 不该被标 tier1/tier2（默认 only_issues=True），否则报告给出误导性的 fix_now。"""
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff), importance=DimensionScore(score=imp)))
+
+    policy = FixPolicyConfig()
+    assert compute_priority(
+        ev(20, 90), category=Category.BUG, policy=policy, item_type=ItemType.ISSUE
+    ) is Priority.TIER1
+    assert compute_priority(
+        ev(20, 90), category=Category.BUG, policy=policy, item_type=ItemType.PR
+    ) is Priority.NONE
+    # only_issues=False 时 PR 也可入选（保留可配置语义）
+    policy.only_issues = False
+    assert compute_priority(
+        ev(20, 90), category=Category.BUG, policy=policy, item_type=ItemType.PR
+    ) is Priority.TIER1
 
 
 def test_rule_adjustments_block_low_authenticity(settings, sample_issue: RawItem) -> None:
