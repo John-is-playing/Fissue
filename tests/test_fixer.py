@@ -648,3 +648,59 @@ def test_save_patch_preserves_chinese(fixer_ctx, repo, sample_issue) -> None:
     text = Path(path).read_text(encoding="utf-8")
     assert "空字符串应返回 0" in text
     assert "绌哄瓧绗" not in text
+
+
+def test_save_patch_uses_pure_lf(fixer_ctx, repo, sample_issue) -> None:
+    """补丁必须纯 LF 落盘。
+
+    回归：``write_text`` 在 Windows 上把 \\n 转成 \\r\\n，补丁每行多一个 CR，
+    git apply 的上下文行匹配不上 → ``patch does not apply``。
+    实测 dry-run 产出的补丁有 13 个 CR 字节，打到干净克隆上直接失败。
+    """
+    _register(repo, sample_issue)
+    creator = PRCreator(fixer_ctx)
+
+    diff = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    path = creator._save_patch(sample_issue, diff)
+    raw = Path(path).read_bytes()
+    assert b"\r" not in raw, "补丁里不该有 CR"
+    assert raw.decode("utf-8") == diff
+
+    # 输入本身带 CRLF 时也要归一，避免上游把 CR 带进来
+    crlf_path = creator._save_patch(sample_issue, diff.replace("\n", "\r\n"))
+    assert b"\r" not in Path(crlf_path).read_bytes()
+
+
+def test_saved_patch_applies_cleanly_to_repo(fixer_ctx, repo, sample_issue, workspace) -> None:
+    """产出的补丁能被 git apply 干净应用——这是补丁的**唯一用途**。
+
+    只断言「文件里有 CR」不够，这里直接拿一个真实 git 仓库真打一次：
+    这正是 dry-run 产物此前失效的方式（crbug 报 patch does not apply）。
+    """
+    _register(repo, sample_issue)
+    creator = PRCreator(fixer_ctx)
+
+    # workspace 是真 git 仓库，app.py 原本是 "def f():\n    return 1\n"
+    diff = (
+        "diff --git a/app.py b/app.py\n"
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def f():\n"
+        "-    return 1\n"
+        "+    return 2\n"
+    )
+    path = creator._save_patch(sample_issue, diff)
+
+    check = subprocess.run(
+        ["git", "apply", "--check", path], cwd=workspace.root,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert check.returncode == 0, f"补丁打不上：{check.stderr}"
+
+    applied = subprocess.run(
+        ["git", "apply", path], cwd=workspace.root,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    assert applied.returncode == 0, f"应用失败：{applied.stderr}"
+    assert "return 2" in (workspace.root / "app.py").read_text(encoding="utf-8")

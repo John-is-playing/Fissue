@@ -46,6 +46,17 @@ from .agent import AgentTrace, FixAgent, branch_name
 log = get_logger(__name__)
 
 
+def _write_patch(path: Path, diff: str) -> None:
+    """以**二进制、纯 LF** 落盘补丁。
+
+    ``.patch`` 是给 ``git apply`` 消费的字节级产物，不是给人读的文本：
+    Windows 上 ``write_text`` 会把 ``\\n`` 转成 ``\\r\\n``，补丁每行多一个 CR，
+    上下文行匹配不上 → ``patch does not apply``（远端 diff 本身是纯 LF）。
+    """
+    data = diff.encode("utf-8").replace(b"\r\n", b"\n")
+    path.write_bytes(data)
+
+
 @dataclass
 class FixReport:
     """一批修复的结果。
@@ -318,7 +329,7 @@ class PRCreator:
         safe = item.key.replace(":", "_").replace("/", "_")
         path = self.settings.data_dir / "patches" / f"{safe}.patch"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(diff, encoding="utf-8")
+        _write_patch(path, diff)
         return str(path)
 
 
@@ -518,7 +529,7 @@ class AutoFixer:
         report_path.write_text("\n".join(lines), encoding="utf-8")
 
         if attempt.diff:
-            (out_dir / "attempt.patch").write_text(attempt.diff, encoding="utf-8")
+            _write_patch(out_dir / "attempt.patch", attempt.diff)
         (out_dir / "trace.json").write_text(
             json.dumps(
                 {
