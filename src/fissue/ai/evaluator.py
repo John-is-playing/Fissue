@@ -13,11 +13,13 @@
 
 from __future__ import annotations
 
+import importlib
 import re as _re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from functools import lru_cache
+from typing import Any, Callable, Sequence
 
-from ..config import ClassificationConfig, EvaluationConfig, FixPolicyConfig, Settings
+from ..config import ClassificationConfig, EvaluationConfig, FixPolicyConfig, FixTier, Settings
 from ..logging_setup import get_logger
 from ..models import (
     Action,
@@ -244,6 +246,90 @@ def parse_evaluation(raw: dict[str, Any], *, model: str, usage: Usage | None = N
 # ---------------------------------------------------------------------------
 
 
+# 档位好坏排序：数值越大越「严」（越不容易拿到、越不需要自动修复）。
+_TIER_ORDER = {Priority.TIER1: 1, Priority.TIER2: 2, Priority.NONE: 3}
+
+
+def _tier_by_importance(difficulty: int, importance: int, t1: FixTier, t2: FixTier) -> Priority:
+    """默认策略：难度是硬门槛，重要性门槛区分 tier1 / tier2。"""
+    if difficulty <= t1.max_difficulty and importance >= t1.min_importance:
+        return Priority.TIER1
+    if difficulty <= t2.max_difficulty and importance >= t2.min_importance:
+        return Priority.TIER2
+    return Priority.NONE
+
+
+def _tier_by_dual(difficulty: int, importance: int, t1: FixTier, t2: FixTier) -> Priority:
+    """双阈值策略：难度、重要性各自判档，取**更严**（更差）的一档。
+
+    两个维度各答「单看它，最松能到哪一档」，再取较差者——当 tier1/tier2 的
+    难度阈值不同（如 tier1 只收 ``<=20``、tier2 放到 ``<=40``）时，难度这一维
+    会真正参与分档；阈值对称时结果与 ``importance`` 一致。
+    """
+    if difficulty <= t1.max_difficulty:
+        d = Priority.TIER1
+    elif difficulty <= t2.max_difficulty:
+        d = Priority.TIER2
+    else:
+        d = Priority.NONE
+
+    if importance >= t1.min_importance:
+        i = Priority.TIER1
+    elif importance >= t2.min_importance:
+        i = Priority.TIER2
+    else:
+        i = Priority.NONE
+    return d if _TIER_ORDER[d] >= _TIER_ORDER[i] else i
+
+
+@lru_cache(maxsize=32)
+def _load_custom_tier(path: str) -> Callable[..., Any] | None:
+    """按 ``pkg.mod:func`` / ``pkg.mod.func`` 加载用户判定函数；失败返回 None。"""
+    mod_name, sep, attr = path.partition(":")
+    if not sep:
+        mod_name, _, attr = path.rpartition(".")
+    mod_name, attr = mod_name.strip(), attr.strip()
+    if not mod_name or not attr:
+        log.warning("fix_policy.custom_tier 路径不合法：%r", path)
+        return None
+    try:
+        module = importlib.import_module(mod_name)
+    except Exception as exc:  # 用户模块自身可能 import 失败
+        log.warning("加载 fix_policy.custom_tier 模块失败 %s：%s", mod_name, exc)
+        return None
+    fn = getattr(module, attr, None)
+    if not callable(fn):
+        log.warning("fix_policy.custom_tier 未找到可调用对象：%s", path)
+        return None
+    return fn
+
+
+def _tier_by_custom(difficulty: int, importance: int, policy: FixPolicyConfig) -> Priority | None:
+    """自定义策略；不可用时返回 None（由调用方回退到默认策略）。
+
+    该模式下各 tier 的 ``min_importance`` **不参与计算**——分档完全交给用户函数。
+    """
+    path = (policy.custom_tier or "").strip()
+    if not path:
+        return None
+    fn = _load_custom_tier(path)
+    if fn is None:
+        return None
+    try:
+        raw = fn(difficulty, importance, policy)
+    except Exception as exc:
+        log.warning("fix_policy.custom_tier 执行失败 %s：%s", path, exc)
+        return None
+    if isinstance(raw, Priority):
+        return raw
+    text = str(raw or "").strip().lower()
+    for p in Priority:
+        if p.value == text:
+            return p
+    log.warning("fix_policy.custom_tier 返回值无法识别（%r），本条目按 none 处理", raw)
+    return Priority.NONE
+
+
 def compute_priority(
     evaluation: Evaluation,
     *,
@@ -255,6 +341,13 @@ def compute_priority(
     """按 Q1 的规则算自动修复优先级。
 
     tier1 = 难度低 + 重要性高；tier2 = 难度低 + 重要性低；其余 none。
+    具体分档算法由 ``policy.tier_strategy`` 选择：
+
+    * ``importance``（默认）—— 难度是硬门槛，重要性门槛区分 tier1/tier2；
+    * ``dual`` —— 难度与重要性各自判档，取更严的一档；
+    * ``custom`` —— 交由 ``policy.custom_tier`` 的用户函数判定，此时
+      ``min_importance`` 不参与计算；函数加载/执行失败时记 warning 并回退默认策略。
+
     ``policy.only_issues`` 为真时（默认）只有 Issue 才自动修复；PR 一律 none，
     否则报告里会给出误导性的 ``fix_now``（实际不会被自动修复）。
     疑似重复/刷量的条目同样不修——DESIGN 的策略闸门要求「排除疑似刷量/重复」，
@@ -270,11 +363,15 @@ def compute_priority(
     importance = evaluation.importance
 
     t1, t2 = policy.tier1, policy.tier2
-    if difficulty <= t1.max_difficulty and importance >= t1.min_importance:
-        return Priority.TIER1
-    if difficulty <= t2.max_difficulty and importance >= t2.min_importance:
-        return Priority.TIER2
-    return Priority.NONE
+    if policy.tier_strategy == "custom":
+        picked = _tier_by_custom(difficulty, importance, policy)
+        if picked is not None:
+            return picked
+        # 用户函数不可用 → 回退默认策略，避免「配错就静默不修」
+        return _tier_by_importance(difficulty, importance, t1, t2)
+    if policy.tier_strategy == "dual":
+        return _tier_by_dual(difficulty, importance, t1, t2)
+    return _tier_by_importance(difficulty, importance, t1, t2)
 
 
 def apply_rule_adjustments(

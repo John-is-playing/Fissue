@@ -256,6 +256,38 @@ class FixPolicyConfig(BaseModel):
     tier2: FixTier = Field(default_factory=lambda: FixTier(max_difficulty=40, min_importance=0))
     only_issues: bool = True
 
+    # 优先级判定策略（tier1/tier2/none 怎么算）：
+    #   importance —— 默认。以``min_importance``门槛为准；调高 tier1.min_importance
+    #                 可让「重要性刚过线」的条目落到 tier2。
+    #   dual       —— 难度与重要性各自判档，取**更严**的一档（双阈值）。
+    #   custom     —— 由 ``custom_tier`` 指定的用户函数判定；此时各 tier 的
+    #                 ``min_importance`` 不再参与计算。
+    tier_strategy: str = "importance"
+    # 用户判定函数路径，支持 ``pkg.mod:func`` 与 ``pkg.mod.func`` 两种写法。
+    # 签名 ``func(difficulty, importance, policy) -> str``，返回值接受
+    # ``tier1`` / ``tier2`` / ``none``（大小写不敏感）。
+    custom_tier: str | None = None
+
+    @field_validator("tier_strategy")
+    @classmethod
+    def _check_tier_strategy(cls, v: str) -> str:
+        allowed = {"importance", "dual", "custom"}
+        if v not in allowed:
+            raise ConfigError(
+                f"fix_policy.tier_strategy 只接受 importance|dual|custom，当前为 {v!r}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _check_custom_tier(self) -> "FixPolicyConfig":
+        # custom 模式没有判定函数等于没有策略，配置期直接报错，别等到运行时才发现。
+        if self.tier_strategy == "custom" and not (self.custom_tier or "").strip():
+            raise ConfigError(
+                "fix_policy.tier_strategy=custom 时必须提供 custom_tier"
+                "（如 'myproj.policy:tier_of'）"
+            )
+        return self
+
 
 class ScheduleConfig(BaseModel):
     enabled: bool = True

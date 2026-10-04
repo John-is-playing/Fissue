@@ -180,6 +180,30 @@ fix_policy:
   # 其余不修复，仅打标签等开发者
   only_issues: true                   # 仅对 Issue 自动修复；PR 交开发者手动合并
 
+  # 分档策略：怎么把「难度 / 重要性」判成 tier1 / tier2 / none。
+  #   importance（默认）—— 难度是硬门槛，min_importance 区分 tier1/tier2。
+  #     想让「重要性刚过线」的条目落到 tier2，调高 tier1.min_importance 即可。
+  #   dual  —— 难度与重要性各自判档，取**更严**的一档；适合给 tier1 更紧的难度
+  #     门槛（如 tier1.max_difficulty: 20、tier2.max_difficulty: 40）。
+  #   custom —— 由 custom_tier 指定的用户函数判定；此时各 tier 的
+  #     min_importance **不生效**（分档完全交给你的函数）。
+  tier_strategy: importance
+
+  # tier_strategy=custom 时的判定函数，支持 pkg.mod:func 与 pkg.mod.func 两种写法。
+  # 签名：func(difficulty, importance, policy) -> str
+  #   返回值接受 "tier1" / "tier2" / "none"（大小写不敏感），也可直接返回
+  #   fissue.models.Priority。函数加载或执行失败时会记 warning 并回退默认策略，
+  #   避免「配置写错 → 静默不修」。
+  #
+  # 示例：
+  #   def tier_of(difficulty, importance, policy):
+  #       if difficulty <= 20 and importance >= 70:
+  #           return "tier1"
+  #       if difficulty <= 40:
+  #           return "tier2"
+  #       return "none"
+  custom_tier: null                   # 仅 custom 策略需要，如 "myproj.policy:tier_of"
+
 # ---------------------------------------------------------------------------
 # 调度与通知（Q4）
 # ---------------------------------------------------------------------------

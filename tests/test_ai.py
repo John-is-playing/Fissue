@@ -268,6 +268,101 @@ def test_compute_priority_blocks_suspicious_items() -> None:
     ) is Priority.NONE
 
 
+def test_compute_priority_dual_strategy_takes_stricter_tier() -> None:
+    """dual 策略：难度与重要性各判一档，取更严的那一档。
+
+    当 tier1 的难度门槛比 tier2 更紧时，难度这一维会真正参与分档——
+    这是 ``importance`` 策略做不到的（它把难度当单一硬门槛）。
+    """
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff),
+                                        importance=DimensionScore(score=imp)))
+
+    policy = FixPolicyConfig(tier_strategy="dual")
+    policy.tier1.max_difficulty, policy.tier1.min_importance = 20, 70
+    policy.tier2.max_difficulty, policy.tier2.min_importance = 40, 40
+
+    # 难度够 tier1、重要性只够 tier2 → 取更严的 tier2（importance 策略会给 tier1）
+    assert compute_priority(ev(20, 50), category=Category.BUG, policy=policy) is Priority.TIER2
+    # 两维都够 tier1
+    assert compute_priority(ev(20, 90), category=Category.BUG, policy=policy) is Priority.TIER1
+    # 难度超 tier1 但仍在 tier2 内、重要性够 tier1 → 取更严的 tier2
+    assert compute_priority(ev(30, 90), category=Category.BUG, policy=policy) is Priority.TIER2
+    # 难度超出 tier2 → none
+    assert compute_priority(ev(50, 90), category=Category.BUG, policy=policy) is Priority.NONE
+    # 重要性低于 tier2 门槛 → none
+    assert compute_priority(ev(10, 10), category=Category.BUG, policy=policy) is Priority.NONE
+
+
+def test_compute_priority_custom_strategy_uses_user_function(tmp_path, monkeypatch) -> None:
+    """custom 策略由用户函数判定，且重要性门槛参数**不生效**。"""
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    (tmp_path / "my_tier_policy.py").write_text(
+        "from fissue.models import Priority\n"
+        "def tier_of(difficulty, importance, policy):\n"
+        "    if difficulty <= 30:\n"
+        "        return Priority.TIER1\n"
+        "    if difficulty <= 60:\n"
+        "        return 'tier2'\n"
+        "    return 'none'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff),
+                                        importance=DimensionScore(score=imp)))
+
+    policy = FixPolicyConfig(tier_strategy="custom", custom_tier="my_tier_policy:tier_of")
+    # 门槛抬到极值：若它生效，下面 diff=20 的条目不可能被判 tier1
+    policy.tier1.min_importance = 99
+    policy.tier2.min_importance = 99
+
+    assert compute_priority(ev(20, 0), category=Category.BUG, policy=policy) is Priority.TIER1
+    assert compute_priority(ev(45, 0), category=Category.BUG, policy=policy) is Priority.TIER2
+    assert compute_priority(ev(80, 0), category=Category.BUG, policy=policy) is Priority.NONE
+
+
+def test_compute_priority_custom_strategy_falls_back_when_unavailable() -> None:
+    """custom 函数加载失败时回退默认策略，而不是「配错就静默不修」。"""
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff),
+                                        importance=DimensionScore(score=imp)))
+
+    policy = FixPolicyConfig(tier_strategy="custom", custom_tier="no.such.module:tier_of")
+    assert compute_priority(ev(20, 90), category=Category.BUG, policy=policy) is Priority.TIER1
+    assert compute_priority(ev(20, 30), category=Category.BUG, policy=policy) is Priority.TIER2
+    assert compute_priority(ev(90, 90), category=Category.BUG, policy=policy) is Priority.NONE
+
+
+def test_compute_priority_custom_strategy_handles_bad_return() -> None:
+    """用户函数抛错或返回无法识别的值时，不得让整条流水线崩掉。"""
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff),
+                                        importance=DimensionScore(score=imp)))
+
+    # 模块名指向本测试文件（可导入），属性不存在 → 加载失败 → 回退默认
+    policy = FixPolicyConfig(tier_strategy="custom", custom_tier="tests.test_ai:not_a_function")
+    assert compute_priority(ev(20, 90), category=Category.BUG, policy=policy) is Priority.TIER1
+
+
+def test_fix_policy_rejects_invalid_tier_strategy() -> None:
+    """非法策略名与「custom 却没给函数」都要在配置期就报错。"""
+    from fissue.config import ConfigError as CfgErr
+
+    with pytest.raises(CfgErr):
+        FixPolicyConfig(tier_strategy="bogus")
+    with pytest.raises(CfgErr):
+        FixPolicyConfig(tier_strategy="custom")
+
+
 def test_rule_adjustments_block_low_authenticity(settings, sample_issue: RawItem) -> None:
     from fissue.models import Action, DimensionScore, Evaluation, Scores
 
