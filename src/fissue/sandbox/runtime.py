@@ -239,11 +239,45 @@ class DockerRuntime:
     def _local_shell(command: str) -> list[str]:
         """选取本机可用的 shell。"""
         if os.name == "nt":
-            sh = shutil.which("sh") or shutil.which("bash")
+            sh = DockerRuntime._find_posix_shell()
             if sh:
                 return [sh, "-lc", command]
             return ["cmd", "/c", command]
         return ["sh", "-lc", command]
+
+    @staticmethod
+    def _find_posix_shell() -> str | None:
+        """在 Windows 上找一个**真正的 POSIX shell**（Git Bash 的 sh/bash）。
+
+        不能直接信 ``which("bash")``：从 PowerShell / 资源管理器启动时，用户 PATH
+        里可能只有 ``%ProgramFiles%\\Git\\cmd``（没有 ``usr\\bin``），于是
+        ``sh`` 取不到、``bash`` 落到 ``C:\\Windows\\System32\\bash.exe`` —— 那是
+        **WSL 的垫片**，不是 Git Bash。WSL 垫片不认 ``-lc``，会报
+        ``execvpe(...): No such file or directory``，导致本地沙盒里的验证器、
+        回归门、e2e 全部失败（「在 Git Bash 里能跑、在 PowerShell 里全红」）。
+        """
+        for name in ("sh", "bash"):
+            found = shutil.which(name)
+            if found and DockerRuntime._is_posix_shell(found):
+                return found
+        # PATH 里没有 Git 的 shell：git.exe 通常仍可达，用它的安装根推导 usr\bin。
+        git = shutil.which("git")
+        if git:
+            candidate = Path(git).resolve().parent.parent / "usr" / "bin" / "sh.exe"
+            if candidate.exists():
+                return str(candidate)
+        return None
+
+    @staticmethod
+    def _is_posix_shell(path: str) -> bool:
+        """排除 WSL 的 bash/wsl 垫片，只认 Git Bash 这类真 POSIX shell。"""
+        p = Path(path)
+        lowered = str(p).lower()
+        if "windowsapps" in lowered:                       # 应用执行别名垫片
+            return False
+        if p.parent.name.lower() == "system32" and p.name.lower() in ("bash.exe", "wsl.exe"):
+            return False
+        return True
 
     # -- 进程封装 ---------------------------------------------------------
 
