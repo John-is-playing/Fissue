@@ -1,2 +1,17 @@
-- name: Hub Mirror Action.
-  uses: Yikun/hub-mirror-action@v1.5
+steps:
+- name: Mirror the Github organization repos to Gitee.
+  uses: Yikun/hub-mirror-action@master
+  with:
+    # 支持Gitee, Github, Gitlab and Gitcode
+    src: github/kunpengcompute
+    # 支持Gitee, Github, Gitlab and Gitcode
+    dst: gitee/kunpengcompute
+    dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
+    dst_token: ${{ secrets.GITEE_TOKEN }}
+    # 如果源端需要认证（如组织或私有仓库），请配置 src_token
+    # src_token: ${{ secrets.GITHUB_TOKEN }}
+    # 支持Github/Gitee/Gitcode的用户、组织以及Gitlab的组
+    account_type: org
+    # 支持分别设置源和目的端的类型
+    # src_account_type: org
+    # dst_account_type: org
