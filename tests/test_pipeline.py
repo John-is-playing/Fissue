@@ -339,6 +339,55 @@ async def test_flush_processor_pr_never_auto_merges(ctx, repo, monkeypatch) -> N
     assert not report.fix_candidates
 
 
+async def test_flush_conclusion_priority_follows_rules_for_pr(ctx, repo, monkeypatch) -> None:
+    """落库的优先级必须与规则一致：only_issues 下 PR 恒为 none。
+
+    回归（ratekit 实测）：PR#11 被 LLM 批量结论写成 tier1 并原样落库，导致
+    items.priority=tier1 与 compute_priority 的「PR 一律 none」自相矛盾，
+    污染报告 / 看板 / API。这里走**生产路径**（make_handler → apply → 落库）
+    复现并锁定修复。
+    """
+    processor = FlushProcessor(ctx)
+
+    async def fake_label(payload, labels):
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", fake_label)
+
+    async def fake_conclude(*, queue_kind, entries):
+        return [
+            {"key": e["key"], "verdict": "merge", "labels": ["ai-verified"],
+             "priority": Priority.TIER1,           # LLM 误给的优先级
+             "reason": "验证通过", "confidence": 0.9, "model": "stub"}
+            for e in entries
+        ]
+
+    monkeypatch.setattr(ctx.evaluator, "conclude_batch", fake_conclude)
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    pr = RawItem(platform=Platform.GITHUB, repo="psf/requests", number=99, item_type=ItemType.PR,
+                 title="fix: 修好了一处缺陷", body="d")
+    repo.upsert_item(rid, pr)
+    repo.save_evaluation(pr.key, Evaluation(
+        category=Category.BUG, priority=Priority.NONE, model="stub",
+        scores=Scores(
+            authenticity=DimensionScore(score=95),
+            importance=DimensionScore(score=85),
+            difficulty=DimensionScore(score=10),
+        ),
+    ))
+    eid = processor.queues.enqueue(QueueName.FIX_BUG, pr.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    outcome = await processor.queues.flush(
+        QueueName.FIX_BUG, handler=processor.make_handler(), force=True
+    )
+    assert outcome.ok and outcome.flushed == 1
+    # 无论模型怎么说，PR 的优先级都必须是 none
+    assert repo.latest_batch_conclusion(pr.key).priority is Priority.NONE
+    assert repo.get_item_row(pr.key).priority == Priority.NONE.value
+
+
 async def test_flush_processor_label_failure_recorded(ctx, repo, monkeypatch) -> None:
     """打标签失败时：要记录错误，但流水线必须继续推进状态。
 
@@ -693,6 +742,29 @@ def test_similar_to_ignores_prs_and_newer_items() -> None:
     assert _similar_to(issue1, pool) == []        # #6 是 PR，不算重复对象
     assert _similar_to(issue2, pool) == []        # #5 更晚，单向指向更早的
     assert [g["number"] for g in _similar_to(issue5, pool)] == [2]
+
+
+def test_similar_to_recalls_chinese_duplicate_titles() -> None:
+    """中文重复标题必须能被预筛召回，否则连候选都进不去。
+
+    回归（ratekit 实测）：#8「含税总价反推出来的不含税价好像不对」与 #2
+    「remove_tax 公式错误，含税价反推净额严重偏低」是同一问题，但中文切成
+    **单字**后相似度只有 0.21，达不到阈值 —— LLM 从未收到 #2 作为候选，于是
+    漏检。改成中文 bigram + 包含度后应能召回；同时不该把只是共用
+    ``parse_amount`` 这个词的 #3 也拉进来。
+    """
+    from fissue.pipeline.stages import _similar_to
+
+    def issue(number: int, title: str) -> RawItem:
+        return RawItem(platform=Platform.GITHUB, repo="John-is-playing/ratekit",
+                       number=number, item_type=ItemType.ISSUE, title=title, body="")
+
+    dup2 = issue(2, "remove_tax 公式错误，含税价反推净额严重偏低")
+    other3 = issue(3, "parse_amount 丢失负号，负数金额被解析成正数")
+    dup8 = issue(8, "含税总价反推出来的不含税价好像不对")
+
+    got = [g["number"] for g in _similar_to(dup8, [dup2, other3, dup8])]
+    assert got == [2]                             # 召回真重复 #2，且不误召 #3
 
 
 async def test_eval_batch_passes_similar_candidates(ctx, repo) -> None:

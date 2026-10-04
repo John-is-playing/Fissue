@@ -114,11 +114,13 @@ class FlushProcessor:
             report.verdicts[key] = verdict
             priority = c.get("priority") if isinstance(c.get("priority"), Priority) else Priority.NONE
 
-            if queue_kind == QueueName.VERIFY.value:
-                # 派发优先级**以规则结论为准**，LLM 的 priority 仅作参考。
-                # 否则模型随手给个 tier2 就能绕过 fix_policy 的阈值与 only_issues，
-                # 把高难度条目也派去自动修复，并与评测阶段算出的优先级对不上。
-                priority = self._rule_priority(key, payload, fallback=priority)
+            # 优先级**一律以规则结论为准**，LLM 的 priority 仅作参考。否则模型随手给个
+            # tier2 就能绕过 fix_policy 的阈值与 only_issues，把高难度条目派去自动修复；
+            # 对 PR 更会写出「items.priority=tier1」这类与规则（only_issues 下 PR 恒为
+            # none）自相矛盾的值，污染报告 / 看板 / API。
+            priority = self._rule_priority(key, payload, fallback=priority)
+            # 回写结论：queue 落库的 batch_conclusions 与 items.priority 必须与派发口径一致。
+            c["priority"] = priority
 
             labels = self._decide_labels(queue_kind, verdict, c)
             if labels:
