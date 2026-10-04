@@ -487,7 +487,7 @@ def test_evaluation_prompt_distinguishes_design_preference_from_defect() -> None
     user = evaluation_prompt(item)[1]["content"]
 
     # 维度说明里点明 authenticity 衡量的是「是否存在真实问题」
-    assert "这是不是一个真实存在的问题" in user
+    assert "这是不是一个真实存在的问题/需求" in user
     assert "不是" in user and "这个诉求是否合理" in user
     # 打分要求里给出可执行判据：设计偏好变更 → authenticity ≤40、category=feature
     assert "行为/API 设计偏好变更 ≠ 缺陷" in user
@@ -495,6 +495,33 @@ def test_evaluation_prompt_distinguishes_design_preference_from_defect() -> None
     assert "category 取 feature" in user
     # 反向也要说清：不符合自身契约的才是缺陷，避免把真 Bug 也压成低真实性
     assert "不符合其自身文档/契约/常识预期" in user
+    # 范围必须限定在「替换现有行为」：否则「新增功能」请求会被一起误压。
+    # 回归（重评实测）：#7「支持按小时计费」曾被这条规则误伤，真实性 95 → 35。
+    assert "仅限" in user and "替换现有行为" in user
+    assert "新增功能不属此类" in user
+    assert "不要**因为它是「新做法」就压低真实性" in user
+
+
+def test_evaluation_prompt_does_not_suppress_new_feature_requests() -> None:
+    """「新增功能」是对新能力的真实需求，不该被设计偏好规则压低真实性。
+
+    回归（重评实测）：加了「设计偏好变更 ≠ 缺陷」后，#7「支持按小时计费与自定义
+    计费周期」真实性从 95 掉到 35，reason 写着「属于明确的功能增强与 API 设计偏好
+    变更」——把「新需求」误当成了「偏好变更」。提示词必须显式排除这一类。
+    """
+    from fissue.ai.prompts import evaluation_prompt
+    from fissue.models import ItemType, Platform, RawItem
+
+    item = RawItem(
+        platform=Platform.GITHUB, repo="x/y", number=7, item_type=ItemType.ISSUE,
+        title="支持按小时计费与自定义计费周期",
+        body="目前只支持按天分摊，希望增加按小时/周/月计费。",
+    )
+    user = evaluation_prompt(item)[1]["content"]
+
+    assert "目前不支持 X，希望增加 X" in user
+    assert "是对新能力的真实需求" in user
+    assert "清晰可实现的合理需求应给高分" in user
 
 
 def test_evaluation_prompt_pr_variant_keeps_guidance() -> None:
