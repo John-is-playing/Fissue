@@ -796,3 +796,89 @@ async def test_eval_batch_passes_similar_candidates(ctx, repo) -> None:
     # 同批内互相可见（此前 similar 从未接线），重复关系单向指向更早的 #2
     assert seen[b.key] and any(s["number"] == 2 for s in seen[b.key])
     assert not seen[a.key]
+
+
+# ---------------------------------------------------------------------------
+# 验证器生成：缺 command 时重生成
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_and_validate_retries_when_executable_lacks_command(ctx, repo, monkeypatch) -> None:
+    """可执行验证器缺 command 时应带反馈重生成，而不是拿它白跑一次沙盒。
+
+    回归（ratekit #6 实测）：模型给出 kind=executable 却没有 command，此前只记一条
+    warning 就继续调 run_once —— 跑不出任何结论，白白浪费一次沙盒执行，最终落个
+    f2p=false 的「可执行」验证器。应重生成以补齐命令。
+    """
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierRun, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 21)
+
+    no_cmd = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="bad",
+                          files={"t.py": "x"}, command=None)
+    with_cmd = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="good",
+                            files={"t.py": "x"}, command="python -m pytest t.py -q")
+
+    calls = {"refine": 0, "run": 0}
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=no_cmd, usage=Usage(),
+                                     warnings=["可执行验证器缺少 command"])
+
+        async def refine(self, spec, **kw):
+            calls["refine"] += 1
+            return GeneratedVerifier(spec=with_cmd, usage=Usage(), warnings=[])
+
+    async def fake_run_once(**kw):
+        calls["run"] += 1
+        return VerifierRun(item_key=item.key, stage="base",
+                           outcome=VerifierOutcome.FAIL, exit_code=1)
+
+    monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)
+    _vid, spec, result = await ctx.verifier.generate_and_validate(
+        item=item, workspace=object(), repo_context="", generator=_Gen()
+    )
+
+    assert calls["refine"] == 1                       # 缺 command → 触发一次重生成
+    assert spec.command == "python -m pytest t.py -q"  # 用补齐后的命令继续
+    assert calls["run"] == 1
+    assert result.reproducible is True
+
+
+async def test_generate_and_validate_unreliable_when_command_never_given(ctx, repo, monkeypatch) -> None:
+    """修正多轮仍不给 command → 直接判不可靠，不浪费沙盒执行。"""
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 22)
+    no_cmd = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="bad",
+                          files={"t.py": "x"}, command=None)
+
+    calls = {"refine": 0, "run": 0}
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=no_cmd, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            calls["refine"] += 1
+            return GeneratedVerifier(spec=no_cmd, usage=Usage(), warnings=[])
+
+    async def fake_run_once(**kw):
+        calls["run"] += 1
+        return None
+
+    monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)
+    max_rounds = max(1, ctx.settings.verifier.max_rounds)
+    _vid, spec, result = await ctx.verifier.generate_and_validate(
+        item=item, workspace=object(), repo_context="", generator=_Gen()
+    )
+
+    assert calls["run"] == 0                          # 从未带着空命令跑沙盒
+    assert calls["refine"] == max_rounds - 1          # 每轮都尝试重生成
+    assert result.f2p_satisfied is False
+    assert "缺少 command" in result.conclusion

@@ -432,6 +432,37 @@ class VerifierRunner:
                 self.repo.set_item_status(item.key, ItemStatus.VERIFIER_READY)
                 return verifier_id, spec, result
 
+            # 可执行验证器却没有 command：跑不出任何结论。此前只记一条 warning 就
+            # 继续拿它跑 base，白白浪费一次沙盒执行，最终落个 f2p=false 的
+            # 「可执行」验证器（ratekit #6 实测如此）。这里改为带明确反馈让模型
+            # 补一条命令，复用既有的修正回路；最后一轮仍缺命令则直接判不可靠转人工。
+            if spec.kind.is_executable and not (spec.command or "").strip():
+                if round_index < max_rounds:
+                    log.warning("验证器 %s 缺少 command，第 %d 轮重新生成", item.key, round_index)
+                    refined = await generator.refine(
+                        spec,
+                        item=item,
+                        repo_context=repo_context,
+                        failure_output=(
+                            "你生成的是可执行验证器，但没有给出 command。没有运行命令就"
+                            "无法执行任何验证。请补上一条可直接运行的命令"
+                            "（例如 `python -m pytest test_x.py -q`）。"
+                        ),
+                        round_index=round_index + 1,
+                        test_hint=test_hint,
+                        linked_context=linked_context,
+                    )
+                    spec = refined.spec
+                    continue
+                self.repo.set_verifier_f2p(verifier_id, False)
+                result = VerifierResult(
+                    kind=spec.kind,
+                    f2p_satisfied=False,
+                    conclusion=f"可执行验证器缺少 command（重试 {max_rounds} 轮仍未给出），无法运行",
+                )
+                log.warning("验证器 %s 缺少 command 且已到最后一轮，判定不可靠", item.key)
+                return verifier_id, spec, result
+
             base = await self.run_once(
                 item_key=item.key,
                 workspace=workspace,
