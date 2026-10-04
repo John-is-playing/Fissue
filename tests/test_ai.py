@@ -468,6 +468,49 @@ async def test_conclude_batch_handles_bad_shape(settings, repo, stub_llm) -> Non
     assert await evaluator.conclude_batch(queue_kind="verify", entries=[{"key": "k1"}]) == []
 
 
+def test_evaluation_prompt_distinguishes_design_preference_from_defect() -> None:
+    """提示词必须把「行为/API 设计偏好变更」与「真缺陷」分开。
+
+    回归（ratekit #9 实测）：Issue 提议「parse_amount 解析失败返回 0 而非抛异常」，
+    这不是缺陷而是 API 设计偏好，却被判 authenticity=90。authenticity 若衡量的只是
+    「诉求是否合理」，就会把它推成高真实性、甚至 fix_now；必须明确它衡量的是
+    「这是不是一个真实存在的问题」。
+    """
+    from fissue.ai.prompts import evaluation_prompt
+    from fissue.models import ItemType, Platform, RawItem
+
+    item = RawItem(
+        platform=Platform.GITHUB, repo="x/y", number=9, item_type=ItemType.ISSUE,
+        title="parse_amount 解析非法输入时应该返回 0 而不是抛异常",
+        body="表单用户乱填就 500 了，建议解析失败返回 0。",
+    )
+    user = evaluation_prompt(item)[1]["content"]
+
+    # 维度说明里点明 authenticity 衡量的是「是否存在真实问题」
+    assert "这是不是一个真实存在的问题" in user
+    assert "不是" in user and "这个诉求是否合理" in user
+    # 打分要求里给出可执行判据：设计偏好变更 → authenticity ≤40、category=feature
+    assert "行为/API 设计偏好变更 ≠ 缺陷" in user
+    assert "≤40" in user
+    assert "category 取 feature" in user
+    # 反向也要说清：不符合自身契约的才是缺陷，避免把真 Bug 也压成低真实性
+    assert "不符合其自身文档/契约/常识预期" in user
+
+
+def test_evaluation_prompt_pr_variant_keeps_guidance() -> None:
+    """PR 分支同样带上该指引（dims 按 PR/Issue 分支构建，别只改了一侧）。"""
+    from fissue.ai.prompts import evaluation_prompt
+    from fissue.models import ItemType, Platform, RawItem
+
+    pr = RawItem(platform=Platform.GITHUB, repo="x/y", number=7, item_type=ItemType.PR,
+                 title="fix: 调整默认返回值为 0", body="d")
+    user = evaluation_prompt(pr)[1]["content"]
+
+    assert "行为/API 设计偏好变更 ≠ 缺陷" in user
+    assert "pr_quality" in user          # PR 专属维度仍在
+    assert "≤40" in user
+
+
 def sample_platform():
     from fissue.models import Platform
 
