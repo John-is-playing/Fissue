@@ -17,7 +17,7 @@ jobs:
           # 源端账户，格式为 平台/用户名或组织名
           src: github/John-is-playing
           # 目标端账户，格式为 平台/用户名或组织名
-          dst: atomgit/qiaoen_python
+          dst: gitcode/qiaoen_python
           # 引用前面配置的 Secrets
           dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
           dst_token: ${{ secrets.GITEE_TOKEN }}
