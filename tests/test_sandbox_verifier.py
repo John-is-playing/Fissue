@@ -319,3 +319,111 @@ class _FakeExec:
 )
 def test_classify_outcome(exec_result, expected) -> None:
     assert classify_outcome(exec_result, link_ok=True) is expected
+
+
+# ---------------------------------------------------------------------------
+# B：正文的兼容性声明必须转成回归断言
+#
+# 背景（demo 实测）：issue #1 正文写着「其余用例不受影响」，但验证器只把
+# 列出的目标用例（""、"   "）翻成断言。而 word_count 用 split(" ") 还是
+# split() 在**目标用例上表现相同**（都返回 0），差异只在未列举的连续空格上：
+# split(" ") → word_count("hello  world") == 3，split() → 2。
+# 于是「改对了目标、却弄坏了别处」的修复照样通过 F2P。回归断言能拦住它。
+# ---------------------------------------------------------------------------
+
+
+def test_verifier_prompt_requires_compat_regression_assertions(sample_issue) -> None:
+    """提示词必须要求把「不受影响 / 保持兼容」这类声明落成断言。"""
+    from fissue.ai import prompts
+
+    text = prompts.verifier_prompt(
+        sample_issue, repo_context="(repo)", test_hint="python -m pytest -q"
+    )[1]["content"]
+    assert "兼容性声明必须转成回归断言" in text
+    assert "其余用例不受影响" in text          # 给出可识别的句式
+    assert "不要臆造" in text                  # 不允许凭空发明契约
+
+
+def _sandbox_outcome(settings, files: dict[str, str]):
+    """在 local 沙盒里跑一段脚本，返回它对应的验证器结果。
+
+    用 ``sys.executable`` 而不是裸 ``python``：命令经 shell 执行，后者不保证
+    解析到当前的虚拟环境解释器。
+    """
+    import sys
+
+    ex = Executor(settings.sandbox)
+    res = ex.execute(
+        ExecRequest(
+            command=f'"{sys.executable}" check.py',
+            files=files,
+            label="compat-assert",
+            timeout_seconds=60,
+        )
+    )
+    return classify_outcome(res, link_ok=True)
+
+
+_IMPL_BASE = "def word_count(text: str) -> int:\n    return len(text.split(' '))\n"
+_IMPL_BROAD = "def word_count(text: str) -> int:\n    return len(text.split())\n"
+
+# 只覆盖 issue 列出的目标用例
+_CHECK_TARGET_ONLY = 'from mod import word_count\nassert word_count("") == 0\n'
+# 增加了正文声明「其余用例不受影响」对应的回归断言
+_CHECK_WITH_REGRESSION = (
+    "from mod import word_count\n"
+    'assert word_count("") == 0\n'
+    'assert word_count("hello  world") == 3\n'
+)
+
+
+def test_regression_assertion_rejects_over_broad_fix(settings) -> None:
+    """回归断言能让「修好目标却弄坏别处」的修复被 F2P 拒掉。
+
+    这是本能力的**全部意义**，所以真在沙盒里跑一次，而不是只查提示词文本。
+    """
+    from fissue.models import VerifierSpec
+
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python check.py")
+
+    # --- 只有目标断言：base 失败、fix 通过 → F2P 成立（放过了语义更宽的修复）
+    base_loose = _sandbox_outcome(settings, {"mod.py": _IMPL_BASE, "check.py": _CHECK_TARGET_ONLY})
+    fix_loose = _sandbox_outcome(settings, {"mod.py": _IMPL_BROAD, "check.py": _CHECK_TARGET_ONLY})
+    assert base_loose is VerifierOutcome.FAIL        # "" 返回 1，目标问题确实存在
+    assert fix_loose is VerifierOutcome.PASS         # "" 返回 0，目标已修好
+    assert judge_f2p(spec, _run("base", base_loose, 1), _run("fix", fix_loose, 0)).f2p_satisfied is True
+
+    # --- 加上回归断言：fix 阶段在 "hello  world" 上失败 → F2P 不成立（正确拒绝）
+    base_strict = _sandbox_outcome(
+        settings, {"mod.py": _IMPL_BASE, "check.py": _CHECK_WITH_REGRESSION}
+    )
+    fix_strict = _sandbox_outcome(
+        settings, {"mod.py": _IMPL_BROAD, "check.py": _CHECK_WITH_REGRESSION}
+    )
+    assert base_strict is VerifierOutcome.FAIL       # 仍由目标用例触发失败
+    assert fix_strict is VerifierOutcome.FAIL        # 回归断言被打破
+    result = judge_f2p(spec, _run("base", base_strict, 1), _run("fix", fix_strict, 1))
+    assert result.f2p_satisfied is False
+    assert result.reproducible is True               # 问题仍被成功复现
+
+
+def test_regression_assertion_accepts_a_correct_fix(settings) -> None:
+    """回归断言不能把**正确**的修复也一起拒掉（否则就是误伤）。"""
+    from fissue.models import VerifierSpec
+
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python check.py")
+    # 正确修法：空值短路 + 保留 split(" ") 的既有语义
+    good = (
+        "def word_count(text: str) -> int:\n"
+        "    if not text.strip():\n"
+        "        return 0\n"
+        "    return len(text.split(' '))\n"
+    )
+    both = _CHECK_WITH_REGRESSION
+    assert _sandbox_outcome(settings, {"mod.py": _IMPL_BASE, "check.py": both}) is VerifierOutcome.FAIL
+    assert _sandbox_outcome(settings, {"mod.py": good, "check.py": both}) is VerifierOutcome.PASS
+    assert judge_f2p(
+        spec,
+        _run("base", _sandbox_outcome(settings, {"mod.py": _IMPL_BASE, "check.py": both}), 1),
+        _run("fix", _sandbox_outcome(settings, {"mod.py": good, "check.py": both}), 0),
+    ).f2p_satisfied is True
