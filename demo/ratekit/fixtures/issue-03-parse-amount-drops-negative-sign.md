@@ -1,7 +1,7 @@
 <!--
 title: parse_amount 丢失负号，负数金额被解析成正数
 labels: bug
-target: tier2（难度低 + 重要性低）→ 应自动修复
+target: tier1（难度低 + 重要性高）→ 应自动修复
 -->
 
 ## 问题描述

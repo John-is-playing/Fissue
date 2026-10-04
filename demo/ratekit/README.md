@@ -19,7 +19,7 @@ demo/ratekit/
 ├── fixtures/                    10 个 Issue 的内容与元数据
 │   ├── issue-01-format-amount-int-loses-decimals.md   tier1：难度低 + 重要性高 → 应自动修复
 │   ├── issue-02-remove-tax-wrong-formula.md           tier1：难度低 + 重要性高 → 应自动修复
-│   ├── issue-03-parse-amount-drops-negative-sign.md   tier2：难度低 + 重要性低 → 应自动修复
+│   ├── issue-03-parse-amount-drops-negative-sign.md   tier1：难度低 + 重要性高 → 应自动修复
 │   ├── issue-04-percent-negative-sign.md              tier2：难度低 + 重要性低 → 应自动修复
 │   ├── issue-05-weekend-saturday-missed.md            tier2：难度低 + 重要性低 → 应自动修复
 │   ├── issue-06-float-rounding-inconsistent.md        难度高 → 不应自动修复
@@ -38,7 +38,7 @@ demo/ratekit/
 |---|---|---|---|
 | 1 | `format_amount(1234)` | `'1,234'`，int 入参丢小数位 | 生成验证器 → base 失败 → tier1 → 自动修复 |
 | 2 | `remove_tax(113.0, 0.13)` | `98.31`，公式应为 `gross/(1+rate)` | 生成验证器 → base 失败 → tier1 → 自动修复 |
-| 3 | `parse_amount("-5.00")` | `5.0`，负号被清洗掉 | tier2 → 自动修复 |
+| 3 | `parse_amount("-5.00")` | `5.0`，负号被清洗掉 | tier1 → 自动修复（资金方向颠倒，重要性高） |
 | 4 | `percent_of(200, -5)` | `10.0`，负数被 `abs()` 抹掉符号 | tier2 → 自动修复 |
 | 5 | `is_weekend(2024-01-06)` | `False`，只认星期日 | tier2 → 自动修复 |
 | 6 | `prorate(10.0, 1, 3)` | `3.33`，应向上取整为 `3.34` | 难自动化/边界 → 可判难度偏高 |
@@ -150,7 +150,7 @@ fissue fetch --repo John-is-playing/ratekit --limit 50
 # 2) 评测（四维评分 + 分类 + 反刷子）
 fissue eval --repo John-is-playing/ratekit --all
 
-# 3) 看结果：#1/#2 应为 tier1，#3/#4/#5 应为 tier2，#7 应为 feature
+# 3) 看结果：#1/#2/#3 应为 tier1，#4/#5 应为 tier2，#7 应为 feature
 fissue report --repo John-is-playing/ratekit
 
 # 4) 生成验证器并做 F2P 验证
@@ -169,7 +169,7 @@ fissue fix --repo John-is-playing/ratekit --dry-run --limit 6
 |---|---|---|---|---|---|
 | 1 | format_amount int 丢小数位 | bug | **tier1** | base 失败（可复现） | 自动修复 → 提 PR |
 | 2 | remove_tax 公式错 | bug | **tier1** | base 失败 | 自动修复 → 提 PR |
-| 3 | parse_amount 丢负号 | bug | **tier2** | base 失败 | 自动修复 → 提 PR |
+| 3 | parse_amount 丢负号 | bug | **tier1** | base 失败 | 自动修复 → 提 PR |
 | 4 | percent_of 负数取绝对值 | bug | **tier2** | base 失败 | 自动修复 → 提 PR |
 | 5 | is_weekend 漏周六 | bug | **tier2** | base 失败 | 自动修复 → 提 PR |
 | 6 | 精度口径不统一 | bug | none | 难自动化 | 不修复，打标签 |

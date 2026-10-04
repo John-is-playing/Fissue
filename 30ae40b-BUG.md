@@ -36,7 +36,7 @@ ratekit 整体表现（详见期望对照表）：
 |---|---|---|---|---|
 | 1 | format_amount int 丢小数位 | bug / tier1 | bug / tier2 | ⚠️ tier 差一档 |
 | 2 | remove_tax 公式错 | bug / tier1 | bug / tier1 | ✅ |
-| 3 | parse_amount 丢负号 | bug / tier2 | bug / tier1 | ⚠️ 偏高 |
+| 3 | parse_amount 丢负号 | bug / **tier1**（期望已修正） | bug / tier1 | ✅ 见 §6.6 |
 | 4 | percent_of 负数取绝对值 | bug / tier2 | bug / tier2 | ✅ |
 | 5 | is_weekend 漏周六 | bug / tier2 | bug / tier2 | ✅ |
 | 6 | 精度口径不统一 | 不自动修 | base 即 pass → f2p=0 → 未入队 | ✅ 高难度被拦住 |
@@ -166,11 +166,12 @@ LLM 给的 priority。
 
 ### E. 难度阈值边界太陡
 
-**现象**：#1 难度 20 → tier2，#3 难度 15 → tier1，一档之差就翻转优先级，
-导致 #1（期望 tier1）落到 tier2、#3（期望 tier2）升到 tier1。
+**现象**：#1 难度 15 → tier2（首次评测），#3 难度 15 → tier1，一档之差就翻转优先级。
 
-**方向**：标定 `fix_policy.tier1.max_difficulty`，或对难度接近边界的条目做平滑/人工复核，
-避免临界值抖动。
+**方向**：标定 `fix_policy.tier1.max_difficulty` / `min_importance`，或对难度接近
+边界的条目做平滑/人工复核。
+
+> **状态：已实现**（阈值可配置 + 三策略），见 §6.3 与 §6.6。
 
 ### F. 「API 设计偏好」被判高真实性
 
@@ -181,7 +182,7 @@ LLM 给的 priority。
 **方向上**：评测提示词里明确区分「缺陷」与「行为偏好变更」，后者真实性应下调。
 （好的一面：#9 未被误打修复标签、未误修，所以风险可控。）
 
-> **状态：已实现**，见第 5.6 节。
+> **状态：已实现**，见 §6.4。
 
 ---
 
@@ -326,8 +327,8 @@ LLM 在 flush 里给的是 tier1，规则（`only_issues=true` → PR 恒为 non
 |---|---|---|---|---|
 | 1 | format_amount int 丢小数位 | tier1 | **tier1** | ✅（修复前 tier2） |
 | 2 | remove_tax 公式错 | tier1 | tier1 | ✅ |
-| 3 | parse_amount 丢负号 | tier2 | tier1 | ⚠️ 仍偏高（见 E） |
-| 4 | percent_of 负数 | tier2 | tier1 | ⚠️ 偏高（重要性 75 越线） |
+| 3 | parse_amount 丢负号 | tier2 → **tier1**（期望已修正，见 §6.6） | tier1 | ✅ |
+| 4 | percent_of 负数 | tier2 | tier1 | ⚠️ 偏高（重要性 75 越线，见 E） |
 | 5 | is_weekend 漏周六 | tier2 | tier1 | ⚠️ 同上 |
 | 6 | 精度口径不统一 | 不自动修 | none / triage | ✅ |
 | 7 | 按小时计费 | feature | feature / triage | ✅ |
@@ -336,9 +337,9 @@ LLM 在 flush 里给的是 tier1，规则（`only_issues=true` → PR 恒为 non
 | 10 | 刷量 | 低真实性 | auth=15 / spam=true / close | ✅ |
 | 11–13 | 三个 PR | 一律 none | **全部 none** | ✅（B 生效） |
 
-> `#3/#4/#5` 的 tier 偏高**不是本次改动引入**——是 `compute_priority` 的阈值
-> 标定问题（重要性 75 恰好越过 `tier1.min_importance`），即提升项 **E**，
-> 需先定标定口径再动。
+> `#4/#5` 的 tier 偏高**不是本次改动引入**——是 `compute_priority` 的阈值
+> 标定问题（重要性 75 恰好越过 `tier1.min_importance`），即提升项 **E**。
+> 该表是 A/B 修复后的复测；C/D/E/F 修复后的再次复测见 §6.6。
 
 ### 5.4 改动清单与验证
 
@@ -436,7 +437,50 @@ custom 函数签名 `func(difficulty, importance, policy) -> "tier1"|"tier2"|"no
 | `9427d9e` | C：dry-run 汇总与明细统一口径 |
 | `14dd85e` | D：验证器缺 command 时带反馈重生成 |
 | `c79c65c` | E：优先级分档策略可配置 |
-| （本次） | F：设计偏好变更判低真实性 |
+| `29b1e82` | F：设计偏好变更判低真实性 |
+| `28420e6` | docs：补记 C/D/E/F |
+| `0bd0e41` | F 收紧：不误伤新增功能 |
 
 **第 3 节的 C / D / E / F 四项均已实现。**
+
+### 6.6 E/F 实测复测（`config.yaml` 调整 + `eval` 重跑）
+
+**配置调整**：`fix_policy.tier1.min_importance` 由 70 调到 80。
+
+**实测结果**：
+
+| # | 条目 | 难度/重要性 | 期望 | 复测 | 判定 |
+|---|---|---|---|---|---|
+| 1 | format_amount | 15 / 85 | tier1 | tier1 | ✅ |
+| 2 | remove_tax | 5 / 95 | tier1 | tier1 | ✅ |
+| **3** | **parse_amount 丢负号** | 15 / **85** | ~~tier2~~ → **tier1** | tier1 | ✅ **期望已修正** |
+| 4 | percent_of | 10 / 65 | tier2 | **tier2** | ✅（原 tier1） |
+| 5 | is_weekend | 10 / 75 | tier2 | **tier2** | ✅（原 tier1） |
+| 6 | 精度口径 | 80 / 85 | none | none | ✅ |
+| 7 | 按小时计费 | 45 / 60 | feature | feature / **auth=90** | ✅（见下） |
+| 8 | 重复 #2 | 25 / 80 | 判重复 | dup=true, of=[2] | ✅ |
+| 9 | 误报 | 30 / 40 | 低真实性 | **auth=30** | ✅（原 90） |
+| 10 | 刷量 | 50 / 10 | 低真实性 | auth=10 / spam=true | ✅ |
+| 11–13 | 三个 PR | — | 一律 none | 全部 none | ✅ |
+
+**#3 的期望修正**：`tier1.min_importance` 提到 80 后 #3 **仍是 tier1**，因为它
+重评后重要性为 **85**。这不是阈值能解决的——「把正数金额当负数解析」会让资金
+方向颠倒，模型判它高重要性并不算错，是**原期望值本身偏低**。若要压到 tier2 得把
+门槛提到 86+，但那会把 #1（85）一起打下去，得不偿失。故修正**期望**：`#3` 应为
+tier1。已同步 `demo/ratekit/README.md`、`fixtures/issue-03-*.md` 头部 target。
+
+**F 的两个方向都验到了**：
+
+```text
+#9（设计偏好变更）  真实性 90 → 30   reason: 属设计偏好变更，非缺陷……
+#7（新增功能）      真实性 95 → 35（过度泛化）→ 90（收紧后）
+                    reason: 明确的新增功能需求，现有库仅支持按天分摊……
+```
+
+即：`#9` 这类「替换现有行为」的诉求被正确压低，而 `#7` 这类「新增能力」的需求
+不被误伤。第一版规则写得太宽导致 `#7` 被压，已收紧为「仅限替换现有行为」并补
+「新增功能不属此类」条款（commit `0bd0e41`）。
+
+> 注：提示词与模型输出是非确定性的，以上为单次实测结果，非稳定保证。单测只锁定
+> 「规则写对了」，不锁定「模型每次照做」。
 
