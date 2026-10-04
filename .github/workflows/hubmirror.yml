@@ -1,17 +1,31 @@
-steps:
-- name: Mirror the Github organization repos to Gitee.
-  uses: Yikun/hub-mirror-action@master
-  with:
-    # 支持Gitee, Github, Gitlab and Gitcode
-    src: github/kunpengcompute
-    # 支持Gitee, Github, Gitlab and Gitcode
-    dst: gitee/kunpengcompute
-    dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
-    dst_token: ${{ secrets.GITEE_TOKEN }}
-    # 如果源端需要认证（如组织或私有仓库），请配置 src_token
-    # src_token: ${{ secrets.GITHUB_TOKEN }}
-    # 支持Github/Gitee/Gitcode的用户、组织以及Gitlab的组
-    account_type: org
-    # 支持分别设置源和目的端的类型
-    # src_account_type: org
-    # dst_account_type: org
+name: Mirror Repos to Gitee
+
+on:
+  push:
+    branches: [ main ]   # 当 main 分支有推送时触发
+  schedule:
+    - cron: '0 2 * * *'  # 可选：每天 UTC 2:00 自动同步一次
+  workflow_dispatch:      # 可选：允许手动在 Actions 页面触发
+
+jobs:
+  repo-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror the Github organization repos to Gitee
+        uses: Yikun/hub-mirror-action@master
+        with:
+          # 源端账户，格式为 平台/用户名或组织名
+          src: github/John-is-playing
+          # 目标端账户，格式为 平台/用户名或组织名
+          dst: atomgit/qiaoen_python
+          # 引用前面配置的 Secrets
+          dst_key: ${{ secrets.GITEE_PRIVATE_KEY }}
+          dst_token: ${{ secrets.GITEE_TOKEN }}
+          # 账户类型：user (个人), org (组织), group (GitLab 组)
+          account_type: user
+          # 可选：强制同步（会覆盖目标端的历史，谨慎使用）
+          # force_update: true
+          # 可选：使用 SSH 克隆（私有仓库推荐）
+          # clone_style: 'ssh'
+          # 可选：只同步特定仓库（白名单）
+          # static_list: 'repo1,repo2,repo3'
