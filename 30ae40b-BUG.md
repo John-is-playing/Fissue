@@ -181,6 +181,8 @@ LLM 给的 priority。
 **方向上**：评测提示词里明确区分「缺陷」与「行为偏好变更」，后者真实性应下调。
 （好的一面：#9 未被误打修复标签、未误修，所以风险可控。）
 
+> **状态：已实现**，见第 5.6 节。
+
 ---
 
 ## 4. 建议的修复与验收
@@ -350,6 +352,91 @@ LLM 在 flush 里给的是 tier1，规则（`only_issues=true` → PR 恒为 non
 验证：全量单测 **394 → 396 passed**（新增 2 个），在 Git Bash 与受限 PATH
 （等价 PowerShell）下均全绿。
 
-**仍未处理**：C（dry-run 汇总口径）、D（验证器缺 command）、E（难度阈值标定）、
-F（设计偏好判高真实性）——见第 3 节。
+**C / D / E / F 四项均已实现**，见第 6 节。
+
+---
+
+## 6. 后续修复记录（C / D / E / F）
+
+### 6.1 C — dry-run 汇总与明细统一口径
+
+**改法**（`fixer/autofix.py` + `cli/ops.py`）：按「补丁已产出即修复成功」这一**既有
+语义**统一到明细侧（而非改汇总——既有测试已锁定该语义）。
+
+- `FixReport` 新增 `dry_run_patches` 计数，`summary` 追加
+  「（其中 dry-run 产出补丁 N）」，让口径在汇总里显式可见；
+- `_attempt_row(a, dry_run=...)`：dry-run 下有补丁的 `NEEDS_MANUAL` 显示为
+  `success`，error 改写为「dry-run：已产出补丁，未提 PR」；补丁路径照常给出。
+  非 dry-run 时维持原状，不把真失败冒充成成功。
+
+新增单测：`test_fix_report_dry_run_patch_counted_and_summary_labeled`、
+`test_attempt_row_matches_summary_under_dry_run`。
+
+### 6.2 D — 可执行验证器缺 command 时重生成
+
+**改法**（落点在 `verifier/runner.py` 的 `generate_and_validate`，非清单原先写的
+`generator.py`——`validate_spec` 只产生 warning，无法触发重生成）：
+
+可执行形态却没有 `command` 时，带着明确反馈走既有 `refine` 回路重生成；
+最后一轮仍缺命令则直接判不可靠转人工，**不再空跑沙盒**。对应 ratekit #6 的
+`command=None` 的「可执行」验证器。
+
+新增单测：`test_generate_and_validate_retries_when_executable_lacks_command`、
+`test_generate_and_validate_unreliable_when_command_never_given`。
+
+### 6.3 E — 优先级分档策略可配置
+
+**改法**（`config.py` + `ai/evaluator.py`）：新增 `fix_policy.tier_strategy` 三选一。
+
+| 策略 | 行为 |
+|---|---|
+| `importance`（默认） | 难度是硬门槛，`min_importance` 区分 tier1/tier2。**行为与改动前一致** |
+| `dual` | 难度、重要性各自判档，**取更严**的一档；tier1 难度门槛更紧时才真正生效 |
+| `custom` | 交由 `custom_tier` 指定的用户函数判定；**`min_importance` 不生效** |
+
+custom 函数签名 `func(difficulty, importance, policy) -> "tier1"|"tier2"|"none"`
+（也接受 `Priority`）；支持 `pkg.mod:func` 与 `pkg.mod.func` 两种写法。函数加载或
+执行失败时记 warning 并**回退默认策略**，避免「配置写错 → 静默不修」；加载结果
+`lru_cache`。配置期校验：非法策略名、`custom` 却未给 `custom_tier`，均直接抛
+`ConfigError`。
+
+这解决了本文件 §5.3 里 `#3/#4/#5` 的 tier 偏差：设 `tier1.min_importance: 80`
+（或改 `dual` 并把 `tier1.max_difficulty` 收到 20）即可让它们落到 tier2。
+
+新增单测：dual 取严、custom 用用户函数且门槛不生效、custom 不可用回退、
+非法配置被拒。
+
+### 6.4 F — 「API 设计偏好」判低真实性
+
+**改法**（`ai/prompts.py`）：在 `evaluation_prompt` 两处加指引。
+
+- authenticity 维度说明：点明它衡量的是「**这是不是一个真实存在的问题**」，
+  **不是**「这个诉求是否合理」；
+- 打分要求：**行为/API 设计偏好变更 ≠ 缺陷**。若诉求只是「把现有行为换一种
+  做法」而现有行为并非错误 → authenticity 判 ≤40、category 取 feature、
+  action 建议 triage；反之，现有行为确实不符合其自身文档/契约/常识预期
+  （如公式算错、边界漏判）才是缺陷，按真实程度给分。
+
+反向条款是关键：只压不抬会把真 Bug 也误伤成低真实性。
+
+对应 ratekit #9（`parse_amount` 解析失败应返回 0），原先被判 `authenticity=90`。
+
+新增单测：`test_evaluation_prompt_distinguishes_design_preference_from_defect`、
+`test_evaluation_prompt_pr_variant_keeps_guidance`（PR 分支同样带该指引）。
+
+### 6.5 累计验证
+
+全量单测：`394 → 396 → 400 → 405 → 407 passed`，无回归。
+
+| commit | 主题 |
+|---|---|
+| `bda74c1` | A + B：重复预筛支持中文、结论优先级以规则为准 |
+| `8e49b0c` | WSL：Windows 本地沙盒不再误选 bash 垫片 |
+| `ccd8d05` | docs：缺陷清单与修复过程 |
+| `9427d9e` | C：dry-run 汇总与明细统一口径 |
+| `14dd85e` | D：验证器缺 command 时带反馈重生成 |
+| `c79c65c` | E：优先级分档策略可配置 |
+| （本次） | F：设计偏好变更判低真实性 |
+
+**第 3 节的 C / D / E / F 四项均已实现。**
 
