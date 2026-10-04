@@ -19,12 +19,72 @@ from ..models import (
     ItemType,
     Platform,
     RawItem,
+    VerifierOutcome,
+    VerifierRun,
 )
 from ..store.repository import Repository
+from ..verifier.regression import REGRESSION_STAGE_BASE, REGRESSION_STAGE_FIX
 
 # ---------------------------------------------------------------------------
 # JSON
 # ---------------------------------------------------------------------------
+
+
+def regression_summary(runs: Sequence[VerifierRun], *, mode: str = "warn") -> dict[str, Any] | None:
+    """把回归门的执行记录整理成可展示的摘要；没跑过返回 ``None``。
+
+    回归门用独立 stage（``regression:base`` / ``regression:fix``）落库，
+    与 base/fix 的 F2P 记录天然区分，报告层据此单独呈现（warn 模式也要可见）。
+    """
+    base = next((r for r in runs if r.stage == REGRESSION_STAGE_BASE), None)
+    fix = next((r for r in runs if r.stage == REGRESSION_STAGE_FIX), None)
+    if base is None and fix is None:
+        return None
+
+    failed = [
+        name
+        for run in (base, fix)
+        if run is not None and run.outcome is VerifierOutcome.FAIL
+        for name in _failed_test_names(run)
+    ]
+
+    if base is None:
+        status = "unknown"
+    elif base.outcome is VerifierOutcome.PASS:
+        status = "pass" if fix is None or fix.outcome is VerifierOutcome.PASS else "fail"
+    elif base.outcome is VerifierOutcome.FAIL:
+        status = "untrusted"          # 仓库本来就不绿 → 本门不可信，不阻断
+    else:
+        status = "untrusted"          # ERROR / TIMEOUT / SKIPPED
+
+    return {
+        "mode": mode,
+        "base": _run_brief(base),
+        "fix": _run_brief(fix),
+        "status": status,
+        "failed_tests": failed[:10],
+        "blocking": bool(
+            mode == "strict" and base is not None and base.outcome is VerifierOutcome.PASS
+            and fix is not None and fix.outcome is VerifierOutcome.FAIL
+        ),
+    }
+
+
+def _run_brief(run: VerifierRun | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    return {
+        "outcome": run.outcome.value,
+        "exit_code": run.exit_code,
+        "duration_seconds": run.duration_seconds,
+        "error": run.error,
+    }
+
+
+def _failed_test_names(run: VerifierRun) -> list[str]:
+    from ..verifier.runner import extract_failed_tests
+
+    return extract_failed_tests(run)
 
 
 def item_to_dict(

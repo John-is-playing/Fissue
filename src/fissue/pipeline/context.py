@@ -26,6 +26,7 @@ from ..sandbox.forwarder import SandboxManager
 from ..store.db import Database, build_database
 from ..store.repository import Repository
 from ..verifier.generator import VerifierGenerator
+from ..verifier.regression import RegressionGate
 from ..verifier.runner import VerifierRunner
 from ..workspace import RepoWorkspace
 
@@ -44,6 +45,7 @@ class RuntimeContext:
     evaluator: Evaluator
     verifier: VerifierRunner
     generator: VerifierGenerator
+    regression_gate: RegressionGate
     _adapters: dict[str, PlatformAdapter] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -60,6 +62,7 @@ class RuntimeContext:
         evaluator = Evaluator(llm, repo, st)
         generator = VerifierGenerator(llm, st)
         verifier = VerifierRunner(sandbox, repo, st, client=llm)
+        regression_gate = RegressionGate(sandbox, repo, st)
 
         return cls(
             settings=st,
@@ -70,6 +73,7 @@ class RuntimeContext:
             evaluator=evaluator,
             verifier=verifier,
             generator=generator,
+            regression_gate=regression_gate,
         )
 
     @classmethod

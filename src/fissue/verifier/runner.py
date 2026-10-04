@@ -104,6 +104,88 @@ def judge_f2p(
 
 
 # ---------------------------------------------------------------------------
+# 既有测试回归门判定（见 docs/REGRESSION-GATE.md §3.3）
+# ---------------------------------------------------------------------------
+
+#: 回归门落库用的 stage 标识定义在 ``verifier/regression.py``
+#: （常量与其使用者同处一处，避免跨模块仅为一个字符串而互相依赖）。
+
+
+def extract_failed_tests(run: VerifierRun) -> list[str]:
+    """从测试输出里尽量提取失败的用例名（strict 拒绝时要点名，否则人工无从复核）。
+
+    覆盖 pytest（``FAILED tests/...::test_x``）、go（``--- FAIL: TestX``）、
+    jest（``✕ name`` / ``● suite › test``）。
+    """
+    seen: list[str] = []
+    for line in (run.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("FAILED ") and "::" in stripped:
+            seen.append(stripped[len("FAILED "):].strip())
+        elif stripped.startswith("--- FAIL:"):
+            seen.append(stripped[len("--- FAIL:"):].strip().split(" ")[0])
+        elif stripped.startswith("✕") or stripped.startswith("✗"):
+            seen.append(stripped[1:].strip())
+        elif stripped.startswith("● ") and "›" in stripped:
+            seen.append(stripped[2:].strip())
+    named: list[str] = []
+    for name in seen:
+        if name and name not in named:
+            named.append(name)
+    return named
+
+
+def judge_regression(
+    base_reg: VerifierRun | None,
+    fix_reg: VerifierRun | None,
+    *,
+    mode: str,
+    f2p_satisfied: bool,
+) -> tuple[bool, str]:
+    """回归门总判定，严格按 REGRESSION-GATE.md §3.3 的判定矩阵。
+
+    返回 ``(是否通过, 说明)``。``mode`` 为 ``off`` / ``warn`` / ``strict``。
+
+    **安全底线**（最容易做错的地方）：base 既有测试不绿、或跑不通
+    （ERROR/TIMEOUT），一律视为「本门不可信」，记 warn 并放行——绝不据此拒绝。
+    否则老仓库里本来就失败/跳过的测试会把**所有**条目误杀。
+    """
+    if mode == "off" or base_reg is None:
+        return True, ""
+
+    # base 跑不通 / 跳过 → 本门不可信，放行
+    if base_reg.outcome in (VerifierOutcome.SKIPPED, VerifierOutcome.ERROR):
+        return True, f"回归门未产生结论（base {base_reg.outcome.value}），放行"
+    if base_reg.outcome is VerifierOutcome.TIMEOUT:
+        return True, "回归门在 base 阶段超时，不可归咎于修复，放行"
+
+    # 仓库本身就不绿 → 本门不可信，放行（§3.3 第 3 行的安全底线）
+    if base_reg.outcome is VerifierOutcome.FAIL:
+        failures = extract_failed_tests(base_reg)
+        detail = ("（如：" + "、".join(failures[:3]) + "）") if failures else ""
+        return True, f"⚠️ 仓库既有测试在 base 阶段就不通过{detail}，回归门不可信，未阻断"
+
+    # base 绿。fix 阶段只是提醒；未跑 fix 时无法判定
+    if fix_reg is None:
+        return True, "既有测试在 base 全绿（修复阶段将再次检查）"
+
+    if fix_reg.outcome is VerifierOutcome.PASS:
+        return True, "既有测试在 base 与 fix 阶段均全绿"
+
+    failures = extract_failed_tests(fix_reg)
+    detail = ("，失败用例：" + "、".join(failures[:5])) if failures else ""
+
+    if fix_reg.outcome is VerifierOutcome.FAIL:
+        message = f"修复破坏了既有测试{detail}"
+        if mode == "strict":
+            return False, message
+        return True, f"⚠️ {message}（未阻断）"
+
+    # fix 阶段 ERROR/TIMEOUT → 环境问题，不可归咎于修复
+    return True, f"修复阶段既有测试未跑通（{fix_reg.outcome.value}），不可归咎于修复，放行"
+
+
+# ---------------------------------------------------------------------------
 # 执行器
 # ---------------------------------------------------------------------------
 

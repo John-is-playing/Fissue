@@ -172,6 +172,27 @@
 </div>
 {% endif %}
 
+{% if regression %}
+<div class="panel">
+  <h2>既有测试回归门</h2>
+  <div>
+    <div class="k">模式</div><div><code>{{ regression.mode }}</code></div>
+    <div class="k">base</div><div>{{ regression.base.outcome if regression.base else '未运行' }}{% if regression.base and regression.base.exit_code is not none %}（exit={{ regression.base.exit_code }}）{% endif %}</div>
+    <div class="k">fix</div><div>{{ regression.fix.outcome if regression.fix else '未运行' }}{% if regression.fix and regression.fix.exit_code is not none %}（exit={{ regression.fix.exit_code }}）{% endif %}</div>
+    <div class="k">结论</div>
+    <div>
+      {% if regression.status == 'pass' %}<span class="ok">既有测试全绿</span>
+      {% elif regression.status == 'fail' %}<span class="bad">⚠️ 修复破坏了既有测试{% if regression.blocking %}（strict：已阻断）{% else %}（未阻断）{% endif %}</span>
+      {% elif regression.status == 'untrusted' %}<span class="muted">仓库本身不绿 / 跑不通 → 回归门不可信，未阻断</span>
+      {% else %}<span class="muted">未见结论</span>{% endif %}
+    </div>
+  </div>
+  {% if regression.failed_tests %}
+  <div style="margin-top:10px"><b>失败用例</b><ul class="muted">{% for t in regression.failed_tests %}<li>{{ t }}</li>{% endfor %}</ul></div>
+  {% endif %}
+</div>
+{% endif %}
+
 {% if fixes %}
 <div class="panel">
   <h2>自动修复记录</h2>

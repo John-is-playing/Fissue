@@ -37,6 +37,7 @@ def ctx(settings, repo) -> RuntimeContext:
     from fissue.ai.evaluator import Evaluator
     from fissue.sandbox.forwarder import SandboxManager
     from fissue.verifier.generator import VerifierGenerator
+    from fissue.verifier.regression import RegressionGate
     from fissue.verifier.runner import VerifierRunner
 
     c = RuntimeContext.__new__(RuntimeContext)
@@ -51,6 +52,7 @@ def ctx(settings, repo) -> RuntimeContext:
     object.__setattr__(c, "evaluator", Evaluator(llm, repo, settings))
     object.__setattr__(c, "generator", VerifierGenerator(llm, settings))
     object.__setattr__(c, "verifier", VerifierRunner(c.sandbox, repo, settings, client=llm))
+    object.__setattr__(c, "regression_gate", RegressionGate(c.sandbox, repo, settings))
     return c
 
 
@@ -494,6 +496,10 @@ class _FakeWorkspace:
 
     def readme(self) -> str:
         return "# textkit"
+
+    def detect_test_command(self, hint: str | None = None) -> str | None:
+        """回归门探测命令；返回 None 表示探不到 → 该门记 skipped，不打扰本用例。"""
+        return None
 
 
 def _pr_item(number: int = 43) -> RawItem:

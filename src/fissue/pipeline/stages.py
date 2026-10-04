@@ -31,9 +31,10 @@ from ..models import (
     VerifierKind,
     VerifierOutcome,
     VerifierResult,
+    VerifierRun,
 )
 from ..sandbox.protocol import MountSpec
-from ..verifier.runner import CONTAINER_WORKDIR, VerifyContext
+from ..verifier.runner import CONTAINER_WORKDIR, VerifyContext, judge_regression
 from ..workspace import RepoWorkspace
 from .context import RuntimeContext
 from .queue import QueueManager
@@ -50,6 +51,7 @@ class StageResult:
     evaluation: Evaluation | None = None
     verifier_kind: VerifierKind | None = None
     verifier_result: VerifierResult | None = None
+    regression_run: VerifierRun | None = None      # 回归门结论（base 或 fix 阶段）
     queued: QueueName | None = None
     status: ItemStatus | None = None
     skipped_reason: str | None = None
@@ -252,6 +254,31 @@ class VerifyStage:
                 result.notes.append(f"问题未能复现：{base_result.conclusion}")
                 return result
 
+            # 既有测试回归门：base 阶段先记一条基线（仓库本身绿不绿）。
+            # 成本只随运行时间增长，与 Issue 数、LLM token 均无关。
+            if self.settings.verifier.regression_gate != "off":
+                base_reg = await self.ctx.regression_gate.run(
+                    item_key=item.key,
+                    workspace=ws,
+                    spec=spec,
+                    repo_cfg=repo_cfg,
+                    stage="base",
+                    verifier_id=verifier_id,
+                )
+                result.regression_run = base_reg
+                passed, why = judge_regression(
+                    base_reg, None,
+                    mode=self.settings.verifier.regression_gate,
+                    f2p_satisfied=base_result.f2p_satisfied,
+                )
+                if why:
+                    result.notes.append(why)
+                if not passed:                       # 目前 strict 下不会发生，留作防御
+                    self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
+                    result.status = ItemStatus.NEEDS_MANUAL
+                    result.skipped_reason = why
+                    return result
+
             # 已验证可复现 → 入验证队列，等批量 flush 打标签
             self.ctx.repo.set_item_status(item.key, ItemStatus.QUEUED)
             entry_id = self.queues.enqueue(
@@ -386,6 +413,21 @@ class PRVerifyStage:
                 result.notes.append("PR 合并验证转人工：" + base_result.conclusion)
                 return result
 
+            # 回归门 base：**必须在 _merge_pr 之前**，否则基线跑在“已修复”的代码上，
+            # 拿不到「仓库原本绿不绿」的判据，strict 就无从区分「修复破坏」与「本就红」。
+            gate_mode = self.settings.verifier.regression_gate
+            base_reg: VerifierRun | None = None
+            if gate_mode != "off":
+                base_reg = await self.ctx.regression_gate.run(
+                    item_key=item.key,
+                    workspace=ws,
+                    spec=spec,
+                    repo_cfg=repo_cfg,
+                    stage="base",
+                    verifier_id=verifier_id,
+                )
+                result.regression_run = base_reg
+
             # base 已确认复现 → 现在才把 PR 的改动合并进工作副本
             merged, merge_note = await self._merge_pr(ws, item, repo_cfg)
             result.notes.append(merge_note)
@@ -408,6 +450,31 @@ class PRVerifyStage:
                 base_run=base_result.base_run,
             )
             result.verifier_result = finished
+
+            # 回归门 fix：在**已合并**的代码上再跑一次，与 base 组成回归判定。
+            # 两者都成立才允许推荐合并（§3.1）。
+            if gate_mode != "off":
+                fix_reg = await self.ctx.regression_gate.run(
+                    item_key=item.key,
+                    workspace=ws,
+                    spec=spec,
+                    repo_cfg=repo_cfg,
+                    stage="fix",
+                    verifier_id=verifier_id,
+                )
+                result.regression_run = fix_reg
+                reg_ok, reg_why = judge_regression(
+                    base_reg, fix_reg, mode=gate_mode, f2p_satisfied=finished.f2p_satisfied
+                )
+                if reg_why:
+                    result.notes.append(reg_why)
+                if not reg_ok:
+                    # strict：修复破坏了既有测试 → 转人工，结论文案已点名失败用例
+                    self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
+                    result.status = ItemStatus.NEEDS_MANUAL
+                    result.skipped_reason = reg_why
+                    result.notes.append("回归门拒绝推荐合并：" + reg_why)
+                    return result
 
             self.ctx.repo.set_item_status(item.key, ItemStatus.QUEUED)
             entry_id = self.queues.enqueue(

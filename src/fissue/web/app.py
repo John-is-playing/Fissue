@@ -267,6 +267,10 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             }
             for run in r.verifier_runs(key, limit=20)
         ]
+        data["regression"] = exp.regression_summary(
+            r.verifier_runs(key, limit=20),
+            mode=request.app.state.settings.verifier.regression_gate,
+        )
         data["fix_attempts"] = [
             {
                 "outcome": a.outcome.value,

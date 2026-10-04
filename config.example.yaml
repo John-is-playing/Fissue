@@ -95,6 +95,14 @@ verifier:
   require_f2p: true                   # F2P：修复前必失败、修复后必通过
   max_rounds: 3                       # 生成验证器后自校正的最大轮次
   allow_checklist_fallback: true      # 无测试框架时降级为自然语言清单（Q16）
+  # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
+  # F2P 只证明「目标用例修好了」，证明不了「没弄坏别的」。本门补上 pass-to-pass：
+  # 在 base 与 fix 两个代码状态上各跑一次仓库自己的测试套件。
+  # 默认 warn 而非 strict：上线首日没人知道仓库绿不绿，strict 会在本就
+  # 失败/跳过的老仓库上大面积误杀（base 不绿一律视为「本门不可信」并放行）。
+  regression_gate: warn               # off（不跑，零开销）| warn（跑+告警，不阻断）| strict（拒坏修复）
+  regression_command: null            # 留空 → 仓库级 test_hint → 探测（pytest/npm test/go test…）
+  regression_timeout_seconds: 900     # 独立预算，通常远大于单测验证器（后者默认 600）
 
 # ---------------------------------------------------------------------------
 # 沙盒（Q8）

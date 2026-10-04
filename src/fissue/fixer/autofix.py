@@ -38,7 +38,8 @@ from ..models import (
     VerifierSpec,
 )
 from ..platforms.registry import parse_repo_ref
-from ..verifier.runner import VerifyContext
+from ..verifier.regression import REGRESSION_STAGE_BASE
+from ..verifier.runner import VerifyContext, judge_regression
 from ..workspace import RepoWorkspace
 from ..pipeline.context import RuntimeContext
 from .agent import AgentTrace, FixAgent, branch_name
@@ -410,6 +411,17 @@ class AutoFixer:
                 attempt.error = f"最终 F2P 未通过：{final.conclusion}"
                 return await self._handle_failure(item, attempt, trace, spec)
 
+            # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
+            # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
+            reg_ok, reg_why = await self._run_regression_gate(
+                item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
+                verifier_id=verifier_id,
+            )
+            if not reg_ok:
+                attempt.outcome = FixOutcome.NEEDS_MANUAL
+                attempt.error = f"回归门未通过：{reg_why}"
+                return await self._handle_failure(item, attempt, trace, spec, regression_note=reg_why)
+
             attempt.diff = attempt.diff or workspace.diff()
 
             if dry_run:
@@ -473,8 +485,51 @@ class AutoFixer:
 
     # -- 失败降级 ---------------------------------------------------------
 
+    async def _run_regression_gate(
+        self,
+        *,
+        item: RawItem,
+        workspace: RepoWorkspace,
+        spec: VerifierSpec,
+        repo_cfg: RepoConfig,
+        verifier_id: int | None = None,
+    ) -> tuple[bool, str]:
+        """在**已修复**的工作区上跑既有测试回归门。返回 ``(是否通过, 说明)``。
+
+        base 阶段的基线从库里取（``VerifyStage`` 已落 ``regression:base``）；
+        取不到时 ``judge_regression`` 会因 ``base_reg is None`` 直接放行。
+        """
+        mode = self.settings.verifier.regression_gate
+        if mode == "off":
+            return True, ""
+
+        base_runs = self.ctx.repo.verifier_runs(item.key, stage=REGRESSION_STAGE_BASE, limit=1)
+        base_reg = base_runs[0] if base_runs else None
+
+        if verifier_id is None:
+            latest = self.ctx.repo.latest_verifier(item.key)
+            verifier_id = latest[0] if latest else None
+        if verifier_id is None:
+            return True, "缺少验证器记录，回归门跳过"
+
+        fix_reg = await self.ctx.regression_gate.run(
+            item_key=item.key,
+            workspace=workspace,
+            spec=spec,
+            repo_cfg=repo_cfg,
+            stage="fix",
+            verifier_id=verifier_id,
+        )
+        return judge_regression(base_reg, fix_reg, mode=mode, f2p_satisfied=True)
+
     async def _handle_failure(
-        self, item: RawItem, attempt: FixAttempt, trace: AgentTrace, spec: VerifierSpec
+        self,
+        item: RawItem,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        spec: VerifierSpec,
+        *,
+        regression_note: str = "",
     ) -> FixAttempt:
         """按 ``on_failure`` 处置失败（Q12 选 report_manual）。"""
         mode = self.settings.auto_fix.on_failure
@@ -486,7 +541,9 @@ class AutoFixer:
         # report_manual / retry_then_report：生成「需人工」报告
         attempt.outcome = FixOutcome.NEEDS_MANUAL
         try:
-            path = self._write_manual_report(item, attempt, trace, spec)
+            path = self._write_manual_report(
+                item, attempt, trace, spec, regression_note=regression_note
+            )
             attempt.report_path = path
         except Exception as exc:
             log.warning("写人工报告失败：%s", exc)
@@ -494,7 +551,13 @@ class AutoFixer:
         return attempt
 
     def _write_manual_report(
-        self, item: RawItem, attempt: FixAttempt, trace: AgentTrace, spec: VerifierSpec
+        self,
+        item: RawItem,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        spec: VerifierSpec,
+        *,
+        regression_note: str = "",
     ) -> str:
         """落盘一份给人工复核的报告（含轨迹与失败证据）。"""
         safe = item.key.replace(":", "_").replace("/", "_")
@@ -518,6 +581,15 @@ class AutoFixer:
             *trace.actions[-60:],
             "```",
         ]
+        if regression_note:
+            lines += [
+                "",
+                "## 回归门（既有测试）",
+                "",
+                regression_note,
+                "",
+                "> 回归门完整输出见 `data/artifacts/<item>/regression:fix/`。",
+            ]
         if trace.rejected:
             lines += ["", "## 被拒绝的写入", "", *[f"- {r}" for r in trace.rejected[-20:]]]
         if trace.written_files:

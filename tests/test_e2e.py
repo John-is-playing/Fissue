@@ -106,6 +106,7 @@ def e2e_ctx(e2e_settings, repo, template_repo, monkeypatch):
     from fissue.ai.evaluator import Evaluator
     from fissue.sandbox.forwarder import SandboxManager
     from fissue.verifier.generator import VerifierGenerator
+    from fissue.verifier.regression import RegressionGate
     from fissue.verifier.runner import VerifierRunner
 
     ctx = RuntimeContext.__new__(RuntimeContext)
@@ -122,6 +123,7 @@ def e2e_ctx(e2e_settings, repo, template_repo, monkeypatch):
     object.__setattr__(ctx, "evaluator", Evaluator(llm, repo, e2e_settings))
     object.__setattr__(ctx, "generator", VerifierGenerator(llm, e2e_settings))
     object.__setattr__(ctx, "verifier", VerifierRunner(sandbox, repo, e2e_settings, client=llm))
+    object.__setattr__(ctx, "regression_gate", RegressionGate(sandbox, repo, e2e_settings))
 
     copies: list[Path] = []
 

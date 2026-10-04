@@ -206,7 +206,44 @@ queues:
   fix_queue:    { flush_size: 10, idle_flush_seconds: 300 }
 ```
 
-### 4.5 通知（可选）
+### 4.5 既有测试回归门（防止「修好一个、弄坏一片」）
+
+F2P（fail-to-pass）只证明**目标用例**被修好了；证明不了「没弄坏别的」。
+典型反例：把 `split(" ")` 改成 `split()`，空串用例确实修对，却改掉了连续
+空格的既有语义。回归门用**仓库自己的测试套件**补上这个 pass-to-pass 方向。
+
+```yaml
+verifier:
+  # off / warn / strict
+  regression_gate: warn
+  regression_command: null            # 留空 → 仓库 test_hint → 自动探测
+  regression_timeout_seconds: 900     # 独立预算，全量套件通常比单测慢很多
+```
+
+三档语义：
+
+| 档位 | 行为 | 适用 |
+|---|---|---|
+| `off` | 完全不跑，零开销 | 不关心回归 / 仓库没测试 |
+| `warn`（默认） | 跑、记录日志、报告里标注，但**不改变**结论 | **上线首日** |
+| `strict` | base 绿而 fix 不绿 → **拒绝**修复并转人工 | 仓库套件稳定全绿之后 |
+
+**推荐姿势**：先 `warn` 跑几天，看日志/报告里有多少仓库「本就红」。
+
+> ⚠️ 若 base 阶段既有测试就不通过（老仓库普遍如此），回归门一律视为
+> **不可信并放行**——绝不据此拒绝，否则会大面积误杀。同理，沙盒禁网导致
+> 依赖装不全、或套件超时（`regression_timeout_seconds` 到点即止），也不阻断。
+
+命令来源优先级（**不由 LLM 现编**，否则就不是「既有测试」了）：
+
+```
+verifier.regression_command  →  repo.test_hint  →  探测
+（pyproject.toml/pytest.ini → pytest；package.json → npm test；go.mod → go test…）
+```
+
+探不到就跳过本门并记 `skipped`，不影响流程。
+
+### 4.6 通知（可选）
 
 ```yaml
 notify:

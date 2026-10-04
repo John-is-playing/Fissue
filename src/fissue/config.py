@@ -162,6 +162,22 @@ class VerifierConfig(BaseModel):
     require_f2p: bool = True
     max_rounds: int = 3
     allow_checklist_fallback: bool = True
+    # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
+    # off | warn | strict。默认 warn：上线首日没人知道仓库绿不绿，
+    # strict 会在本就失败/跳过的老仓库上大面积误杀。
+    regression_gate: str = "warn"
+    regression_command: str | None = None  # 留空则取仓库级 test_hint，再探测
+    regression_timeout_seconds: int = 900  # 独立预算，通常远大于单测验证器
+
+    @field_validator("regression_gate")
+    @classmethod
+    def _check_regression_gate(cls, v: str) -> str:
+        allowed = {"off", "warn", "strict"}
+        if v not in allowed:
+            raise ConfigError(
+                f"verifier.regression_gate 只接受 off|warn|strict，当前为 {v!r}"
+            )
+        return v
 
 
 class SandboxForwarderConfig(BaseModel):

@@ -197,6 +197,7 @@ def fixer_ctx(settings, repo):
     from fissue.pipeline.context import RuntimeContext
     from fissue.sandbox.forwarder import SandboxManager
     from fissue.verifier.generator import VerifierGenerator
+    from fissue.verifier.regression import RegressionGate
     from fissue.verifier.runner import VerifierRunner
 
     c = RuntimeContext.__new__(RuntimeContext)
@@ -211,6 +212,7 @@ def fixer_ctx(settings, repo):
     object.__setattr__(c, "evaluator", Evaluator(llm, repo, settings))
     object.__setattr__(c, "generator", VerifierGenerator(llm, settings))
     object.__setattr__(c, "verifier", VerifierRunner(c.sandbox, repo, settings, client=llm))
+    object.__setattr__(c, "regression_gate", RegressionGate(c.sandbox, repo, settings))
     return c
 
 
