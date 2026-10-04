@@ -65,6 +65,10 @@ class FixReport:
     分开计数，避免把「没成功」「策略跳过」「dry-run」统统塞进「失败」——
     那会让报告里的数字完全不可信（dry-run 下成功必然被报成失败，因为 dry-run
     本来就不提 PR）。
+
+    dry-run 下「补丁已产出」的尝试会**同时**计入 ``succeeded`` 与
+    ``dry_run_patches``：汇总以「成功」表述，明细则以同一口径显示为成功态，
+    避免出现「汇总说成功 6、明细说需人工 6」的自相矛盾。
     """
 
     attempted: int = 0
@@ -72,6 +76,7 @@ class FixReport:
     needs_manual: int = 0
     skipped: int = 0
     failed: int = 0
+    dry_run_patches: int = 0                                       # 其中「dry-run 仅产出补丁」的条数
     prs: list[tuple[str, str]] = field(default_factory=list)      # (item_key, pr_url)
     attempts: list[FixAttempt] = field(default_factory=list)
 
@@ -86,6 +91,7 @@ class FixReport:
             # （genuine 失败走 _handle_failure，产出的是 report_path 而非 patch_path）
             if dry_run and attempt.patch_path:
                 self.succeeded += 1
+                self.dry_run_patches += 1
             else:
                 self.needs_manual += 1
         else:
@@ -93,10 +99,13 @@ class FixReport:
 
     @property
     def summary(self) -> str:
-        return (
+        text = (
             f"修复尝试 {self.attempted}，成功 {self.succeeded}，需人工 {self.needs_manual}，"
             f"跳过 {self.skipped}，失败 {self.failed}，产出 PR {len(self.prs)}"
         )
+        if self.dry_run_patches:
+            text += f"（其中 dry-run 产出补丁 {self.dry_run_patches}）"
+        return text
 
 
 class PRCreator:

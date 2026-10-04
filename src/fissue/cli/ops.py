@@ -12,7 +12,7 @@ from typing import Any, Optional
 import typer
 
 from ..errors import FissueError
-from ..models import Category, ItemStatus, ItemType, Priority, QueueName
+from ..models import Category, FixOutcome, ItemStatus, ItemType, Priority, QueueName
 from .main import (
     CONFIG_OPT,
     ENV_OPT,
@@ -70,7 +70,7 @@ def fix(
                 if item is None:
                     fail(f"条目不存在：{key}")
                 attempt = await fixer.fix_item(item, dry_run=dry_run, max_rounds=rounds)
-                rows.append(_attempt_row(attempt))
+                rows.append(_attempt_row(attempt, dry_run=dry_run))
             else:
                 for cfg in repos:
                     if plan:
@@ -88,7 +88,7 @@ def fix(
                         repo_slug=cfg.slug, limit=limit, dry_run=dry_run, max_rounds=rounds
                     )
                     emit(report.summary)
-                    rows.extend(_attempt_row(a) for a in report.attempts)
+                    rows.extend(_attempt_row(a, dry_run=dry_run) for a in report.attempts)
 
         if json_out:
             emit_json(rows)
@@ -103,14 +103,29 @@ def fix(
     run_async(main())
 
 
-def _attempt_row(attempt) -> dict[str, Any]:
+def _attempt_row(attempt, *, dry_run: bool = False) -> dict[str, Any]:
+    """把一次修复尝试转成明细表的一行。
+
+    明细与汇总必须同一口径：dry-run 下「补丁已产出」的尝试，汇总计入「成功」
+    （见 ``FixReport.record``），明细也应显示成功态，否则会出现「汇总说成功 6、
+    明细说需人工 6」的自相矛盾。补丁路径仍照常给出，便于核对。
+    """
+    outcome = attempt.outcome.value
+    error = attempt.error or ""
+    if (
+        dry_run
+        and attempt.outcome is FixOutcome.NEEDS_MANUAL
+        and attempt.patch_path
+    ):
+        outcome = FixOutcome.SUCCESS.value
+        error = "dry-run：已产出补丁，未提 PR"
     return {
         "key": attempt.item_key,
-        "outcome": attempt.outcome.value,
+        "outcome": outcome,
         "rounds": attempt.rounds,
         "branch": attempt.branch or "-",
         "pr": attempt.pr_url or attempt.patch_path or "-",
-        "error": (attempt.error or "")[:60],
+        "error": error[:60],
     }
 
 

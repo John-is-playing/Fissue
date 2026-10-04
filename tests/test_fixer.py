@@ -401,6 +401,48 @@ def test_fix_report_counts_all_outcomes_separately() -> None:
         assert frag in r.summary
 
 
+def test_fix_report_dry_run_patch_counted_and_summary_labeled() -> None:
+    """dry-run 产出补丁的条数要单独可见，汇总里点明口径。
+
+    回归（ratekit 实测）：dry-run 6 条全产出补丁，汇总显示「成功 6，需人工 0」，
+    同一屏的明细却全写 needs_manual，读者无法判断到底成没成。
+    """
+    from fissue.fixer.autofix import FixReport
+    from fissue.models import FixAttempt
+
+    r = FixReport()
+    r.attempted = 6
+    for i in range(6):
+        r.record(
+            FixAttempt(item_key=f"k{i}", outcome=FixOutcome.NEEDS_MANUAL,
+                       patch_path=f"/p{i}.patch"),
+            dry_run=True,
+        )
+    assert r.succeeded == 6 and r.dry_run_patches == 6
+    assert r.needs_manual == 0
+    assert "dry-run 产出补丁 6" in r.summary
+
+
+def test_attempt_row_matches_summary_under_dry_run() -> None:
+    """明细与汇总必须同一口径：dry-run 补丁已产出 → 明细也显示成功态。
+
+    回归：汇总计入「成功」，明细却原样输出 needs_manual，自相矛盾。
+    非 dry-run 时不得把真失败(needs_manual)冒充成成功。
+    """
+    from fissue.cli.ops import _attempt_row
+    from fissue.models import FixAttempt
+
+    a = FixAttempt(item_key="k", outcome=FixOutcome.NEEDS_MANUAL, patch_path="/p.patch",
+                   error="dry-run：仅产出补丁，未提交 PR")
+
+    dry = _attempt_row(a, dry_run=True)
+    assert dry["outcome"] == "success"
+    assert dry["pr"] == "/p.patch"                 # 补丁路径照常给出，便于核对
+
+    real = _attempt_row(a, dry_run=False)
+    assert real["outcome"] == "needs_manual"       # 非 dry-run 不冒充成功
+
+
 # ---------------------------------------------------------------------------
 # 失败降级报告
 # ---------------------------------------------------------------------------
