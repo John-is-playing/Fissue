@@ -494,8 +494,59 @@ def test_fix_candidates_orders_tier1_first(ctx, repo) -> None:
     processor = FlushProcessor(ctx)
     t2 = _seed_issue(repo, 1, priority=Priority.TIER2)
     t1 = _seed_issue(repo, 2, priority=Priority.TIER1)
+    repo.set_item_status(t2.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER2)
+    repo.set_item_status(t1.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
     candidates = processor.fix_candidates()
     assert [c.number for c in candidates] == [2, 1]
+
+
+def test_fix_candidates_only_returns_still_queued(ctx, repo) -> None:
+    """只有仍停在 fix_queued 的条目才是候选。
+
+    回归（envkit 实测）：``fix_candidates`` 此前只按 priority 取条目，不筛状态。
+    priority 是评测阶段落的「值不值得修」，修完不会清掉，于是已经转成
+    needs_manual / pr_created 的条目仍会被选中——``fix --limit 3`` 连跑四轮
+    都只在重复处理同一批 #9/#8/#7，后面的 #1-#6 永远轮不到。
+    """
+    processor = FlushProcessor(ctx)
+
+    done = _seed_issue(repo, 1, priority=Priority.TIER1)
+    repo.set_item_status(done.key, ItemStatus.NEEDS_MANUAL, priority=Priority.TIER1)
+
+    opened = _seed_issue(repo, 2, priority=Priority.TIER1)
+    repo.set_item_status(opened.key, ItemStatus.PR_CREATED, priority=Priority.TIER1)
+
+    still = _seed_issue(repo, 3, priority=Priority.TIER1)
+    repo.set_item_status(still.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+
+    candidates = processor.fix_candidates()
+
+    assert [c.number for c in candidates] == [3]     # 只剩余队条目
+    assert repo.get_item_row(still.key).status == ItemStatus.FIX_QUEUED.value
+
+
+def test_fix_candidates_advances_to_next_batch_across_rounds(ctx, repo) -> None:
+    """连跑多轮必须能推进到下一批，而不是每轮从同一批重修。
+
+    只断言「跨轮不重复、且两轮合起来恰好覆盖全部待修条目」——
+    同一秒内写入的条目之间排序是并列的，具体谁先谁后不属于契约。
+    """
+    processor = FlushProcessor(ctx)
+    for n in (1, 2, 3, 4):
+        item = _seed_issue(repo, n, priority=Priority.TIER1)
+        repo.set_item_status(item.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+
+    first = processor.fix_candidates(limit=2)
+    assert len(first) == 2
+
+    # 第一轮的两条修完后转为 needs_manual
+    for c in first:
+        repo.set_item_status(c.key, ItemStatus.NEEDS_MANUAL, priority=Priority.TIER1)
+
+    second = processor.fix_candidates(limit=2)
+    assert len(second) == 2
+    assert not {c.number for c in first} & {c.number for c in second}   # 不重复处理
+    assert {c.number for c in first} | {c.number for c in second} == {1, 2, 3, 4}  # 全部轮到过
 
 
 # ---------------------------------------------------------------------------

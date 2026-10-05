@@ -280,12 +280,26 @@ class FlushProcessor:
         return out
 
     def fix_candidates(self, *, repo_slug: str | None = None, limit: int = 20) -> list[RawItem]:
-        """取出可以自动修复的条目（优先级 tier1 / tier2）。"""
+        """取出可以自动修复的条目（优先级 tier1 / tier2）。
+
+        只取仍在 ``FIX_QUEUED`` 的条目：``priority`` 是评测阶段落的「值不值得修」，
+        修完之后不会清掉，所以不能拿它当「还没修过」的依据。否则一条已转
+        ``needs_manual`` / ``pr_created`` 的条目会因为 priority 还在而被反复选中——
+        每轮都从第一批开始重修，后面的条目永远轮不到（envkit 实测：四轮都在
+        重复处理同一批 #9/#8/#7）。
+
+        与常驻服务 ``daemon._dispatch_fixes`` 的口径保持一致，两处都按
+        ``FIX_QUEUED`` 取候选。
+        """
         out: list[RawItem] = []
         for prio in (Priority.TIER1, Priority.TIER2):
             out.extend(
                 self.ctx.repo.list_items(
-                    repo_slug=repo_slug, item_type=ItemType.ISSUE, priority=prio, limit=limit
+                    repo_slug=repo_slug,
+                    item_type=ItemType.ISSUE,
+                    status=ItemStatus.FIX_QUEUED,
+                    priority=prio,
+                    limit=limit,
                 )
             )
         # 保持 tier1 在前（优先级更高）
