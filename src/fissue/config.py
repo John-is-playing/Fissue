@@ -79,7 +79,13 @@ class LLMConfig(BaseModel):
     fallback_model: str | None = None
     api_key: str = Field(default="", repr=False)
     temperature: float = 0.2
-    max_tokens: int = 8192
+    #: 单次补全的 token 上限。这只是**上限**，不是预留——实际计费按真实用量，
+    #: 调高不会产生闲置成本。推理模型的 reasoning_content 会吃掉大量预算
+    #: （实测同一提示的推理长度在 14207~17264 字符间波动），8192 余量偏紧。
+    max_tokens: int = 16384
+    #: 被长度截断后自动加码的上限（见 LLMClient.chat_json）。
+    #: 截断时翻倍重试，但不超过此上限，避免单次调用失控。
+    max_tokens_ceiling: int = 32768
     timeout_seconds: int = 120
     max_retries: int = 4
     concurrency: int = 4

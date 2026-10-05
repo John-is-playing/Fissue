@@ -25,7 +25,11 @@ llm:
   model: deepseek-chat
   fallback_model: deepseek-chat
   temperature: 0.2
-  max_tokens: 8192
+  # 单次补全的 token 上限（上限而已，按真实用量计费，调高不产生闲置成本）。
+  # 推理模型的 reasoning_content 会吃掉大量预算，实测同一提示的推理长度在
+  # 14207~17264 字符间波动，8192 余量偏紧；被截断时会自动加码重试到 ceiling。
+  max_tokens: 16384
+  max_tokens_ceiling: 32768
   timeout_seconds: 120
   max_retries: 4
   # 并发与预算控制（Q17）

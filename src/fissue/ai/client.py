@@ -74,6 +74,20 @@ def _merge_usage(total: Usage, part: Usage) -> Usage:
     return total
 
 
+#: 长度截断后的加码下限：一次不够就翻倍，且不低于这个值
+_TOKEN_ESCALATE_FLOOR = 16384
+
+
+def _escalate_tokens(current: int, ceiling: int) -> int:
+    """长度截断后计算下一轮的 ``max_tokens``：先翻倍，再保证不低于 16384。
+
+    推理长度随提示波动很大（同一提示实测 14207~17264 字符），固定预算迟早撞顶；
+    截断说明「推理 + 正文」比预算长，翻倍并设下限能一次跳出多数截断。
+    """
+    nxt = max(int(current) * 2, _TOKEN_ESCALATE_FLOOR)
+    return min(nxt, max(int(ceiling), int(current)))
+
+
 UsageSink = Callable[[Usage], None | Awaitable[None]]
 UsageGetter = Callable[[], dict[str, Any]]
 
@@ -347,11 +361,15 @@ class LLMClient:
         （实测 ``finish_reason=length``、``content`` 长度 0）。这类「截断导致的
         空/半 JSON」是**偶发**的，原样重问一次通常就能拿到完整对象；
         而此前直接返回空 dict，等于让上层白跑一轮（多余的重生成/重试）。
+
+        被长度截断时还会**自动加大 max_tokens** 重试（见 ``_escalate_tokens``）：
+        推理长度会剧烈波动（实测同一提示 14207~17264 字符），固定预算迟早撞顶。
         """
         attempts = max(1, max_parse_attempts)
         usage = Usage(purpose=purpose)
         last_content = ""
         last_finish = ""
+        cur_max_tokens = max_tokens
 
         for attempt in range(1, attempts + 1):
             msgs = list(messages)
@@ -375,7 +393,7 @@ class LLMClient:
                 purpose=purpose,
                 json_mode=True,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=cur_max_tokens,
             )
             usage = _merge_usage(usage, resp.usage)
             last_content = resp.content or ""
@@ -389,6 +407,12 @@ class LLMClient:
                 "LLM[%s] 返回内容无法解析为 JSON，长度=%d finish_reason=%s（第 %d/%d 次）",
                 purpose, len(last_content), last_finish or "-", attempt, attempts,
             )
+
+            # 被长度截断 → 下一轮加大预算，给推理+正文留出余量
+            if last_finish == "length":
+                cur_max_tokens = _escalate_tokens(cur_max_tokens or self.config.max_tokens,
+                                                  self.config.max_tokens_ceiling)
+                log.warning("上一轮因长度截断，下一轮 max_tokens 提到 %d", cur_max_tokens)
 
         return (default if default is not None else {}), usage
 

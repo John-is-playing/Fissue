@@ -620,3 +620,72 @@ async def test_chat_json_single_attempt_when_disabled() -> None:
                                      purpose="test", max_parse_attempts=1)
     assert data == {}
     assert calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 长度截断自动加码（推理模型 reasoning 吃光预算）
+# ---------------------------------------------------------------------------
+
+
+def test_escalate_tokens_doubles_and_floors() -> None:
+    """截断后加码：翻倍，且不低于 16384，但不超过 ceiling。"""
+    from fissue.ai.client import _escalate_tokens
+
+    assert _escalate_tokens(512, 32768) == 16384      # 极小值 → 抬到下限
+    assert _escalate_tokens(8192, 32768) == 16384
+    assert _escalate_tokens(16384, 32768) == 32768    # 翻倍到上限
+    assert _escalate_tokens(20000, 32768) == 32768
+    assert _escalate_tokens(8192, 12000) == 12000     # ceiling 更低时按 ceiling
+    assert _escalate_tokens(40000, 32768) == 40000    # 已超 ceiling 不回退
+
+
+async def test_chat_json_escalates_max_tokens_on_length_truncation() -> None:
+    """被长度截断 → 下一轮自动加大 max_tokens，而不是原样重问。
+
+    实测：推理模型用 token 写 reasoning_content，同一提示的推理长度在
+    14207~17264 字符间波动，固定预算迟早撞顶（撞顶时 finish_reason=length、
+    content 为空）。原样重问很可能再撞一次，必须加码。
+    """
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    cfg = LLMConfig(api_key="k", max_tokens=8192, max_tokens_ceiling=32768, concurrency=1)
+    client = LLMClient(cfg)
+    seen: list[int | None] = []
+
+    async def fake_chat(messages, **kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        if len(seen) == 1:
+            return LLMResponse(content="", model="m", usage=Usage(),
+                               raw={"choices": [{"finish_reason": "length"}]})
+        return LLMResponse(content='{"ok": true}', model="m", usage=Usage(),
+                           raw={"choices": [{"finish_reason": "stop"}]})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    data, _ = await client.chat_json([{"role": "user", "content": "x"}], purpose="t")
+
+    assert data == {"ok": True}
+    # 第一轮不显式传（由 config.max_tokens=8192 兜底），第二轮加码到 16384
+    assert seen[0] is None
+    assert seen[1] == 16384
+
+
+async def test_chat_json_does_not_escalate_on_plain_parse_failure() -> None:
+    """非长度原因的解析失败（如模型啰嗦）不该加码——加码解决不了它。"""
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    cfg = LLMConfig(api_key="k", max_tokens=8192, max_tokens_ceiling=32768, concurrency=1)
+    client = LLMClient(cfg)
+    seen: list[int | None] = []
+
+    async def fake_chat(messages, **kwargs):
+        seen.append(kwargs.get("max_tokens"))
+        return LLMResponse(content="这不是 JSON", model="m", usage=Usage(),
+                           raw={"choices": [{"finish_reason": "stop"}]})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    data, _ = await client.chat_json([{"role": "user", "content": "x"}], purpose="t")
+
+    assert data == {}
+    assert seen == [None, None]        # 两轮都不加码
