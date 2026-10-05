@@ -436,10 +436,15 @@ class AutoFixer:
             if dry_run:
                 path = self.pr_creator._save_patch(item, attempt.diff)
                 attempt.outcome = FixOutcome.NEEDS_MANUAL
+                attempt.dry_run = True
                 attempt.patch_path = path
                 attempt.pr_url = None
                 attempt.error = "dry-run：仅产出补丁，未提交 PR"
                 self.ctx.repo.save_fix_attempt(attempt)
+                # 干跑没产出 PR，条目等于还没修：放回待修队列，否则一趟 dry-run
+                # 就把待修队列消费掉（条目会卡在 fixing/needs_manual），
+                # 之后去掉 --dry-run 的真跑反而取不到任何候选。
+                self.ctx.repo.set_item_status(item.key, ItemStatus.FIX_QUEUED)
                 return attempt
 
             # 3) 提交 PR

@@ -748,3 +748,111 @@ def test_saved_patch_applies_cleanly_to_repo(fixer_ctx, repo, sample_issue, work
     )
     assert applied.returncode == 0, f"应用失败：{applied.stderr}"
     assert "return 2" in (workspace.root / "app.py").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# 干跑不得消费待修队列
+# ---------------------------------------------------------------------------
+
+
+class _FakeWS:
+    """只够 fix_item 收尾用的工作区替身。"""
+
+    def diff(self) -> str:
+        return "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-1\n+2\n"
+
+    def detect_language(self) -> str:
+        return "python"
+
+    def file_tree(self, limit: int = 200) -> str:
+        return "app.py"
+
+    def readme(self) -> str:
+        return "# demo"
+
+    def cleanup(self) -> None:
+        return None
+
+
+async def test_dry_run_keeps_item_in_fix_queue(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """干跑只出补丁、不提 PR → 条目必须留在 fix_queued。
+
+    回归（envkit 实测）：dry-run 把 9 条全跑了一遍后，条目被置成 needs_manual，
+    而修复候选只取 fix_queued —— 于是去掉 --dry-run 的真跑反而取不到任何候选，
+    待修队列被一趟干跑白消费掉。
+    """
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt, VerifierKind, VerifierResult
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key,
+                         Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key,
+                       VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
+
+    fixer = AutoFixer(fixer_ctx)
+
+    async def fake_clone(repo_cfg, **kwargs):
+        return _FakeWS()
+
+    async def fake_agent_run(**kwargs):
+        return FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS), AgentTrace(rounds=1)
+
+    async def fake_verify_fix(ctx_verify, *, verifier_id=None, base_run=None):
+        return VerifierResult(kind=VerifierKind.EXECUTABLE, f2p_satisfied=True, conclusion="ok")
+
+    async def fake_gate(**kwargs):
+        return True, ""
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(fixer.agent, "run", fake_agent_run)
+    monkeypatch.setattr(fixer_ctx.verifier, "verify_fix", fake_verify_fix)
+    monkeypatch.setattr(fixer, "_run_regression_gate", fake_gate)
+    monkeypatch.setattr(fixer.pr_creator, "_save_patch", lambda item, diff: "/tmp/x.patch")
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert attempt.dry_run is True
+    assert attempt.patch_path == "/tmp/x.patch"
+    # 关键：仍在待修队列里，真跑才取得到
+    assert repo.get_item_row(sample_issue.key).status == ItemStatus.FIX_QUEUED.value
+
+
+async def test_real_run_after_dry_run_still_finds_candidate(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """干跑之后再跑真修，候选仍取得到（端到端口径一致）。"""
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt, VerifierKind, VerifierResult
+    from fissue.pipeline.flush import FlushProcessor
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key,
+                         Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key,
+                       VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
+
+    fixer = AutoFixer(fixer_ctx)
+
+    async def fake_clone(repo_cfg, **kwargs):
+        return _FakeWS()
+
+    async def fake_agent_run(**kwargs):
+        return FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS), AgentTrace(rounds=1)
+
+    async def fake_verify_fix(ctx_verify, *, verifier_id=None, base_run=None):
+        return VerifierResult(kind=VerifierKind.EXECUTABLE, f2p_satisfied=True, conclusion="ok")
+
+    async def fake_gate(**kwargs):
+        return True, ""
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(fixer.agent, "run", fake_agent_run)
+    monkeypatch.setattr(fixer_ctx.verifier, "verify_fix", fake_verify_fix)
+    monkeypatch.setattr(fixer, "_run_regression_gate", fake_gate)
+    monkeypatch.setattr(fixer.pr_creator, "_save_patch", lambda item, diff: "/tmp/x.patch")
+
+    await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    candidates = FlushProcessor(fixer_ctx).fix_candidates(repo_slug=sample_issue.repo, limit=10)
+    assert sample_issue.key in {c.key for c in candidates}

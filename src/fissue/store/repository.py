@@ -834,7 +834,9 @@ class Repository:
             )
             s.add(row)
             item = s.scalar(select(ItemRow).where(ItemRow.key == attempt.item_key))
-            if item is not None:
+            if item is not None and not attempt.dry_run:
+                # 干跑不改状态：只出了补丁、没提 PR，条目仍应留在 fix_queued
+                # 等真正修复；否则干跑一趟就把待修队列消费掉了。
                 item.status = {
                     FixOutcome.SUCCESS: ItemStatus.PR_CREATED.value,
                     FixOutcome.NEEDS_MANUAL: ItemStatus.NEEDS_MANUAL.value,

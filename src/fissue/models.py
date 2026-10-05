@@ -403,6 +403,9 @@ class FixAttempt(BaseModel):
     rounds: int = 0
     error: str | None = None
     report_path: str | None = None
+    #: 本次只是干跑（只出补丁、不提 PR）。干跑不改变条目的排队状态：
+    #: 没产出 PR 就等于还没修，否则会被移出 fix_queued 而永远修不成。
+    dry_run: bool = False
     created_at: datetime = Field(default_factory=utcnow)
 
 
