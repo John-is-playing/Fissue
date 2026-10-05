@@ -1086,15 +1086,24 @@ async def test_generate_and_validate_retries_on_verifier_self_error(ctx, repo, m
     async def fake_run_once(**kw):
         calls["run"] += 1
         if calls["run"] == 1:
-            # 第一次：验证器自己调用了不存在的方法
+            # 第一次：验证器自己调用了不存在的方法。
+            # 定位行落在验证器自己的文件（t.py）里 —— 真实 pytest 的输出形态。
             return VerifierRun(
                 item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
-                stdout="E   AttributeError: 'TTLCache' object has no attribute 'put'",
+                stdout=(
+                    ">       cache.put(\"k\", \"v\")\n"
+                    "E       AttributeError: 'TTLCache' object has no attribute 'put'\n\n"
+                    "t.py:21: AttributeError\n"
+                ),
             )
         # 第二次：真正的断言失败 → 问题确实可复现
         return VerifierRun(
             item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
-            stdout="E   AssertionError: assert 330 == -330",
+            stdout=(
+                ">       assert parse_offset('-05:30') == -330\n"
+                "E       AssertionError: assert 330 == -330\n\n"
+                "t.py:9: AssertionError\n"
+            ),
         )
 
     monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)
@@ -1126,9 +1135,14 @@ async def test_generate_and_validate_gives_up_after_self_error_rounds(ctx, repo,
             return GeneratedVerifier(spec=bad, usage=Usage(), warnings=[])
 
     async def fake_run_once(**kw):
+        # 每轮都是验证器自身写错：定位行落在验证器自己的文件（t.py）里
         return VerifierRun(
             item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
-            stdout="E   ModuleNotFoundError: No module named 'nonexistent'",
+            stdout=(
+                ">       import nonexistent\n"
+                "E       ModuleNotFoundError: No module named 'nonexistent'\n\n"
+                "t.py:1: ModuleNotFoundError\n"
+            ),
         )
 
     monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)

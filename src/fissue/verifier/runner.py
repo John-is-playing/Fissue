@@ -15,8 +15,10 @@ F2P（fail-to-pass）判定逻辑
 
 from __future__ import annotations
 
+import re
 import shutil
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,18 +114,37 @@ _VERIFIER_BROKEN_HINTS = (
     "interrupted: ",
 )
 
-#: 失败输出里出现这些异常、且**完全没有** AssertionError 时，基本可判定是
-#: 验证器自己调用出错（如引用了库里不存在的方法），而非断言到错误行为。
-_VERIFIER_FAULT_EXC = ("AttributeError", "ImportError", "ModuleNotFoundError", "SyntaxError")
+#: 这些异常若**抛在验证器自己的文件里**，基本可判定是验证器调用了不存在的
+#: API（方法名 / 属性 / 导入路径写错），而不是被测项目的行为。
+_VERIFIER_FAULT_EXC = frozenset(
+    {"AttributeError", "ImportError", "ModuleNotFoundError", "SyntaxError"}
+)
+
+#: pytest 每个失败用例的定位行：``<路径>.py:<行号>: <异常名>``。
+#: 只匹配这种短摘要行；``...: in test_x`` 这类栈帧行与 ``::test_y`` 都不会命中。
+_LOCATION_RE = re.compile(r"^([^\s:]+\.py):(\d+):\s*([A-Za-z_][\w.]*)\s*$", re.MULTILINE)
 
 
-def verifier_self_error(run: VerifierRun) -> str | None:
+def _norm_path(path: str) -> str:
+    return path.replace("\\", "/").lstrip("./")
+
+
+def verifier_self_error(run: VerifierRun, *, verifier_files: Iterable[str] = ()) -> str | None:
     """判断这次失败是否由**验证器自身**引起；是则返回一句说明，否则 None。
 
-    base 阶段失败只说明「验证器没通过」，并不等于「问题已复现」：验证器引用了
-    库里并不存在的 API、导入失败、语法错误，或 pytest 根本没收集到用例，
-    都会得到同样的非零退出码。把这类失败当成复现，会把一条真问题误判为
-    无效请求（envkit #12 实测：测试调用 `TTLCache.put`，而库里只有 `set`）。
+    base 阶段失败只说明「验证器没通过」，并不等于「问题已复现」。两者必须分开，
+    否则会出现双向误判：
+
+    * **验证器自己写错**：测试调用了库里并不存在的方法（envkit #12 调用
+      ``TTLCache.put``，而库里只有 ``set``），pytest 因 AttributeError 非零退出，
+      与「断言到错误行为」的退出码一模一样 —— 会被当成复现，把真问题误标无效。
+    * **被测库自己抛异常**：Issue 报的就是「调用某个 API 会抛 AttributeError」，
+      这时 AttributeError 正是**合法证据**，若一律当成验证器写错，
+      会把真缺陷反复退回去重生成，永远验不出来。
+
+    区分依据是**异常抛在哪里**，而不是异常叫什么名字：抛在验证器自己的文件里
+    → 验证器写错；抛在被测库的文件里 → 真缺陷。``verifier_files`` 传该验证器
+    写入工作区的文件路径（``spec.files`` 的键）。
     """
     if run.outcome is not VerifierOutcome.FAIL:
         return None
@@ -131,18 +152,27 @@ def verifier_self_error(run: VerifierRun) -> str | None:
     text = f"{run.stdout or ''}\n{run.stderr or ''}"
     lowered = text.lower()
 
+    # 测试压根没跑起来（收集失败 / 一个用例都没有）——与断言无关，直接算自错
     for hint in _VERIFIER_BROKEN_HINTS:
         if hint in lowered:
             return f"验证器未能正常执行（{hint.strip()}）"
 
-    # 出现断言失败 → 验证器确实在断言目标行为，按「复现」处理
-    if "AssertionError" in text:
+    fault_locs = [(_norm_path(p), exc) for p, _, exc in _LOCATION_RE.findall(text) if exc in _VERIFIER_FAULT_EXC]
+    if not fault_locs:
+        # 只有断言失败（或形态未知）→ 按「问题已复现」处理
         return None
 
-    for exc in _VERIFIER_FAULT_EXC:
-        if exc in text:
-            return f"验证器自身抛出 {exc}（疑似引用了不存在的 API）"
+    files = {_norm_path(f) for f in verifier_files}
+    if not files:
+        # 不知道验证器写了哪些文件，就无从判断异常归属。宁可放行（按复现处理），
+        # 也不要把一条真缺陷误判成验证器写错、白白退回重生成。
+        return None
 
+    if all(path in files for path, _ in fault_locs):
+        excs = ", ".join(sorted({exc for _, exc in fault_locs}))
+        return f"验证器自身抛出 {excs}（疑似引用了不存在的 API）"
+
+    # 异常落在被测库的文件里 → 这是真缺陷，不是验证器的锅
     return None
 
 
@@ -520,7 +550,7 @@ class VerifierRunner:
             # 验证器自身写坏（引用不存在的 API / 导入失败 / 没收集到用例）也会
             # 让 base 非零退出，与「问题已复现」的退出码一模一样。这里必须把
             # 两者分开，否则一条真问题会被判成「无法复现」而转人工甚至误标无效。
-            self_error = verifier_self_error(base)
+            self_error = verifier_self_error(base, verifier_files=tuple(spec.files))
             if self_error is not None:
                 log.warning("验证器自身有误 %s（第 %d 轮）：%s", item.key, round_index, self_error)
                 result.conclusion = self_error

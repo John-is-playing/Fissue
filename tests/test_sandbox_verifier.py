@@ -26,7 +26,7 @@ from fissue.sandbox.protocol import (
     result_to_dict,
 )
 from fissue.verifier.generator import VerifierGenerator, _safe_relpath, validate_spec
-from fissue.verifier.runner import classify_outcome, judge_f2p
+from fissue.verifier.runner import classify_outcome, judge_f2p, verifier_self_error
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +300,100 @@ def test_judge_f2p_require_false() -> None:
     result = judge_f2p(spec, _run("base", VerifierOutcome.PASS, 0), _run("fix", VerifierOutcome.PASS, 0),
                        require_f2p=False)
     assert result.f2p_satisfied is True
+
+
+# ---------------------------------------------------------------------------
+# 验证器自错 vs 真复现：按**异常抛出位置**区分
+# ---------------------------------------------------------------------------
+
+#: pytest 失败定位行的真实形态（路径:行号: 异常名）
+_SELF_ERR_OUT = (
+    "_________________________________ test_repro __________________________________\n\n"
+    "    def test_repro():\n"
+    ">       Thing().nonexistent_method()\n"
+    "E       AttributeError: 'Thing' object has no attribute 'nonexistent_method'\n\n"
+    "tests/test_self_bug.py:5: AttributeError\n"
+)
+
+#: 异常抛在**被测库**的文件里 —— 这正是 Issue 报的缺陷，属于合法证据
+_LIB_ERR_OUT = (
+    "_________________________________ test_repro __________________________________\n\n"
+    "    def test_repro():\n"
+    ">       crashes()\n\n"
+    "tests/test_lib_bug.py:4: \n"
+    "_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n"
+    "    def crashes():\n"
+    ">       return None.missing_attr\n"
+    "E       AttributeError: 'NoneType' object has no attribute 'missing_attr'\n\n"
+    "pylib/__init__.py:2: AttributeError\n"
+)
+
+
+def _fail_run(stdout: str) -> VerifierRun:
+    return VerifierRun(item_key="k", stage="base", outcome=VerifierOutcome.FAIL,
+                       exit_code=1, stdout=stdout)
+
+
+def test_self_error_detected_when_exception_in_verifier_file() -> None:
+    """验证器自己调用了不存在的 API → 必须识别为自错，别当成「已复现」。"""
+    got = verifier_self_error(_fail_run(_SELF_ERR_OUT),
+                              verifier_files=["tests/test_self_bug.py"])
+    assert got is not None
+    assert "AttributeError" in got
+
+
+def test_self_error_not_reported_when_exception_in_library_file() -> None:
+    """被测库自己在缺陷路径抛异常 → 这是真缺陷，绝不能误判为验证器写错。
+
+    否则这类 Issue（「调用 X 会抛 AttributeError」）会被反复退回重生成，
+    永远验不出来。
+    """
+    got = verifier_self_error(_fail_run(_LIB_ERR_OUT),
+                              verifier_files=["tests/test_lib_bug.py"])
+    assert got is None
+
+
+def test_self_error_detected_on_real_envkit_case() -> None:
+    """envkit #12 的真实形态：断言把 AttributeError 包进断言信息里。
+
+    输出末尾确实有 ``AssertionError``，但 AttributeError 的定位行落在
+    **验证器自己的测试文件**里 —— 之前只看「有没有 AssertionError」会漏判。
+    """
+    text = (
+        "    def test_concurrent_access_isolation(self):\n"
+        ">       assert not errors, f\"并发执行出现异常: {errors}\"\n"
+        "E       AssertionError: 并发执行出现异常: [AttributeError(\"'TTLCache' object "
+        "has no attribute 'put'\")]\n\n"
+        "tests/test_cache_bug_reproduce.py:21: AttributeError\n"
+        "tests/test_cache_bug_reproduce.py:94: AssertionError\n"
+    )
+    got = verifier_self_error(_fail_run(text),
+                              verifier_files=["tests/test_cache_bug_reproduce.py"])
+    assert got is not None
+    assert "AttributeError" in got
+
+
+def test_self_error_conservative_without_verifier_files() -> None:
+    """不知道验证器写了哪些文件时保守放行，不误杀真缺陷。"""
+    assert verifier_self_error(_fail_run(_SELF_ERR_OUT)) is None
+
+
+def test_self_error_ignores_plain_assertion_failure() -> None:
+    """纯断言失败（无定位到验证器文件的异常）→ 正常按复现处理。"""
+    text = (
+        "    def test_repro():\n"
+        ">       assert parse_offset('-05:30') == -330\n"
+        "E       AssertionError: assert 330 == -330\n\n"
+        "tests/test_t.py:5: AssertionError\n"
+    )
+    assert verifier_self_error(_fail_run(text), verifier_files=["tests/test_t.py"]) is None
+
+
+def test_self_error_detects_collection_failure() -> None:
+    """测试压根没跑起来（收集失败）→ 直接算自错。"""
+    got = verifier_self_error(_fail_run("errors during collection\nERROR: found no collectors\n"),
+                              verifier_files=["tests/test_t.py"])
+    assert got is not None
 
 
 class _FakeExec:
