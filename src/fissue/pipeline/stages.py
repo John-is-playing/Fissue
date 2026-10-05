@@ -224,6 +224,21 @@ class VerifyStage:
             result.skipped_reason = f"分类为 {evaluation.category.value}，不走 BUG 验证流程"
             return result
 
+        # 策略闸门：疑似刷量/重复的条目在**生成验证器之前**就要排除。
+        # 否则会为一条刷量请求白跑一轮沙盒（envkit #14 实测：评测已判 spam，
+        # 验证阶段仍生成验证器并给出 fix 结论），也会为重复条目重复建验证器。
+        if evaluation is not None and evaluation.spam.suspicious:
+            kinds = "".join(
+                [
+                    "刷量" if evaluation.spam.is_spam else "",
+                    "重复" if evaluation.spam.is_duplicate else "",
+                ]
+            )
+            self.ctx.repo.set_item_status(item.key, ItemStatus.SKIPPED)
+            result.status = ItemStatus.SKIPPED
+            result.skipped_reason = f"疑似{kinds or '无效'}，不生成验证器"
+            return result
+
         repo_cfg = self._repo_config(item)
         owns_workspace = workspace is None
         ws = workspace
@@ -367,6 +382,19 @@ class PRVerifyStage:
             return result
         if item.state == "closed":
             result.skipped_reason = "PR 已关闭"
+            return result
+
+        # 与 VerifyStage 同口径：疑似刷量/重复的 PR 也不进沙盒验证与合并流程。
+        if evaluation is not None and evaluation.spam.suspicious:
+            kinds = "".join(
+                [
+                    "刷量" if evaluation.spam.is_spam else "",
+                    "重复" if evaluation.spam.is_duplicate else "",
+                ]
+            )
+            self.ctx.repo.set_item_status(item.key, ItemStatus.SKIPPED)
+            result.status = ItemStatus.SKIPPED
+            result.skipped_reason = f"疑似{kinds or '无效'}，不做 PR 验证"
             return result
 
         category = evaluation.category if evaluation else Category.FEATURE

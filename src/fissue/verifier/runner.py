@@ -103,6 +103,49 @@ def judge_f2p(
     return result
 
 
+#: 验证器「自身写坏」的失败特征：测试代码压根没跑起来。
+_VERIFIER_BROKEN_HINTS = (
+    "errors during collection",
+    "error collecting",
+    "collected 0 items",
+    "no tests ran",
+    "interrupted: ",
+)
+
+#: 失败输出里出现这些异常、且**完全没有** AssertionError 时，基本可判定是
+#: 验证器自己调用出错（如引用了库里不存在的方法），而非断言到错误行为。
+_VERIFIER_FAULT_EXC = ("AttributeError", "ImportError", "ModuleNotFoundError", "SyntaxError")
+
+
+def verifier_self_error(run: VerifierRun) -> str | None:
+    """判断这次失败是否由**验证器自身**引起；是则返回一句说明，否则 None。
+
+    base 阶段失败只说明「验证器没通过」，并不等于「问题已复现」：验证器引用了
+    库里并不存在的 API、导入失败、语法错误，或 pytest 根本没收集到用例，
+    都会得到同样的非零退出码。把这类失败当成复现，会把一条真问题误判为
+    无效请求（envkit #12 实测：测试调用 `TTLCache.put`，而库里只有 `set`）。
+    """
+    if run.outcome is not VerifierOutcome.FAIL:
+        return None
+
+    text = f"{run.stdout or ''}\n{run.stderr or ''}"
+    lowered = text.lower()
+
+    for hint in _VERIFIER_BROKEN_HINTS:
+        if hint in lowered:
+            return f"验证器未能正常执行（{hint.strip()}）"
+
+    # 出现断言失败 → 验证器确实在断言目标行为，按「复现」处理
+    if "AssertionError" in text:
+        return None
+
+    for exc in _VERIFIER_FAULT_EXC:
+        if exc in text:
+            return f"验证器自身抛出 {exc}（疑似引用了不存在的 API）"
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 既有测试回归门判定（见 docs/REGRESSION-GATE.md §3.3）
 # ---------------------------------------------------------------------------
@@ -473,6 +516,38 @@ class VerifierRunner:
             )
             result = judge_f2p(spec, base, None, require_f2p=self.settings.verifier.require_f2p)
             best_result = result
+
+            # 验证器自身写坏（引用不存在的 API / 导入失败 / 没收集到用例）也会
+            # 让 base 非零退出，与「问题已复现」的退出码一模一样。这里必须把
+            # 两者分开，否则一条真问题会被判成「无法复现」而转人工甚至误标无效。
+            self_error = verifier_self_error(base)
+            if self_error is not None:
+                log.warning("验证器自身有误 %s（第 %d 轮）：%s", item.key, round_index, self_error)
+                result.conclusion = self_error
+                if round_index >= max_rounds:
+                    self.repo.set_verifier_f2p(verifier_id, False)
+                    # 自错 ≠ 复现：必须摘掉 base_run，否则 reproducible 仍为真，
+                    # 下游又会把这条真问题当成「已验证」推进。
+                    result.base_run = None
+                    return verifier_id, spec, result
+                evidence = (
+                    f"{self_error}\n\n"
+                    "上面的失败来自验证器代码本身，而不是被测项目的行为。请检查你"
+                    "所调用的 API 是否真实存在于该库中（方法名、参数、导入路径），"
+                    "修正后重新给出验证器。\n\n"
+                    f"=== 原始输出 ===\n{(base.stdout or '')}\n{(base.stderr or '')}"
+                )
+                refined = await generator.refine(
+                    spec,
+                    item=item,
+                    repo_context=repo_context,
+                    failure_output=evidence,
+                    round_index=round_index + 1,
+                    test_hint=test_hint,
+                    linked_context=linked_context,
+                )
+                spec = refined.spec
+                continue
 
             if result.reproducible:
                 self.repo.set_verifier_f2p(verifier_id, False)   # 仅 base 通过，完整 F2P 待修复阶段

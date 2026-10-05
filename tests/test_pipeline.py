@@ -700,6 +700,41 @@ async def test_pr_verify_unreproducible_base_never_merges(ctx, repo, monkeypatch
     assert repo.get_item_row(item.key).status == ItemStatus.NEEDS_MANUAL.value
 
 
+@pytest.mark.parametrize(
+    "spam_kwargs, keyword",
+    [
+        ({"is_spam": True}, "刷量"),
+        ({"is_duplicate": True, "duplicate_of": [1]}, "重复"),
+    ],
+)
+async def test_pr_verify_blocks_suspicious_before_verifying(
+    ctx, repo, monkeypatch, spam_kwargs, keyword
+) -> None:
+    """疑似刷量/重复的 PR 与 Issue 同口径：不验证、不合并。"""
+    from fissue.models import SpamSignal
+    from fissue.pipeline.stages import PRVerifyStage
+
+    item = _pr_item(45 if keyword == "刷量" else 46)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, item)
+
+    order: list[str] = []
+
+    async def boom(**kw):
+        raise AssertionError("疑似刷量/重复的 PR 不该进验证/合并流程")
+
+    monkeypatch.setattr(ctx, "clone_workspace", boom)
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", boom)
+
+    ev = Evaluation(category=Category.BUG, model="stub", spam=SpamSignal(**spam_kwargs))
+    result = await PRVerifyStage(ctx).run(item, ev)
+
+    assert order == []
+    assert result.status is ItemStatus.SKIPPED
+    assert keyword in result.skipped_reason
+    assert repo.get_item_row(item.key).status == ItemStatus.SKIPPED.value
+
+
 # ---------------------------------------------------------------------------
 # 重复检测：候选预筛 + 接入评测
 # ---------------------------------------------------------------------------
@@ -961,3 +996,135 @@ async def test_generate_and_validate_unreliable_when_command_never_given(ctx, re
     assert calls["refine"] == max_rounds - 1          # 每轮都尝试重生成
     assert result.f2p_satisfied is False
     assert "缺少 command" in result.conclusion
+
+
+# ---------------------------------------------------------------------------
+# 验证器自身写坏：与「问题已复现」区分开
+# ---------------------------------------------------------------------------
+
+
+async def test_generate_and_validate_retries_on_verifier_self_error(ctx, repo, monkeypatch) -> None:
+    """验证器引用了库里不存在的 API → 应带反馈重生成，而不是当成「问题已复现」。
+
+    回归（envkit #12 实测）：生成的测试调用了 ``TTLCache.put``（库里只有 ``set``），
+    pytest 因 AttributeError 非零退出，被 judge_f2p 当作 base 失败 = 复现，
+    最终这条真问题被打上 invalid。
+    """
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierRun, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 23)
+    bad = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="bad",
+                       files={"t.py": "x"}, command="python -m pytest t.py -q")
+    good = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="good",
+                        files={"t.py": "y"}, command="python -m pytest t.py -q")
+
+    calls = {"refine": 0, "run": 0}
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=bad, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            calls["refine"] += 1
+            # 反馈里应明确指出是验证器自身的问题
+            assert "验证器" in kw.get("failure_output", "")
+            return GeneratedVerifier(spec=good, usage=Usage(), warnings=[])
+
+    async def fake_run_once(**kw):
+        calls["run"] += 1
+        if calls["run"] == 1:
+            # 第一次：验证器自己调用了不存在的方法
+            return VerifierRun(
+                item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
+                stdout="E   AttributeError: 'TTLCache' object has no attribute 'put'",
+            )
+        # 第二次：真正的断言失败 → 问题确实可复现
+        return VerifierRun(
+            item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
+            stdout="E   AssertionError: assert 330 == -330",
+        )
+
+    monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)
+    _vid, spec, result = await ctx.verifier.generate_and_validate(
+        item=item, workspace=object(), repo_context="", generator=_Gen()
+    )
+
+    assert calls["run"] == 2          # 自错那一轮不算复现，重试了一次
+    assert calls["refine"] == 1
+    assert spec.name == "good"
+    assert result.reproducible is True
+
+
+async def test_generate_and_validate_gives_up_after_self_error_rounds(ctx, repo, monkeypatch) -> None:
+    """每轮都因验证器自身出错而失败 → 到最后判不可靠，不谎报「已复现」。"""
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierRun, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 24)
+    bad = VerifierSpec(kind=VerifierKind.EXECUTABLE, name="bad",
+                       files={"t.py": "x"}, command="python -m pytest t.py -q")
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=bad, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            return GeneratedVerifier(spec=bad, usage=Usage(), warnings=[])
+
+    async def fake_run_once(**kw):
+        return VerifierRun(
+            item_key=item.key, stage="base", outcome=VerifierOutcome.FAIL, exit_code=1,
+            stdout="E   ModuleNotFoundError: No module named 'nonexistent'",
+        )
+
+    monkeypatch.setattr(ctx.verifier, "run_once", fake_run_once)
+    _vid, spec, result = await ctx.verifier.generate_and_validate(
+        item=item, workspace=object(), repo_context="", generator=_Gen()
+    )
+
+    assert result.reproducible is False         # 绝不能把自错当成复现
+    assert "验证器" in result.conclusion
+
+
+# ---------------------------------------------------------------------------
+# 策略闸门：疑似刷量/重复的条目不得生成验证器
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spam_kwargs, keyword",
+    [
+        ({"is_spam": True}, "刷量"),
+        ({"is_duplicate": True, "duplicate_of": [1]}, "重复"),
+    ],
+)
+async def test_verify_stage_blocks_suspicious_before_generating(
+    ctx, repo, monkeypatch, spam_kwargs, keyword
+) -> None:
+    """评测已判定疑似刷量/重复 → 验证阶段直接跳过，不生成验证器、不跑沙盒。
+
+    回归（envkit #14 实测）：评测已给出 is_spam=true、建议关闭，
+    验证阶段仍为它生成了验证器并跑出 fix 结论，白烧一轮沙盒。
+    """
+    from fissue.models import SpamSignal
+    from fissue.pipeline.stages import VerifyStage
+
+    item = _seed_issue(repo, 30 if keyword == "刷量" else 32)
+    ev = Evaluation(category=Category.BUG, priority=Priority.TIER1, model="stub",
+                    spam=SpamSignal(**spam_kwargs))
+    repo.save_evaluation(item.key, ev)
+
+    async def boom(**kw):                      # 走到生成验证器就是失败
+        raise AssertionError("疑似刷量/重复的条目不该走到生成验证器")
+
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", boom)
+    monkeypatch.setattr(ctx, "clone_workspace", boom)
+
+    result = await VerifyStage(ctx).run(item, ev)
+
+    assert result.status is ItemStatus.SKIPPED
+    assert keyword in result.skipped_reason
+    assert repo.get_item(item.key).status is ItemStatus.SKIPPED
