@@ -225,8 +225,9 @@ def evaluation_prompt(
             for s in similar_issues[:10]
         ]
         dup_hint = (
-            "\n\n本仓库中标题相似的既有条目（判断是否为重复提交时参考，注意只是标题相似，"
-            "需结合内容判断，不要仅凭标题就判定重复）：\n" + "\n".join(lines)
+            "\n\n本仓库中**可能相关**的既有条目（判断是否为重复提交时参考；这只是词面/"
+            "正文线索，需结合内容判断。判重从严：只有确认是同一问题才算重复，"
+            "「同一模块的不同问题」不是重复）：\n" + "\n".join(lines)
         )
 
     kind = "Pull Request" if is_pr else "Issue"

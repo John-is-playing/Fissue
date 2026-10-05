@@ -767,6 +767,85 @@ def test_similar_to_recalls_chinese_duplicate_titles() -> None:
     assert got == [2]                             # 召回真重复 #2，且不误召 #3
 
 
+def test_similar_to_recalls_duplicate_by_body_evidence() -> None:
+    """标题措辞完全不同、但正文在说同一处代码的重复，也要能进候选。
+
+    回归（pipekit 实测）：#12「count_batches 有时候会少算一个分片」与 #3
+    「in_ranges 漏掉区间右端点，进而算错剩余分片数」实为同一问题，但两条标题
+    的标识符完全不同，词面包含度只有 0.10，仅靠标题连候选都进不去，模型因此
+    从未看到 #3，漏判为非重复。它们正文贴的是同一段过滤逻辑，共享
+    ``count_batches`` / ``ranges`` / ``stats`` 这些辨识性标识符。
+    """
+    from fissue.pipeline.stages import _similar_to
+
+    def issue(number: int, title: str, body: str) -> RawItem:
+        return RawItem(platform=Platform.GITHUB, repo="John-is-playing/pipekit",
+                       number=number, item_type=ItemType.ISSUE, title=title, body=body)
+
+    dup3 = issue(
+        3,
+        "in_ranges 漏掉区间右端点，进而算错剩余分片数",
+        "`filterops.in_ranges(point, ranges)` 对右端点返回 False。\n"
+        "```python\nfrom pipekit import in_ranges, count_batches, drop_ranges\n"
+        "print(count_batches([(0, 4), (5, 9)], [(5, 5)]))\n"
+        "print(drop_ranges([(5, 9)], [(5, 9)]))\n```\n",
+    )
+    other1 = issue(
+        1,
+        "intervals.merge 不合并端点相接的区间",
+        "`merge` 漏了端点相接的情况。\n"
+        "```python\nfrom pipekit.intervals import merge\nprint(merge([(1, 3), (3, 5)]))\n```\n",
+    )
+    dup12 = issue(
+        12,
+        "count_batches 有时候会少算一个分片",
+        "过滤用的 ranges 边界正好跟分片起点重合的时候最容易出现。\n"
+        "```python\nfrom pipekit import count_batches, drop_ranges\n"
+        "print(count_batches(slices, ranges))\n```\n",
+    )
+
+    got = [g["number"] for g in _similar_to(dup12, [dup3, other1, dup12])]
+    assert 3 in got                                # 正文同源 → 召回 #3
+
+
+def test_similar_to_ignores_boilerplate_only_bodies() -> None:
+    """只共享贴代码的样板词（import/print/return）不算重复证据。"""
+    from fissue.pipeline.stages import _similar_to
+
+    def issue(number: int, title: str, body: str) -> RawItem:
+        return RawItem(platform=Platform.GITHUB, repo="psf/requests", number=number,
+                       item_type=ItemType.ISSUE, title=title, body=body)
+
+    boiler = (
+        "复现步骤：\n```python\n"
+        "import requests\nfrom requests import get\nprint(get('https://example.com'))\n"
+        "result = 1\nreturn result\n```\n"
+    )
+    a = issue(2, "连接超时后没有重试", boiler)
+    b = issue(5, "重定向时丢掉了请求头", boiler)
+
+    assert [g["number"] for g in _similar_to(b, [a, b])] == []
+
+
+def test_similar_to_body_signal_needs_more_than_one_shared_word() -> None:
+    """正文里只共享一个标识符不足以当重复证据（同模块下的不同问题）。
+
+    标题刻意不共享任何词——否则会被**标题通道**的 ASCII 抬分命中，
+    测不到正文通道本身。
+    """
+    from fissue.pipeline.stages import _similar_to
+
+    def issue(number: int, title: str, body: str) -> RawItem:
+        return RawItem(platform=Platform.GITHUB, repo="John-is-playing/pipekit",
+                       number=number, item_type=ItemType.ISSUE, title=title, body=body)
+
+    a = issue(2, "结果整体偏大", "coverage 算出来的值不对。\n```python\nprint(coverage(x))\n```\n")
+    b = issue(6, "空列表会让统计崩溃", "传空列表进来就崩。\n```python\nprint(coverage([]))\n```\n")
+
+    # 标题无共享词；正文只共享 coverage 一个标识符 → 不构成候选
+    assert [g["number"] for g in _similar_to(b, [a, b])] == []
+
+
 async def test_eval_batch_passes_similar_candidates(ctx, repo) -> None:
     from fissue.pipeline.stages import EvalStage
 

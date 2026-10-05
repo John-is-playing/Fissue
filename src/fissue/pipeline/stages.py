@@ -681,6 +681,33 @@ _TITLE_STOPWORDS = frozenset({
     "the", "and", "for", "not", "but", "with", "you", "are", "can", "does", "issue",
     "bug", "fix", "error", "test", "add", "use", "new", "get", "set", "url", "api",
 })
+
+#: 预筛阈值。标题词面相似度与「正文标识符」相似度都以此为界。
+_SIMILARITY_THRESHOLD = 0.22
+
+#: 正文里「贴代码 / 贴日志」必然出现的样板词：任意两条报告之间都会重合，
+#: 不能当重复信号（否则 import/print/python/return 就能把不相干的两条连起来）。
+#: 剔除后剩下的才是「在说同一处代码」的证据。
+_BODY_STOPWORDS = frozenset({
+    "import", "print", "python", "python3", "return", "from", "def", "self", "class",
+    "none", "true", "false", "assert", "value", "result", "items", "item", "args",
+    "kwargs", "example", "code", "output", "input", "error", "test", "tests", "expect",
+    "expected", "actual", "version", "readme", "pip", "install", "bash", "shell",
+    "http", "https", "json", "traceback", "raise", "typeerror", "valueerror", "line",
+})
+
+#: 正文标识符参与比较的最小长度与最小共享个数。单个共享词（如两条都提到
+#: ``coverage``）不足以说明同源，容易把同一模块下的不同问题混为一谈。
+_BODY_MIN_LEN = 5
+_BODY_MIN_SHARED = 2
+
+#: 正文「高频词」的判定：文档频超过池子这个比例的词算到处都是的模块名，
+#: 不具区分度（如 pipekit 里的 ``slices``）。用比例而非绝对数，随仓库规模自适应。
+_BODY_DF_RATIO = 0.35
+
+#: 正文通道的折算权重。正文远长于标题、词面必然更杂，故按包含度打折后再与
+#: 标题分数取较大者——正文只做「补召回」，不改变标题已经能定的判断。
+_BODY_SIM_WEIGHT = 1.5
 _ASCII_TOKEN = re.compile(r"[0-9a-z_]+")
 _CJK_RUN = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -697,6 +724,9 @@ def _title_tokens(title: str) -> set[str]:
     改切**字符二元组**后，短语级重合（``含税``/``税价``/``反推``…）能被保留，
     单字版则可看作 bigram 版在长标题上退化的下界。与 ``_similar_to`` 的
     包含度配合，长标题对短标题的重复才不会被长度差淹没。
+
+    本函数只用于**标题**；正文的重复证据由 :func:`_body_evidence` 单独提取
+    （正文要剔除样板词与高频词，规则不同）。
     """
     text = (title or "").lower()
     out: set[str] = set()
@@ -711,8 +741,32 @@ def _title_tokens(title: str) -> set[str]:
     return out
 
 
+def _body_evidence(raw: set[str], df: dict[str, int], cutoff: int) -> set[str]:
+    """从一条正文的 token 里取「可当重复证据」的标识符。
+
+    只留 ASCII 标识符，并剔除两类干扰：
+
+    * 样板词（``_BODY_STOPWORDS``）：贴代码必然出现的 ``import`` / ``print`` 等。
+    * 高频词（df 超过 ``cutoff``）：在本仓库里到处都是的模块名，区分度低。
+
+    剩下的才近似「这条报告具体在说哪处代码」。
+    """
+    return {
+        tok
+        for tok in raw
+        if tok.isascii() and len(tok) >= _BODY_MIN_LEN and tok not in _BODY_STOPWORDS
+        and df.get(tok, 0) <= cutoff
+    }
+
+
+def _containment(a: set[str], b: set[str]) -> float:
+    """包含度：交集 / 较短一侧。对「一条啰嗦、一条精炼」的重复对不敏感。"""
+    smaller = min(len(a), len(b))
+    return len(a & b) / smaller if smaller else 0.0
+
+
 def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> list[dict[str, Any]]:
-    """挑出标题上最可能重复的条目，作为**候选**交给 LLM 判断。
+    """挑出最可能重复的条目，作为**候选**交给 LLM 判断。
 
     只与**同类型、更早**的条目比较：
 
@@ -722,22 +776,39 @@ def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> li
       而其中更早的往往才是该保留的正主。
 
     这是**面向召回**的预筛（宁可多给几条，绝不代替判断）：提示词已明确要求
-    「只是标题相似，需结合内容判断，不要仅凭标题就判定重复」。共享有辨识度的
+    「只是内容相似，需结合内容判断，不要仅凭标题就判定重复」。共享有辨识度的
     ASCII 词（如 ``slugify``）是最强的词面重复信号，故直接抬到阈值以上。
 
     相似度用**包含度**（交集 / 较短一侧）而非 Jaccard：重复条目之间常是
     「一条啰嗦、一条精炼」，长度差会把 Jaccard 的分母撑大、相似度压低。
-    包含度回答的是「较短标题是否基本被较长标题覆盖」，对长度差不敏感；
+    包含度回答的是「较短一侧是否基本被较长一侧覆盖」，对长度差不敏感；
     又因只与**更早**条目单向比较，不存在互标重复的问题。
 
-    阈值 0.22 是在 ratekit 夹具上标定出来的：真实的重复对（#8「含税总价反推
-    出来的不含税价好像不对」~ #2「remove_tax 公式错误，含税价反推净额严重偏低」）
-    得 0.286，而仅同属 ``parse_amount``、实为设计偏好而非重复的 #3~#9 只得
-    0.154——0.22 落在两者中间，两侧各留 0.066 间隔。
+    阈值 0.22 在 ratekit 夹具上标定：真重复对（#8「含税总价反推出来的不含税价
+    好像不对」~ #2「remove_tax 公式错误，含税价反推净额严重偏低」）得 0.286，
+    而仅同属 ``parse_amount``、实为设计偏好而非重复的 #3~#9 只得 0.154。
+
+    **标题之外还要看正文**：pipekit 实测 #12「count_batches 有时候会少算一个分片」
+    与 #3「in_ranges 漏掉区间右端点，进而算错剩余分片数」是同一问题（后者是根因
+    所在），但两条标题的标识符完全不同、词面包含度只有 0.10，仅靠标题连候选都
+    进不去。而它们正文里都贴着同一段过滤逻辑，共享 ``count_batches`` / ``ranges``
+    / ``stats`` 这些**辨识性标识符**。故正文按「剔除样板词与高频词后，共享的
+    ASCII 标识符个数 >= ``_BODY_MIN_SHARED``」作为补召回通道——单个共享词
+    （两条都提到 ``coverage``）不作数，避免把同模块下的不同问题混为一谈。
     """
     base = _title_tokens(item.title)
     if not base:
         return []
+
+    # 正文证据需要文档频：先切出候选池各条的正文 token，再算每个词的 df。
+    raw_body = {o.key: _title_tokens(getattr(o, "body", "") or "") for o in pool}
+    df: dict[str, int] = {}
+    for toks in raw_body.values():
+        for tok in toks:
+            df[tok] = df.get(tok, 0) + 1
+    cutoff = max(_BODY_MIN_SHARED, int(len(pool) * _BODY_DF_RATIO))
+    my_body = _body_evidence(raw_body.get(item.key, set()), df, cutoff)
+
     scored: list[tuple[float, RawItem]] = []
     for other in pool:
         if other.key == item.key:
@@ -747,12 +818,14 @@ def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> li
         toks = _title_tokens(other.title)
         if not toks:
             continue
-        inter = base & toks
-        smaller = min(len(base), len(toks))
-        score = len(inter) / smaller if smaller else 0.0
+        score = _containment(base, toks)
         if any(t.isascii() and t in toks for t in base):
             score = max(score, 0.5)
-        if score >= 0.22:
+        # 正文补召回：共享足够多的辨识性标识符，说明在说同一处代码。
+        other_body = _body_evidence(raw_body.get(other.key, set()), df, cutoff)
+        if len(my_body & other_body) >= _BODY_MIN_SHARED:
+            score = max(score, _BODY_SIM_WEIGHT * _containment(my_body, other_body))
+        if score >= _SIMILARITY_THRESHOLD:
             scored.append((score, other))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [
