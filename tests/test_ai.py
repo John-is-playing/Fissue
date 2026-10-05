@@ -542,3 +542,81 @@ def sample_platform():
     from fissue.models import Platform
 
     return Platform.GITHUB
+
+
+# ---------------------------------------------------------------------------
+# chat_json：解析失败要带原始输出重试（推理模型截断场景）
+# ---------------------------------------------------------------------------
+
+
+async def test_chat_json_retries_once_when_content_unparseable() -> None:
+    """首次返回空/半截 JSON → 带原始输出重问一次，而不是直接认输返回空 dict。
+
+    实测根因：推理模型先用 token 写 reasoning_content，max_tokens 被吃光后
+    finish_reason=length、content 为空（实测长度 0）。这类截断是偶发的，
+    原样重问一次通常就能拿到完整对象；此前直接返回空 dict，等于让上层白跑一轮
+    （多余的重生成 / 重试），envkit 实测 #8 花 4 轮、#12 花 3 轮。
+    """
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    client = LLMClient(LLMConfig(api_key="k"))
+    seen: list[list] = []
+
+    async def fake_chat(messages, **kwargs):
+        seen.append(list(messages))
+        if len(seen) == 1:
+            # 第一次：被长度截断，content 为空
+            return LLMResponse(content="", model="m", usage=Usage(),
+                               raw={"choices": [{"finish_reason": "length"}]})
+        return LLMResponse(content='{"category": "bug"}', model="m", usage=Usage(),
+                           raw={"choices": [{"finish_reason": "stop"}]})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    data, usage = await client.chat_json([{"role": "user", "content": "x"}], purpose="test")
+
+    assert data == {"category": "bug"}
+    assert len(seen) == 2                       # 确实重试了一次
+    # 第二轮把上一轮的原始输出与「别再截断」的指令喂回去了
+    assert len(seen[1]) > len(seen[0])
+    assert "JSON" in seen[1][-1]["content"]
+
+
+async def test_chat_json_gives_default_after_all_attempts_fail() -> None:
+    """每轮都解析不出来 → 仍返回 default 且不抛异常（上层可降级继续）。"""
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    client = LLMClient(LLMConfig(api_key="k"))
+    calls = {"n": 0}
+
+    async def fake_chat(messages, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(content="完全不是 JSON", model="m", usage=Usage(),
+                           raw={"choices": [{"finish_reason": "stop"}]})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    data, usage = await client.chat_json([{"role": "user", "content": "x"}],
+                                         purpose="test", default={"fallback": True})
+
+    assert data == {"fallback": True}
+    assert calls["n"] == 2                      # 试满次数才放弃
+
+
+async def test_chat_json_single_attempt_when_disabled() -> None:
+    """max_parse_attempts=1 时保持旧行为（只问一次）。"""
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    client = LLMClient(LLMConfig(api_key="k"))
+    calls = {"n": 0}
+
+    async def fake_chat(messages, **kwargs):
+        calls["n"] += 1
+        return LLMResponse(content="", model="m", usage=Usage(), raw={})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    data, _ = await client.chat_json([{"role": "user", "content": "x"}],
+                                     purpose="test", max_parse_attempts=1)
+    assert data == {}
+    assert calls["n"] == 1

@@ -63,6 +63,17 @@ class LLMResponse:
     from_fallback: bool = False
 
 
+def _merge_usage(total: Usage, part: Usage) -> Usage:
+    """把一次调用的用量累加进累计值（重试多轮时逐次累计，便于计费与排障）。"""
+    total.prompt_tokens += part.prompt_tokens
+    total.completion_tokens += part.completion_tokens
+    total.cost_usd += part.cost_usd
+    total.model = part.model or total.model
+    total.purpose = part.purpose or total.purpose
+    total.success = total.success and part.success
+    return total
+
+
 UsageSink = Callable[[Usage], None | Awaitable[None]]
 UsageGetter = Callable[[], dict[str, Any]]
 
@@ -324,24 +335,62 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         default: dict[str, Any] | None = None,
+        max_parse_attempts: int = 2,
     ) -> tuple[dict[str, Any], Usage]:
         """要求模型返回 JSON 对象并解析。
 
-        解析失败时返回 ``default``（默认空 dict），不抛异常——AI 输出不可靠时
-        上层应能降级继续，而不是整批任务崩掉。
+        解析失败时**带原始输出重试一次**，再失败才返回 ``default``（默认空 dict）
+        且不抛异常——AI 输出不可靠时上层应能降级继续，而不是整批任务崩掉。
+
+        为什么要重试：推理模型会先用掉大量 token 写 ``reasoning_content``，
+        一旦 ``max_tokens`` 被推理吃光，``content`` 直接为空
+        （实测 ``finish_reason=length``、``content`` 长度 0）。这类「截断导致的
+        空/半 JSON」是**偶发**的，原样重问一次通常就能拿到完整对象；
+        而此前直接返回空 dict，等于让上层白跑一轮（多余的重生成/重试）。
         """
-        resp = await self.chat(
-            messages,
-            purpose=purpose,
-            json_mode=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        parsed = extract_json(resp.content)
-        if parsed is None:
-            log.warning("LLM[%s] 返回内容无法解析为 JSON，长度=%d", purpose, len(resp.content))
-            return (default if default is not None else {}), resp.usage
-        return parsed, resp.usage
+        attempts = max(1, max_parse_attempts)
+        usage = Usage(purpose=purpose)
+        last_content = ""
+        last_finish = ""
+
+        for attempt in range(1, attempts + 1):
+            msgs = list(messages)
+            if attempt > 1:
+                # 把上一轮的原始输出喂回去，并明确要求「只给 JSON、别写解释」
+                msgs = list(messages) + [
+                    {"role": "assistant", "content": last_content or "(上一轮返回为空)"},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"上面这轮没有返回可解析的 JSON"
+                            f"{f'（finish_reason={last_finish}）' if last_finish else ''}。"
+                            "请**只输出一个 JSON 对象**，不要任何解释、前言或 Markdown 代码块；"
+                            "务必输出完整闭合的 JSON（不要被长度截断）。"
+                        ),
+                    },
+                ]
+
+            resp = await self.chat(
+                msgs,
+                purpose=purpose,
+                json_mode=True,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            usage = _merge_usage(usage, resp.usage)
+            last_content = resp.content or ""
+            last_finish = str((resp.raw.get("choices") or [{}])[0].get("finish_reason") or "")
+
+            parsed = extract_json(resp.content)
+            if parsed is not None:
+                return parsed, usage
+
+            log.warning(
+                "LLM[%s] 返回内容无法解析为 JSON，长度=%d finish_reason=%s（第 %d/%d 次）",
+                purpose, len(last_content), last_finish or "-", attempt, attempts,
+            )
+
+        return (default if default is not None else {}), usage
 
     async def _record(self, usage: Usage) -> None:
         if self.usage_sink is None:
