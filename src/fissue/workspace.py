@@ -384,6 +384,130 @@ class RepoWorkspace:
                     continue
         return ""
 
+    def api_signatures(self, *, max_files: int = 40, limit: int = 80) -> str:
+        """提取仓库里 Python 模块的**公开 API 签名**（给 LLM 当契约用）。
+
+        为什么需要它：只有文件树和 README 时，模型会**猜** API 的形状——
+        envkit #12 实测，生成的验证器对 ``TTLCache`` 用了下标赋值
+        ``cache["a"] = 1``，还在 ``stats()`` 的返回值上取 ``.hits`` 属性
+        （实际返回 dict），结果处处自错、反复重生成也修不好。
+        把真实签名摆出来，模型就不必猜。
+
+        只输出公开名（不含下划线开头），最多 ``max_files`` 个文件、``limit`` 个成员，
+        避免上下文无限膨胀。解析失败的文件直接跳过。
+        """
+        return extract_api_signatures(
+            self.list_files(limit=max_files * 4), self.read,
+            max_files=max_files, limit=limit,
+        )
+
+
+def extract_api_signatures(
+    files: Sequence[str],
+    read: Any,
+    *,
+    max_files: int = 40,
+    limit: int = 80,
+) -> str:
+    """从 Python 文件的**公开 API** 里抽出签名，渲染成给 LLM 的契约文本。
+
+    ``read`` 是「相对路径 → 文件内容」的可调用对象（便于测试注入）。
+    只取 ``.py`` 且不在 tests/ 目录下的文件；只列公开名（不以 ``_`` 开头），
+    并附上顶层常量的字面值——常量往往正是契约的一部分
+    （例如某个 ``_UNIT_FACTORS`` 被改成公开名时，模型需要知道它长什么样）。
+    """
+    import ast
+
+    chunks: list[str] = []
+    used = 0
+    for rel in files:
+        if not rel.endswith(".py"):
+            continue
+        parts = rel.replace("\\", "/").split("/")
+        if "tests" in parts or "test" in parts or parts[0].startswith("."):
+            continue
+        if used >= max_files:
+            break
+        try:
+            src = read(rel)
+        except Exception:            # 读不到就跳过，不影响主流程
+            continue
+        if not src:
+            continue
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+
+        members: list[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("_"):
+                    continue
+                members.append(f"def {node.name}{_format_signature(node)}")
+            elif isinstance(node, ast.ClassDef):
+                if node.name.startswith("_"):
+                    continue
+                bases = [ast.unparse(b) for b in node.bases]
+                head = f"class {node.name}" + (f"({', '.join(bases)})" if bases else "")
+                methods = [
+                    f"    def {m.name}{_format_signature(m)}"
+                    for m in node.body
+                    if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not m.name.startswith("_")
+                ]
+                members.append("\n".join([head, *methods]) if methods else head)
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                name, value = _module_constant(node)
+                if name and value is not None:
+                    members.append(f"{name} = {value}")
+            if len(members) >= limit:
+                break
+
+        if members:
+            used += 1
+            chunks.append(f"# {rel}\n" + "\n".join(members))
+
+    return "\n\n".join(chunks)
+
+
+def _format_signature(node: Any) -> str:
+    """把函数节点渲染成 ``(参数) -> 返回类型``（取不到也不报错）。"""
+    import ast
+
+    try:
+        args = ast.unparse(node.args)
+    except Exception:                # pragma: no cover
+        args = "..."
+    ret = ""
+    if getattr(node, "returns", None) is not None:
+        try:
+            ret = f" -> {ast.unparse(node.returns)}"
+        except Exception:            # pragma: no cover
+            ret = ""
+    return f"({args}){ret}"
+
+
+def _module_constant(node: Any) -> tuple[str, str | None]:
+    """顶层常量赋值 → ``(名字, 字面值文本)``；非常量或私有名返回 ``(name, None)``。"""
+    import ast
+
+    if isinstance(node, ast.AnnAssign):
+        target, value = node.target, node.value
+    else:
+        target, value = (node.targets[0] if node.targets else None), node.value
+    if not isinstance(target, ast.Name) or target.id.startswith("_"):
+        return "", None
+    if value is None:
+        return target.id, None
+    try:
+        text = ast.unparse(value)
+    except Exception:                # pragma: no cover
+        return target.id, None
+    if len(text) > 200:              # 太长的不放，避免上下文膨胀
+        return target.id, None
+    return target.id, text
+
 
 def stage_verifier_files(workspace: RepoWorkspace, files: dict[str, str]) -> list[str]:
     """把验证器文件写入工作区，返回写入的相对路径列表。"""

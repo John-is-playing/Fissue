@@ -770,6 +770,9 @@ class _FakeWS:
     def readme(self) -> str:
         return "# demo"
 
+    def api_signatures(self, **kw) -> str:
+        return "def f() -> int"
+
     def cleanup(self) -> None:
         return None
 

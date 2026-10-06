@@ -349,6 +349,7 @@ class VerifyStage:
             language_hint=ws.detect_language(),
             file_tree=ws.file_tree(limit=150),
             readme=ws.readme(),
+            api_signatures=ws.api_signatures(),
         )
 
 
@@ -633,6 +634,7 @@ class PRVerifyStage:
             language_hint=ws.detect_language(),
             file_tree=ws.file_tree(limit=150),
             readme=ws.readme(),
+            api_signatures=ws.api_signatures(),
         )
 
     def _linked_issue_context(self, item: RawItem, repo_cfg) -> str:

@@ -597,6 +597,10 @@ class _FakeWorkspace:
     def readme(self) -> str:
         return "# textkit"
 
+    def api_signatures(self, **kw) -> str:
+        """公开 API 契约（真实工作区由 ast 抽取；替身给最小样本）。"""
+        return "def slugify(text: str) -> str"
+
     def detect_test_command(self, hint: str | None = None) -> str | None:
         """回归门探测命令；返回 None 表示探不到 → 该门记 skipped，不打扰本用例。"""
         return None

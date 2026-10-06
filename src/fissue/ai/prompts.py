@@ -136,8 +136,15 @@ def render_repo_context(
     language_hint: str | None = None,
     file_tree: Sequence[str] | None = None,
     readme: str | None = None,
+    api_signatures: str | None = None,
 ) -> str:
-    """仓库上下文（沙盒/修复阶段用）。"""
+    """仓库上下文（沙盒/修复阶段用）。
+
+    ``api_signatures``：模块公开 API 的真实签名（由
+    :meth:`RepoWorkspace.api_signatures` 抽取）。没有它，模型只能靠文件树与
+    README **猜** API 形状——envkit #12 实测因此反复写出自错验证器
+    （对 ``TTLCache`` 用下标赋值、在 ``stats()`` 的 dict 上取 ``.hits`` 属性）。
+    """
     parts: list[str] = []
     if language_hint:
         parts.append(f"主要语言：{language_hint}")
@@ -147,6 +154,11 @@ def render_repo_context(
         parts.append("仓库文件（节选）：\n" + "\n".join(f"- {p}" for p in file_tree[:200]))
     if readme:
         parts.append("README 摘要：\n" + _truncate(readme.strip(), 3000))
+    if api_signatures:
+        parts.append(
+            "公开 API 契约（**照此调用，不要臆测方法名、参数或返回类型**）：\n"
+            + _truncate(api_signatures.strip(), 6000)
+        )
     return "\n".join(parts) if parts else "（无额外上下文）"
 
 

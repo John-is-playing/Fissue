@@ -689,3 +689,101 @@ async def test_chat_json_does_not_escalate_on_plain_parse_failure() -> None:
 
     assert data == {}
     assert seen == [None, None]        # 两轮都不加码
+
+
+# ---------------------------------------------------------------------------
+# 公开 API 契约进上下文：让模型不必猜方法名/返回类型
+# ---------------------------------------------------------------------------
+
+
+def _sig_files() -> dict[str, str]:
+    return {
+        "envkit/cache.py": (
+            "class TTLCache:\n"
+            "    def __init__(self, ttl: float, *, clock=None) -> None: ...\n"
+            "    def set(self, key: str, value) -> None: ...\n"
+            "    def stats(self) -> dict[str, int]: ...\n"
+            "    def _private(self): ...\n"
+            "\n"
+            "def helper(x: int) -> str: ...\n"
+            "_secret = 1\n"
+            "VERSION = '0.6.0'\n"
+        ),
+        "tests/test_cache.py": "def test_x():\n    pass\n",
+        "README.md": "# envkit\n",
+    }
+
+
+def test_extract_api_signatures_includes_public_api() -> None:
+    """公开类/方法/函数与顶层常量都要抽出来——它们是模型写验证器的依据。"""
+    from fissue.workspace import extract_api_signatures
+
+    files = _sig_files()
+    out = extract_api_signatures(list(files), lambda r: files[r], max_files=10, limit=50)
+
+    assert "class TTLCache" in out
+    assert "def set(self, key: str, value)" in out
+    assert "def stats(self) -> dict[str, int]" in out      # 返回类型是关键契约
+    assert "def helper(x: int) -> str" in out
+    assert "VERSION = '0.6.0'" in out
+
+
+def test_extract_api_signatures_skips_private_and_tests() -> None:
+    """私有名与测试文件不进契约——前者不是契约，后者会污染上下文。"""
+    from fissue.workspace import extract_api_signatures
+
+    files = _sig_files()
+    out = extract_api_signatures(list(files), lambda r: files[r], max_files=10, limit=50)
+
+    assert "_private" not in out
+    assert "_secret" not in out
+    assert "test_cache" not in out
+
+
+def test_extract_api_signatures_is_bounded_and_resilient() -> None:
+    """必须能限长，且遇到语法错误的文件要跳过而不是崩掉。"""
+    from fissue.workspace import extract_api_signatures
+
+    files = {
+        "bad.py": "def broken(:\n",                       # 语法错 → 跳过
+        "a.py": "def f1() -> int: ...\ndef f2() -> int: ...",
+        "b.py": "def g1() -> int: ...",
+        "c.py": "def h1() -> int: ...",
+    }
+    out = extract_api_signatures(list(files), lambda r: files[r], max_files=2, limit=50)
+    assert "broken" not in out
+    assert out.count("# ") == 2                            # max_files 生效
+
+    many = {"m.py": "\n".join(f"def fn{i}(): ..." for i in range(50))}
+    limited = extract_api_signatures(list(many), lambda r: many[r], max_files=5, limit=3)
+    assert limited.count("def fn") == 3                    # limit 生效
+
+
+def test_extract_api_signatures_empty_when_no_python() -> None:
+    from fissue.workspace import extract_api_signatures
+
+    files = {"README.md": "# hi", "go.mod": "module x"}
+    assert extract_api_signatures(list(files), lambda r: files[r]) == ""
+
+
+def test_render_repo_context_includes_api_contract() -> None:
+    """API 契约要出现在仓库上下文里，并明确要求「不要臆测」。"""
+    from fissue.ai.prompts import render_repo_context
+
+    text = render_repo_context(
+        language_hint="python",
+        file_tree=["envkit/cache.py"],
+        readme="# envkit",
+        api_signatures="class TTLCache\n    def stats(self) -> dict[str, int]",
+    )
+    assert "公开 API 契约" in text
+    assert "dict[str, int]" in text
+    assert "不要臆测" in text
+
+
+def test_render_repo_context_omits_empty_api_contract() -> None:
+    """没有契约时不要冒出空标题（否则模型会以为仓库没有公开 API）。"""
+    from fissue.ai.prompts import render_repo_context
+
+    text = render_repo_context(language_hint="python", api_signatures="")
+    assert "公开 API 契约" not in text

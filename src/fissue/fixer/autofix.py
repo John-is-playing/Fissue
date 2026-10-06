@@ -668,6 +668,7 @@ class AutoFixer:
             language_hint=ws.detect_language(),
             file_tree=ws.file_tree(limit=200),
             readme=ws.readme(),
+            api_signatures=ws.api_signatures(),
         )
 
     def _item_url(self, item: RawItem) -> str:

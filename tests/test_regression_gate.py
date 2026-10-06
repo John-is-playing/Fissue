@@ -368,6 +368,10 @@ class _FakeWs:
     def readme(self) -> str:
         return "# x"
 
+    def api_signatures(self, **kw) -> str:
+        """公开 API 契约；替身给最小样本即可。"""
+        return "def f() -> int"
+
     def detect_test_command(self, hint: str | None = None) -> str | None:
         return None
 
