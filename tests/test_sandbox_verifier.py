@@ -396,6 +396,53 @@ def test_self_error_detects_collection_failure() -> None:
     assert got is not None
 
 
+#: envkit #12 实测形态：验证器用**下标赋值**操作只提供 set()/get() 的缓存
+#: ``TypeError: 'TTLCache' object does not support item assignment``
+_VERIFIER_TYPE_ERROR_OUT = (
+    "    def test_basic(self):\n"
+    "        cache = TTLCache(ttl=0.1)\n"
+    ">       cache[\"a\"] = 1\n"
+    "E       TypeError: 'TTLCache' object does not support item assignment\n\n"
+    "tests/test_reproduce_issue12.py:84: TypeError\n"
+)
+
+#: 同一类异常，但抛在**被测库**里 —— 这是真缺陷，必须放行
+_LIB_TYPE_ERROR_OUT = (
+    "    def test_repro(self):\n"
+    ">       parse_offset(\"-05:30\")\n\n"
+    "tests/test_lib_bug.py:4: \n\n"
+    "    def parse_offset(text):\n"
+    ">       return None + 1\n"
+    "E       TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'\n\n"
+    "pylib/__init__.py:3: TypeError\n"
+)
+
+
+def test_self_error_detects_type_error_in_verifier_file() -> None:
+    """验证器用错语法（下标赋值）→ 必须识别为自错。
+
+    回归（envkit #12 实测）：生成的测试对 ``TTLCache`` 用了 ``cache["a"] = 1``，
+    而该库只提供 ``set()``/``get()``，pytest 报 TypeError。TypeError 此前不在
+    故障异常集合里，于是被当成「问题已复现」放行，条目最终被误标 invalid——
+    真正识破它的只是结论阶段的 LLM，机制本身漏了。
+    """
+    got = verifier_self_error(_fail_run(_VERIFIER_TYPE_ERROR_OUT),
+                              verifier_files=["tests/test_reproduce_issue12.py"])
+    assert got is not None
+    assert "TypeError" in got
+
+
+def test_self_error_ignores_type_error_from_library() -> None:
+    """被测库自己抛 TypeError → 真缺陷，绝不能误判为验证器写错。
+
+    这是给 TypeError 加入集合时的安全前提：判定按**抛出位置**走，
+    库里的异常定位在库文件，因此不受影响。
+    """
+    got = verifier_self_error(_fail_run(_LIB_TYPE_ERROR_OUT),
+                              verifier_files=["tests/test_lib_bug.py"])
+    assert got is None
+
+
 class _FakeExec:
     def __init__(self, ok: bool, code: int | None = None, timed_out: bool = False) -> None:
         self.ok, self.exit_code, self.timed_out = ok, code, timed_out

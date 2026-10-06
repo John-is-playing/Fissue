@@ -115,9 +115,17 @@ _VERIFIER_BROKEN_HINTS = (
 )
 
 #: 这些异常若**抛在验证器自己的文件里**，基本可判定是验证器调用了不存在的
-#: API（方法名 / 属性 / 导入路径写错），而不是被测项目的行为。
+#: API（方法名 / 属性 / 导入路径写错，或用错了语法），而不是被测项目的行为。
+#:
+#: ``TypeError`` 也要算：envkit #12 实测，验证器对 ``TTLCache`` 用了下标赋值
+#: ``cache["a"] = 1``（该库只提供 ``set()``），pytest 报
+#: ``TypeError: 'TTLCache' object does not support item assignment``，
+#: 定位在验证器自己的文件里——此前不在集合中，被当成「问题已复现」放行，
+#: 最终靠结论阶段的 LLM 才识破，条目被误标 invalid。
+#: 判定依据是**抛出位置**（见 ``verifier_self_error``），所以库自身抛 TypeError
+#: 的真缺陷不受影响：那种情况的定位行落在被测库的文件里，会被放行。
 _VERIFIER_FAULT_EXC = frozenset(
-    {"AttributeError", "ImportError", "ModuleNotFoundError", "SyntaxError"}
+    {"AttributeError", "ImportError", "ModuleNotFoundError", "SyntaxError", "TypeError"}
 )
 
 #: pytest 每个失败用例的定位行：``<路径>.py:<行号>: <异常名>``。
