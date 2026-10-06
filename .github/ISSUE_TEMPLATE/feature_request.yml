@@ -1,0 +1,81 @@
+name: 功能建议
+description: 提议一个新功能或行为变更（请先对齐再动手）
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > ⚠️ **大改动请先在这里对齐再动手**（见
+        > [CONTRIBUTING.md 开始之前](https://github.com/John-is-playing/Fissue/blob/main/CONTRIBUTING.md#1-开始之前)）。
+        > 避免你写完一个大 PR 却与项目方向不符。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过已有 Issue 与 `docs/DESIGN.md`，确认这不是已有计划
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 请描述**问题本身**，而不是先给方案。你现在的痛点是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的方案
+      description: 可选。若有明确想法请写出来，包括你会怎么验证它有效。
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 考虑过的替代方案
+      description: 你是否试过用现有配置 / 现有命令达到目的？为什么不够？
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响面
+      description: 这个改动会动到哪里？
+      multiple: true
+      options:
+        - CLI 命令 / 参数
+        - REST API / Web
+        - 配置项（config.yaml）
+        - 平台适配器
+        - 验证器 / F2P / 回归门
+        - 自动修复 / 护栏
+        - 沙盒 / 安全边界
+        - 存储 / 导出
+        - 提示词（prompts）
+        - 纯文档
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: breaking
+    attributes:
+      label: 兼容性
+      options:
+        - label: 这是**破坏性变更**（会改变现有配置 / 命令 / 存储格式的含义）
+          required: false
+        - label: 这是**安全相关**变更（涉及沙盒隔离或自动修复护栏）——请务必说明威胁模型影响
+          required: false
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: 你打算自己实现吗
+      options:
+        - label: 我打算提 PR 实现它
+          required: false

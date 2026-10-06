@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 报告安全漏洞
+    url: https://github.com/John-is-playing/Fissue/security/advisories/new
+    about: 请勿用公开 Issue 报告安全问题，走私密渠道（详见 SECURITY.md）。
+  - name: 📖 使用手册与故障排查
+    url: https://github.com/John-is-playing/Fissue/blob/main/docs/USAGE.md
+    about: 安装、配置、命令用法、常见问题的解决办法。
+  - name: 🏗 架构设计
+    url: https://github.com/John-is-playing/Fissue/blob/main/docs/DESIGN.md
+    about: 分层、状态机、队列、F2P 与回归门、安全模型。
+  - name: 💬 提问 / 讨论
+    url: https://github.com/John-is-playing/Fissue/discussions
+    about: 不确定是 Bug 还是用法问题时，先来这里讨论。

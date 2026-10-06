@@ -1,0 +1,147 @@
+name: Bug 报告
+description: 报告 Fissue 的行为与预期不符（请先确认不是配置问题）
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢报告问题。请尽量填满下面的信息——**Fissue 对证据的要求比较严格**，
+        缺少复现步骤的报告很难定位。
+
+        > 🔒 **发现安全漏洞请不要走这里**，见 [SECURITY.md](https://github.com/John-is-playing/Fissue/blob/main/SECURITY.md)。
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过已有 Issue，确认不是重复报告
+          required: true
+        - label: 我已读过 [USAGE.md 的故障排查](https://github.com/John-is-playing/Fissue/blob/main/docs/USAGE.md#11-故障排查)，确认不是配置问题
+          required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / commit
+      description: 运行 `git rev-parse --short HEAD`，或写清发布版本号
+      placeholder: "9513c15"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 涉及模块
+      multiple: true
+      options:
+        - 抓取（fetch / platforms）
+        - 评测（eval / ai）
+        - 验证器生成（verifier/generator）
+        - 沙盒执行（sandbox）
+        - F2P / 回归门
+        - 批量定论（flush / 队列）
+        - 自动修复（fix / fixer）
+        - 打标签 / 评论（平台写操作）
+        - CLI
+        - Web / REST API
+        - 常驻服务（serve / notify）
+        - 存储 / 导出（store）
+        - 文档
+        - 其它
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 实际行为
+      description: 发生了什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 你认为应该发生什么？请说明依据（文档 / 常识 / 你自己的判断）
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: 最小复现步骤
+      description: 请给出能稳定复现的最短路径。能用夹具（demo/）复现最好。
+      placeholder: |
+        1. 登记仓库 `github:xxx/yyy`
+        2. 跑 `fissue eval --repo xxx/yyy --all`
+        3. 看到 ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: command-output
+    attributes:
+      label: 完整命令与输出
+      description: |
+        请贴出**加了 `--verbose`** 的完整输出（脱敏后）。
+        `--json` 输出也很有用。
+      render: shell
+    validations:
+      required: true
+
+  - type: dropdown
+    id: environment
+    attributes:
+      label: 运行环境
+      options:
+        - Windows + Git Bash
+        - Windows + PowerShell
+        - Linux
+        - macOS
+        - Docker / 容器
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python 版本
+      description: "`python --version` 的输出"
+      placeholder: "3.12.1"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: sandbox-runtime
+    attributes:
+      label: 沙盒运行时
+      description: 若问题与验证 / 修复有关，请说明
+      options:
+        - 不涉及
+        - Docker（有隔离）
+        - local（降级，无隔离）⚠️
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: 使用的模型
+      description: 若问题与 AI 输出有关。**模型输出是非确定性的**，请附上原始响应。
+      placeholder: "deepseek-chat / qwen3.6-plus / ..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: artifacts
+    attributes:
+      label: 相关产物（若与验证 / 修复有关）
+      description: |
+        `data/artifacts/<key>/` 下的 stdout / stderr / meta.json，
+        或 `data/manual/<key>/report.md`。**尤其是 LLM 原始响应**。
+      render: text
+    validations:
+      required: false

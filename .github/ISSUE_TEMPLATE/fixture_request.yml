@@ -1,0 +1,89 @@
+name: 新测试夹具提案
+description: 提议新增一套对抗性测试夹具（最适合第一次贡献的路径）
+title: "[Fixture] "
+labels: ["fixture", "good first issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        夹具是 Fissue 最重要的资产。**每套夹具都是对一个真实维护场景的对抗性模拟。**
+
+        请先读 [CONTRIBUTING.md 的路径 ①](https://github.com/John-is-playing/Fissue/blob/main/CONTRIBUTING.md#路径--加一套测试夹具--最适合第一次贡献)。
+
+        现有五套：`textkit`（单函数语义）、`ratekit`（数值边界）、
+        `pipekit`（跨模块根因定位）、`envkit`（状态副作用）、`lockkit`（资源不变量）。
+
+  - type: input
+    id: name
+    attributes:
+      label: 夹具名
+      description: 建议 `<领域>kit` 形式，与现有命名一致
+      placeholder: "racekit / storekit / netkit ..."
+    validations:
+      required: true
+
+  - type: input
+    id: domain
+    attributes:
+      label: 领域
+      description: 这套夹具模拟什么类型的仓库？
+      placeholder: "并发时序 / 数据库事务 / 网络重试 ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-it-tests
+    attributes:
+      label: 它考什么（关键）
+      description: |
+        现有五套分别在考：单函数语义、数值边界、跨模块调用链、状态副作用、资源不变量。
+        **你的这套要不要开一个新的维度？** 请在下方说明。
+      placeholder: |
+        例如：并发时序——缺陷只在特定交错顺序下出现，正常串行路径完全看不出来。
+        验证器必须真正制造并发才能抓住。
+    validations:
+      required: true
+
+  - type: textarea
+    id: defects
+    attributes:
+      label: 计划植入的缺陷
+      description: 列出每个缺陷：位置（模块/函数）、表现、为什么基线测试覆盖不到
+      placeholder: |
+        1. `Counter.incr()` 非原子 → 并发下丢计数（基线测试全串行，覆盖不到）
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: adversarial
+    attributes:
+      label: 对抗性样本
+      description: |
+        **硬要求**：至少包含
+        ① 一个"只修一半"的 PR、② 一个重复 Issue、③ 一个刷量 Issue、④ 一个误报/设计偏好 Issue。
+        请逐个说明你打算怎么设计。
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: requirements
+    attributes:
+      label: 设计硬要求
+      options:
+        - label: 基线测试将**全绿**，且**刻意不覆盖**植入的缺陷（逼 Fissue 真去读代码写验证器）
+          required: true
+        - label: 期望结果会写进 `fixtures/*.md` 头部的 `target` 字段
+          required: true
+        - label: 会提供 README 说明"这套夹具考什么"与期望结果对照表
+          required: true
+        - label: "`demo/<name>/repo` 会带上 `.gitattributes` 强制 LF（否则 `git apply` 会失败）"
+          required: true
+
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: 你打算自己实现吗
+      options:
+        - label: 我打算提 PR 实现它（欢迎！可以在实现中随时来这个 Issue 讨论）
+          required: false
