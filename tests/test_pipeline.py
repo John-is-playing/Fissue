@@ -603,10 +603,16 @@ class _FakeWorkspace:
 
 
 def _pr_item(number: int = 43) -> RawItem:
+    from fissue.models import FileChange
+
     return RawItem(
         platform=Platform.GITHUB, repo="psf/requests", number=number,
         item_type=ItemType.PR, title="fix: 修复超时处理", body="修复 #42",
         head_branch="fix-timeout", base_branch="main", linked_issues=[42],
+        # 带上文件清单：默认是「改了代码」的 PR。
+        # 没有它，PR 验证会去平台现拉一次文件列表（判「纯文档改动」用），
+        # 而单测禁止真实网络，于是卡在重试退避上直到超时。
+        files=[FileChange(path="requests/adapters.py", status="modified", additions=5, deletions=2)],
     )
 
 
@@ -1193,3 +1199,241 @@ async def test_verify_stage_blocks_suspicious_before_generating(
     assert result.status is ItemStatus.SKIPPED
     assert keyword in result.skipped_reason
     assert repo.get_item(item.key).status is ItemStatus.SKIPPED
+
+
+# ---------------------------------------------------------------------------
+# PR-FEATURE 必须验证（不能按 category 一刀切挡掉）
+# ---------------------------------------------------------------------------
+
+
+def _seed_pr(repo, number: int, *, category: Category = Category.FEATURE) -> RawItem:
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    item = RawItem(
+        platform=Platform.GITHUB, repo="psf/requests", number=number,
+        item_type=ItemType.PR, title="feat: 补充文档", body="见 files.py",
+        head_branch="docs", base_branch="main",
+    )
+    repo.upsert_item(rid, item)
+    repo.save_evaluation(
+        item.key,
+        Evaluation(category=category, priority=Priority.NONE,
+                   scores=Scores(authenticity=DimensionScore(score=90)), model="stub"),
+    )
+    return item
+
+
+async def test_process_repo_routes_feature_pr_to_pr_verify(ctx, repo, monkeypatch) -> None:
+    """PR-FEATURE 必须走 PR 验证，不能被当作「FEATURE 不验证」跳过。
+
+    回归（envkit #18 实测）：调用点用 ``category is not BUG`` 一刀切，
+    把功能类 PR 与 Issue-FEATURE 一起挡掉，于是「只改文档却宣称实现了功能」
+    这类 PR 停在 labeled、没有任何结论，fix_feature 队列一条都没有
+    （DESIGN §2 明确要求 PR|FEATURE 入 fix_feature 队列）。
+    """
+    from fissue.pipeline.stages import BatchResult, Pipeline, StageResult
+
+    pr = _seed_pr(repo, 71, category=Category.FEATURE)
+    calls = {"pr": 0}
+
+    async def fake_eval(items, *, deep=False, concurrency=3):
+        br = BatchResult(repo="psf/requests")
+        for it in items:
+            br.add(StageResult(key=it.key, category=Category.FEATURE,
+                               evaluation=Evaluation(category=Category.FEATURE, model="stub")))
+        return br
+
+    async def fake_pr_run(item, evaluation=None, **kw):
+        calls["pr"] += 1
+        return StageResult(key=item.key, status=ItemStatus.QUEUED, queued=QueueName.FIX_FEATURE,
+                           skipped_reason=None)
+
+    pipe = Pipeline(ctx)
+    monkeypatch.setattr(pipe, "evaluate_items", fake_eval)
+    monkeypatch.setattr(pipe.pr_stage, "run", fake_pr_run)
+
+    await pipe.process_repo("psf/requests", limit=10)
+
+    assert calls["pr"] == 1, "PR-FEATURE 应进入 PR 验证流程"
+
+
+async def test_process_repo_still_labels_feature_issue(ctx, repo, monkeypatch) -> None:
+    """Issue-FEATURE 仍然只打标签（没有缺陷可复现，不进验证）。"""
+    from fissue.pipeline.stages import BatchResult, Pipeline, StageResult
+
+    issue = _seed_issue(repo, 72, category=Category.FEATURE)
+    calls = {"pr": 0, "issue": 0}
+
+    async def fake_eval(items, *, deep=False, concurrency=3):
+        br = BatchResult(repo="psf/requests")
+        for it in items:
+            br.add(StageResult(key=it.key, category=Category.FEATURE,
+                               evaluation=Evaluation(category=Category.FEATURE, model="stub")))
+        return br
+
+    async def fake_pr_run(item, evaluation=None, **kw):
+        calls["pr"] += 1
+        return StageResult(key=item.key)
+
+    async def fake_issue_run(item, evaluation=None, **kw):
+        calls["issue"] += 1
+        return StageResult(key=item.key)
+
+    pipe = Pipeline(ctx)
+    monkeypatch.setattr(pipe, "evaluate_items", fake_eval)
+    monkeypatch.setattr(pipe.pr_stage, "run", fake_pr_run)
+    monkeypatch.setattr(pipe.verify_stage, "run", fake_issue_run)
+
+    await pipe.process_repo("psf/requests", limit=10)
+
+    assert calls == {"pr": 0, "issue": 0}          # 两种验证流程都没走
+    assert repo.get_item_row(issue.key).status == ItemStatus.LABELED.value
+
+
+# ---------------------------------------------------------------------------
+# 只改文档的 PR：明确不推荐合并（不给含糊结论）
+# ---------------------------------------------------------------------------
+
+
+def test_is_doc_path_classification() -> None:
+    from fissue.pipeline.stages import _is_doc_path
+
+    assert _is_doc_path("README.md") is True
+    assert _is_doc_path("docs/guide.md") is True
+    assert _is_doc_path("CHANGELOG.md") is True
+    # 代码/配置即便在 docs/ 下也不算文档
+    assert _is_doc_path("docs/conf.py") is False
+    assert _is_doc_path("envkit/files.py") is False
+    assert _is_doc_path("pyproject.toml") is False
+
+
+async def test_pr_verify_docs_only_pr_explicitly_rejects_merge(ctx, repo, monkeypatch) -> None:
+    """只改文档、没有代码实现的 PR → 明确「不建议合并」，不跑沙盒、不给含糊结论。
+
+    回归（envkit #18 实测）：该 PR 只改 README 却宣称提供 envkit/files.py，
+    验证器必然 ModuleNotFoundError（与「验证器自己写错」无法区分），
+    此前的结论含糊地停在「验证器自身有误」，没有明确的不合并建议。
+    """
+    from fissue.models import FileChange
+    from fissue.pipeline.stages import PRVerifyStage
+
+    item = _pr_item(73)
+    item.files = [FileChange(path="README.md", status="modified", additions=21, deletions=0)]
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, item)
+
+    async def boom(**kw):
+        raise AssertionError("纯文档 PR 不该进沙盒验证")
+
+    monkeypatch.setattr(ctx, "clone_workspace", boom)
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", boom)
+
+    ev = Evaluation(category=Category.FEATURE, model="stub")
+    result = await PRVerifyStage(ctx).run(item, ev)
+
+    assert result.status is ItemStatus.NEEDS_MANUAL
+    assert "不建议合并" in (result.skipped_reason or "")
+    assert "README.md" in (result.skipped_reason or "")
+
+
+async def test_pr_verify_code_pr_is_not_short_circuited(ctx, repo, monkeypatch) -> None:
+    """含代码改动的 PR 不能被文档闸门误拦——必须照常走验证。"""
+    from fissue.models import FileChange
+    from fissue.pipeline.stages import PRVerifyStage
+
+    item = _pr_item(74)
+    item.files = [FileChange(path="envkit/units.py", status="modified", additions=5, deletions=2)]
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, item)
+
+    reached = {"n": 0}
+
+    async def spy_clone(repo_cfg, **kw):
+        reached["n"] += 1
+        raise RuntimeError("到这里说明闸门放行了（本用例只验证放行）")
+
+    monkeypatch.setattr(ctx, "clone_workspace", spy_clone)
+
+    ev = Evaluation(category=Category.BUG, model="stub")
+    await PRVerifyStage(ctx).run(item, ev)
+
+    assert reached["n"] == 1, "含代码改动的 PR 应继续走验证"
+
+
+# ---------------------------------------------------------------------------
+# #12 的端到端验证：真沙盒里「自错识别 → 重生成 → 不谎报复现」
+# ---------------------------------------------------------------------------
+
+
+async def test_e2e_self_error_detected_then_regenerates_in_real_sandbox(ctx, repo, tmp_path) -> None:
+    """真沙盒端到端：首轮验证器写了不存在的 API → 识别为自错 → 重生成 → 真复现。
+
+    静态单测只能证明判定函数本身对；这里证明整条链路成立：
+    真 pytest 输出 → 定位行解析 → 识别为验证器自错 → 带反馈重生成 → 拿到真复现，
+    且**不把自错那轮谎报成「问题已复现」**（envkit #12 实测的失效模式）。
+    """
+    import sys
+
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+    from fissue.workspace import RepoWorkspace
+
+    item = _seed_issue(repo, 91)
+
+    # 真工作区：放一个有真实缺陷的库（丢负号）
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "mylib.py").write_text(
+        "def parse_offset(text):\n"
+        "    body = text.lstrip('+-')\n"
+        "    h, m = body.split(':')\n"
+        "    return int(h) * 60 + int(m)\n",
+        encoding="utf-8",
+    )
+
+    cmd = f'"{sys.executable}" -m pytest tests/test_repro.py -q'
+    # 首轮：调用了不存在的方法 put() → AttributeError 落在验证器自己的文件里
+    broken = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE, name="broken",
+        files={"tests/test_repro.py": (
+            "from mylib import parse_offset\n\n"
+            "def test_calls_missing_api():\n"
+            "    parse_offset.put('k', 'v')\n"
+        )},
+        command=cmd,
+    )
+    # 重生成后：正经断言到缺陷行为 → 真复现
+    good = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE, name="good",
+        files={"tests/test_repro.py": (
+            "from mylib import parse_offset\n\n"
+            "def test_sign():\n"
+            "    assert parse_offset('-05:30') == -330\n"
+        )},
+        command=cmd,
+    )
+
+    calls = {"generate": 0, "refine": 0, "feedback": ""}
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            calls["generate"] += 1
+            return GeneratedVerifier(spec=broken, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, *, failure_output="", **kw):
+            calls["refine"] += 1
+            calls["feedback"] = failure_output
+            return GeneratedVerifier(spec=good, usage=Usage(), warnings=[])
+
+    ws = RepoWorkspace(root=root, slug="psf/requests")
+    _vid, spec, result = await ctx.verifier.generate_and_validate(
+        item=item, workspace=ws, repo_context="", generator=_Gen()
+    )
+
+    assert calls["generate"] == 1
+    assert calls["refine"] == 1, "首轮自错必须触发重生成"
+    assert "验证器" in calls["feedback"], "反馈要点名是验证器自身的问题"
+    assert spec.name == "good"
+    # 真复现：次轮是真断言失败，而不是把自错当成复现
+    assert result.reproducible is True
+    assert "验证器自身" not in result.conclusion
