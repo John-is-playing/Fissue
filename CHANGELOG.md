@@ -59,6 +59,9 @@
 - 新增架构设计（`docs/DESIGN.md`）、使用手册（`docs/USAGE.md`）、环境说明（`docs/ENV.md`）、回归门说明（`docs/REGRESSION-GATE.md`）
 - 新增五套夹具各自的 README，说明每套夹具「考什么」与期望结果对照表
 - 新增 `30ae40b-BUG.md`：基于 ratekit 实测的缺陷清单与逐项修复记录
+- 新增 `BENCHMARK.md`：五套夹具的公开基准，含方法学、实测结果、已知失败与尚未测量项
+- 新增 `CONTRIBUTING.md` / `SECURITY.md` / `CODE_OF_CONDUCT.md` / `LICENSE`，
+  以及 `.github` 下的 Issue 模板、PR 模板与漏洞上报表单
 
 ### 安全
 
