@@ -125,7 +125,11 @@ fetch → eval（四维评分 + 分类 + 反刷子）
 | `pipekit` | PR4 `merge_adjacent` 修复 | `regression:fix` = **fail** |
 | `envkit` | PR4 `sanitize` 修复 | `regression:fix` = **fail** |
 
-三套夹具的"回归门对抗样本"**全部被拦下**。实测失败输出示例
+`ratekit` / `pipekit` / `envkit` 三套的"回归门对抗样本"**全部被拦下**。
+但 **`lockkit` 的同名样本经构造期实测失效**——它并不会产生任何回归，
+详见 [§4.6](#46-lockkit-pr4-的回归门样本失效构造期发现)。
+
+实测失败输出示例
 （`data/artifacts/github_John-is-playing_ratekit#12/regression_fix/stdout.log`）：
 
 ```text
@@ -229,6 +233,37 @@ Agent 循环的失败尝试属于正常现象（自纠错过程的中间态）�
 > ⚠️ 注意：以上**没有任何一次真实提 PR**。Fissue 的自动提 PR 路径
 > **尚未在本基准中被端到端验证过**。
 
+### 4.6 lockkit PR4 的回归门样本失效（构造期发现）
+
+**这一条不是 Fissue 的缺陷，是夹具自身的规格 bug**，但同样公开。
+
+**现象**：`lockkit` README 声称 PR4（`fix/retry-cap-and-subclass`）会让
+`tests/test_gate.py` 的相关既有测试「从绿变红」，从而演示回归门拦截。
+构造该分支时实测**并非如此**：
+
+```text
+把 Latch.open 由 `self._remaining == 0` 改成 `self._remaining <= 0`
+ →  87 passed，没有任何一条测试变红
+```
+
+**根因（三条叠加）**：
+
+1. 基线只断言 `open is False`，此时 `remaining == 2` —— `== 0` 与 `<= 0` 都满足；
+2. 能区分两者的唯一路径是「一次 `count_down(n)` 跨过阈值」，
+   而 `count_down()` 的返回值**就是** `open`，基线从未构造这个场景；
+3. 最关键：`<= 0` 恰恰是 Issue #7 的**正确修复**，不是回归——
+   `count_down` 返回 `self.open`，若恢复 `== 0`，`count_down(5)` 会把闩锁
+   留在「未打开」状态。PR 正文把它描述成「顺手统一口径」，
+   实际是在修一个真缺陷。
+
+**后果**：PR4 会走「F2P 成立 + 回归门通过 → 建议合并」这条**正确**路径，
+但夹具预期的「回归门拦截」**演示不出来**。即 `lockkit` 无法像另外三套那样
+提供回归门对抗样本。
+
+**状态**：未修复。可选修法——在 `tests/test_gate.py` 补一条覆盖
+「一次跨过阈值」的基线断言，并改用一个**真正**破坏既有行为的改动
+（例如动 `ResourcePool.release` 的重复归还判定）来替代 PR4 的回归引入。
+
 ---
 
 ## 5. 尚未测量
@@ -237,7 +272,7 @@ Agent 循环的失败尝试属于正常现象（自纠错过程的中间态）�
 
 | 项 | 状态 |
 |---|---|
-| `lockkit`（15 Issue + 5 PR） | **从未运行**。夹具已完成、基线自测 87 passed 全绿，但未进入 fetch→eval→verify→fix 链路 |
+| `lockkit`（15 Issue + 5 PR） | **从未运行**。夹具与 5 个 `fix/*` 分支已就绪、基线 87 passed 全绿；但 Fissue 只支持从平台 API 抓取（无本地导入），该仓库尚未推送到 GitHub，故无法进入 fetch→eval→verify→fix 链路 |
 | 真实提 PR（`mode: fork` + `auto_submit: true`） | **从未运行**。所有修复均为 dry-run |
 | Gitee / AtomGit / GitLab 平台 | 仅单测覆盖，**无端到端实测** |
 | PostgreSQL 后端 | 开发期使用 SQLite |
