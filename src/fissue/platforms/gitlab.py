@@ -174,13 +174,28 @@ class GitLabAdapter(PlatformAdapter):
                     pass
             raw.merged = bool(payload.get("merged_at")) or payload.get("state") == "merged"
             raw.mergeable = payload.get("merge_status") in ("can_be_merged", "mergeable")
-            # 变更统计：changes 端点一次性给出
+            # 变更统计：changes 端点一次性给出。顺带把文件清单落库——
+            # 验证阶段要据此判定「是否只改了文档」（无代码变更 → 明确不建议合并），
+            # 而验证阶段必须离线可跑，不能在那儿现拉。
             try:
                 changes = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
                 if isinstance(changes, dict):
                     raw.additions = int(changes.get("additions") or 0)
                     raw.deletions = int(changes.get("deletions") or 0)
                     raw.changed_files = len(changes.get("changes") or [])
+                    raw.files = [
+                        FileChange(
+                            path=str(c.get("new_path") or c.get("old_path") or ""),
+                            # 与 fetch_files 保持同一套状态口径
+                            status=(
+                                "removed" if c.get("deleted_file")
+                                else "added" if c.get("new_file")
+                                else "modified"
+                            ),
+                        )
+                        for c in (changes.get("changes") or [])
+                        if isinstance(c, dict) and (c.get("new_path") or c.get("old_path"))
+                    ]
             except PlatformError:
                 pass
             closable = payload.get("closes_issue_iid")

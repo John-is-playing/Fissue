@@ -209,6 +209,12 @@ class V5Adapter(PlatformAdapter):
             raw.additions = int(payload.get("additions") or 0)
             raw.deletions = int(payload.get("deletions") or 0)
             raw.changed_files = int(payload.get("changed_files") or len(payload.get("files") or []))
+            # 文件清单落库：验证阶段要据此判定「是否只改了文档」
+            # （无代码变更 → 明确不建议合并），而验证阶段必须离线可跑，不能在那儿现拉。
+            try:
+                raw.files = await self.fetch_files(repo, number)
+            except Exception as exc:      # 取不到不影响主流程：验证阶段会保守放行
+                log.warning("[%s] 拉取 PR #%s 文件清单失败：%s", self.platform.value, number, exc)
             raw.linked_issues = extract_linked_issues(title, body)
             # v5 提供 PR 关联 Issue 的专用端点
             try:

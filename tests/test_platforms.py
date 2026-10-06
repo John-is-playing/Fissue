@@ -426,3 +426,74 @@ def test_retry_after_parsing() -> None:
     assert _parse_retry_after(r) == 3.0
     r2 = httpx.Response(429)
     assert _parse_retry_after(r2) == 5.0
+
+
+# ---------------------------------------------------------------------------
+# PR 文件清单必须在**抓取阶段**落库（验证阶段靠它判「纯文档 PR」，且须离线可跑）
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_gitlab_fetch_pr_populates_files(gl) -> None:
+    """GitLab MR 抓取时要顺手把文件清单落库（复用 changes 端点，不多发请求）。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/merge_requests").mock(
+        return_value=httpx.Response(200, json=[{
+            "iid": 6, "title": "mr", "description": "", "state": "opened",
+            "labels": [], "author": {"username": "d"}, "target_branch": "main",
+            "source_branch": "docs", "merge_status": "can_be_merged",
+        }])
+    )
+    respx.get(f"{GL}/projects/{pid}/merge_requests/6/changes").mock(
+        return_value=httpx.Response(200, json={
+            "additions": 3, "deletions": 0,
+            "changes": [{"old_path": "README.md", "new_path": "README.md", "diff": "@@\n+a\n"}],
+        })
+    )
+    respx.get(f"{GL}/projects/{pid}/merge_requests/6/notes").mock(return_value=httpx.Response(200, json=[]))
+
+    items = [i async for i in gl.fetch_items(REPO, item_types=[ItemType.PR])]
+    assert len(items) == 1
+    pr = items[0]
+    assert [f.path for f in pr.files] == ["README.md"]
+    assert pr.files[0].status == "modified"
+
+
+@respx.mock
+async def test_v5_fetch_pr_populates_files(atomgit) -> None:
+    """v5 系（Gitee/AtomGit）PR 抓取时也要落文件清单。"""
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[{"number": 8, "title": "pr", "state": "open"}])
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/8").mock(
+        return_value=httpx.Response(200, json={
+            "number": 8, "title": "pr", "body": "", "state": "open",
+            "labels": [], "user": {"login": "dev"},
+            "head": {"ref": "f", "repo": {"full_name": "dev/requests"}},
+            "base": {"ref": "master"},
+            "additions": 1, "deletions": 0, "changed_files": 1,
+        })
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/8/files").mock(
+        return_value=httpx.Response(200, json=[{
+            "filename": "README.md", "status": "modified", "additions": 1, "deletions": 0,
+        }])
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/8/issues").mock(return_value=httpx.Response(200, json=[]))
+    respx.get(f"{ATOMGIT}/repos/psf/requests/issues/8/comments").mock(return_value=httpx.Response(200, json=[]))
+
+    items = [i async for i in atomgit.fetch_items(REPO, item_types=[ItemType.PR])]
+    assert len(items) == 1
+    assert [f.path for f in items[0].files] == ["README.md"]
+
+
+async def test_captured_files_feed_docs_only_gate() -> None:
+    """抓取阶段落下的清单能直接喂给「纯文档 PR」判定——闭环成立。"""
+    from fissue.models import FileChange
+    from fissue.pipeline.stages import _is_doc_path
+
+    files = [FileChange(path="README.md"), FileChange(path="docs/guide.md")]
+    assert all(_is_doc_path(f.path) for f in files)
+    # 含一个代码文件 → 不构成「纯文档」
+    mixed = files + [FileChange(path="envkit/units.py")]
+    assert not all(_is_doc_path(f.path) for f in mixed)
