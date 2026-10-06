@@ -371,8 +371,11 @@ def verify(
                 if ev is None:
                     emit(f"跳过 {item.key}：尚未评测")
                     continue
-                if ev.category is not _C.BUG:
-                    emit(f"跳过 {item.key}：分类为 {ev.category.value}（FEATURE 不验证，只打标签）")
+                # 只有 Issue-FEATURE 不验证（没有缺陷可复现，只打标签等开发者）；
+                # PR-FEATURE 要照常验证——否则「只改文档冒充功能实现」的 PR 会
+                # 没有任何结论（envkit #18 实测）。与 process_repo 的口径一致。
+                if ev.category is not _C.BUG and item.item_type is ItemType.ISSUE:
+                    emit(f"跳过 {item.key}：分类为 {ev.category.value}（Issue-FEATURE 不验证，只打标签）")
                     ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
                     continue
                 r = await (stage_issue.run(item, ev) if item.item_type is ItemType.ISSUE else stage_pr.run(item, ev))

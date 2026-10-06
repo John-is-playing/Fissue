@@ -163,6 +163,13 @@ class GitHubAdapter(PlatformAdapter):
         raw.additions = int(pr.get("additions") or 0)
         raw.deletions = int(pr.get("deletions") or 0)
         raw.changed_files = int(pr.get("changed_files") or 0)
+        # 变更文件清单：验证阶段要据此判定「是否只改了文档」（无代码变更 → 明确
+        # 不建议合并）。必须在**抓取阶段**取，验证阶段只读库里的结果，否则会在
+        # 无网络的环境（单测）里发请求而卡住。
+        try:
+            raw.files = await self.fetch_files(repo, number)
+        except Exception as exc:      # 取不到不影响主流程：验证阶段会保守放行
+            log.warning("拉取 PR #%s 文件清单失败：%s", number, exc)
         # 关联 Issue：优先用 API 的 timeline 提取（此处用正文正则兜底，省一次请求）
         raw.linked_issues = extract_linked_issues(pr.get("title") or "", pr.get("body") or "")
 

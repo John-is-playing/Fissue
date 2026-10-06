@@ -402,6 +402,24 @@ class PRVerifyStage:
         queue = QueueName.FIX_BUG if category is Category.BUG else QueueName.FIX_FEATURE
 
         repo_cfg = self._repo_config(item)
+
+        # 纯文档改动的 PR 无法做功能验证：验证器要断言的「新 API / 新行为」
+        # 在代码里根本不存在，跑出来只会是 ModuleNotFoundError / TypeError 之类的
+        # 导入期错误——而那与「验证器自己写错」在输出上无法区分（envkit #18 实测：
+        # 只改 README 宣称 envkit/files.py，验证器报 No module named 'envkit.files'，
+        # 被判成「验证器自身有误」，结论含糊且没有明确的不合并建议）。
+        # 这里用确定性规则先判掉：没有代码改动 → 给不出功能证据 → 明确不推荐合并。
+        docs_only = self._docs_only_paths(item)
+        if docs_only is not None:
+            self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
+            result.status = ItemStatus.NEEDS_MANUAL
+            result.skipped_reason = (
+                f"仅改动文档（{', '.join(docs_only[:3])}），未包含代码实现，"
+                "无法提供功能证据，不建议合并"
+            )
+            result.notes.append("无代码变更：明确不推荐合并")
+            return result
+
         ws: RepoWorkspace | None = None
         try:
             who = await self._author_kind(item)
@@ -546,6 +564,21 @@ class PRVerifyStage:
             return item.author_kind
         return item.author_kind if item.author_kind is not AuthorKind.UNKNOWN else AuthorKind.COMMUNITY
 
+    def _docs_only_paths(self, item: RawItem) -> list[str] | None:
+        """PR 是否**只改了文档**。是则返回文档路径列表，否则（含代码变更 / 取不到）返回 None。
+
+        只读 ``item.files``（抓取阶段已落库），**不发任何请求**——验证阶段必须能在
+        离线环境跑；此前在这里现拉平台文件清单，会让单测卡在网络重试上。
+        没有文件清单时一律返回 None：宁可放行让流程照常验证，
+        也不要凭空下「不建议合并」的结论。
+        """
+        paths = [f.path for f in (item.files or []) if getattr(f, "path", "")]
+        if not paths:
+            return None
+
+        docs = [p for p in paths if _is_doc_path(p)]
+        return docs if len(docs) == len(paths) else None
+
     async def _merge_pr(
         self, ws: RepoWorkspace, item: RawItem, repo_cfg
     ) -> tuple[bool, str]:
@@ -681,8 +714,14 @@ class Pipeline:
             item = self.ctx.repo.get_item(r.key)
             if item is None:
                 continue
-            if r.evaluation.category is not Category.BUG:
-                # FEATURE：只打标签，等开发者
+            # Issue 的 FEATURE 没有缺陷可复现 → 只打标签等开发者。
+            #
+            # 但 **PR-FEATURE 必须验证**（DESIGN §2：PR|FEATURE 入 fix_feature 队列）。
+            # PRVerifyStage 本身是分类无关的——它按 category 自行选 FIX_BUG/FIX_FEATURE，
+            # 所以在这里按 category 一刀切会把功能类 PR 全部挡在门外，导致
+            # 「只改文档却宣称实现了功能」这类 PR 无人识破（envkit #18 实测：
+            # 停在 labeled、没有任何结论，fix_feature 队列一条都没有）。
+            if r.evaluation.category is not Category.BUG and item.item_type is ItemType.ISSUE:
                 self.ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
                 combined.add(
                     StageResult(
@@ -866,6 +905,42 @@ def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> li
         }
         for s, o in scored[:limit]
     ]
+
+
+#: 纯文档的文件名（大小写不敏感），及文档目录
+_DOC_FILENAMES = frozenset({
+    "readme", "readme.md", "readme.rst", "readme.txt",
+    "changelog", "changelog.md", "changes", "changes.md",
+    "license", "license.md", "licence", "copying",
+    "contributing.md", "code_of_conduct.md", "authors", "notice",
+})
+_DOC_SUFFIXES = (".md", ".rst", ".txt", ".adoc")
+_DOC_DIRS = ("docs/", "doc/", "documentation/", "changelog.d/", ".github/")
+
+
+#: 这些后缀是代码/配置，即便落在 docs/ 目录下也不算「纯文档」
+_CODE_SUFFIXES = (
+    ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".sh", ".bash", ".zsh", ".ps1", ".rb", ".go", ".rs", ".java",
+    ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".swift", ".kt",
+    ".toml", ".ini", ".cfg", ".yaml", ".yml", ".json", ".lock",
+)
+
+
+def _is_doc_path(path: str) -> bool:
+    """路径是否属于「文档」。用于判定「只改文档、没有代码实现」的 PR。"""
+    p = (path or "").replace("\\", "/").lstrip("./").lower()
+    if not p:
+        return False
+    if p.endswith(_CODE_SUFFIXES):
+        # docs/conf.py、docs/build.sh 这类是代码，不是文档
+        return False
+    name = p.rsplit("/", 1)[-1]
+    if name in _DOC_FILENAMES:
+        return True
+    if p.startswith(_DOC_DIRS):
+        return True
+    return p.endswith(_DOC_SUFFIXES)
 
 
 def _base_reproduced(spec: Any, base_result: VerifierResult) -> bool:
