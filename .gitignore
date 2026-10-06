@@ -24,6 +24,7 @@ demo/textkit/
 demo/ratekit/repo/
 demo/pipekit/repo/
 demo/envkit/repo/
+demo/lockkit/repo/
 
 # demo 产物
 demo/**/__pycache__/
