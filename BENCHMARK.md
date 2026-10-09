@@ -96,7 +96,8 @@ fetch → eval（四维评分 + 分类 + 反刷子）
 - `base pass` 表示验证器不可靠（在**未修复**代码上就通过了），Fissue 会触发修正回路，
   修正不了则转人工。textkit 早期有 6 次，ratekit 1 次。
 - `base error` 表示沙盒执行本身出错（结论不可信，不进入自动修复）。
-  **pipekit 的 15 次全部是 error**，这是本基准最大的一个未解问题，见 [§4.1](#41-pipekit-的-base-error)。
+  pipekit 的 15 次 error **属同一个瞬态环境故障（基础镜像当时不在），
+  且每条随后都重跑成功**，故不作为能力证据，见 [§4.1](#41-pipekit-的-base-error)。
 - `regression:fix fail` 就是**成功拦下的"修好目标却弄坏别处"**。
 
 ---
@@ -124,10 +125,10 @@ fetch → eval（四维评分 + 分类 + 反刷子）
 | `ratekit` | PR2 `is_weekend` 修复 | `regression:fix` = **fail**（exit=1）→ 转人工 |
 | `pipekit` | PR4 `merge_adjacent` 修复 | `regression:fix` = **fail** |
 | `envkit` | PR4 `sanitize` 修复 | `regression:fix` = **fail** |
+| `lockkit` | PR4 `should_retry` 合同被破坏 | 既有测试 `1 failed, 86 passed`（构造期实测；见 [§4.6](#46-lockkit-pr4-的回归门样本一次失效与修复构造期发现已修)） |
 
-`ratekit` / `pipekit` / `envkit` 三套的"回归门对抗样本"**全部被拦下**。
-但 **`lockkit` 的同名样本经构造期实测失效**——它并不会产生任何回归，
-详见 [§4.6](#46-lockkit-pr4-的回归门样本失效构造期发现)。
+四套夹具的"回归门对抗样本"**全部有效**。
+其中 `lockkit` 的样本曾是失效的，修复过程（含一次被否决的错误修法）记在 §4.6。
 
 实测失败输出示例
 （`data/artifacts/github_John-is-playing_ratekit#12/regression_fix/stdout.log`）：
@@ -170,19 +171,62 @@ test_add_working_days_zero:         ...
 
 **这一节是本文档最重要的部分。**
 
-### 4.1 pipekit 的 base error
+### 4.1 pipekit 的 base error（已定位：瞬态环境故障，非能力问题）
+
+> **本节曾被写成"本基准最大的未解问题"。复核数据后推翻了那个结论，原文保留在文末「修订记录」。**
 
 **现象**：pipekit 有 **15 次 `base` 阶段 `error`**，且只有 3 个验证器达到 `f2p_satisfied=1`
 （相对 20 个条目）。
 
-**含义**：沙盒执行本身失败，结论不可信，这些条目**未被自动修复**（保守行为正确），
-但也意味着 **pipekit 的根因定位能力大部分没能被验证**。
+**复核**：15 次 error 的 `error` 字段**去重后只有一条文案**：
 
-**影响**：这是目前最大的未解问题。pipekit 是专门设计来考"跨模块根因定位"的夹具，
-它的 base 阶段大面积失败，说明该维度的能力**尚未得到有效测量**。
+```text
+镜像不可用：fissue/sandbox-base:latest
+```
 
-**状态**：未修复。需要单独排查（沙盒环境？依赖装不全？超时？），
-建议后续用 `fissue verify --repo John-is-playing/pipekit --key <单条>` 逐条定位。
+且这 15 条的 `exit_code` 全为 `NULL`、`duration_seconds` 仅 **0.42~0.72 秒**、`stderr` 为 0 字节——
+沙盒根本没启动，是执行前的准备阶段就返回了失败。按 `created_at` 切分，时间线干净得反常：
+
+| 时段 | `base` 阶段结果 |
+|---|---|
+| 11:21–12:01 | **15 × `error`**（镜像不可用） |
+| 13:02–13:49 | **16 × `fail`**（正常复现） |
+
+**每一条带 `error` 的条目，随后都拿到了一次 `fail`**：
+
+```text
+#1  error 11:21 → fail 13:02   |   #10 error 11:45 → fail 13:31
+#2  error 11:59 → fail 13:49   |   #14 error 11:35 → fail 13:17   （16 条同形态）
+```
+
+**根因**：当晚基础镜像未构建（`docker build -t fissue/sandbox-base:latest docker/sandbox`
+是 `USAGE.md` 里的准备步骤），而运行期 `ensure_image()` 尝试去 Docker Hub 拉同名镜像又超时失败。
+该报错路径已在本地复现：
+
+```text
+INFO  镜像 fissue/…:latest 不存在，尝试拉取…
+ERROR 拉取镜像失败：… context deadline exceeded
+→  ExecResult(ok=False, error='镜像不可用：…')
+```
+
+再者，本文档自己的口径是「取**最新一次**结论，阶段统计是**累计**的」（§7.3）。
+15 次 error 与 16 次 fail 按时段互斥、且逐条一一对应——**累计统计把同一个瞬态故障算成了"大面积失败"**。
+
+**修正后的结论**：
+
+- 那 15 次 error **不构成"根因定位未被测量"的证据**，应从「站不住」中撤下。
+- pipekit 得到的是 **16 条 `base fail` + 16 条 `regression:base` 全 `pass`**（12 Issue + 4 PR）——
+  验证器生成能在未修复代码上稳定复现这些跨模块缺陷。
+- `f2p_satisfied=1` 只有 3 条，指的是 **PR 侧**：5 个 PR 里 PR1/PR4/PR5 的三段式
+  （`base` fail → `fix` pass → 回归门 pass）成立。`fix` 阶段的 **4 次运行全部来自 PR**
+  （#16/#17/#19/#20；#18 是纯文档 PR，按设计不验证），**与 Issue 无关**。
+- pipekit 真正未被测量的是 **Issue 侧自动修复**：10 条 tier1/tier2 全部停在 `fix_queued`，
+  `fix_attempts` 记录为 **0**、`data/patches/` 无 pipekit 补丁（与 §4.5 一致），见 [§5](#5-尚未测量)。
+
+**状态**：**已定位**（非夹具缺陷、非能力缺陷，是环境准备缺失 + 统计口径），并已加固工具链：
+`fissue verify` 现在会在跑整批之前做一次**基础镜像前置检查**——只查存在性、**不触发拉取**
+（拉取失败前要空等约 20 秒超时，放进逐条检查会比原问题更糟），缺镜像时毫秒级拦下整批并给出
+`docker build` 命令，取代原来「每条先克隆 + LLM 生成验证器、最后才在沙盒里报错」的形态。
 
 ### 4.2 envkit 的 5 处 tier 期望偏差
 
@@ -233,36 +277,65 @@ Agent 循环的失败尝试属于正常现象（自纠错过程的中间态）�
 > ⚠️ 注意：以上**没有任何一次真实提 PR**。Fissue 的自动提 PR 路径
 > **尚未在本基准中被端到端验证过**。
 
-### 4.6 lockkit PR4 的回归门样本失效（构造期发现）
+### 4.6 lockkit PR4 的回归门样本：一次失效与修复（构造期发现，已修）
 
-**这一条不是 Fissue 的缺陷，是夹具自身的规格 bug**，但同样公开。
+**这一条不是 Fissue 的缺陷，是夹具自身的规格 bug**，但同样公开——
+包括我们**第一次修错**的过程。
 
-**现象**：`lockkit` README 声称 PR4（`fix/retry-cap-and-subclass`）会让
-`tests/test_gate.py` 的相关既有测试「从绿变红」，从而演示回归门拦截。
-构造该分支时实测**并非如此**：
+#### 4.6.1 原设计失效
+
+`lockkit` 最初把 PR4（`fix/retry-cap-and-subclass`）设计为「顺手把
+`Latch.open` 由 `== 0` 改成 `<= 0`」，声称这会让
+`tests/test_gate.py` 的既有测试从绿变红。构造时实测**并非如此**：
 
 ```text
 把 Latch.open 由 `self._remaining == 0` 改成 `self._remaining <= 0`
  →  87 passed，没有任何一条测试变红
 ```
 
-**根因（三条叠加）**：
+三条原因叠加：
 
 1. 基线只断言 `open is False`，此时 `remaining == 2` —— `== 0` 与 `<= 0` 都满足；
 2. 能区分两者的唯一路径是「一次 `count_down(n)` 跨过阈值」，
    而 `count_down()` 的返回值**就是** `open`，基线从未构造这个场景；
-3. 最关键：`<= 0` 恰恰是 Issue #7 的**正确修复**，不是回归——
+3. **最关键**：`<= 0` 恰恰是 Issue #7 的**正确修复**，不是回归——
    `count_down` 返回 `self.open`，若恢复 `== 0`，`count_down(5)` 会把闩锁
-   留在「未打开」状态。PR 正文把它描述成「顺手统一口径」，
-   实际是在修一个真缺陷。
+   留在「未打开」状态。
 
-**后果**：PR4 会走「F2P 成立 + 回归门通过 → 建议合并」这条**正确**路径，
-但夹具预期的「回归门拦截」**演示不出来**。即 `lockkit` 无法像另外三套那样
-提供回归门对抗样本。
+#### 4.6.2 一个看似显然、实则有害的「修法」
 
-**状态**：未修复。可选修法——在 `tests/test_gate.py` 补一条覆盖
-「一次跨过阈值」的基线断言，并改用一个**真正**破坏既有行为的改动
-（例如动 `ResourcePool.release` 的重复归还判定）来替代 PR4 的回归引入。
+顺着上面的分析，最自然的补救是「给 `tests/test_gate.py` 补一条覆盖
+『一次跨过阈值』的基线断言」。**这个想法是错的，已否决**：
+
+那条断言在**未修复的 `main`** 上就会失败（`count_down(5)` 后 `open` 为 `False`
+而 `remaining` 为 0）。把它加进基线，等于让基线**不再是全绿**——
+而全绿基线正是本夹具赖以成立的前提（也是回归门「base 绿则可信」判定的前提）。
+换句话说，用「补断言」去造回归样本，会让 `main` 变成「本就红」的仓库，
+反而使**整条回归门对所有条目失效**。
+
+**这提醒了一件事**：造回归样本必须选一个「既有行为确实正确、却被改坏」的点，
+不能选「本来就错、被改对」的点。
+
+#### 4.6.3 已采用的修法
+
+改用 `should_retry` 作为被破坏点。PR4 在修好 `delay_for`（目标用例通过）的同时，
+「顺手」剥掉 `should_retry` 的 `attempt >= self.attempts` 次数判断，
+只留异常类型判定，并声称「尝试次数耗尽交由调用方判断」。
+
+`should_retry` 是对外契约、有独立语义，因此真有既有测试变红：
+
+```text
+FAILED tests/test_retry.py::test_should_retry_exhausted_attempts
+E   assert True is False
+E    +  where True = should_retry(ValueError('x'), attempt=2)   # attempts=2，已耗尽
+1 failed, 86 passed
+```
+
+而 `retry_call` 自己就用 `attempt >= active.attempts` 判断、并不走 `should_retry`，
+所以功能上「看着没事」——**只看 F2P 会误判为「可合并」，只有跑既有测试回归门
+才拦得住**。这正是该样本要演示的东西。
+
+**状态**：**已修复**。`lockkit` 现在与另外三套一样，能提供有效的回归门对抗样本。
 
 ---
 
@@ -272,11 +345,12 @@ Agent 循环的失败尝试属于正常现象（自纠错过程的中间态）�
 
 | 项 | 状态 |
 |---|---|
+| **`pipekit` 的 Issue 侧自动修复（`fissue fix`）** | **从未运行**（`fix_attempts` = 0、无 patch 产物），10 条 tier1/tier2 全部停在 `fix_queued`。注意：PR 侧 5 个 PR 中 4 个**已完整测量**（#18 为纯文档 PR，按设计不验证），详见 [§4.1](#41-pipekit-的-base-error已定位瞬态环境故障非能力问题) |
 | `lockkit`（15 Issue + 5 PR） | **从未运行**。夹具与 5 个 `fix/*` 分支已就绪、基线 87 passed 全绿；但 Fissue 只支持从平台 API 抓取（无本地导入），该仓库尚未推送到 GitHub，故无法进入 fetch→eval→verify→fix 链路 |
 | 真实提 PR（`mode: fork` + `auto_submit: true`） | **从未运行**。所有修复均为 dry-run |
 | Gitee / AtomGit / GitLab 平台 | 仅单测覆盖，**无端到端实测** |
 | PostgreSQL 后端 | 开发期使用 SQLite |
-| 冻结版本的可复现跑分 | **不存在**。需要固定 commit + 固定模型温度重跑 |
+| 冻结版本的可复现跑分 | **工具已就绪**（`fissue bench`），但**尚未冻结任何正式基线**。`bench capture` 会记录 git commit + 是否有未提交改动、模型与采样参数、关键配置指纹，以及各阶段结果；`bench diff` 先判**可比性**再给逐项增量。缺的只是一次「commit 干净 + 参数固定」的正式测量——见 [§6](#6-如何复现)。 |
 
 ---
 
@@ -304,6 +378,32 @@ fissue fix    --repo John-is-playing/ratekit --dry-run --limit 6
 fissue report --repo John-is-playing/ratekit --format markdown --out data/exports/ratekit.md
 ```
 
+### 6.1 冻结一份可复现的基线
+
+上面「出报告」只产出**可读**的 Markdown，无法机械比对。要做正式跑分，
+用 `fissue bench` 冻结**机器可读**的基线——它同时记录**前提**与**结果**：
+
+```bash
+# 1) 前提必须先干净：commit 已提交、工作区无未提交改动、模型参数固定
+git status --short          # 应无输出
+git rev-parse HEAD          # 记下这个 commit
+
+# 2) 冻结（只读数据库，不触发抓取/评测）
+fissue bench capture --repo John-is-playing/ratekit --label ratekit-<commit 短哈希>
+
+# 3) 之后任何改动（代码或配置）再冻结一次，然后逐项对比
+fissue bench capture --repo John-is-playing/ratekit --label ratekit-<新哈希>
+fissue bench diff data/benchmarks/ratekit-<旧哈希>.json data/benchmarks/ratekit-<新哈希>.json
+```
+
+`bench diff` **先判可比性再给数字**；若 commit、模型或工作区状态不一致，
+它会直接标 `不可比` 并说明原因，不会给出一个会被误当成回归结论的增量。
+退出码：`0` 可比且无变化｜`1` **不可比**｜`2` 可比但有变化。
+
+> ⚠️ **工作区脏的基线会被标记 `reproducible: false`**。这是刻意的：
+> 本文档 §7.2「非冻结」这一局限，正是靠这个标记被机械地表达出来——
+> 不允许拿「代码随时会变」的两次测量当回归依据。所以**正式跑分前先提交**。
+
 **注意**：`fissue eval/verify/fix` 需要 LLM Key；单测（`python -m pytest -q`）
 完全离线，不需要 Key 也不需要 Docker。
 
@@ -321,7 +421,7 @@ fissue report --repo John-is-playing/ratekit --format markdown --out data/export
    本文档取**最新一次**结论，但阶段统计是**累计**的。
 4. **模型差异**：换一个 LLM 供应商，全部数字都会变。
 5. **夹具偏差**：五套夹具由本项目设计，可能存在"照着 Fissue 的长处出题"的偏差。
-   反面证据：pipekit 的大量 `base error` 说明**不是所有维度都好看**。
+   反面证据：pipekit 的 Issue 侧自动修复**从未运行**，说明**不是所有维度都好看**。
 
 ---
 
@@ -335,7 +435,10 @@ fissue report --repo John-is-playing/ratekit --format markdown --out data/export
 
 **站不住的**：
 
-- pipekit 的跨模块根因定位能力**基本未被有效测量**（15 次 base error）。
+- pipekit 的 **Issue 侧自动修复从未运行**（10 条 tier1/tier2 停在 `fix_queued`），
+  故「跨模块根因定位 → 自动改对文件」这一环**未被测量**
+  ——注意：这**不是**早先归因的「15 次 base error」，那 15 次是瞬态环境故障，见 [§4.1](#41-pipekit-的-base-error已定位瞬态环境故障非能力问题)。
+  （PR 侧的合并验证已覆盖 4/5 个 PR。）
 - 真实提 PR 路径**从未端到端验证**。
 - lockkit（并发/资源不变量维度）**完全未测量**。
 - tier 标定存在**公开保留**的期望不一致（envkit 5 处）。
@@ -356,3 +459,44 @@ fissue report --repo John-is-playing/ratekit --format markdown --out data/export
 | 评测报告（逐条结论） | `data/exports/*.md` |
 | 缺陷清单与修复过程 | `30ae40b-BUG.md` |
 | 各夹具期望对照表 | `demo/<kit>/README.md` |
+
+---
+
+## 附二：修订记录
+
+### §4.1 的原文（2026-10-08 复核前）
+
+本节曾是本文档「最重要的未解问题」，现按 [§4.1](#41-pipekit-的-base-error已定位瞬态环境故障非能力问题) 的复核结论改写。
+原文照抄如下，供读者核对这次修正是否站得住：
+
+```text
+### 4.1 pipekit 的 base error
+
+**现象**：pipekit 有 15 次 base 阶段 error，且只有 3 个验证器达到 f2p_satisfied=1
+（相对 20 个条目）。
+
+**含义**：沙盒执行本身失败，结论不可信，这些条目未被自动修复（保守行为正确），
+但也意味着 pipekit 的根因定位能力大部分没能被验证。
+
+**影响**：这是目前最大的未解问题。pipekit 是专门设计来考"跨模块根因定位"的夹具，
+它的 base 阶段大面积失败，说明该维度的能力尚未得到有效测量。
+
+**状态**：未修复。需要单独排查（沙盒环境？依赖装不全？超时？），
+建议后续用 fissue verify --repo John-is-playing/pipekit --key <单条> 逐条定位。
+```
+
+**改了什么**：
+
+| 位置 | 原文 | 现文 |
+|---|---|---|
+| §2.2 说明 | 「pipekit 的 15 次全部是 error，这是本基准最大的一个未解问题」 | 同一瞬态故障、且每条随后都重跑成功 |
+| §4.1 标题 | 「pipekit 的 base error」 | 追加「已定位：瞬态环境故障，非能力问题」 |
+| §5 | 无 pipekit 行 | 新增「Issue 侧自动修复从未运行」为真正未测量项 |
+| §7.5 | 反面证据=「大量 base error」 | 反面证据=Issue 侧自动修复从未运行 |
+| §8 站不住 | 「根因定位基本未被有效测量（15 次 base error）」 | 「Issue 侧自动修复从未运行」 |
+| `README.md` | 同 §8 | 同 §8 |
+
+**依据**：`fissue.db` 的 `verifier_runs` 表。15 次 error 的 `error` 字段去重后仅
+`镜像不可用：fissue/sandbox-base:latest` 一条，`exit_code` 全 `NULL`、
+`duration_seconds` 0.42~0.72s、`stderr` 0 字节；按时段切分与后续 16 次 `fail`
+互斥且逐条对应。复现与加固过程见 §4.1「状态」。

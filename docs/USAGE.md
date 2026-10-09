@@ -551,7 +551,43 @@ fissue export --category bug --status evaluated        # 按条件过滤
 # 查看当前状态（条目统计 / 队列 / 用量 / 沙盒）
 fissue status
 fissue status --json
+
+# 跑分基线：冻结一次测量的前提与结果，日后逐项对比
+fissue bench capture --label ratekit-v1        # → data/benchmarks/ratekit-v1.json
+fissue bench list                             # 列出已冻结的基线
+fissue bench diff 旧.json 新.json              # 逐项增量 + 是否可比
 ```
+
+**为什么需要跑分基线**：`BENCHMARK.md` 里的数字来自「开发期累计运行」，
+期间项目自身在改代码、模型输出又不确定，于是那些数字**回答不了**最基本的问题——
+*这次改动让结果变好了还是变坏了？* `bench` 把「测量」变成可对比的快照：
+
+| 记录 | 内容 |
+|---|---|
+| **前提** | git commit + 是否有未提交改动、模型与采样参数（temperature/max_tokens）、关键配置指纹（回归门档位、stall_rounds、tier 阈值…） |
+| **结果** | 条目分布、各阶段 outcome 交叉表、F2P 成立数、修复结果（补丁/PR/轮次） |
+
+```bash
+# 典型用法：改动前后各冻结一次，再对比
+fissue bench capture --repo John-is-playing/ratekit --label ratekit-before
+#   … 改代码 / 调配置 …
+fissue bench capture --repo John-is-playing/ratekit --label ratekit-after
+fissue bench diff data/benchmarks/ratekit-before.json data/benchmarks/ratekit-after.json
+```
+
+`diff` 会**先判可比性**再给数字，三种情形显式点名：
+
+```
+✅ 可比：commit / 模型 / 工作区状态一致
+⚠️  不可比——以下前提不同，结论不能当回归依据：
+   - commit 不同（68d5bd49 → c3f1a2b0）
+   - 存在未提交改动（新基线 38 个文件）
+   - 模型不同（qwen3.6-plus → deepseek-chat）
+```
+
+退出码：`0` 可比且无变化｜`1` **不可比**（结论不能当回归依据）｜`2` 可比但有变化——
+便于塞进 CI 当回归门。基线文件默认落在 `data/benchmarks/`，**是唯一进版本库的
+`data/` 子目录**（其余数据仍在 `.gitignore` 内）。
 
 ### 8.2 常驻服务（serve）
 
@@ -958,6 +994,10 @@ fissue fix   [-r owner/name] [--key KEY] [--limit N] [--plan] [--dry-run] [--rou
 fissue report [-r owner/name] [-f markdown|json] [-o 路径] [--with-body]
 fissue export [-f json|markdown] [-o 路径] [--category X] [--status Y]
 fissue status [--json]
+
+fissue bench capture [-r owner/name] [--label 名字] [-o 路径] [--json]
+fissue bench list [--json]
+fissue bench diff 旧.json 新.json [--json]     # 退出码 0=无变化 1=不可比 2=有变化
 
 fissue serve [--once] [--with-web]
 fissue web [--host H] [--port P] [--reload]
