@@ -137,6 +137,7 @@ def render_repo_context(
     file_tree: Sequence[str] | None = None,
     readme: str | None = None,
     api_signatures: str | None = None,
+    call_graph: str | None = None,
 ) -> str:
     """仓库上下文（沙盒/修复阶段用）。
 
@@ -144,6 +145,10 @@ def render_repo_context(
     :meth:`RepoWorkspace.api_signatures` 抽取）。没有它，模型只能靠文件树与
     README **猜** API 形状——envkit #12 实测因此反复写出自错验证器
     （对 ``TTLCache`` 用下标赋值、在 ``stats()`` 的 dict 上取 ``.hits`` 属性）。
+
+    ``call_graph``：跨模块调用链（由 :meth:`RepoWorkspace.call_graph` 抽取）。
+    没有它，模型会只改报错点所在文件、不去看真正的根因模块——pipekit #3 实测
+    就是这样连续 10 轮零进展的。
     """
     parts: list[str] = []
     if language_hint:
@@ -158,6 +163,17 @@ def render_repo_context(
         parts.append(
             "公开 API 契约（**照此调用，不要臆测方法名、参数或返回类型**）：\n"
             + _truncate(api_signatures.strip(), 6000)
+        )
+    if call_graph:
+        parts.append(
+            "跨模块调用链（**报错点常常不是根因**：顺着链找到真正被调用的那个模块再改）：\n"
+            + _truncate(call_graph.strip(), 4000)
+        )
+        parts.append(
+            "排查顺序要求：验证器失败时，**先按上面的调用链逐层往下看**——"
+            "从失败用例调用的那个函数出发，找到它真正依赖的下层函数，"
+            "确认哪一层的输入输出不符合文档语义。**不要只在报错点所在文件里反复改**："
+            "同一个语义约定可能同时存在于链上多处，需要分别修正。"
         )
     return "\n".join(parts) if parts else "（无额外上下文）"
 

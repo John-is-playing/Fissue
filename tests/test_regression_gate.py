@@ -372,6 +372,10 @@ class _FakeWs:
         """公开 API 契约；替身给最小样本即可。"""
         return "def f() -> int"
 
+    def call_graph(self, **kw) -> str:
+        """跨模块调用链；替身给最小样本即可（真实工作区由 ast 抽取）。"""
+        return "a.f → b.g"
+
     def detect_test_command(self, hint: str | None = None) -> str | None:
         return None
 

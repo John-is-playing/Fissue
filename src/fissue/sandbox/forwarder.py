@@ -403,6 +403,19 @@ class SandboxManager:
         runtime = DockerRuntime(self.cfg)
         return runtime.available()
 
+    def image_ready(self, image: str) -> tuple[bool, str]:
+        """基础镜像是否就绪（快速存在性检查，**不触发拉取**）。
+
+        ``local`` 模式 / 未启用沙盒时无需镜像，一律返回就绪——
+        否则 ``fissue verify`` 会在本机开发模式下被前置闸门挡住。
+        转发组件模式下由远端提供镜像，宿主侧无从判断，故也放行。
+        """
+        if not self.cfg.enabled or self.cfg.runtime == "local":
+            return True, "无需基础镜像（未启用容器沙盒）"
+        if not self.inline:
+            return True, "镜像由转发组件侧提供"
+        return DockerRuntime(self.cfg).image_ready(image or self.cfg.image)
+
     async def run(self, req: ExecRequest) -> ExecResult:
         if not self.cfg.enabled:
             return ExecResult(ok=False, error="沙盒未启用（sandbox.enabled=false）")

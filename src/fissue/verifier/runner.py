@@ -192,14 +192,15 @@ def verifier_self_error(run: VerifierRun, *, verifier_files: Iterable[str] = ())
 #: （常量与其使用者同处一处，避免跨模块仅为一个字符串而互相依赖）。
 
 
-def extract_failed_tests(run: VerifierRun) -> list[str]:
-    """从测试输出里尽量提取失败的用例名（strict 拒绝时要点名，否则人工无从复核）。
+def failed_test_ids_from_output(text: str) -> tuple[str, ...]:
+    """从测试输出文本里提取失败用例名（顺序保留、去重）。
 
     覆盖 pytest（``FAILED tests/...::test_x``）、go（``--- FAIL: TestX``）、
-    jest（``✕ name`` / ``● suite › test``）。
+    jest（``✕ name`` / ``● suite › test``）。Agent 循环用它判断「是否还在推进」，
+    故返回**元组**（可哈希、可比较，便于放进 dataclass 与集合运算）。
     """
     seen: list[str] = []
-    for line in (run.stdout or "").splitlines():
+    for line in (text or "").splitlines():
         stripped = line.strip()
         if stripped.startswith("FAILED ") and "::" in stripped:
             seen.append(stripped[len("FAILED "):].strip())
@@ -213,7 +214,16 @@ def extract_failed_tests(run: VerifierRun) -> list[str]:
     for name in seen:
         if name and name not in named:
             named.append(name)
-    return named
+    return tuple(named)
+
+
+def extract_failed_tests(run: VerifierRun) -> list[str]:
+    """从测试输出里尽量提取失败的用例名（strict 拒绝时要点名，否则人工无从复核）。
+
+    覆盖 pytest（``FAILED tests/...::test_x``）、go（``--- FAIL: TestX``）、
+    jest（``✕ name`` / ``● suite › test``）。
+    """
+    return list(failed_test_ids_from_output(run.stdout or ""))
 
 
 def judge_regression(

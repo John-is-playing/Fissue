@@ -161,6 +161,89 @@ def test_sandbox_manager_disabled(settings) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 基础镜像前置检查（image_ready）
+#
+# 缺镜像时，每条验证都要「克隆 → LLM 生成验证器 → 沙盒报错」白跑一遍：
+# pipekit 实测 15 条全栽在 `镜像不可用` 这一条上。前置检查把它提前到毫秒级。
+# 前提：检查**只能查存在性，绝不触发拉取**——拉取失败前会空等约 20 秒超时，
+# 放进逐条前置检查会比原问题更糟。
+# ---------------------------------------------------------------------------
+
+
+def test_docker_runtime_image_ready_never_pulls(monkeypatch) -> None:
+    """缺镜像时只报「不存在」，不得触发 docker pull。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    calls: list[list[str]] = []
+
+    class _Proc:
+        def __init__(self, code: int, out: str = "", err: str = "") -> None:
+            self.returncode, self.stdout, self.stderr = code, out, err
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _Proc(1, "", "Error: No such image")
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", fake_run)
+    rt = DockerRuntime(SandboxConfig(runtime="docker", image="fissue/x:latest"))
+    rt._docker_bin = "docker"          # 不依赖本机是否装了 docker
+
+    ok, why = rt.image_ready("fissue/x:latest")
+
+    assert ok is False
+    assert "基础镜像不存在" in why
+    assert calls and all("pull" not in c for c in calls), f"不该触发拉取：{calls}"
+
+
+def test_docker_runtime_image_ready_true_when_present(monkeypatch) -> None:
+    """镜像已在本地 → 判就绪（一条命令、无拉取）。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    calls: list[list[str]] = []
+
+    class _Proc:
+        returncode, stdout, stderr = 0, "[]", ""
+
+    monkeypatch.setattr(
+        "fissue.sandbox.runtime.subprocess.run",
+        lambda cmd, **kw: (calls.append(list(cmd)), _Proc())[1],
+    )
+    rt = DockerRuntime(SandboxConfig(runtime="docker", image="fissue/x:latest"))
+    rt._docker_bin = "docker"
+
+    assert rt.image_ready("fissue/x:latest")[0] is True
+    assert len(calls) == 1 and "pull" not in calls[0]
+
+
+def test_sandbox_manager_image_ready_by_mode(settings, monkeypatch) -> None:
+    """local / 未启用沙盒 → 无需镜像，一律放行（否则本机开发跑不了 verify）。"""
+    settings.sandbox.runtime = "local"
+    assert SandboxManager(settings.sandbox, force_inline=True).image_ready("x:latest")[0] is True
+
+    settings.sandbox.runtime = "docker"
+    settings.sandbox.enabled = False
+    assert SandboxManager(settings.sandbox, force_inline=True).image_ready("x:latest")[0] is True
+
+    # docker 模式：透传到 runtime，且空值回落到配置里的镜像名
+    from fissue.sandbox.runtime import DockerRuntime
+
+    settings.sandbox.enabled = True
+    seen: dict[str, str] = {}
+
+    def fake(self, image):  # noqa: ANN001
+        seen["image"] = image
+        return False, f"基础镜像不存在：{image}"
+
+    monkeypatch.setattr(DockerRuntime, "image_ready", fake)
+    ok, why = SandboxManager(settings.sandbox, force_inline=True).image_ready("")
+
+    assert ok is False and "基础镜像不存在" in why
+    assert seen["image"] == settings.sandbox.image
+
+
+# ---------------------------------------------------------------------------
 # 验证器生成
 # ---------------------------------------------------------------------------
 

@@ -24,7 +24,9 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,8 +34,10 @@ import typer
 
 from ..config import Settings, load_settings
 from ..errors import FissueError
-from ..logging_setup import setup_logging
+from ..logging_setup import get_logger, setup_logging
 from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
+
+log = get_logger(__name__)
 
 app = typer.Typer(
     name="fissue",
@@ -43,8 +47,10 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库管理")
 sandbox_app = typer.Typer(help="沙盒与转发组件")
+bench_app = typer.Typer(help="跑分基线：冻结测量前提与结果，便于逐项对比")
 app.add_typer(db_app, name="db")
 app.add_typer(sandbox_app, name="sandbox")
+app.add_typer(bench_app, name="bench")
 
 # ---------------------------------------------------------------------------
 # 通用选项与输出
@@ -327,9 +333,20 @@ def verify(
     verbose: bool = VERBOSE_OPT,
     limit: Optional[int] = LIMIT_OPT,
     key: Optional[str] = typer.Option(None, "--key", help="只验证指定条目，如 github:owner/name#12"),
+    concurrency: Optional[int] = typer.Option(
+        None, "--concurrency", help="条目级并发数（默认取 config.yaml 的 verifier.concurrency）"
+    ),
+    retries: Optional[int] = typer.Option(
+        None, "--retries", help="单条失败（如克隆/网络抖动）后的重试次数（默认取 verifier.item_retries）"
+    ),
     json_out: bool = JSON_OPT,
 ) -> None:
-    """生成验证器并在沙盒中做 F2P 验证（base 必失败、修复后必通过）。"""
+    """生成验证器并在沙盒中做 F2P 验证（base 必失败、修复后必通过）。
+
+    每条耗时几乎全在 LLM 生成验证器上（单次数十秒到数分钟），沙盒执行只占 1~2 秒，
+    因此条目级并发能近似线性压缩墙钟时间。每条默认带重试，避免一次克隆/网络抖动
+    就把整条打成 ``failed``（重跑要从头再来一遍）。
+    """
     settings = load_cfg(config, env, verbose=verbose, require_llm=True)
 
     async def main() -> int:
@@ -350,7 +367,6 @@ def verify(
                 if item is None:
                     fail(f"条目不存在：{key}")
                 targets = [item]
-                repos_cfg = None
             else:
                 repos = _resolve_repos(settings, repo, platform)
                 targets = []
@@ -362,34 +378,106 @@ def verify(
                             limit=limit or 30,
                         )
                     )
-                repos_cfg = repos
 
             stage_issue = VerifyStage(ctx)
             stage_pr = PRVerifyStage(ctx)
-            for item in targets:
-                ev = ctx.repo.latest_evaluation(item.key)
-                if ev is None:
-                    emit(f"跳过 {item.key}：尚未评测")
-                    continue
-                # 只有 Issue-FEATURE 不验证（没有缺陷可复现，只打标签等开发者）；
-                # PR-FEATURE 要照常验证——否则「只改文档冒充功能实现」的 PR 会
-                # 没有任何结论（envkit #18 实测）。与 process_repo 的口径一致。
-                if ev.category is not _C.BUG and item.item_type is ItemType.ISSUE:
-                    emit(f"跳过 {item.key}：分类为 {ev.category.value}（Issue-FEATURE 不验证，只打标签）")
-                    ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
-                    continue
-                r = await (stage_issue.run(item, ev) if item.item_type is ItemType.ISSUE else stage_pr.run(item, ev))
-                rows.append(
-                    {
-                        "key": r.key,
-                        "type": item.item_type.value,
-                        "verifier": r.verifier_kind.value if r.verifier_kind else "-",
-                        "reproduced": bool(r.verifier_result and r.verifier_result.reproducible),
-                        "f2p": bool(r.verifier_result and r.verifier_result.f2p_satisfied),
-                        "queued": r.queued.value if r.queued else "-",
-                        "note": (r.skipped_reason or r.error or (r.notes[-1] if r.notes else ""))[:48],
-                    }
-                )
+            total = len(targets)
+            if not total:
+                emit("（没有待验证条目：只处理 status=evaluated；failed 条目请用 --key 指定）")
+                if json_out:
+                    emit_json(rows)
+                return 0
+
+            # 基础镜像前置检查（快速存在性判断，**不触发拉取**）。
+            # 缺镜像时每条都要「克隆 → LLM 生成验证器 → 沙盒报错」白跑一遍，
+            # 十几条叠起来既烧 token 又白等（pipekit 实测 15 条全栽在这同一条上）。
+            # 放在「确认有目标条目」之后：空队列仍然安静退出。
+            # ``--key`` 单条诊断不拦——那正是逐条定位问题用的路径。
+            if not key:
+                ready, img_reason = ctx.sandbox.image_ready(settings.sandbox.image)
+                if not ready:
+                    fail(
+                        f"{img_reason}\n"
+                        f"   先构建基础镜像再跑验证：docker build -t {settings.sandbox.image} docker/sandbox\n"
+                        "   （或以 sandbox.runtime: local 运行，隔离性更弱、仅建议本机开发）"
+                    )
+
+            workers = max(1, concurrency or settings.verifier.concurrency)
+            max_retries = max(0, retries if retries is not None else settings.verifier.item_retries)
+            emit(
+                f"待验证 {total} 条｜并发 {min(workers, total)}｜单条重试 {max_retries} 次"
+                "（每条耗时几乎全在 LLM 生成验证器，请耐心等待）"
+            )
+
+            # 进度计数：并发下由 lock 保护，保证「第 N/M 条」单调不重复。
+            done = 0
+            lock = asyncio.Lock()
+            sem = asyncio.Semaphore(workers)
+
+            async def run_one(item) -> dict[str, Any] | None:
+                nonlocal done
+                async with sem:
+                    # 整条包一层兜底：任何未捕获异常都不能让 gather 连累整批，
+                    # 否则一条失败会把已经跑完的 N 条结果一起丢掉。
+                    try:
+                        ev = ctx.repo.latest_evaluation(item.key)
+                        if ev is None:
+                            emit(f"跳过 {item.key}：尚未评测")
+                            return None
+                        # 只有 Issue-FEATURE 不验证（没有缺陷可复现，只打标签等开发者）；
+                        # PR-FEATURE 要照常验证——否则「只改文档冒充功能实现」的 PR 会
+                        # 没有任何结论（envkit #18 实测）。与 process_repo 的口径一致。
+                        if ev.category is not _C.BUG and item.item_type is ItemType.ISSUE:
+                            emit(f"跳过 {item.key}：分类为 {ev.category.value}（Issue-FEATURE 不验证，只打标签）")
+                            ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
+                            return None
+
+                        stage = stage_issue if item.item_type is ItemType.ISSUE else stage_pr
+                        started = time.monotonic()
+                        async with lock:
+                            emit(f"▶  {item.key} 开始验证（{time.strftime('%H:%M:%S')}）")
+                        r = await _verify_with_retry(
+                            lambda: stage.run(item, ev),
+                            item_key=item.key,
+                            max_retries=max_retries,
+                        )
+                        elapsed = time.monotonic() - started
+                        row = {
+                            "key": r.key,
+                            "type": item.item_type.value,
+                            "verifier": r.verifier_kind.value if r.verifier_kind else "-",
+                            "reproduced": bool(r.verifier_result and r.verifier_result.reproducible),
+                            "f2p": bool(r.verifier_result and r.verifier_result.f2p_satisfied),
+                            "queued": r.queued.value if r.queued else "-",
+                            "note": (r.skipped_reason or r.error or (r.notes[-1] if r.notes else ""))[:48],
+                        }
+                        async with lock:
+                            done += 1
+                            emit(
+                                f"[{done}/{total}] {_verify_progress(r, elapsed)}"
+                                f"（本条 {elapsed:.0f}s）"
+                            )
+                        return row
+                    except Exception as exc:
+                        from ..pipeline.stages import StageResult as _SR
+
+                        log.exception("验证条目异常 %s", item.key)
+                        err = _SR(key=item.key, error=f"{type(exc).__name__}: {exc}")
+                        async with lock:
+                            done += 1
+                            emit(f"[{done}/{total}] ❌ {item.key} 异常：{err.error[:60]}")
+                        return {
+                            "key": item.key,
+                            "type": item.item_type.value,
+                            "verifier": "-",
+                            "reproduced": False,
+                            "f2p": False,
+                            "queued": "-",
+                            "note": err.error[:48],
+                        }
+
+            results = await asyncio.gather(*(run_one(i) for i in targets))
+            rows.extend(r for r in results if r is not None)
         if json_out:
             emit_json(rows)
         else:
@@ -397,6 +485,77 @@ def verify(
         return 0
 
     run_async(main())
+
+
+# 克隆/LLM 网络抖动导致的失败不值得让整条作废：重跑要重走生成+沙盒。
+# 只重试这类「环境错误」，验证器自身写错（自错）由 runner 内部的修正回路处理，
+# 不在这里重试——那只会重复花 LLM 的钱而不改变结论。
+_TRANSIENT_ERROR_MARKERS = (
+    "克隆失败",
+    "GitError",
+    "git 超时",
+    "网络错误",
+    "连接失败",
+    "超时",
+    "timed out",
+    "timeout",
+    "Connection",
+    "LLM 服务错误",
+    "LLM 请求失败",
+)
+
+
+async def _verify_with_retry(run, *, item_key: str, max_retries: int):
+    """执行一次验证；失败且属环境错误时退避重试。
+
+    ``run`` 是无参协程工厂（每次重试都要新建协程对象，协程不可复用）。
+    重试用尽仍失败则返回一个带 ``error`` 的 StageResult，而不是抛异常——
+    否则一条失败会经 ``asyncio.gather`` 的默认行为连累整批。
+    """
+    from ..pipeline.stages import StageResult
+
+    delay = 2.0
+    last_error = ""
+    for attempt in range(1, max_retries + 2):
+        try:
+            return await run()
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt > max_retries:
+                break
+            if not _is_transient(last_error):
+                # 非环境错误（如配置错、条目状态异常）重试无意义，立即上抛由外层兜底
+                break
+            log.warning("验证失败（第 %d 次，将重试）：%s：%s", attempt, item_key, last_error[:200])
+            emit(f"⚠️  {item_key} 第 {attempt} 次失败（{last_error.split(':', 1)[0]}），{delay:.0f}s 后重试")
+            await asyncio.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 30.0)
+    log.error("验证失败（已用尽重试）：%s：%s", item_key, last_error)
+    return StageResult(key=item_key, error=last_error)
+
+
+def _is_transient(error: str) -> bool:
+    return any(marker in error for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _verify_progress(result, elapsed: float) -> str:
+    """把一条 StageResult 压成一行进度摘要，让长跑时有实时反馈。"""
+    if result.error:
+        return f"❌ {result.key} 失败：{result.error[:60]}"
+    if result.skipped_reason:
+        return f"⏭  {result.key} 跳过：{result.skipped_reason[:60]}"
+    vr = result.verifier_result
+    kind = result.verifier_kind.value if result.verifier_kind else "-"
+    if vr is None:
+        return f"？  {result.key}（{kind}）无结果"
+    if vr.reproducible:
+        mark = "✅"
+    elif vr.f2p_satisfied:
+        mark = "✅"
+    else:
+        mark = "⚠️ "
+    note = (result.notes[-1] if result.notes else vr.conclusion or "")[:40]
+    return f"{mark} {result.key}（{kind}）复现={vr.reproducible} f2p={vr.f2p_satisfied} {note}"
 
 
 # ---------------------------------------------------------------------------

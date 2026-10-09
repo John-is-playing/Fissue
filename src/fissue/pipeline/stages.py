@@ -350,6 +350,9 @@ class VerifyStage:
             file_tree=ws.file_tree(limit=150),
             readme=ws.readme(),
             api_signatures=ws.api_signatures(),
+            # 跨模块调用链：报错点常常不是根因，让模型能顺着链定位
+            # （pipekit #3：报错在 stats.count_batches，根因在 filterops.in_ranges）。
+            call_graph=ws.call_graph(),
         )
 
 
@@ -635,6 +638,9 @@ class PRVerifyStage:
             file_tree=ws.file_tree(limit=150),
             readme=ws.readme(),
             api_signatures=ws.api_signatures(),
+            # 跨模块调用链：报错点常常不是根因，让模型能顺着链定位
+            # （pipekit #3：报错在 stats.count_batches，根因在 filterops.in_ranges）。
+            call_graph=ws.call_graph(),
         )
 
     def _linked_issue_context(self, item: RawItem, repo_cfg) -> str:

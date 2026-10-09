@@ -538,11 +538,14 @@ class _ScriptLLM:
     def __init__(self, steps: list[dict]) -> None:
         self.steps = list(steps)
         self.calls = 0
+        #: 每轮收到的消息快照，供断言「提示是否真的进了上下文」。
+        self.history: list[list[dict]] = []
 
     async def chat_json(self, messages, *, purpose: str = "", **kwargs):
         from fissue.ai.client import Usage
 
         self.calls += 1
+        self.history.append(list(messages))
         data = self.steps.pop(0) if self.steps else {}
         return data, Usage(purpose="agent", model="scripted", prompt_tokens=10,
                            completion_tokens=5, cost_usd=0.0)
@@ -645,6 +648,166 @@ async def test_agent_requires_done_when_no_verifier_run(settings, workspace, sam
     )
     assert attempt.outcome is FixOutcome.FAILED
     assert runner.runs == 0
+
+
+# ---------------------------------------------------------------------------
+# Agent 循环：停滞检测（输出完全一致 → 提前收工）
+#
+# 回归：demo 实测 pipekit #8 —— base 阶段复现成功，但 Agent 每轮都只把
+# drop_ranges 的 s[1] 改成 s[0]，验证器输出连续 10 轮**逐字节相同**
+# （sha 一致、耗时同为 1.4s），一路空转到 12 轮上限，最后报出
+# 「达到最大轮次（12）仍未通过验证器」——而真相是「卡住了」，不是「修了 12 次」。
+# ---------------------------------------------------------------------------
+
+
+class _DigestRunner:
+    """按预设序列返回**不同输出**的验证器桩，用于驱动「输出是否变化」的判定。"""
+
+    def __init__(self, outputs: list[tuple[int, str]]) -> None:
+        from fissue.models import VerifierOutcome
+
+        self.outputs = list(outputs) or [(1, "boom")]
+        self.runs = 0
+        self._Outcome = VerifierOutcome
+
+    async def run_once(self, **kwargs):
+        from fissue.models import VerifierRun
+
+        exit_code, text = self.outputs[min(self.runs, len(self.outputs) - 1)]
+        self.runs += 1
+        outcome = self._Outcome.PASS if exit_code == 0 else self._Outcome.FAIL
+        return VerifierRun(
+            item_key=kwargs.get("item_key", "k"),
+            stage="agent",
+            outcome=outcome,
+            exit_code=exit_code,
+            stdout=text,
+        )
+
+
+def _agent_with_runner(settings, steps, runner):
+    llm = _ScriptLLM(steps)
+    return FixAgent(llm, None, runner, settings), llm, runner  # type: ignore[arg-type]
+
+
+async def test_agent_stops_early_when_verifier_output_never_changes(settings, workspace, sample_issue) -> None:
+    """输出完全一致且无进展 → 在 stall_rounds 内提前收工，不再空转到上限。"""
+    settings.auto_fix.stall_rounds = 3
+    # 每次都写同一个文件、验证器永远返回同一份失败输出
+    steps = [{"action": "write", "files": {"app.py": "def f():\n    return 9\n"}}] * 10
+    agent, llm, runner = _agent_with_runner(settings, steps, _DigestRunner([(1, "same failure")]))
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=12,
+    )
+
+    assert attempt.outcome is FixOutcome.FAILED
+    # 第 1 轮记基线（best=0），之后每轮无进展；累计到 3 → 第 4 轮收工
+    assert runner.runs == 4
+    assert llm.calls == 4                      # 没有空转到 12 轮
+    assert "停滞" in (attempt.error or "")
+    assert "仍未通过验证器" not in (attempt.error or "")   # 口径必须区分开
+    assert trace.no_progress_streak == 3
+
+
+async def test_agent_stalls_on_same_failing_case_despite_noisy_output(settings, workspace, sample_issue) -> None:
+    """回归 pipekit #3：每轮输出字节都不同（临时路径/耗时噪声），但失败的**是同一个用例**。
+
+    旧判据（输出逐字节相同）在这里完全失效——实测 #3 连跑 11 轮，每轮 sha 都不同，
+    失败用例却始终是 test_count_batches_endpoint_overlap。新判据看「失败用例数
+    有没有刷新更少」，因此能拦住这种形态。
+    """
+    settings.auto_fix.stall_rounds = 3
+    noisy = [
+        (1, f"FAILED tests/test_issue3.py::test_count_batches_endpoint_overlap\n"
+            f"============================= 1 failed in 0.{i}s =============================")
+        for i in range(12)
+    ]
+    # 每轮输出都不同（sha 各异），但失败用例数恒为 1
+    steps = [{"action": "write", "files": {"app.py": f"def f():\n    return {i}\n"}} for i in range(12)]
+    agent, llm, runner = _agent_with_runner(settings, steps, _DigestRunner(noisy))
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=12,
+    )
+
+    assert runner.runs == 4                    # 旧判据下这里会跑到 12 轮
+    assert llm.calls == 4
+    assert "停滞" in (attempt.error or "")
+    assert "test_count_batches_endpoint_overlap" in (attempt.error or "")   # 点名仍是哪条
+    assert trace.failed_tests == ("tests/test_issue3.py::test_count_batches_endpoint_overlap",)
+
+
+async def test_agent_stall_gate_can_be_disabled(settings, workspace, sample_issue) -> None:
+    """stall_rounds=0 关闭闸门 → 退回旧的「耗尽轮次」行为。"""
+    settings.auto_fix.stall_rounds = 0
+    steps = [{"action": "write", "files": {"app.py": "def f():\n    return 9\n"}}] * 10
+    agent, _llm, runner = _agent_with_runner(settings, steps, _DigestRunner([(1, "same failure")]))
+
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=3,
+    )
+
+    assert runner.runs == 3
+    assert "仍未通过验证器" in (attempt.error or "")
+
+
+async def test_agent_keeps_going_while_output_keeps_changing(settings, workspace, sample_issue) -> None:
+    """输出每轮都不同（真在推进）→ 不得被停滞闸门误杀。"""
+    settings.auto_fix.stall_rounds = 2         # 阈值故意设得很激进
+    steps = [{"action": "write", "files": {"app.py": f"def f():\n    return {i}\n"}} for i in range(1, 5)]
+    runner = _DigestRunner([(1, "fail A"), (1, "fail B"), (1, "fail C"), (1, "fail D")])
+    agent, _llm, _ = _agent_with_runner(settings, steps, runner)
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=4,
+    )
+
+    assert runner.runs == 4                    # 一路跑到轮次上限，未被提前掐断
+    assert trace.identical_output_streak == 1
+    assert "仍未通过验证器" in (attempt.error or "")
+
+
+async def test_agent_progress_resets_streak_when_failures_drop(settings, workspace, sample_issue) -> None:
+    """失败用例数在减少（真在推进）→ 即使失败的还是同名用例，也不得判停滞。"""
+    settings.auto_fix.stall_rounds = 2
+    # 3 → 2 → 1 → 1 → 1 …… 稳步收敛，只是慢
+    outputs = [
+        (1, "FAILED t.py::a\nFAILED t.py::b\nFAILED t.py::c"),
+        (1, "FAILED t.py::a\nFAILED t.py::b"),
+        (1, "FAILED t.py::a"),
+        (1, "FAILED t.py::a"),
+    ]
+    steps = [{"action": "write", "files": {"app.py": f"def f():\n    return {i}\n"}} for i in range(4)]
+    agent, _llm, runner = _agent_with_runner(settings, steps, _DigestRunner(outputs))
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=4,
+    )
+
+    assert runner.runs == 4, "收敛中不该被判停滞"
+    assert trace.best_failure_count == 1
+    assert "仍未通过验证器" in (attempt.error or "")   # 是「修不完」，不是「停滞」
+
+
+async def test_agent_escalation_hint_appears_once(settings, workspace, sample_issue) -> None:
+    """出现停滞迹象时，给模型一次「换思路」提示；之后不再重复塞入。"""
+    settings.auto_fix.stall_rounds = 0         # 关闭收工，专门看提示
+    steps = [{"action": "write", "files": {"app.py": "def f():\n    return 9\n"}}] * 5
+    agent, llm, _ = _agent_with_runner(settings, steps, _DigestRunner([(1, "same")]))
+
+    await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC,
+        repo_context="ctx", max_rounds=5,
+    )
+
+    prompts = "\n".join(m["content"] for call in llm.history for m in call)
+    assert prompts.count("没有任何进展") == 1, "提示应只出现一次"
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +935,9 @@ class _FakeWS:
 
     def api_signatures(self, **kw) -> str:
         return "def f() -> int"
+
+    def call_graph(self, **kw) -> str:
+        return "a.f → b.g"
 
     def cleanup(self) -> None:
         return None

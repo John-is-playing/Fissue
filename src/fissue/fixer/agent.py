@@ -39,7 +39,7 @@ from ..models import (
     VerifierSpec,
 )
 from ..store.repository import Repository
-from ..verifier.runner import VerifierRunner
+from ..verifier.runner import VerifierRunner, failed_test_ids_from_output
 from ..workspace import RepoWorkspace
 
 log = get_logger(__name__)
@@ -60,6 +60,16 @@ class AgentTrace:
     written_files: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
+    #: 上一轮验证器输出的指纹，与 :attr:`identical_output_streak` 一起用于给出提示。
+    last_verifier_digest: str | None = None
+    #: 验证器输出**逐字节**相同的轮数（首次出现记 1）。
+    identical_output_streak: int = 0
+    #: 最近一轮失败的用例集合（pytest 的 ``FAILED ...::id``）。
+    failed_tests: tuple[str, ...] = ()
+    #: 迄今见到的最少失败用例数（``None`` 表示还没跑过失败的验证器）。
+    best_failure_count: int | None = None
+    #: 连续多少轮**没有刷新最少失败数**。这是判定停滞的主判据。
+    no_progress_streak: int = 0
     usage: Usage = field(default_factory=Usage)
     summary: str = ""
     give_up_reason: str | None = None
@@ -155,7 +165,9 @@ class FixAgent:
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
-                finished = self._success_if_passed(attempt, trace, workspace, round_index)
+                finished, last_output = self._after_verifier_run(
+                    attempt, trace, workspace, round_index, last_output
+                )
                 if finished is not None:
                     return finished
                 continue
@@ -164,7 +176,9 @@ class FixAgent:
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
-                finished = self._success_if_passed(attempt, trace, workspace, round_index)
+                finished, last_output = self._after_verifier_run(
+                    attempt, trace, workspace, round_index, last_output
+                )
                 if finished is not None:
                     return finished
                 continue
@@ -187,7 +201,11 @@ class FixAgent:
                     attempt.outcome = FixOutcome.SUCCESS
                     attempt.rounds = round_index
                     return self._finalize(attempt, trace, workspace)
+                stalled = self._stall_stop(attempt, trace, workspace)
+                if stalled is not None:
+                    return stalled
                 trace.note("模型声称完成但验证器未通过，继续修复")
+                last_output = self._maybe_escalate(trace, last_output)
                 continue
 
             trace.note(f"未识别的动作：{action}")
@@ -372,13 +390,137 @@ class FixAgent:
         )
         output = f"[exit={run.exit_code} outcome={run.outcome.value}]\n{run.stdout}\n{run.stderr}"
         trace.test_outputs.append(output[:4000])
+        self._note_verifier_progress(trace, output, passed=self._last_passed(trace))
         return output[:6000]
+
+    def _note_verifier_progress(self, trace: AgentTrace, output: str, *, passed: bool) -> None:
+        """记录本轮验证器进展，用于识别「原地打转」的停滞。
+
+        判据不是「输出逐字节相同」，而是**失败用例数有没有刷新更少**。
+        否则会漏掉真实的停滞形态：输出里带容器临时路径（``/tmp/...``）与耗时，
+        每轮字节都不同，但失败的是**同一个用例**——demo 实测 pipekit #3 连跑
+        11 轮，输出 sha 每轮都变，失败用例却始终是 ``test_count_batches_endpoint_overlap``。
+        """
+        digest = hashlib.sha1(output.encode("utf-8")).hexdigest()
+        if digest == trace.last_verifier_digest:
+            trace.identical_output_streak += 1
+        else:
+            trace.last_verifier_digest = digest
+            trace.identical_output_streak = 1
+
+        if passed:
+            trace.no_progress_streak = 0
+            return
+
+        failed = failed_test_ids_from_output(output)
+        trace.failed_tests = failed
+        count = len(failed)
+
+        # 「有进展」= 失败用例数刷新更少。拿不到用例名时（非 pytest 形态、
+        # 输出被截断），退回「输出是否发生变化」——判据必须保守，没有证据
+        # 说明「没进展」就不能掐断循环。
+        improved = trace.best_failure_count is None or count < trace.best_failure_count
+        if count == 0:
+            improved = improved or trace.identical_output_streak == 1
+
+        if improved:
+            trace.best_failure_count = count
+            trace.no_progress_streak = 0
+        else:
+            trace.no_progress_streak += 1
 
     def _last_passed(self, trace: AgentTrace) -> bool:
         if not trace.test_outputs:
             return False
         last = trace.test_outputs[-1]
         return last.startswith("[exit=0") or "outcome=pass" in last[:60]
+
+    def _stall_rounds(self) -> int:
+        """停滞闸门的轮数阈值（``<=1`` 表示关闭）。"""
+        try:
+            return int(getattr(self.cfg, "stall_rounds", 4))
+        except (TypeError, ValueError):  # pragma: no cover - 配置异常时用默认值
+            return 4
+
+    def _maybe_escalate(self, trace: AgentTrace, last_output: str) -> str:
+        """出现停滞迹象时，给模型一次**改变思路**的明确提示。
+
+        仅在 ``no_progress_streak == 2`` 时提示一次：否则会把同一段话重复塞进
+        每一轮上下文。提示里带上仍然失败的用例名——那正是「没有进展」的具体证据。
+
+        这条提示是 C（调用链注入）的**兜底**：只把调用链摊在上下文里是「被动信息」，
+        模型可能视而不见（pipekit #3 实测：链就在上下文里，Agent 仍连续 5 轮只改
+        同一个文件）。这里把「换文件」说成一条**必须执行的动作**，并明确禁止
+        重复同一个改动。
+        """
+        if trace.no_progress_streak != 2:
+            return last_output
+        stuck = "、".join(trace.failed_tests[:3]) or "（未能识别用例名）"
+        return (
+            last_output
+            + "\n\n⚠️ 注意：连续两轮验证器输出没有任何进展"
+            f"（仍然失败的用例：{stuck}）。说明你上一轮的改动**没有产生效果**。\n"
+            "请立刻换一个**不同的文件**去改，不要在同一个文件上重复同一个改动：\n"
+            "1) 在这个失败的用例里找到它**实际调用**的函数（不是测试文件本身）；\n"
+            "2) 沿着仓库上下文给出的『跨模块调用链』往下一层走，检查**被调用方**的\n"
+            "   输入输出是否符合它的文档语义（例如：它问的到底是分片的**起点**还是**终点**？\n"
+            "   区间端点算不算在内？）；\n"
+            "3) 如果链上多处都存在同类语义问题，**每一处都要分别修正**——\n"
+            "   改好一处并不能顺带修好另一处。"
+        )
+
+    def _stall_stop(
+        self,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        workspace: RepoWorkspace,
+    ) -> tuple[FixAttempt, AgentTrace] | None:
+        """连续多轮「失败用例数没有刷新更少」→ 判定停滞，提前收工。
+
+        选这个判据而不是「输出逐字节相同」：输出里带容器临时路径与耗时，
+        逐字节比较会被噪声骗过。demo 实测 pipekit #3 连跑 11 轮，每轮输出 sha
+        都不同，失败的却始终是同一个用例 ``test_count_batches_endpoint_overlap``。
+
+        与轮次耗尽的区别必须体现在 ``error`` 里：停滞是「没有进展」，
+        不是「修了很多次没修好」。把两者混为一谈会误导人工复核。
+        """
+        limit = self._stall_rounds()
+        if limit <= 1 or trace.no_progress_streak < limit:
+            return None
+        stuck = "、".join(trace.failed_tests[:3]) or "（未能识别用例名）"
+        reason = (
+            f"连续 {trace.no_progress_streak} 轮没有任何进展（失败用例数未再减少，"
+            f"仍为 {len(trace.failed_tests)} 条：{stuck}），判定为停滞"
+            f"（第 {trace.rounds} 轮提前收工，上限 {limit} 轮）"
+        )
+        trace.give_up_reason = reason
+        trace.summary = reason
+        attempt.outcome = FixOutcome.FAILED
+        attempt.rounds = trace.rounds
+        attempt.error = reason
+        return self._finalize(attempt, trace, workspace)
+
+    def _after_verifier_run(
+        self,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        workspace: RepoWorkspace,
+        round_index: int,
+        last_output: str,
+    ) -> tuple[tuple[FixAttempt, AgentTrace] | None, str]:
+        """验证器刚跑完后的统一处置：先看是否通过，再看是否停滞。
+
+        通过优先于停滞——「已经修好」永远是最该收工的理由。
+        两者都没有时，若输出与上一轮完全一致，额外给模型一次改变思路的提示
+        （否则模型会拿到同一份输出、做出同一动作，一路空转）。
+        """
+        finished = self._success_if_passed(attempt, trace, workspace, round_index)
+        if finished is not None:
+            return finished, last_output
+        stalled = self._stall_stop(attempt, trace, workspace)
+        if stalled is not None:
+            return stalled, last_output
+        return None, self._maybe_escalate(trace, last_output)
 
     def _success_if_passed(
         self,

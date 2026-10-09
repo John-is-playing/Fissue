@@ -329,8 +329,8 @@ class PRCreator:
         labels = [strategy.label, *strategy.extra_labels]
         try:
             ref = parse_repo_ref(item.repo, item.platform)
-            for lbl in labels:
-                await adapter.ensure_label(ref, lbl)
+            # 批量确保：一次拉取标签列表，避免每个标签各拉一遍全量（带分页）。
+            await adapter.ensure_labels(ref, labels)
             await adapter.add_labels(ref, int(pr_number), labels, ItemType.PR)
         except Exception as exc:
             log.warning("给 PR #%s 打标签失败：%s", pr_number, exc)
@@ -486,6 +486,11 @@ class AutoFixer:
         from ..pipeline.flush import FlushProcessor
 
         report = FixReport()
+        # 先认领上次被中断（Ctrl-C / 崩溃）留在 fixing 的条目，否则它们既修不到、
+        # 也不会出现在候选里——demo 实测 pipekit #12 就这么消失了。
+        reclaimed = self.ctx.repo.reclaim_fixing_items(repo_slug=repo_slug)
+        if reclaimed:
+            log.info("已把 %d 条上次中断残留的条目放回待修队列：%s", len(reclaimed), ", ".join(reclaimed[:5]))
         candidates = FlushProcessor(self.ctx).fix_candidates(repo_slug=repo_slug, limit=limit)
         for item in candidates:
             attempt = await self.fix_item(item, dry_run=dry_run, max_rounds=max_rounds)
@@ -669,6 +674,9 @@ class AutoFixer:
             file_tree=ws.file_tree(limit=200),
             readme=ws.readme(),
             api_signatures=ws.api_signatures(),
+            # 跨模块调用链：让模型能顺着链定位根因，而不是只改报错点所在文件
+            # （pipekit #3 实测：只改报告点文件 → 连续 10 轮零进展）。
+            call_graph=ws.call_graph(),
         )
 
     def _item_url(self, item: RawItem) -> str:

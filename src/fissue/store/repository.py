@@ -375,6 +375,34 @@ class Repository:
                 values["priority"] = priority.value
             s.execute(update(ItemRow).where(ItemRow.key == key).values(**values))
 
+    def reclaim_fixing_items(self, *, repo_slug: str | None = None) -> list[str]:
+        """把「卡在 ``fixing``」的条目放回 ``fix_queued``，返回被恢复的 key。
+
+        为什么需要它：``fix_item`` 在**开工前**就把状态置为 ``FIXING``，但只有
+        正常结束（写回终态或 dry-run 主动归还）才会离开该状态。进程被 Ctrl-C /
+        崩溃打断时，条目会永久留在 ``FIXING``，而 ``fix_candidates`` 只取
+        ``FIX_QUEUED``——于是这条**再也不会被修**，且没有任何命令能放它回去
+        （demo 实测：pipekit #12 就是这样卡住的，Ctrl-C 后从候选里消失）。
+
+        安全性：调用点在**一批修复开始之前**，此时本进程自己还没把任何条目置为
+        ``FIXING``，所以恢复到的必然是上一次（已死）运行留下的残留。同一进程内
+        修复是顺序执行的，不存在「误抢自己正在修的条目」。
+        跨进程例外：若 ``serve`` 正在修某条、同时你手动跑 ``fix``，那条会被这里
+        放回队列。系统本来就没有跨进程的修复互斥，此处不引入新风险。
+        """
+        with self.db.session() as s:
+            stmt = select(ItemRow.key).where(ItemRow.status == ItemStatus.FIXING.value)
+            if repo_slug:
+                stmt = stmt.where(ItemRow.repo_slug == repo_slug)
+            keys = list(s.scalars(stmt))
+            if keys:
+                s.execute(
+                    update(ItemRow)
+                    .where(ItemRow.key.in_(keys))
+                    .values(status=ItemStatus.FIX_QUEUED.value)
+                )
+            return keys
+
     def set_item_category(self, key: str, category: Category) -> None:
         with self.db.session() as s:
             s.execute(update(ItemRow).where(ItemRow.key == key).values(category=category.value))

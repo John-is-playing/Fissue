@@ -401,6 +401,18 @@ class RepoWorkspace:
             max_files=max_files, limit=limit,
         )
 
+    def call_graph(self, *, max_files: int = 40, limit: int = 60) -> str:
+        """仓库内的跨模块调用链摘要（给 LLM 定位根因用）。
+
+        pipekit #3 实测：报错点在 ``stats.count_batches``，根因却在
+        ``filterops.in_ranges``。只给文件树与 API 签名时，Agent 会盯着报错点
+        所在文件反复改、零进展；把调用链摆出来才能顺着链路走到根因文件。
+        """
+        return extract_call_graph(
+            self.list_files(limit=max_files * 4), self.read,
+            max_files=max_files, limit=limit,
+        )
+
 
 def extract_api_signatures(
     files: Sequence[str],
@@ -469,6 +481,77 @@ def extract_api_signatures(
             chunks.append(f"# {rel}\n" + "\n".join(members))
 
     return "\n\n".join(chunks)
+
+
+def extract_call_graph(
+    files: Sequence[str],
+    read: Any,
+    *,
+    max_files: int = 40,
+    limit: int = 60,
+) -> str:
+    """抽取 Python 模块间的**跨模块调用边**，渲染成给 LLM 的调用链摘要。
+
+    为什么需要它：pipekit #3 实测——报错点在 ``stats.count_batches``，根因却在
+    ``filterops.in_ranges``。Agent 只盯着报错点所在的文件，连续 10 轮重写同一个
+    文件、零进展。把「谁调用谁」直接摆出来，模型才有可能**顺着链路**走到真正的
+    根因文件，而不是在一个改对了却仍失败的局部最优里空转。
+
+    只保留「被调方属于本仓库模块」的边，滤掉 ``json.dumps`` 这类标准库/三方调用。
+    ``read`` 是「相对路径 → 文件内容」的可调用对象（便于测试注入）。
+    """
+    import ast
+
+    # 文件路径 → 模块短名（``pipekit/filterops.py`` → ``filterops``）
+    modules: dict[str, str] = {}
+    for rel in files:
+        if not rel.endswith(".py"):
+            continue
+        parts = rel.replace("\\", "/").split("/")
+        if "tests" in parts or "test" in parts or parts[0].startswith("."):
+            continue
+        if parts[-1] == "__init__.py":
+            continue
+        modules[rel] = parts[-1][:-3]
+    if not modules:
+        return ""
+    known = set(modules.values())
+
+    lines: list[str] = []
+    used = 0
+    for rel, mod in modules.items():
+        if used >= max_files or len(lines) >= limit:
+            break
+        try:
+            src = read(rel)
+            tree = ast.parse(src or "")
+        except Exception:            # 读不到 / 语法错误 → 跳过，不影响主流程
+            continue
+        used += 1
+        for node in tree.body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            callees: list[str] = []
+            for sub in ast.walk(node):
+                callee = _called_qualified_name(sub)
+                if callee and callee.split(".")[0] in known and callee not in callees:
+                    callees.append(callee)
+            if callees:
+                lines.append(f"- {mod}.{node.name} → " + "、".join(callees))
+
+    return "\n".join(lines[:limit])
+
+
+def _called_qualified_name(node: Any) -> str | None:
+    """把一次调用还原成 ``模块.函数``（只认 ``mod.func(...)`` 且 ``mod`` 是名字）。"""
+    import ast
+
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return None
 
 
 def _format_signature(node: Any) -> str:

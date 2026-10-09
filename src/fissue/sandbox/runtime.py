@@ -58,20 +58,53 @@ class DockerRuntime:
             return False, f"docker 不可用：{exc}"
         if proc.returncode != 0:
             return False, f"Docker 守护进程未运行：{proc.stderr.strip()[:200]}"
-        return True, f"Docker {proc.stdout.strip()}"
+        server_version = proc.stdout.strip()
+        if not server_version:
+            # Windows 上 docker 客户端在引擎不可达时会 **exit 0 但无输出**
+            # （Linux 下同样情况通常是非零退出码）。只看 returncode 会把它判成
+            # 「可用」，于是 run() 走 _run_docker → 镜像不可用，而已经写好、
+            # 且文档承诺的本地降级分支永远不触发。
+            return False, "Docker 守护进程不可达（未取到 ServerVersion）"
+        return True, f"Docker {server_version}"
+
+    def _image_present(self, image: str) -> bool:
+        """本地是否已有该镜像（**不触发拉取**，毫秒级）。"""
+        if self._docker_bin is None:
+            return False
+        return (
+            subprocess.run(
+                [self._docker_bin, "image", "inspect", image],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            ).returncode
+            == 0
+        )
+
+    def image_ready(self, image: str) -> tuple[bool, str]:
+        """基础镜像是否就绪——**只做快速存在性检查，绝不触发拉取**。
+
+        供 ``fissue verify`` / 常驻服务在跑整批之前做一次前置判定：
+        一条条目要先克隆工作区、再花几十秒到数分钟让 LLM 生成验证器，
+        最后才在沙盒里发现镜像不在——把这个必然失败的结果提前到几毫秒内、
+        且只报一次，而不是每条各报一次。
+
+        为什么不能在这里调 :meth:`ensure_image`：它会 ``docker pull``，
+        而本机实测拉取失败前要空等约 20 秒超时。若把它放进逐条的前置检查，
+        就退化成比原问题更糟的形态（每条多等 20 秒）。
+        """
+        if self._docker_bin is None:
+            return False, "未找到 docker 命令"
+        if self._image_present(image):
+            return True, f"镜像就绪：{image}"
+        return False, f"基础镜像不存在：{image}"
 
     def ensure_image(self, image: str) -> bool:
         """确保镜像存在（不存在则拉取）。"""
         if self._docker_bin is None:
             return False
-        inspect = subprocess.run(
-            [self._docker_bin, "image", "inspect", image],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        if inspect.returncode == 0:
+        if self._image_present(image):
             return True
         log.info("镜像 %s 不存在，尝试拉取…", image)
         pull = subprocess.run(

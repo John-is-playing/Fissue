@@ -258,6 +258,11 @@ class FissueService:
             if not self._budget_ok(ctx, cfg, notifier):
                 continue
             try:
+                # 常驻服务同样要先认领上次中断残留的 fixing 条目，否则它们
+                # 永远不在候选里（状态机不会自己回到 fix_queued）。
+                reclaimed = ctx.repo.reclaim_fixing_items(repo_slug=cfg.slug)
+                if reclaimed:
+                    log.info("已认领 %d 条残留的修复中条目：%s", len(reclaimed), ", ".join(reclaimed[:3]))
                 candidates = ctx.repo.list_items(
                     repo_slug=cfg.slug,
                     item_type=ItemType.ISSUE,

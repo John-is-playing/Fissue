@@ -394,6 +394,47 @@ def test_fix_attempt_roundtrip_sets_status(repo: Repository) -> None:
     assert repo.get_item_row(key).status == ItemStatus.PR_CREATED.value
 
 
+def test_reclaim_fixing_items_returns_stuck_entries_to_queue(repo: Repository) -> None:
+    """被中断（Ctrl-C / 崩溃）留在 fixing 的条目必须能被放回待修队列。
+
+    回归：demo 实测 pipekit #12 —— 进程被 Ctrl-C 打断后条目永久停在 fixing，
+    而 fix_candidates 只取 fix_queued，于是它既修不到、也不再出现在候选里。
+    """
+    _seed(repo, number=20)
+    _seed(repo, number=21)
+    _seed(repo, number=22)
+    for n in (20, 21):
+        repo.set_item_status(f"github:psf/requests#{n}", ItemStatus.FIXING)
+
+    reclaimed = repo.reclaim_fixing_items(repo_slug="psf/requests")
+
+    assert sorted(reclaimed) == ["github:psf/requests#20", "github:psf/requests#21"]
+    assert repo.get_item_row("github:psf/requests#20").status == ItemStatus.FIX_QUEUED.value
+    assert repo.get_item_row("github:psf/requests#21").status == ItemStatus.FIX_QUEUED.value
+    # 正常情况下（没卡住的条目）不该被动
+    assert repo.get_item_row("github:psf/requests#22").status == ItemStatus.NEW.value
+    # 幂等：再调一次没有可认领的
+    assert repo.reclaim_fixing_items(repo_slug="psf/requests") == []
+
+
+def test_reclaim_fixing_items_respects_repo_scope(repo: Repository) -> None:
+    """限定仓库时不碰别家仓库的 fixing 条目。"""
+    _seed(repo, number=30)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="urllib3"))
+    other = RawItem(
+        platform=Platform.GITHUB, repo="psf/urllib3", number=1, item_type=ItemType.ISSUE,
+        title="别家", body="x", labels=["bug"], author="u",
+    )
+    repo.upsert_item(rid, other)
+    repo.set_item_status("github:psf/requests#30", ItemStatus.FIXING)
+    repo.set_item_status("github:psf/urllib3#1", ItemStatus.FIXING)
+
+    reclaimed = repo.reclaim_fixing_items(repo_slug="psf/requests")
+
+    assert reclaimed == ["github:psf/requests#30"]
+    assert repo.get_item_row("github:psf/urllib3#1").status == ItemStatus.FIXING.value
+
+
 def test_usage_records_and_today(repo: Repository) -> None:
     repo.record_usage(repo_key="psf/requests", purpose="evaluate", model="m",
                       prompt_tokens=1000, completion_tokens=500, cost_usd=0.01)

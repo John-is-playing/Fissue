@@ -29,6 +29,7 @@ from .main import (
     print_table,
     run_async,
     sandbox_app,
+    bench_app,
 )
 
 
@@ -421,6 +422,167 @@ def web(
     p = port or settings.web.port
     emit(f"🌐 Web/API 启动于 http://{h}:{p}（API 前缀 {settings.api.prefix}）")
     uvicorn.run(application, host=h, port=p, reload=reload, log_level=settings.app.log_level)
+
+
+# ---------------------------------------------------------------------------
+# 跑分基线（bench）
+# ---------------------------------------------------------------------------
+
+#: 基线默认落盘目录（相对 data_dir）。
+BENCH_DIR = "benchmarks"
+
+
+def _bench_dir(settings) -> Path:
+    return settings.data_dir / BENCH_DIR
+
+
+def _bench_path(settings, label: str) -> Path:
+    """基线文件名：``<label>.json``；label 缺省用时间戳。"""
+    from datetime import datetime, timezone
+
+    safe = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in label.strip())
+    if not safe:
+        safe = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return _bench_dir(settings) / f"{safe}.json"
+
+
+@bench_app.command("capture")
+def bench_capture(
+    config: Optional[str] = CONFIG_OPT,
+    env: Optional[str] = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="只统计该仓库（owner/name）"),
+    label: str = typer.Option("", "--label", help="基线名，如 ratekit-baseline；缺省用时间戳"),
+    out: Optional[str] = typer.Option(None, "--out", "-o", help="输出文件路径（默认 data/benchmarks/<label>.json）"),
+    json_out: bool = JSON_OPT,
+) -> None:
+    """冻结当前跑分基线（只读数据库，不触发抓取/评测）。
+
+    记录**前提**（git commit + 是否脏、模型与采样参数、关键配置指纹）与
+    **结果**（条目分布、各阶段 outcome、F2P、修复）。之后用 `bench diff` 逐项对比。
+    """
+    from .. import __version__
+    from .. import benchmark as bm
+    from ..store.db import build_database
+
+    settings = load_cfg(config, env, verbose=verbose)
+    database = build_database(settings)
+    database.ensure_schema()          # 空库也要能出基线（全 0，而不是崩）
+
+    record = bm.capture(settings, database, repo_slug=repo, label=label)
+    path = bm.save(record, out or _bench_path(settings, label))
+
+    if json_out:
+        emit_json(record)
+        return
+
+    git = record["provenance"]["git"]
+    res = record["result"]
+    emit(f"📌 基线已冻结：{path}")
+    emit(
+        f"   版本：fissue {__version__} @ {str(git.get('commit'))[:8]}"
+        f"（{git.get('branch')}）"
+    )
+    if git.get("dirty"):
+        emit(
+            f"   ⚠️  工作区有 {git.get('dirty_files')} 个未提交改动 → 标记为**不可复现**"
+            "（与其它基线对比时会显式提示）",
+            style="yellow",
+        )
+    else:
+        emit("   ✅ 工作区干净 → 可复现")
+    emit(
+        f"   模型：{record['provenance']['config']['llm']['model']}"
+        f"（temp={record['provenance']['config']['llm']['temperature']}）"
+    )
+    emit(
+        f"   结果：条目 {res['items']['total']}｜评测 {res['evaluation']['evaluated_items']}"
+        f"｜验证器运行 {res['verifier']['runs_total']}｜修复尝试 {res['fix']['attempts']}"
+    )
+
+
+@bench_app.command("diff")
+def bench_diff(
+    old: str = typer.Argument(..., help="旧基线文件"),
+    new: str = typer.Argument(..., help="新基线文件"),
+    config: Optional[str] = CONFIG_OPT,
+    env: Optional[str] = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+    json_out: bool = JSON_OPT,
+) -> None:
+    """对比两份基线，给出逐项增量与「是否可比」的判定。
+
+    退出码：`0` 可比且无变化；`1` 不可比（前提不同，结论不能当回归依据）；
+    `2` 可比但有变化。
+    """
+    from .. import benchmark as bm
+
+    load_cfg(config, env, verbose=verbose)      # 仅为统一日志级别，不读库
+    try:
+        a = bm.load(old)
+        b = bm.load(new)
+    except FileNotFoundError as exc:
+        fail(f"基线文件不存在：{exc.filename}")
+
+    d = bm.diff(a, b)
+    if json_out:
+        emit_json(d)
+    else:
+        emit(bm.render_diff(d))
+
+    if not d["comparable"]:
+        raise typer.Exit(1)
+    raise typer.Exit(2 if d["changed"] else 0)
+
+
+@bench_app.command("list")
+def bench_list(
+    config: Optional[str] = CONFIG_OPT,
+    env: Optional[str] = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+    json_out: bool = JSON_OPT,
+) -> None:
+    """列出已冻结的基线（按时间倒序）。"""
+    from .. import benchmark as bm
+
+    settings = load_cfg(config, env, verbose=verbose)
+    directory = _bench_dir(settings)
+    files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    rows: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            rec = bm.load(p)
+        except Exception as exc:  # 坏文件不该让列表整体失败
+            rows.append({"file": p.name, "label": "(无法解析)", "note": str(exc)[:60]})
+            continue
+        git = (rec.get("provenance") or {}).get("git") or {}
+        res = rec.get("result") or {}
+        rows.append(
+            {
+                "file": p.name,
+                "label": rec.get("label") or "-",
+                "captured_at": rec.get("captured_at") or "-",
+                "commit": str(git.get("commit") or "-")[:8],
+                "dirty": "脏" if git.get("dirty") else "净",
+                "model": ((rec.get("provenance") or {}).get("config") or {}).get("llm", {}).get("model", "-"),
+                "items": (res.get("items") or {}).get("total", "-"),
+                "runs": (res.get("verifier") or {}).get("runs_total", "-"),
+                "fixes": (res.get("fix") or {}).get("attempts", "-"),
+            }
+        )
+
+    if json_out:
+        emit_json(rows)
+        return
+    if not rows:
+        emit(f"（{directory} 下还没有基线；先跑 `fissue bench capture`）")
+        return
+    emit(f"基线目录：{directory}")
+    print_table(
+        rows,
+        columns=["file", "label", "captured_at", "commit", "dirty", "model", "items", "runs", "fixes"],
+    )
 
 
 # ---------------------------------------------------------------------------

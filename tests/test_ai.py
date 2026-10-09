@@ -787,3 +787,146 @@ def test_render_repo_context_omits_empty_api_contract() -> None:
 
     text = render_repo_context(language_hint="python", api_signatures="")
     assert "公开 API 契约" not in text
+
+
+# ---------------------------------------------------------------------------
+# 跨模块调用链（给模型定位根因用）
+#
+# 回归：demo 实测 pipekit #3 —— 报错点在 stats.count_batches，根因却在
+# filterops.in_ranges。只给文件树 + API 签名时，Agent 盯着报错点所在文件
+# 连改 10 轮、零进展；把调用链摆出来才能顺着链走到根因模块。
+# ---------------------------------------------------------------------------
+
+
+def _chain_files() -> dict[str, str]:
+    """复刻 pipekit 的调用链形态：stats → pipeline → filterops。"""
+    return {
+        "pipekit/filterops.py": (
+            "def in_ranges(point, ranges):\n"
+            "    return any(s <= point < e for s, e in ranges)\n"
+        ),
+        "pipekit/pipeline.py": (
+            "from . import filterops\n\n"
+            "def drop_ranges(slices, ranges):\n"
+            "    return [s for s in slices if not filterops.in_ranges(s[1], ranges)]\n"
+        ),
+        "pipekit/stats.py": (
+            "from . import pipeline\n\n"
+            "def count_batches(slices, ranges):\n"
+            "    return len(pipeline.drop_ranges(slices, ranges))\n"
+        ),
+    }
+
+
+def test_extract_call_graph_shows_cross_module_chain() -> None:
+    """调用链必须跨模块——这正是「顺着报错点找根因」的依据。"""
+    from fissue.workspace import extract_call_graph
+
+    files = _chain_files()
+    out = extract_call_graph(list(files), lambda r: files[r])
+
+    assert "stats.count_batches → pipeline.drop_ranges" in out
+    assert "pipeline.drop_ranges → filterops.in_ranges" in out
+
+
+def test_extract_call_graph_ignores_stdlib_and_unknown_modules() -> None:
+    """只认本仓库模块：json.dumps / os.path 这类不该进链，否则是噪声。"""
+    from fissue.workspace import extract_call_graph
+
+    files = {
+        "pkg/a.py": (
+            "import json, os\n"
+            "from . import b\n\n"
+            "def f(x):\n"
+            "    print(json.dumps(x))\n"
+            "    os.path.join('a', 'b')\n"
+            "    return b.helper(x)\n"
+        ),
+        "pkg/b.py": "def helper(x):\n    return x\n",
+    }
+    out = extract_call_graph(list(files), lambda r: files[r])
+
+    assert "a.f → b.helper" in out
+    assert "json" not in out and "os." not in out
+
+
+def test_extract_call_graph_skips_tests_dunder_and_bad_syntax() -> None:
+    """测试文件、__init__、语法错的文件都不参与；且不得抛异常。"""
+    from fissue.workspace import extract_call_graph
+
+    files = {
+        "pkg/__init__.py": "from . import core\n",
+        "pkg/core.py": "def run():\n    return 1\n",
+        "tests/test_core.py": "from pkg.core import run\ndef test_x():\n    run()\n",
+        "pkg/broken.py": "def oops(:\n",
+    }
+    out = extract_call_graph(list(files), lambda r: files[r])
+
+    assert "__init__" not in out and "test_core" not in out and "broken" not in out
+
+
+def test_extract_call_graph_is_bounded_and_empty_safe() -> None:
+    """必须能限长；没有可分析文件时返回空串而不是崩。"""
+    from fissue.workspace import extract_call_graph
+
+    files = {
+        "p/a.py": "from . import b\ndef f1():\n    return b.g()\ndef f2():\n    return b.g()",
+        "p/b.py": "def g():\n    return 1\n",
+    }
+    assert extract_call_graph(list(files), lambda r: files[r], limit=1).count("→") == 1
+    assert extract_call_graph([], lambda r: "") == ""
+    assert extract_call_graph(["README.md"], lambda r: "# x") == ""
+
+
+def test_render_repo_context_includes_call_graph() -> None:
+    """调用链要进仓库上下文，并点明「报错点常常不是根因」。"""
+    from fissue.ai.prompts import render_repo_context
+
+    text = render_repo_context(
+        language_hint="python",
+        call_graph="stats.count_batches → pipeline.drop_ranges",
+    )
+    assert "跨模块调用链" in text
+    assert "stats.count_batches → pipeline.drop_ranges" in text
+    assert "根因" in text
+
+
+def test_render_repo_context_omits_empty_call_graph() -> None:
+    """没有调用链时不要冒出空标题。"""
+    from fissue.ai.prompts import render_repo_context
+
+    text = render_repo_context(language_hint="python", call_graph="")
+    assert "跨模块调用链" not in text
+
+
+def test_agent_repo_context_carries_call_graph(settings, tmp_path) -> None:
+    """端到端接线：修复阶段的仓库上下文里真的带上了调用链。
+
+    这是防止「实现写了但忘了接线」的守卫——上下文不含链的话，
+    模型依然只能看见文件树与签名，pipekit #3 式的空转就会复发。
+    """
+    import subprocess
+
+    from fissue.config import RepoConfig
+    from fissue.fixer.autofix import AutoFixer
+    from fissue.models import Platform
+    from fissue.workspace import RepoWorkspace
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
+    (root / "pkg").mkdir()
+    (root / "pkg" / "a.py").write_text(
+        "from . import b\n\ndef f(x):\n    return b.g(x)\n", encoding="utf-8"
+    )
+    (root / "pkg" / "b.py").write_text("def g(x):\n    return x\n", encoding="utf-8")
+    # 必须入索引：RepoWorkspace.list_files 走的是 ``git ls-files``，
+    # 未跟踪的文件根本不会出现在调用链分析里。
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    ws = RepoWorkspace(root=root, slug="o/n")
+
+    fixer = AutoFixer.__new__(AutoFixer)          # 只测上下文拼装，不需要完整 ctx
+    text = fixer._repo_context(ws, RepoConfig(platform=Platform.GITHUB, owner="o", name="n"))
+
+    assert "跨模块调用链" in text
+    assert "a.f → b.g" in text
