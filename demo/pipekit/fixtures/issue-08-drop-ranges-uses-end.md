@@ -43,24 +43,48 @@ print(drop_ranges([(5, 9)], [(5, 5)]))          # 起点 5 在 (5,5) 内 → 应
 
 ## 根因分析
 
-`pipekit/pipeline.py`：
+**注意：这一条要修好，需要链路上两处都改对；只改 `drop_ranges` 仍然过不了验证。**
+
+**缺陷 A（本 Issue 的根因）**：`pipekit/pipeline.py`
 
 ```python
 return [s for s in slices if not filterops.in_ranges(s[1], ranges)]
 #                                                     ↑ 取了终点；文档与语义都要求用起点 s[0]
 ```
 
+**缺陷 B（被它调用的下层，独立 Issue 见 #3）**：`pipekit/filterops.py`
+
+```python
+return any(start <= point < end for start, end in ranges)
+#                    ↑ 用了半开判定；闭区间应为 point <= end
+```
+
+看起来「把 `s[1]` 改成 `s[0]`」就够了，其实不然——改完它问的就是**起点**，
+而起点恰好等于单点区间的值时，`in_ranges` 仍会因为半开判定返回 `False`：
+
+```python
+drop_ranges([(5, 9)], [(5, 5)])
+# 改完 A 之后：问 in_ranges(5, [(5, 5)])
+#             5 <= 5 < 5  →  False  →  分片没被剔除，仍是 [(5, 9)]
+```
+
+所以必须**同时**把 `in_ranges` 的闭区间判定修对。
+
+> 两处必须**分别**修：这个用例考的是「分片起点」判定（问哪一点），
+> `in_ranges` 考的是「闭区间端点算不算在内」。**问对了点，还要那个点能被正确判为『在内』。**
+> 修的时候别把两者混在一起糊过去——它们在同一条链上，但改动互不覆盖。
+
 ## 期望修复
 
 ```python
 drop_ranges([(0, 4)], [(4, 4)])                 # [(0, 4)]
-drop_ranges([(5, 9)], [(5, 5)])                 # []
+drop_ranges([(5, 9)], [(5, 5)])                 # []   ← 需要 A 与 B 都修好
 drop_ranges([(0, 4), (5, 9)], [(6, 8)])         # [(0, 4), (5, 9)]
 drop_ranges([(0, 4), (5, 9)], [(5, 9)])         # [(0, 4)]
 ```
 
-注意：本用例是「分片起点」判定，与 `in_ranges` 自身的闭区间判定（见 #3）是两回事，
-修的时候别把两者混在一起。
+第 2 行**只有在 A 与 B 都修好后才会成立**——它走的是
+`drop_ranges` → `in_ranges` 这条跨模块链路。
 
 ## 环境
 
