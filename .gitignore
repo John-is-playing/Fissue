@@ -3,7 +3,11 @@
 config.yaml
 
 # 数据与产物
-data/
+# 注意：这里用 ``data/*`` 而不是 ``data/``——被整目录排除时 git 根本不会
+# 往里看，后面的 ``!`` 反排除就永远无效。用通配符排除「内容」才能单独放行
+# 跑分基线（它是**要进版本库**的：冻结基线的意义就是日后能拿来逐项对比）。
+data/*
+!data/benchmarks/
 *.log
 .pytest_cache/
 .ruff_cache/
