@@ -1,0 +1,76 @@
+name: CI
+
+# 单测是本项目最重要的安全网：代码绝大多数由 AI Agent 驱动编写，
+# 唯一能拦住「看起来对、实际坏了」的就是这 491 项离线测试。
+#
+# 设计要点
+# --------
+# 1) **完全离线**：conftest.py 里有 autouse 的网络守卫，LLM 用打桩客户端、
+#    平台适配器用 respx 拦截、沙盒走 local+force_inline。
+#    因此 CI **不需要任何 Secret**（无 LLM Key、无平台 token、无 Docker）。
+# 2) **测试阻断、lint 不阻断**：测试当前全绿（491 passed），必须守住；
+#    而 ruff / mypy 目前尚有存量问题（见下），如实设为 continue-on-error，
+#    避免「CI 一上来就是红的」而失去信号价值。修完存量后应改为阻断。
+# 3) 版本矩阵取最低支持版本（requires-python >= 3.10）与一个现代版本，
+#    保证「声明支持的最老版本」真的有机器在验证。
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 跑离线单测
+        run: python -m pytest -q -p no:cacheprovider
+
+  lint:
+    name: ruff + mypy（暂不阻断）
+    runs-on: ubuntu-latest
+    # ⚠️ 存量问题：ruff 208 项、mypy 32 项（含 `flush.py::_refresh_labels` 定义冲突）。
+    #    先让它在 CI 里**可见**，但不拦合并；存量清零后删掉这两个 continue-on-error。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: ruff
+        continue-on-error: true
+        run: python -m ruff check src tests
+
+      - name: mypy
+        continue-on-error: true
+        run: python -m mypy src/fissue
