@@ -105,6 +105,50 @@ def judge_f2p(
     return result
 
 
+#: 回归断言的**用例名前缀约定**。生成器被要求把「修复前就已成立」的断言以此开头命名，
+#: 我们才能机械地校验「自称回归断言的东西在未修复代码上确实通过」。
+#: 见 :func:`regression_assertion_conflict`。
+REGRESSION_TEST_PREFIX = "test_regression"
+
+
+def _leaf_test_name(test_id: str) -> str:
+    """``tests/a.py::Cls::test_x`` → ``test_x``（取最后一段）。"""
+    return (test_id or "").rsplit("::", 1)[-1].strip()
+
+
+def regression_assertion_conflict(run: VerifierRun) -> str | None:
+    """检查「自称回归断言」的用例是否在**未修复代码上就失败**——那是自相矛盾。
+
+    为什么需要它：pipekit #8 实测，自动生成的验证器里有一条
+    ``test_regression_standard_drop_behavior``，断言
+    ``drop_ranges([(1, 3), (4, 6)], [(2, 5)]) == []``。这条断言在**未修复的 main 上
+    同样失败**，而且与该验证器自己的其它断言互斥（任何「按单个分片判定剔除」的
+    自然实现都不可能同时满足，我实测两种语义都试过）——**数学上不可满足**。
+    它被标成「回归断言（保持向后兼容）」，实际却在描述一个从未存在过的行为。
+
+    后果很隐蔽：Agent 把两处缺陷都改对了、仓库自带基线 61 项全绿，**仍然永远过不了
+    这个验证器**（12 轮空转到上限）。而 ``verifier_self_error`` 拦不住——那只判
+    「异常抛在验证器自己的文件里」，这是一条**正常失败的断言**，看起来与
+    「问题已复现」毫无区别。
+
+    判据：名字带回归前缀、却在 base 阶段失败 → 它描述的不是「既有行为」，
+    按定义不是回归断言。
+    """
+    if run.outcome is not VerifierOutcome.FAIL:
+        return None
+    failed = failed_test_ids_from_output(run.stdout or "")
+    offenders = [t for t in failed if _leaf_test_name(t).startswith(REGRESSION_TEST_PREFIX)]
+    if not offenders:
+        return None
+    names = "、".join(offenders[:3])
+    return (
+        f"被命名为回归断言的用例在**未修复代码上就失败**：{names}。"
+        "回归断言描述的是「修复前就已成立的既有行为」，它在 base 阶段**必须通过**；"
+        "在 base 就失败的断言说明它的期望值与库的真实语义不符。"
+        "请改正该断言的期望值（或删掉它）——不要为了让它通过去改被测代码。"
+    )
+
+
 #: 验证器「自身写坏」的失败特征：测试代码压根没跑起来。
 _VERIFIER_BROKEN_HINTS = (
     "errors during collection",
@@ -590,6 +634,34 @@ class VerifierRunner:
                     item=item,
                     repo_context=repo_context,
                     failure_output=evidence,
+                    round_index=round_index + 1,
+                    test_hint=test_hint,
+                    linked_context=linked_context,
+                )
+                spec = refined.spec
+                continue
+
+            # 自称「回归断言」却在未修复代码上就失败 = 自相矛盾。必须在判定
+            # 「可复现」**之前**拦下：它的 base 确实失败了，不拦就会被当成一条
+            # 合格的复现证据（pipekit #8 实测：该验证器数学上不可满足，
+            # Agent 把两处缺陷都改对了、仓库基线全绿，仍永远过不了，空转到上限）。
+            conflict = regression_assertion_conflict(base)
+            if conflict is not None:
+                log.warning("验证器回归断言自相矛盾 %s（第 %d 轮）：%s", item.key, round_index, conflict)
+                result.conclusion = conflict
+                if round_index >= max_rounds:
+                    self.repo.set_verifier_f2p(verifier_id, False)
+                    # 自相矛盾 ≠ 复现：必须摘掉 base_run，否则 reproducible 仍为真，
+                    # 下游会把一条不可满足的验证器当成「已复现」推进。
+                    result.base_run = None
+                    return verifier_id, spec, result
+                refined = await generator.refine(
+                    spec,
+                    item=item,
+                    repo_context=repo_context,
+                    failure_output=(
+                        f"{conflict}\n\n=== 原始输出 ===\n{(base.stdout or '')}\n{(base.stderr or '')}"
+                    ),
                     round_index=round_index + 1,
                     test_hint=test_hint,
                     linked_context=linked_context,

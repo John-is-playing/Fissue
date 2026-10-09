@@ -568,6 +568,100 @@ def test_verifier_prompt_requires_compat_regression_assertions(sample_issue) -> 
     assert "不要臆造" in text                  # 不允许凭空发明契约
 
 
+def test_verifier_prompt_requires_regression_naming_convention(sample_issue) -> None:
+    """提示词必须写明命名约定——否则机械校验无从识别哪些是回归断言。"""
+    from fissue.ai import prompts
+
+    text = prompts.verifier_prompt(sample_issue, repo_context="(repo)")[1]["content"]
+
+    assert "test_regression" in text
+    assert "必须通过" in text                  # 说清「在未修复代码上必须通过」
+
+
+# ---------------------------------------------------------------------------
+# C：自称「回归断言」却在未修复代码上失败 → 自相矛盾，必须拦下
+#
+# 背景（pipekit #8 实测）：自动生成的验证器里有一条
+# ``test_regression_standard_drop_behavior``，断言
+# ``drop_ranges([(1, 3), (4, 6)], [(2, 5)]) == []``。它在**未修复的 main 上同样
+# 失败**，且与该验证器自身其它断言互斥——数学上不可满足。后果极隐蔽：
+# Agent 把两处缺陷都改对了、仓库自带基线 61 项全绿，仍永远过不了，空转到轮次上限。
+# 而 verifier_self_error 拦不住：那是一条**正常失败的断言**，与「问题已复现」无异。
+# ---------------------------------------------------------------------------
+
+
+def test_regression_conflict_flagged_on_real_pipekit_case() -> None:
+    """pipekit #8 的真实形态：回归前缀的用例在 base 失败 → 判自相矛盾。"""
+    from fissue.verifier.runner import regression_assertion_conflict
+
+    text = (
+        "......F                                                                  [100%]\n"
+        "=================================== FAILURES ===================================\n"
+        "_________ TestIssue8DropRanges.test_regression_standard_drop_behavior _________\n\n"
+        "    def test_regression_standard_drop_behavior(self):\n"
+        "        # 起点完全在区间内，正常剔除\n"
+        ">       assert drop_ranges([(1, 3), (4, 6)], [(2, 5)]) == []\n"
+        "E       assert [(1, 3)] == []\n\n"
+        "tests/test_issue8_drop_ranges.py:60: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_issue8_drop_ranges.py::TestIssue8DropRanges::"
+        "test_regression_standard_drop_behavior\n"
+    )
+    got = regression_assertion_conflict(_fail_run(text))
+
+    assert got is not None
+    assert "回归断言" in got
+    assert "test_regression_standard_drop_behavior" in got
+    # 必须点明「不要为了让它通过去改被测代码」——否则模型可能反过来改库
+    assert "不要为了让它通过去改被测代码" in got
+
+
+def test_regression_conflict_none_when_only_target_tests_fail() -> None:
+    """只有目标用例失败（回归断言没失败）→ 正常按「问题已复现」处理。"""
+    from fissue.verifier.runner import regression_assertion_conflict
+
+    text = (
+        "..F.......                                                               [100%]\n"
+        "FAILED tests/t.py::TestX::test_count_batches_boundary_overlap\n"
+    )
+    assert regression_assertion_conflict(_fail_run(text)) is None
+
+
+def test_regression_conflict_none_when_run_passed() -> None:
+    """base 通过时不做判定（没有失败就没有矛盾）。"""
+    from fissue.verifier.runner import regression_assertion_conflict
+
+    run = VerifierRun(
+        item_key="k", stage="base", outcome=VerifierOutcome.PASS, exit_code=0,
+        stdout="FAILED tests/t.py::TestX::test_regression_x\n",   # 即便文本里有，也不该触发
+    )
+    assert regression_assertion_conflict(run) is None
+
+
+def test_regression_conflict_matches_nested_class_and_multi_offenders() -> None:
+    """能识别嵌套类下的用例名，并把多条同类违规都点名。"""
+    from fissue.verifier.runner import regression_assertion_conflict
+
+    text = (
+        "FAILED tests/t.py::Outer::Inner::test_regression_alpha\n"
+        "FAILED tests/t.py::test_regression_beta\n"
+        "FAILED tests/t.py::test_target\n"
+    )
+    got = regression_assertion_conflict(_fail_run(text))
+
+    assert got is not None
+    assert "test_regression_alpha" in got and "test_regression_beta" in got
+    assert "test_target" not in got
+
+
+def test_regression_conflict_ignores_similarly_named_target_test() -> None:
+    """名字只是碰巧含 regression 而不是前缀的，不算回归断言（避免误伤）。"""
+    from fissue.verifier.runner import regression_assertion_conflict
+
+    text = "FAILED tests/t.py::test_count_regression_cases\n"
+    assert regression_assertion_conflict(_fail_run(text)) is None
+
+
 def _sandbox_outcome(settings, files: dict[str, str]):
     """在 local 沙盒里跑一段脚本，返回它对应的验证器结果。
 
