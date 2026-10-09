@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -105,6 +106,7 @@ class FlushProcessor:
         report = FlushReport(queue=queue_kind, batch_id="")
         by_key = {str(e.get("key")): e for e in entries}
 
+        prepared: list[dict[str, Any]] = []
         for c in conclusions:
             key = str(c.get("key") or "")
             payload = by_key.get(key)
@@ -122,13 +124,35 @@ class FlushProcessor:
             # 回写结论：queue 落库的 batch_conclusions 与 items.priority 必须与派发口径一致。
             c["priority"] = priority
 
-            labels = self._decide_labels(queue_kind, verdict, c)
-            if labels:
-                ok, err = await self._safe_label(payload, labels)
+            prepared.append(
+                {
+                    "key": key,
+                    "payload": payload,
+                    "verdict": verdict,
+                    "priority": priority,
+                    "labels": self._decide_labels(queue_kind, verdict, c),
+                }
+            )
+
+        # 打标签并发跑：每条一次 add_labels，彼此独立（无共享状态、无顺序依赖）。
+        # 串行会把「每条一次 HTTP」直接叠加成 N 倍墙钟时间——实测 10 条要 39s。
+        # 结果按结论顺序回填，保证报告里 labeled / label_errors 的顺序稳定。
+        if prepared:
+            results = await self._label_all(
+                [(p["payload"], p["labels"]) for p in prepared]
+            )
+            for p, (ok, err) in zip(prepared, results):
+                if not p["labels"]:
+                    continue
                 if ok:
-                    report.labeled.append(key)
+                    report.labeled.append(p["key"])
                 else:
-                    report.label_errors.append(f"{key}: {err}")
+                    report.label_errors.append(f'{p["key"]}: {err}')
+
+        for p in prepared:
+            key = p["key"]
+            verdict = p["verdict"]
+            priority = p["priority"]
 
             if queue_kind == QueueName.VERIFY.value:
                 # Issue-BUG：只有明确 fix 且优先级为 tier1/tier2 才派发自动修复
@@ -216,32 +240,106 @@ class FlushProcessor:
         labels.append("fissue")          # 统一来源标记
         return _dedupe(labels)
 
-    async def _safe_label(self, payload: dict[str, Any], labels: list[str]) -> tuple[bool, str]:
-        """给条目打标签（失败只记录，不抛出）。"""
-        try:
-            from ..config import RepoConfig
+    async def _label_all(
+        self, items: Sequence[tuple[dict[str, Any], list[str]]]
+    ) -> list[tuple[bool, str]]:
+        """并发给多条打标签，返回与输入**同序**的 ``(是否成功, 错误)``。
 
-            repo_slug = str(payload.get("repo") or "")
-            item_type = ItemType(payload.get("item_type") or "issue")
+        条目之间彼此独立（不同 issue 编号、各自的标签调用），并发是安全的；
+        标签本身的「是否已存在」由适配器层的缓存 + 锁保证，不会重复创建。
+
+        标签列表的对齐（见 :meth:`_refresh_labels`）放在 :meth:`_safe_label`
+        里，而不是这里统一预跑一遍——那样会把「打标签」这一步从既有的
+        打桩缝里挤出去，且每个仓库都要先走一次真实请求。
+        """
+        if not items:
+            return []
+        # 打标签是纯平台 HTTP、不消耗 token：优先用平台侧自己的并发上限，
+        # 未配置时才退回 llm.concurrency（避免把纯 HTTP 与 LLM 限流绑死）。
+        configured = getattr(self.settings.platforms, "label_concurrency", None)
+        try:
+            limit = max(1, int(configured if configured is not None else self.settings.llm.concurrency))
+        except Exception:  # pragma: no cover - 配置异常时退化为串行
+            limit = 1
+        sem = asyncio.Semaphore(limit)
+
+        async def one(payload: dict[str, Any], labels: list[str]) -> tuple[bool, str]:
+            async with sem:
+                return await self._safe_label(payload, labels)
+
+        return list(await asyncio.gather(*(one(p, l) for p, l in items)))
+
+    def _repo_config_for(self, payload: dict[str, Any]) -> Any:
+        """从队列载荷解析出仓库配置（未登记则按载荷里的平台临时构造）。"""
+        from ..config import RepoConfig
+
+        repo_slug = str(payload.get("repo") or "")
+        try:
+            return self.ctx.settings.repo(repo_slug)
+        except Exception:
+            owner, _, name = repo_slug.partition("/")
             platform = None
-            try:
-                repo_cfg = self.ctx.settings.repo(repo_slug)
-            except Exception:
+            if payload.get("platform"):
                 from ..models import Platform as _P
 
-                owner, _, name = repo_slug.partition("/")
-                repo_cfg = RepoConfig(platform=_P.GITHUB, owner=owner, name=name)
-                platform = repo_cfg.platform
+                try:
+                    platform = _P(str(payload["platform"]).lower())
+                except ValueError:
+                    platform = None
+            if platform is None:
+                # 未登记仓库 + 载荷未带平台：沿用配置里的默认平台（与旧行为一致）
+                platform = self.ctx.settings.repos[0].platform if self.ctx.settings.repos else None
+            if platform is None:
+                raise ValueError(f"无法确定仓库平台：{repo_slug}")
+            return RepoConfig(platform=platform, owner=owner, name=name)
 
+    async def _safe_label(self, payload: dict[str, Any], labels: list[str]) -> tuple[bool, str]:
+        """给条目打标签（失败只记录，不抛出）。
+
+        打标签前先把目标仓库的标签列表对齐一次（见 :meth:`_refresh_labels`）：
+        ``ensure_labels`` 判「标签是否已存在」靠的就是这份缓存，缓存在常驻
+        服务里迟早会陈旧，而它一旦判错就会走到创建、吃到 422 并抛异常。
+        """
+        try:
+            repo_cfg = self._repo_config_for(payload)
             adapter = await self.ctx.adapter_for_repo(repo_cfg)
-            ref = parse_repo_ref(repo_slug, repo_cfg.platform if platform is None else platform)
-            for lbl in labels[:6]:          # 先确保标签存在，再打
-                await adapter.ensure_label(ref, lbl)
-            await adapter.add_labels(ref, int(payload.get("number") or 0), labels, item_type)
+            ref = parse_repo_ref(str(payload.get("repo") or ""), repo_cfg.platform)
+            await self._refresh_labels(adapter, ref, key=str(payload.get("key") or ""))
+            # 一次批量确保标签存在：原来逐个 ensure_label 会为**每个标签**各拉一遍
+            # 全量标签列表（还有分页），是 flush 打标阶段的主要耗时来源。
+            await adapter.ensure_labels(ref, labels[:6])
+            await adapter.add_labels(ref, int(payload.get("number") or 0), labels, ItemType(payload.get("item_type") or "issue"))
             return True, ""
         except Exception as exc:
             log.warning("打标签失败 %s：%s", payload.get("key"), exc)
             return False, str(exc)[:200]
+
+    async def _refresh_labels(self, adapter: Any, ref: Any, *, key: str = "") -> bool:
+        """打标签前对齐一次目标仓库的标签列表。
+
+        仅在缓存缺失或已过 TTL 时才真正发请求；同一仓库在一轮 flush 里
+        至多对齐一次（对齐后写入时刻被推到现在，后续条目都命中缓存）。
+        ``TTL <= 0``（关缓存）时不需要对齐——``ensure_labels`` 自己会实拉。
+
+        失败**不阻断**打标签：对齐属于加固，拿不到最新列表时按缓存继续，
+        真正的失败（如 422）仍由调用方 ``_safe_label`` 记录。
+        返回是否真的拉取了一次。
+        """
+        ttl = float(getattr(adapter, "label_cache_ttl", 0.0) or 0.0)
+        if ttl <= 0:
+            return False
+        try:
+            age = adapter.label_cache_age(ref)
+            if age is not None and age < ttl:
+                return False              # 缓存仍新鲜
+            await adapter.cached_repo_labels(ref, refresh=True)
+            log.debug(
+                "已对齐标签列表：%s（原缓存年龄 %s）", ref.slug, "-" if age is None else f"{age:.0f}s"
+            )
+            return True
+        except Exception as exc:          # pragma: no cover - 平台异常时按缓存继续
+            log.warning("对齐远端标签列表失败 %s（按缓存继续）：%s", key or ref.slug, exc)
+            return False
 
     # -- 修复优先级批量规划 ----------------------------------------------
 

@@ -475,7 +475,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         adapter = ctx.adapter_for_platform(item.platform)
         ref = parse_repo_ref(item.repo, item.platform)
         try:
-            await adapter.ensure_label(ref, "merge-approved")
+            await adapter.ensure_labels(ref, ["merge-approved"])
             await adapter.add_labels(ref, item.number, ["merge-approved"], ItemType.PR)
             if body.note:
                 await adapter.comment(ref, item.number, f"✅ 维护者已确认可合并：{body.note}", ItemType.PR)

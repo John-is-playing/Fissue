@@ -168,6 +168,16 @@ class VerifierConfig(BaseModel):
     require_f2p: bool = True
     max_rounds: int = 3
     allow_checklist_fallback: bool = True
+    # -- verify 命令的执行调度（Q7）----------------------------------------
+    # 单条验证的耗时几乎全在「LLM 生成验证器」上（实测数万字符推理，
+    # 单次数十秒到数分钟），沙盒执行只占 1~2 秒。条目之间彼此独立
+    # （各自克隆工作区、各自生成验证器），所以并发能近似线性压缩墙钟时间。
+    # 上限受沙盒并发与 LLM 限流约束，默认与 llm.concurrency 对齐。
+    concurrency: int = 4
+    #: 单条因**环境错误**（克隆失败 / 网络抖动 / LLM 服务错误）失败后的重试次数。
+    #: 重跑一条要从头走「克隆 → 生成验证器 → 沙盒」，代价很高；
+    #: 验证器自身写错由 runner 内部的修正回路处理，不走这里。
+    item_retries: int = 2
     # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
     # off | warn | strict。默认 warn：上线首日没人知道仓库绿不绿，
     # strict 会在本就失败/跳过的老仓库上大面积误杀。
@@ -241,6 +251,12 @@ class PRStrategy(BaseModel):
 class AutoFixConfig(BaseModel):
     enabled: bool = True
     agent_max_rounds: int = 12
+    #: 连续多少轮「验证器输出完全一致」即判定停滞、提前收工。
+    #: 没有这个闸门时，模型会把同一次失败原样重放直到 ``agent_max_rounds``：
+    #: demo 实测 pipekit #8 连续 10 轮输出**逐字节相同**、耗时同为 1.4s，
+    #: 白烧 10 轮 LLM 调用与沙盒执行，最后还报出误导性的「仍未通过验证器」
+    #: （真相是「卡住了」，不是「修了 12 次没修好」）。设 0 关闭该闸门。
+    stall_rounds: int = 4
     allow_file_write: bool = True
     run_tests_in_loop: bool = True
     protected_paths: list[str] = Field(
@@ -353,6 +369,21 @@ class PlatformTokens(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class PlatformConfig(BaseModel):
+    """平台适配器的通用行为（四平台共用）。"""
+
+    #: 仓库标签列表的进程内缓存时长（秒）。打标签是批量行为，缓存能把
+    #: 「每条 × 每标签各拉一次标签列表」压成一次；但常驻服务（``fissue serve``）
+    #: 长跑时缓存若永不过期，平台侧新建的标签会被一直判为「不存在」——
+    #: 表现为持续的 422 创建失败并在 :meth:`ensure_labels` 里直接抛出。
+    #: 默认 600s：单次 flush（秒级~分钟级）内仍是 0 次重复拉取，跨轮次又能自愈。
+    #: 设为 0 表示不缓存（每次都拉，最保守）。
+    label_cache_ttl_seconds: float = 600.0
+    #: 打标签的并发上限；留空（None）跟随 ``llm.concurrency``——
+    #: 打标签是纯平台 HTTP、不消耗 token，语义上不该被 LLM 并发数绑死。
+    label_concurrency: int | None = None
+
+
 class Settings(BaseModel):
     """Fissue 全局配置。"""
 
@@ -372,6 +403,7 @@ class Settings(BaseModel):
     web: WebConfig = Field(default_factory=WebConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     export: ExportConfig = Field(default_factory=ExportConfig)
+    platforms: PlatformConfig = Field(default_factory=PlatformConfig)
     tokens: PlatformTokens = Field(default_factory=PlatformTokens)
 
     # 运行期元信息（不写入文件）
@@ -474,6 +506,15 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
     for plat in ("GITHUB", "GITEE", "ATOMGIT", "GITLAB"):
         if v := env_of(plat + "_TOKEN"):
             tokens[plat.lower()] = v
+
+    # 标签名缓存时长（秒；0 = 不缓存）
+    if v := env_of("LABEL_CACHE_TTL"):
+        try:
+            merged.setdefault("platforms", {})["label_cache_ttl_seconds"] = float(v)
+        except ValueError as exc:
+            raise ConfigError(
+                f"环境变量 {ENV_PREFIX}LABEL_CACHE_TTL 必须是数字（秒），当前为 {v!r}"
+            ) from exc
 
     # 日志级别
     if v := env_of("LOG_LEVEL"):

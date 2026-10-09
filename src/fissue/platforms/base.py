@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,10 @@ log = get_logger(__name__)
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 # 分页默认页大小
 DEFAULT_PER_PAGE = 50
+# 仓库标签名缓存的默认 TTL（秒）。覆盖项见 Settings.platforms.label_cache_ttl_seconds。
+LABEL_CACHE_TTL_SECONDS = 600.0
+# 标签缓存条目数上限：长跑进程里仓库数只增不减，需封顶（过期者优先淘汰）。
+LABEL_CACHE_MAX_ENTRIES = 64
 
 
 class PlatformAdapter(ABC):
@@ -46,6 +51,7 @@ class PlatformAdapter(ABC):
         per_page: int = DEFAULT_PER_PAGE,
         max_retries: int = 4,
         timeout: httpx.Timeout | None = None,
+        label_cache_ttl: float | None = None,
     ) -> None:
         self.token = token
         self.api_base = (api_base or self.default_api_base).rstrip("/")
@@ -53,6 +59,20 @@ class PlatformAdapter(ABC):
         self.max_retries = max_retries
         self.timeout = timeout or DEFAULT_TIMEOUT
         self._client: httpx.AsyncClient | None = None
+        #: 仓库标签名缓存的存活时长（秒）。``<= 0`` 表示不缓存，每次都拉。
+        self.label_cache_ttl: float = (
+            LABEL_CACHE_TTL_SECONDS if label_cache_ttl is None else float(label_cache_ttl)
+        )
+        # 仓库标签名缓存：``"owner/name" -> ({标签名}, 写入时刻)``。
+        # 打标签是批量的（一次 flush 给几十条各打若干标签），而每次
+        # ``ensure_label`` 都要先拉一遍全量标签列表（还有分页）。
+        # 不回填这个缓存就会产生「同一份标签列表被反复 GET」的 O(条目) 次请求。
+        # 带 TTL 是因为常驻服务长跑：平台侧新建的标签若被永久判为「不存在」，
+        # 会一直尝试创建并吃到 422，进而拖垮整条打标签链路。
+        # 时刻用 ``time.monotonic()``：不受系统时钟回拨影响。
+        self._label_cache: dict[str, tuple[set[str], float]] = {}
+        # 惰性创建：适配器可能在事件循环之外构造，避免绑定错误的 loop
+        self._label_lock: asyncio.Lock | None = None
 
     # -- 子类必须提供 ------------------------------------------------------
 
@@ -98,8 +118,125 @@ class PlatformAdapter(ABC):
         """仓库已有标签名列表（用于复用而非新建）。"""
         return []
 
+    # -- 标签：进程内缓存 + 批量确保 --------------------------------------
+
+    def _label_key(self, repo: RepoRef) -> str:
+        return f"{repo.owner}/{repo.name}"
+
+    def _label_guard(self) -> asyncio.Lock:
+        """惰性创建互斥锁（适配器可能在事件循环外构造）。"""
+        if self._label_lock is None:
+            self._label_lock = asyncio.Lock()
+        return self._label_lock
+
+    def _label_entry(self, key: str, *, now: float | None = None) -> set[str] | None:
+        """取未过期的缓存标签集合；过期则删掉并返回 ``None``。
+
+        惰性淘汰：没有后台清理任务，由每次读写顺手判断——
+        调用点少、开销可忽略，也避免了「定时器绑在错误的 loop 上」这类坑。
+        """
+        entry = self._label_cache.get(key)
+        if entry is None:
+            return None
+        names, stored_at = entry
+        ttl = self.label_cache_ttl
+        if ttl <= 0:                       # 不缓存：留在这里只会永远判为过期
+            self._label_cache.pop(key, None)
+            return None
+        age = (time.monotonic() if now is None else now) - stored_at
+        if age >= ttl:
+            self._label_cache.pop(key, None)
+            return None
+        return names
+
+    def _store_label_entry(self, key: str, names: set[str]) -> None:
+        """写入/刷新缓存条目，并在超上限时淘汰最陈旧的那些。"""
+        self._label_cache[key] = (names, time.monotonic())
+        if len(self._label_cache) > LABEL_CACHE_MAX_ENTRIES:
+            # 按写入时刻排序淘汰一半：留下的都是较新的，避免每次都淘汰
+            # 导致「刚写入就被踢」的抖动。
+            stale = sorted(self._label_cache.items(), key=lambda kv: kv[1][1])
+            for k, _ in stale[: len(stale) // 2]:
+                self._label_cache.pop(k, None)
+
+    def label_cache_age(self, repo: RepoRef) -> float | None:
+        """缓存条目的已存活秒数；未缓存（或未配 TTL）返回 ``None``。
+
+        供调用方决定「是否需要先对齐一次远端」——比按批号/条目数猜更稳。
+        """
+        if self.label_cache_ttl <= 0:
+            return None
+        entry = self._label_cache.get(self._label_key(repo))
+        return None if entry is None else time.monotonic() - entry[1]
+
+    async def cached_repo_labels(self, repo: RepoRef, *, refresh: bool = False) -> set[str]:
+        """仓库标签名集合，**进程内按 TTL 复用**。
+
+        同一进程里打标签是批量行为（一次 flush 几十条），而标签列表在整批内
+        几乎不变。不缓存的话每条、每个标签都会触发一次（带分页的）全量 GET。
+        缓存超过 :attr:`label_cache_ttl` 秒后自动失效重拉（常驻服务长跑时，
+        平台侧新建/删除的标签才能被看见）。
+
+        ``refresh=True`` 强制重新拉取并**顺带把写入时刻推到现在**——
+        整批打标签前显式刷新一次，可以让「刷新 → 打完这一批」之间不再
+        被 TTL 拦腰打断（原来用 ``invalidate`` 清空后，紧接着的一次
+        拉取仍会把时间戳记在刷新之前，长批次中间又会过期再拉一遍）。
+        """
+        key = self._label_key(repo)
+        if not refresh and (names := self._label_entry(key)) is not None:
+            return set(names)
+        async with self._label_guard():
+            if not refresh and (names := self._label_entry(key)) is not None:
+                return set(names)          # 双检：并发下只拉一次
+            fetched = set(await self.fetch_repo_labels(repo))
+            self._store_label_entry(key, fetched)
+            return set(fetched)
+
+    def invalidate_label_cache(self, repo: RepoRef | None = None) -> None:
+        """失效标签缓存（``None`` 表示全部）。"""
+        if repo is None:
+            self._label_cache.clear()
+        else:
+            self._label_cache.pop(self._label_key(repo), None)
+
     async def ensure_label(self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI") -> None:
-        """确保标签存在（不存在则创建）。"""
+        """确保标签存在（不存在则创建）。走缓存，不重复拉取标签列表。"""
+        await self.ensure_labels(repo, [label], color=color, description=description)
+
+    async def ensure_labels(
+        self, repo: RepoRef, labels: Iterable[str], *, color: str = "0e8a16", description: str = "Fissue AI"
+    ) -> None:
+        """确保一批标签存在：**一次**拉取列表，只创建缺失的那些。
+
+        与「逐个 ``ensure_label``」相比，标签数量不再放大请求数——
+        原来 N 个标签要 N 次列表 GET，现在固定 1 次（命中缓存则 0 次）。
+        """
+        wanted = [str(lbl) for lbl in labels if str(lbl).strip()]
+        if not wanted:
+            return
+        existing = await self.cached_repo_labels(repo)
+        if all(lbl in existing for lbl in wanted):
+            return
+        # 创建阶段串行化：避免并发下同一标签被重复创建（平台会回 422 噪音）。
+        async with self._label_guard():
+            key = self._label_key(repo)
+            # 锁内重读：等锁期间可能已有别的协程建好并回填了缓存（TTL 可能已到点）。
+            current = self._label_entry(key) or existing
+            created = False
+            for lbl in wanted:
+                if lbl in current:
+                    continue
+                await self._create_label(repo, lbl, color=color, description=description)
+                current.add(lbl)
+                created = True
+            if created:
+                # 回填并续期：刚 ensure 过的那批标签在 TTL 内无须再查。
+                self._store_label_entry(key, current)
+
+    async def _create_label(
+        self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
+    ) -> None:
+        """创建单个标签（子类实现）。基类无标签能力时为空操作。"""
         return None
 
     async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:

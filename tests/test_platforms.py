@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -497,3 +498,292 @@ async def test_captured_files_feed_docs_only_gate() -> None:
     # 含一个代码文件 → 不构成「纯文档」
     mixed = files + [FileChange(path="envkit/units.py")]
     assert not all(_is_doc_path(f.path) for f in mixed)
+
+
+# ---------------------------------------------------------------------------
+# 标签缓存 / 批量复用
+#
+# 打标签是批量行为（一次 flush 给几十条各打若干标签）。原先每次 ensure_label
+# 都要拉一遍全量标签列表（还带分页），使请求数随「条目 × 标签数」放大——
+# 实测 10 条 39 秒。这几条用例把「只拉一次」锁死，防止回归。
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_label_list_cached_across_calls(gh) -> None:
+    """标签列表在进程内只拉一次，重复调用不再发 GET。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+
+    assert await gh.cached_repo_labels(REPO) == {"bug"}
+    for _ in range(5):
+        assert await gh.cached_repo_labels(REPO) == {"bug"}
+
+    assert labels.call_count == 1
+
+
+@respx.mock
+async def test_ensure_label_reuses_cache_and_skips_existing(gh) -> None:
+    """已存在的标签：不创建；且多个标签共用**一次**列表拉取。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}, {"name": "fissue"}])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    await gh.ensure_label(REPO, "bug")
+    await gh.ensure_label(REPO, "fissue")
+    await gh.ensure_labels(REPO, ["bug", "fissue"])
+
+    assert labels.call_count == 1      # 三次调用只拉一次
+    assert create.call_count == 0      # 都已存在 → 一个都不创建
+
+
+@respx.mock
+async def test_ensure_labels_creates_missing_with_single_listing(gh) -> None:
+    """缺失标签：列表只拉一次，缺失的逐个创建，已存在的跳过。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    await gh.ensure_labels(REPO, ["bug", "reproduced", "fissue"])
+
+    assert labels.call_count == 1
+    assert create.call_count == 2      # bug 已有，只建其余两个
+    created = {json.loads(c.request.content)["name"] for c in create.calls}
+    assert created == {"reproduced", "fissue"}
+
+    # 新建的标签进入缓存：再调不产生任何请求
+    await gh.ensure_labels(REPO, ["reproduced", "fissue"])
+    assert labels.call_count == 1
+    assert create.call_count == 2
+
+
+@respx.mock
+async def test_concurrent_ensure_labels_lists_once(gh) -> None:
+    """并发下标签列表仍只拉一次（双检锁），且不重复创建同一标签。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    await asyncio.gather(*(gh.ensure_label(REPO, "fissue") for _ in range(10)))
+
+    assert labels.call_count == 1
+    assert create.call_count == 1      # 同一个标签只创建一次
+
+
+@respx.mock
+async def test_invalidate_label_cache_forces_refetch(gh) -> None:
+    """失效后重新拉取（供「刚在别处建了标签」等场景使用）。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+
+    await gh.cached_repo_labels(REPO)
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 1
+
+    gh.invalidate_label_cache(REPO)
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 2
+
+    gh.invalidate_label_cache()        # 全清
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 3
+
+
+@respx.mock
+async def test_label_cache_is_per_repo(gh) -> None:
+    """缓存按仓库隔离，不会串用别家仓库的标签。"""
+    other = RepoRef(platform=Platform.GITHUB, owner="psf", name="urllib3")
+    a = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    b = respx.get(f"{GH}/repos/psf/urllib3/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "docs"}])
+    )
+
+    assert await gh.cached_repo_labels(REPO) == {"bug"}
+    assert await gh.cached_repo_labels(other) == {"docs"}
+    assert a.call_count == 1 and b.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 标签缓存 TTL
+#
+# 缓存不能永不过期：常驻服务（fissue serve）长跑时，平台侧新建的标签若被
+# 一直判为「不存在」，ensure_labels 会反复创建并吃 422（该异常直接抛出，
+# 整条打标签链路失败）。这几条用例锁死「过期 → 重拉」「未过期 → 不重拉」。
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_label_cache_expires_after_ttl(gh, monkeypatch) -> None:
+    """超过 TTL 后重新拉取（时间打桩，不真等）。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    import fissue.platforms.base as base_mod
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(base_mod.time, "monotonic", lambda: clock["now"])
+    gh.label_cache_ttl = 10.0
+
+    assert await gh.cached_repo_labels(REPO) == {"bug"}
+    assert labels.call_count == 1
+
+    clock["now"] += 9.0                    # 未到点 → 仍命中缓存
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 1
+
+    clock["now"] += 1.5                    # 越过 TTL → 过期重拉
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 2
+
+    # 重拉后计时重置：再前进 9 秒仍在 TTL 内
+    clock["now"] += 9.0
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 2
+
+
+@respx.mock
+async def test_label_cache_ttl_zero_disables_cache(gh) -> None:
+    """TTL=0 表示不缓存：每次调用都实拉（最保守，便于排查）。"""
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    gh.label_cache_ttl = 0.0
+
+    await gh.cached_repo_labels(REPO)
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 2
+    assert gh.label_cache_age(REPO) is None
+
+
+@respx.mock
+async def test_label_cache_expiry_recovers_from_stale_creation(gh, monkeypatch) -> None:
+    """场景回归：平台侧已存在的标签，缓存过期后不再重复创建。
+
+    这是 TTL 要解决的实际故障——进程启动时标签列表为空并缓存下来，
+    之后别处建好了同一个标签，缓存若永不过期就会一直 POST /labels，
+    平台回 422，整个 ensure_labels 抛异常。
+    """
+    import fissue.platforms.base as base_mod
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(base_mod.time, "monotonic", lambda: clock["now"])
+
+    # 第一次拉取：远端还没有 fissue 标签
+    listing = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    gh.label_cache_ttl = 10.0
+
+    await gh.ensure_labels(REPO, ["fissue"])
+    assert create.call_count == 1
+
+    # 别处建好了该标签（远端变成已有），但缓存未过期 → 仍按旧结论处理
+    listing.mock(return_value=httpx.Response(200, json=[{"name": "fissue"}]))
+    clock["now"] += 11.0                   # 越过 TTL：重拉列表，看到新标签
+    await gh.ensure_labels(REPO, ["fissue"])
+    assert listing.call_count == 2
+    assert create.call_count == 1          # 不再重复创建
+
+    # 缓存已被新的列表刷新：紧接着的调用连列表都不拉
+    await gh.ensure_labels(REPO, ["fissue"])
+    assert listing.call_count == 2
+
+
+@respx.mock
+async def test_ensure_labels_refresh_extends_cache(gh, monkeypatch) -> None:
+    """refresh=True 强制重拉，并把计时推到现在（整批打标签前对齐用）。"""
+    import fissue.platforms.base as base_mod
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(base_mod.time, "monotonic", lambda: clock["now"])
+    labels = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    gh.label_cache_ttl = 10.0
+
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 1
+
+    clock["now"] += 9.0
+    await gh.cached_repo_labels(REPO, refresh=True)   # 显式对齐
+    assert labels.call_count == 2
+
+    clock["now"] += 9.0                                # 距离对齐才 9s，未过期
+    await gh.cached_repo_labels(REPO)
+    assert labels.call_count == 2                      # 若换成 invalidate 清空，这里会重拉
+
+
+@respx.mock
+async def test_label_cache_evicts_when_over_capacity(gh, monkeypatch) -> None:
+    """条目数超上限时淘汰最陈旧的一半，且不误删最近写入的。"""
+    import fissue.platforms.base as base_mod
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(base_mod.time, "monotonic", lambda: clock["now"])
+    respx.get(url__regex=rf"{GH}/repos/psf/.*/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    cap = base_mod.LABEL_CACHE_MAX_ENTRIES
+    for i in range(cap + 1):
+        clock["now"] += 1.0
+        await gh.cached_repo_labels(RepoRef(platform=Platform.GITHUB, owner="psf", name=f"r{i}"))
+
+    assert len(gh._label_cache) <= cap
+    newest = RepoRef(platform=Platform.GITHUB, owner="psf", name=f"r{cap}")
+    assert gh.label_cache_age(newest) is not None      # 最新的必须还在
+    oldest = RepoRef(platform=Platform.GITHUB, owner="psf", name="r0")
+    assert gh.label_cache_age(oldest) is None          # 最陈旧的已被淘汰
+    await gh.cached_repo_labels(oldest)                # 淘汰后仍能正常重建
+    assert gh.label_cache_age(oldest) is not None
+
+
+@respx.mock
+async def test_build_adapter_passes_configured_ttl(settings) -> None:
+    """TTL 从配置贯通到适配器（默认值 + 显式覆盖）。"""
+    settings.platforms.label_cache_ttl_seconds = 42.0
+    adapter = build_adapter(settings, platform=Platform.GITHUB, token="t")
+    assert adapter.label_cache_ttl == 42.0
+
+    settings.platforms.label_cache_ttl_seconds = 0.0
+    assert build_adapter(settings, platform=Platform.GITHUB, token="t").label_cache_ttl == 0.0
+
+
+@respx.mock
+async def test_gitlab_and_v5_reuse_base_cache(gitee, gl) -> None:
+    """缓存/批量复用做在基类上，各平台适配器同样受益。"""
+    gitee_labels = respx.get(f"{GITEE}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    gitee_create = respx.post(f"{GITEE}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    await gitee.ensure_labels(REPO, ["a", "b"])
+    assert gitee_labels.call_count == 1
+    assert gitee_create.call_count == 2
+
+    gl_labels = respx.get(f"{GL}/projects/psf%2Frequests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    gl_create = respx.post(f"{GL}/projects/psf%2Frequests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    await gl.ensure_labels(REPO, ["bug"])
+    assert gl_labels.call_count == 1
+    assert gl_create.call_count == 0   # 已存在

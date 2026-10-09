@@ -94,10 +94,10 @@ class V5Adapter(PlatformAdapter):
             names.extend(_label_names(batch))
         return names
 
-    async def ensure_label(self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI") -> None:
-        existing = set(await self.fetch_repo_labels(repo))
-        if label in existing:
-            return
+    async def _create_label(
+        self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
+    ) -> None:
+        """创建单个标签。是否已存在由基类的 :meth:`ensure_labels` 统一判定（带缓存）。"""
         try:
             await self._post(f"{self._repo_api(repo)}/labels", {"name": label, "color": color.replace("#", "")})
             log.info("[%s] 已创建标签 %s", self.platform.value, label)

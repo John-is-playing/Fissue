@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
+import respx
 
 from fissue.models import (
     Category,
@@ -23,6 +25,8 @@ from fissue.pipeline.context import RuntimeContext
 from fissue.pipeline.fetcher import Fetcher, FetchStats, _collect_types
 from fissue.pipeline.flush import FlushProcessor
 from fissue.pipeline.queue import QueueManager
+
+GH = "https://api.github.com"
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +604,10 @@ class _FakeWorkspace:
     def api_signatures(self, **kw) -> str:
         """公开 API 契约（真实工作区由 ast 抽取；替身给最小样本）。"""
         return "def slugify(text: str) -> str"
+
+    def call_graph(self, **kw) -> str:
+        """跨模块调用链（真实工作区由 ast 抽取；替身给最小样本）。"""
+        return "stats.count_batches → pipeline.drop_ranges"
 
     def detect_test_command(self, hint: str | None = None) -> str | None:
         """回归门探测命令；返回 None 表示探不到 → 该门记 skipped，不打扰本用例。"""
@@ -1441,3 +1449,232 @@ async def test_e2e_self_error_detected_then_regenerates_in_real_sandbox(ctx, rep
     # 真复现：次轮是真断言失败，而不是把自错当成复现
     assert result.reproducible is True
     assert "验证器自身" not in result.conclusion
+
+
+# ---------------------------------------------------------------------------
+# flush 打标签的并发化
+# ---------------------------------------------------------------------------
+
+
+async def test_label_all_runs_concurrently_and_keeps_order(ctx, repo, monkeypatch) -> None:
+    """打标签并发跑：墙钟远小于串行，且返回值与输入同序。
+
+    串行时 N 条标签请求的耗时直接相加（实测 10 条 39s），并发能近似压到一份。
+    """
+    processor = FlushProcessor(ctx)
+    seen: list[int] = []
+
+    async def slow_label(payload, labels):
+        seen.append(payload["number"])
+        await asyncio.sleep(0.05)
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", slow_label)
+    items = [({"key": f"k{n}", "number": n}, ["bug"]) for n in range(1, 9)]
+
+    start = asyncio.get_running_loop().time()
+    results = await processor._label_all(items)
+    elapsed = asyncio.get_running_loop().time() - start
+
+    assert results == [(True, "")] * 8
+    # 8 条 × 0.05s：并发（≥2 路）必然远快于串行的 0.4s
+    assert elapsed < 0.3, f"未并发（耗时 {elapsed:.3f}s）"
+    assert sorted(seen) == list(range(1, 9))          # 每条都被处理
+
+
+async def test_label_all_preserves_input_order(ctx, repo, monkeypatch) -> None:
+    """并发完成顺序不确定，但结果必须按输入顺序回填（报告顺序才稳定）。"""
+    processor = FlushProcessor(ctx)
+
+    async def uneven(payload, labels):
+        # 让先发起的更慢，诱导乱序完成
+        await asyncio.sleep(0.02 * (10 - payload["number"]))
+        return payload["number"] != 3, f"err{payload['number']}"
+
+    monkeypatch.setattr(processor, "_safe_label", uneven)
+    items = [({"key": f"k{n}", "number": n}, ["bug"]) for n in range(1, 6)]
+
+    results = await processor._label_all(items)
+    assert [ok for ok, _ in results] == [True, True, False, True, True]
+    assert results[2] == (False, "err3")
+
+
+async def test_apply_labels_every_entry_with_shared_labels(ctx, repo, monkeypatch) -> None:
+    """apply 把每条结论的标签都交给打标签流程（并发路径不丢条目）。"""
+    processor = FlushProcessor(ctx)
+    got: dict[str, list[str]] = {}
+
+    async def record(payload, labels):
+        got[payload["key"]] = list(labels)
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", record)
+    a = _seed_issue(repo, 21)
+    b = _seed_issue(repo, 22)
+    entries = [
+        {"key": a.key, "repo": a.repo, "number": a.number, "item_type": "issue"},
+        {"key": b.key, "repo": b.repo, "number": b.number, "item_type": "issue"},
+    ]
+    conclusions = [
+        {"key": a.key, "verdict": "fix", "labels": ["bug"], "priority": Priority.TIER1,
+         "reason": "r", "confidence": 0.9},
+        {"key": b.key, "verdict": "needs_review", "labels": [], "priority": Priority.NONE,
+         "reason": "r", "confidence": 0.5},
+    ]
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    assert set(got) == {a.key, b.key}
+    # 状态标签由我方规则补上，并统一带来源标记
+    assert "reproduced" in got[a.key] and "fissue" in got[a.key]
+    assert "needs-review" in got[b.key]
+    assert sorted(report.labeled) == sorted([a.key, b.key])
+    assert not report.label_errors
+
+
+# ---------------------------------------------------------------------------
+# 打标签前的标签列表对齐（TTL）
+#
+# 缓存带 TTL 之后，打标签前会把过期/缺失的仓库标签列表对齐一次：否则平台侧
+# 新建的标签会被缓存一直判为「不存在」，导致反复创建并吃 422（该异常由适配器
+# 直接抛出，整条打标签失败）。对齐只应发生在缓存过期或缺失时。
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_adapter(ctx, *, label_ttl: float):
+    """造一个不触网的适配器：拉标签列表换成计数桩。"""
+    from fissue.platforms.registry import build_adapter
+
+    ctx.settings.platforms.label_cache_ttl_seconds = label_ttl
+    adapter = build_adapter(ctx.settings, platform=Platform.GITHUB, token="t")
+    calls = {"n": 0}
+
+    async def fake_list(_repo):
+        calls["n"] += 1
+        return ["bug"]
+
+    adapter.fetch_repo_labels = fake_list
+    return adapter, calls
+
+
+REPO_REF = RepoRef(platform=Platform.GITHUB, owner="psf", name="requests")
+
+
+async def test_refresh_labels_fetches_when_cache_cold(ctx) -> None:
+    """冷缓存：对齐真的拉一次远端标签列表，并把写入时刻推到现在。"""
+    processor = FlushProcessor(ctx)
+    adapter, calls = _install_fake_adapter(ctx, label_ttl=600.0)
+
+    assert adapter.label_cache_age(REPO_REF) is None
+    assert await processor._refresh_labels(adapter, REPO_REF, key="psf/requests#1") is True
+
+    assert calls["n"] == 1
+    assert adapter.label_cache_age(REPO_REF) is not None
+
+
+async def test_refresh_labels_skips_when_cache_fresh(ctx) -> None:
+    """缓存新鲜：对齐**不发任何请求**（否则 TTL 反而增加了流量）。"""
+    processor = FlushProcessor(ctx)
+    adapter, calls = _install_fake_adapter(ctx, label_ttl=600.0)
+    await adapter.cached_repo_labels(REPO_REF)     # 预热：模拟上一轮 flush 刚对齐过
+    assert calls["n"] == 1
+
+    assert await processor._refresh_labels(adapter, REPO_REF) is False
+    assert calls["n"] == 1                         # 未新增拉取
+
+
+async def test_refresh_labels_refetches_after_ttl(ctx, monkeypatch) -> None:
+    """缓存过期：对齐重新拉取（常驻服务跨轮次才会看到平台侧的新标签）。"""
+    import fissue.platforms.base as base_mod
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(base_mod.time, "monotonic", lambda: clock["now"])
+    processor = FlushProcessor(ctx)
+    adapter, calls = _install_fake_adapter(ctx, label_ttl=100.0)
+
+    await processor._refresh_labels(adapter, REPO_REF)
+    assert calls["n"] == 1
+
+    clock["now"] += 101.0
+    await processor._refresh_labels(adapter, REPO_REF)
+    assert calls["n"] == 2
+
+
+async def test_refresh_labels_skips_when_cache_disabled(ctx) -> None:
+    """TTL=0（关缓存）：不对齐——每次 ensure 都会实拉，再对齐纯属浪费。"""
+    processor = FlushProcessor(ctx)
+    adapter, calls = _install_fake_adapter(ctx, label_ttl=0.0)
+
+    assert await processor._refresh_labels(adapter, REPO_REF) is False
+    assert calls["n"] == 0
+
+
+async def test_refresh_labels_swallows_adapter_errors(ctx) -> None:
+    """对齐失败不抛：它只是加固手段，不能让一次网络抖动废掉整条打标签。"""
+    processor = FlushProcessor(ctx)
+    adapter, _ = _install_fake_adapter(ctx, label_ttl=600.0)
+
+    async def boom(_repo):
+        raise RuntimeError("模拟标签列表拉取失败")
+
+    adapter.fetch_repo_labels = boom
+    assert await processor._refresh_labels(adapter, REPO_REF, key="psf/requests#9") is False
+
+
+# -- 打标签并发 -------------------------------------------------------------
+
+
+@respx.mock
+async def test_safe_label_aligns_then_labels(ctx, repo) -> None:
+    """端到端（HTTP 层）：_safe_label 先对齐标签列表，再 ensure + 打标签。"""
+    from fissue.platforms.registry import build_adapter
+
+    ctx.settings.platforms.label_cache_ttl_seconds = 600.0
+    adapter = build_adapter(ctx.settings, platform=Platform.GITHUB, token="t")
+    ctx._adapters["github:psf/requests"] = adapter
+
+    listing = respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={})
+    )
+    add = respx.post(f"{GH}/repos/psf/requests/issues/7/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    processor = FlushProcessor(ctx)
+    payload = {"key": "psf/requests#7", "repo": "psf/requests", "number": 7, "item_type": "issue"}
+
+    assert await processor._safe_label(payload, ["bug", "fissue"]) == (True, "")
+    assert listing.call_count == 1                 # 对齐这一次
+    assert create.call_count == 1                  # 缺失的 fissue 建一次
+    assert add.call_count == 1                     # 打标签一次
+    assert adapter.label_cache_age(REPO_REF) is not None
+
+    # 第二条：缓存新鲜 → 不再对齐，但打标签照常
+    await processor._safe_label(payload, ["bug"])
+    assert listing.call_count == 1
+    assert add.call_count == 2
+
+
+async def test_label_all_concurrency_follows_platform_setting(ctx, repo, monkeypatch) -> None:
+    """打标签的并发上限跟随 platforms.label_concurrency（不再绑死 llm.concurrency）。"""
+    processor = FlushProcessor(ctx)
+    ctx.settings.platforms.label_concurrency = 1
+    inflight = {"now": 0, "max": 0}
+
+    async def counted(payload, labels):
+        inflight["now"] += 1
+        inflight["max"] = max(inflight["max"], inflight["now"])
+        await asyncio.sleep(0.01)
+        inflight["now"] -= 1
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", counted)
+    items = [({"key": f"k{n}", "number": n}, ["bug"]) for n in range(4)]
+    await processor._label_all(items)
+    assert inflight["max"] == 1                # 上限 1 → 严格串行
+
+    ctx.settings.platforms.label_concurrency = 4
+    inflight["max"] = 0
+    await processor._label_all(items)
+    assert inflight["max"] > 1                 # 放开后确实并行

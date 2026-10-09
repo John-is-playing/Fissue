@@ -30,7 +30,7 @@ llm:
   # 14207~17264 字符间波动，8192 余量偏紧；被截断时会自动加码重试到 ceiling。
   max_tokens: 16384
   max_tokens_ceiling: 32768
-  timeout_seconds: 120
+  timeout_seconds: 120  # 有概率会因为超时导致不断重试的问题，可通过增加该值缓解
   max_retries: 4
   # 并发与预算控制（Q17）
   concurrency: 4
@@ -97,7 +97,7 @@ evaluation:
 verifier:
   mode: hybrid                        # executable | checklist | hybrid
   require_f2p: true                   # F2P：修复前必失败、修复后必通过
-  max_rounds: 3                       # 生成验证器后自校正的最大轮次
+  max_rounds: 2                       # 生成验证器后自校正的最大轮次
   allow_checklist_fallback: true      # 无测试框架时降级为自然语言清单（Q16）
   # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
   # F2P 只证明「目标用例修好了」，证明不了「没弄坏别的」。本门补上 pass-to-pass：
@@ -153,6 +153,11 @@ queues:
 auto_fix:
   enabled: true
   agent_max_rounds: 12                # Agent 循环最大轮次
+  # 停滞闸门：连续多少轮「验证器输出完全一致」即提前收工（0 = 关闭）。
+  # 没有它时，模型会把同一次失败原样重放直到 agent_max_rounds：
+  # 实测 pipekit #8 连续 10 轮输出逐字节相同、耗时同为 1.4s，
+  # 白烧 10 轮 LLM 调用与沙盒执行，最后还报出误导性的「仍未通过验证器」。
+  stall_rounds: 4
   allow_file_write: true
   run_tests_in_loop: true
   # 允许修改的文件范围（glob），敏感文件默认排除
@@ -251,3 +256,17 @@ api:
 export:
   default_format: json                # json | markdown
   output_dir: ./data/exports
+
+# ---------------------------------------------------------------------------
+# 平台适配器（四平台共用）
+# ---------------------------------------------------------------------------
+platforms:
+  # 仓库标签列表的进程内缓存时长（秒）。打标签是批量行为（一次 flush 几十条），
+  # 缓存把「每条 × 每标签各拉一次标签列表」压成一次；但**常驻服务长跑时不能永不过期**：
+  # 平台侧新建的标签若被一直判为「不存在」，会反复创建并吃到 422，
+  # 该异常由适配器直接抛出，最终整条打标签失败。0 = 不缓存（每次都拉，最保守）。
+  # 单次 flush 通常远短于 600s，所以这个值在批内仍是 0 次重复拉取。
+  label_cache_ttl_seconds: 600
+  # 打标签的并发上限；留空（null）跟随 llm.concurrency。
+  # 打标签是纯平台 HTTP、不消耗 token，语义上不必与 LLM 并发数绑死。
+  label_concurrency: null

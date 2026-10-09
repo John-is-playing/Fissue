@@ -55,10 +55,10 @@ class GitHubAdapter(PlatformAdapter):
             names.extend(str(x.get("name", "")) for x in batch if x.get("name"))
         return names
 
-    async def ensure_label(self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI") -> None:
-        existing = set(await self.fetch_repo_labels(repo))
-        if label in existing:
-            return
+    async def _create_label(
+        self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
+    ) -> None:
+        """创建单个标签。是否已存在由基类的 :meth:`ensure_labels` 统一判定（带缓存）。"""
         try:
             await self._request(
                 "POST",
