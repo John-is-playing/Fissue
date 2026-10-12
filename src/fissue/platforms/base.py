@@ -364,6 +364,8 @@ class PlatformAdapter(ABC):
         headers: dict[str, str] | None = None,
         expect_json: bool = True,
         probe: Callable[[], Awaitable[Any]] | None = None,
+        return_headers: bool = False,
+        expect_text_prefix: tuple[str, ...] | None = None,
     ) -> Any:
         """带重试与限流处理的请求。
 
@@ -377,6 +379,13 @@ class PlatformAdapter(ABC):
 
         否则，一次网关 502 或者慢 POST 的读超时，就会在真实仓库上多出一个
         重复的 PR 或重复的评论，公开且撤不回来。
+
+        ``return_headers=True`` 时返回 ``(载荷, 响应头)``：`Link` 头只存在于响应里，
+        分页需要读它。
+
+        ``expect_json=False`` 时可用 ``expect_text_prefix`` 做形态校验：平台在限流或
+        登录失效时可能回 200 + 一个 HTML 页，不校验就会被当成 diff 一路带到下游
+        （`git apply` 阶段）才炸，错误现场离病根很远。
         """
         last_exc: Exception | None = None
         idempotent = method.upper() in _IDEMPOTENT_METHODS
@@ -438,15 +447,31 @@ class PlatformAdapter(ABC):
                 )
 
             if not expect_json:
-                return resp.text
-            if not resp.content:
-                return None
-            try:
-                return resp.json()
-            except ValueError as exc:
-                raise PlatformError(
-                    self.sanitize(f"{self.platform.display} 返回非 JSON：{resp.text[:300]}")
-                ) from exc
+                payload: Any = resp.text
+                # 形态校验：空正文不算异常（例如「这个 PR 没有改动」），
+                # 但非空却不像预期文本，就是平台给了个别的东西（多半是登录页/限流页）。
+                if (
+                    expect_text_prefix
+                    and payload.strip()
+                    and not payload.lstrip().startswith(expect_text_prefix)
+                ):
+                    raise PlatformError(
+                        self.sanitize(
+                            f"{self.platform.display} 返回的不是预期文本（{method} {url}）："
+                            f"期望以 {expect_text_prefix[0]!r} 开头，实际以 {payload[:80]!r} 开头"
+                        )
+                    )
+            elif not resp.content:
+                payload = None
+            else:
+                try:
+                    payload = resp.json()
+                except ValueError as exc:
+                    raise PlatformError(
+                        self.sanitize(f"{self.platform.display} 返回非 JSON：{resp.text[:300]}")
+                    ) from exc
+            # `Link` 头只存在于响应里，分页要用它，所以允许调用方连头一起拿走。
+            return (payload, resp.headers) if return_headers else payload
 
         raise PlatformError(
             self.sanitize(f"{self.platform.display} 请求最终失败：{method} {url}（{last_exc}）")
@@ -529,7 +554,15 @@ class PlatformAdapter(ABC):
 
     async def _get(self, url: str, **params: Any) -> Any:
         clean = {k: v for k, v in params.items() if v is not None}
-        return await self._request("GET", url, params=clean)
+        # 注意：**空 dict 不能往外传**。httpx 收到 `params={}` 时会用它覆盖 URL 上
+        # 原有的查询串（`Request("GET", "…/x?page=2", params={}).url` → `…/x`），
+        # 于是「把完整 URL 直接拿来再请求」的用法会静默丢参数。
+        return await self._request("GET", url, params=clean or None)
+
+    async def _get_with_headers(self, url: str, **params: Any) -> tuple[Any, httpx.Headers]:
+        """GET 一次，连响应头一起返回（``Link`` 头分页要用）。"""
+        clean = {k: v for k, v in params.items() if v is not None}
+        return await self._request("GET", url, params=clean or None, return_headers=True)
 
     async def _paginate(
         self,
@@ -541,29 +574,39 @@ class PlatformAdapter(ABC):
     ) -> AsyncIterator[list[dict[str, Any]]]:
         """通用分页。
 
-        :param style: ``page``（page/per_page，GitHub/Gitee/AtomGit）、
-            ``offset``（GitLab 的 page/per_page 亦可用）、
-            ``link``（跟随 Link 头，GitHub 风格）。
+        :param style: ``page`` 与 ``offset`` 都是 page/per_page（GitHub、Gitee、
+            AtomGit、GitLab 均支持，故走同一条分支）；``link`` 则跟随响应里的
+            `Link` 头（GitHub 风格）。
         """
         base_params = dict(params or {})
         page = 1
+        next_url: str | None = None
         while page <= max_pages:
-            if style == "page":
-                payload = await self._get(url, **{**base_params, "page": page, "per_page": self.per_page})
-            elif style == "offset":
+            if style == "link":
+                # GitHub 风格：页码不在请求参数里，而在响应的 `Link` 头里
+                # （`<https://…&page=2>; rel="next"`）。所以第一页不带 page，
+                # 之后直接沿用 next 给出的**完整 URL**——它已带全查询参数。
+                payload, resp_headers = await self._get_with_headers(
+                    next_url or url,
+                    **({} if next_url else {**base_params, "per_page": self.per_page}),
+                )
+            else:
                 payload = await self._get(
                     url, **{**base_params, "page": page, "per_page": self.per_page}
                 )
-            else:  # link
-                payload = await self._get(url, **{**base_params, "per_page": self.per_page})
             if payload is None:
                 return
             batch = payload if isinstance(payload, list) else payload.get("items", [])
             if not isinstance(batch, list) or not batch:
                 return
             yield batch
-            if len(batch) < self.per_page:
-                return
+
+            if style == "link":
+                next_url = _next_link(resp_headers)
+                if not next_url:
+                    return          # 没有 rel="next" → 这就是最后一页
+            elif len(batch) < self.per_page:
+                return              # 不满一页 → 到底了
             page += 1
 
     @staticmethod
@@ -575,6 +618,29 @@ class PlatformAdapter(ABC):
 # ---------------------------------------------------------------------------
 # 共享工具
 # ---------------------------------------------------------------------------
+
+
+def _next_link(headers: httpx.Headers) -> str | None:
+    """从 `Link` 响应头里取出 ``rel="next"`` 的 URL（GitHub 风格分页）。
+
+    形如::
+
+        <https://api.github.com/repos/o/r/issues?page=2>; rel="next",
+        <https://api.github.com/repos/o/r/issues?page=9>; rel="last"
+
+    没有 next（即最后一页）时返回 None。
+    """
+    raw = headers.get("link") or ""
+    for part in raw.split(","):
+        segments = [s.strip() for s in part.split(";")]
+        if len(segments) < 2:
+            continue
+        target = segments[0]
+        if not (target.startswith("<") and target.endswith(">")):
+            continue
+        if any(s in ('rel="next"', "rel=next") for s in segments[1:]):
+            return target[1:-1]
+    return None
 
 
 def _parse_retry_after(resp: httpx.Response, *, max_seconds: float | None = None) -> float:

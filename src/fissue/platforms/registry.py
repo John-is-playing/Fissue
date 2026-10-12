@@ -57,7 +57,7 @@ def build_adapter(
         token=token if token is not None else settings.tokens.get(plat),
         api_base=api_base or (repo.api_base if repo else None),
         per_page=50,
-        max_retries=settings.llm.max_retries,
+        max_retries=settings.platforms.max_retries,
         # 标签缓存 TTL 由配置决定（常驻服务长跑时缓存必须能过期，见 PlatformConfig）
         label_cache_ttl=settings.platforms.label_cache_ttl_seconds,
         max_retry_after=settings.platforms.max_retry_after_seconds,

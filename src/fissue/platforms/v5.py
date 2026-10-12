@@ -61,7 +61,8 @@ class V5Adapter(PlatformAdapter):
 
     async def _get(self, url: str, **params: Any) -> Any:  # type: ignore[override]
         merged = {**self._auth_params(), **{k: v for k, v in params.items() if v is not None}}
-        return await self._request("GET", url, params=merged)
+        # 空 dict 不能往外传：httpx 会用它覆盖 URL 原有的查询串（见 base._get）
+        return await self._request("GET", url, params=merged or None)
 
     async def _post(
         self, url: str, payload: dict[str, Any], *, probe: Callable[[], Awaitable[Any]] | None = None
@@ -344,7 +345,14 @@ class V5Adapter(PlatformAdapter):
     async def fetch_diff(self, repo: RepoRef, number: int) -> str:
         """v5 支持在 PR URL 后加 ``.diff`` 直接取 diff 文本。"""
         url = f"{self._repo_api(repo)}/pulls/{number}.diff"
-        return await self._request("GET", url, params=self._auth_params() or None, expect_json=False)
+        return await self._request(
+            "GET",
+            url,
+            params=self._auth_params() or None,
+            expect_json=False,
+            # 同 GitHub：200 + HTML 登录页/限流页不能当成 diff 放行。
+            expect_text_prefix=("diff --git",),
+        )
 
     # -- 写操作 -----------------------------------------------------------
 

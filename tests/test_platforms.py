@@ -992,3 +992,115 @@ async def test_label_creation_success_is_cached(settings) -> None:
     await adapter.ensure_labels(REPO, ["new-label"])
     await adapter.ensure_labels(REPO, ["new-label"])
     assert create.call_count == 1, "建成功之后不该再建"
+
+
+# ---------------------------------------------------------------------------
+# P2：Link 头分页、取 diff 的形态校验、重试次数的来源
+# ---------------------------------------------------------------------------
+
+
+def test_next_link_parsing() -> None:
+    """从 `Link` 头里取 rel="next"；没有就返回 None。"""
+    from fissue.platforms.base import _next_link
+
+    with_next = httpx.Headers({
+        "link": '<https://api.github.com/repos/o/r/issues?page=2>; rel="next", '
+                '<https://api.github.com/repos/o/r/issues?page=9>; rel="last"'
+    })
+    assert _next_link(with_next) == "https://api.github.com/repos/o/r/issues?page=2"
+
+    only_last = httpx.Headers({
+        "link": '<https://api.github.com/repos/o/r/issues?page=1>; rel="prev"'
+    })
+    assert _next_link(only_last) is None
+    assert _next_link(httpx.Headers({})) is None
+    # 无引号、顺序在前的写法也要认
+    assert _next_link(httpx.Headers({"link": "<https://x/p2>; rel=next"})) == "https://x/p2"
+
+
+@respx.mock
+async def test_paginate_follows_link_header(gh) -> None:
+    """`style="link"` 必须真的跟着 Link 头走。
+
+    此前这个分支既不推进页码、也不读 Link 头，`page += 1` 对它无效——首页满页时
+    会把**同一页重复拉 200 次**（同一批数据 yield 200 遍 + 199 次多余请求）。
+    """
+    page1 = [{"number": i} for i in range(gh.per_page)]
+    page2 = [{"number": 999}]
+    next_url = f"{GH}/repos/psf/requests/issues?page=2&per_page={gh.per_page}"
+
+    # 先注册更具体的「第二页」路由：respx 命中**第一条**匹配的规则，而下面那条只
+    # 写了路径、没写查询参数，会把带 page=2 的请求也一起吃掉。
+    second = respx.get(next_url).mock(return_value=httpx.Response(200, json=page2))
+    first = respx.get(f"{GH}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(
+            200,
+            json=page1,
+            headers={"Link": f'<{next_url}>; rel="next"'},     # 只有 next，到头
+        )
+    )
+
+    batches = [
+        b async for b in gh._paginate(f"{GH}/repos/psf/requests/issues", style="link", max_pages=5)
+    ]
+
+    assert len(batches) == 2, "应当跟着 Link 头翻到第二页，而不是重复首页"
+    assert batches[0] == page1 and batches[1] == page2
+    assert first.call_count == 1 and second.call_count == 1, "同一页不该被重复请求"
+    # link 风格下页码由响应头决定，第一页**不该**带 page 参数
+    assert "page" not in dict(first.calls[0].request.url.params)
+
+
+@respx.mock
+async def test_paginate_link_stops_when_no_next(gh) -> None:
+    """没有 rel="next" 就是最后一页，不该再发请求。"""
+    route = respx.get(f"{GH}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(
+            200, json=[{"number": 1}], headers={"Link": '<https://x?page=1>; rel="prev"'}
+        )
+    )
+    batches = [b async for b in gh._paginate(f"{GH}/repos/psf/requests/issues", style="link")]
+    assert len(batches) == 1
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_fetch_diff_rejects_html_page(gh) -> None:
+    """200 + HTML（登录页/限流页）不能被当成 diff 放行。
+
+    不校验的话它会一路带到下游的 `git apply` 才炸，错误现场离病根很远。
+    """
+    from fissue.errors import PlatformError
+
+    respx.get(f"{GH}/repos/psf/requests/pulls/5").mock(
+        return_value=httpx.Response(200, text="<html><body>Please sign in</body></html>")
+    )
+
+    with pytest.raises(PlatformError) as exc:
+        await gh.fetch_diff(REPO, 5)
+    assert "不是预期文本" in str(exc.value)
+
+
+@respx.mock
+async def test_fetch_diff_accepts_real_diff_and_empty(gh) -> None:
+    """真 diff 放行；空正文（PR 没有改动）也不算异常。"""
+    route = respx.get(f"{GH}/repos/psf/requests/pulls/5")
+    route.mock(return_value=httpx.Response(200, text="diff --git a/x b/x\n--- a/x\n+++ b/x\n"))
+    assert (await gh.fetch_diff(REPO, 5)).startswith("diff --git")
+
+    route.mock(return_value=httpx.Response(200, text=""))
+    assert await gh.fetch_diff(REPO, 5) == ""
+
+
+def test_platform_retries_come_from_platforms_config(settings) -> None:
+    """平台重试次数不再借用 `llm.max_retries`。
+
+    两者共用一个数时，「把 LLM 重试调成 0」会顺手关掉平台重试；调大又会放大写请求
+    的风险——两个不相干的旋钮不该绑在一起。
+    """
+    from fissue.platforms.registry import build_adapter
+
+    settings.llm.max_retries = 0
+    settings.platforms.max_retries = 7
+    adapter = build_adapter(settings, platform=Platform.GITHUB, token="t")
+    assert adapter.max_retries == 7

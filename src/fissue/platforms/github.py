@@ -217,6 +217,9 @@ class GitHubAdapter(PlatformAdapter):
             f"{self.api_base}/repos/{repo.owner}/{repo.name}/pulls/{number}",
             headers=headers,
             expect_json=False,
+            # 限流或登录失效时 GitHub 可能回 200 + 一个 HTML 页；不校验的话
+            # 它会被当成 diff 一路带到 `git apply` 才炸。
+            expect_text_prefix=("diff --git",),
         )
 
     async def _fetch_comments(
