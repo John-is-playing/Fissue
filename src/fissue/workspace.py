@@ -132,10 +132,14 @@ class RepoWorkspace:
             self.sanitize(proc.stderr),
         )
 
+    #: 短于此长度的「令牌」不参与脱敏（理由同平台适配器：把一两个字符做全局
+    #: 替换会把 git 的正常报错也打成一堆 `***`）。
+    MIN_REDACT_LEN = 8
+
     def sanitize(self, text: str) -> str:
         if not text:
             return ""
-        if self.token and self.token in text:
+        if self.token and len(self.token) >= self.MIN_REDACT_LEN and self.token in text:
             text = text.replace(self.token, "***")
         return text
 

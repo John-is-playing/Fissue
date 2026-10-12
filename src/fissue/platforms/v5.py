@@ -98,15 +98,20 @@ class V5Adapter(PlatformAdapter):
 
     async def _create_label(
         self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
-    ) -> None:
-        """创建单个标签。是否已存在由基类的 :meth:`ensure_labels` 统一判定（带缓存）。"""
+    ) -> bool:
+        """创建单个标签，返回「该标签现在确实存在」。"""
         try:
             await self._post(f"{self._repo_api(repo)}/labels", {"name": label, "color": color.replace("#", "")})
             log.info("[%s] 已创建标签 %s", self.platform.value, label)
+            return True
         except RateLimitError:
             raise
         except PlatformError as exc:
-            log.warning("[%s] 创建标签失败（忽略）：%s", self.platform.value, exc)
+            if self._is_already_exists(exc):
+                log.info("[%s] 标签 %s 已存在", self.platform.value, label)
+                return True
+            log.warning("[%s] 创建标签失败（不计入缓存，稍后会重试）：%s", self.platform.value, exc)
+            return False
 
     # -- 抓取 -------------------------------------------------------------
 

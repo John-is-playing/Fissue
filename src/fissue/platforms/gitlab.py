@@ -41,7 +41,12 @@ class GitLabAdapter(PlatformAdapter):
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json", "User-Agent": "Fissue/0.1"}
         if self.token:
-            headers["PRIVATE-TOKEN"] = self.token
+            # 用 Authorization 而不是 PRIVATE-TOKEN：httpx 在跨域重定向时**只**会
+            # 剥掉 Authorization，自定义头会原样转发给跳转目标——自建实例挂在
+            # 反代/SSO 后面返回一个指向他域的 3xx，令牌就明文发出去了。
+            # GitLab 官方文档对个人/项目/群组访问令牌同时支持这两种传法，
+            # 换成 Authorization 即免费拿到这层保护（其余三家适配器本来就这样）。
+            headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
     @staticmethod
@@ -70,8 +75,8 @@ class GitLabAdapter(PlatformAdapter):
 
     async def _create_label(
         self, repo: RepoRef, label: str, *, color: str = "#0e8a16", description: str = "Fissue AI"
-    ) -> None:
-        """创建单个标签。是否已存在由基类的 :meth:`ensure_labels` 统一判定（带缓存）。"""
+    ) -> bool:
+        """创建单个标签，返回「该标签现在确实存在」。"""
         try:
             await self._request(
                 "POST",
@@ -79,10 +84,15 @@ class GitLabAdapter(PlatformAdapter):
                 json={"name": label, "color": color if color.startswith("#") else f"#{color}"},
             )
             log.info("[gitlab] 已创建标签 %s", label)
+            return True
         except RateLimitError:
             raise
         except PlatformError as exc:
-            log.warning("[gitlab] 创建标签失败（忽略）：%s", exc)
+            if self._is_already_exists(exc):
+                log.info("[gitlab] 标签 %s 已存在", label)
+                return True
+            log.warning("[gitlab] 创建标签失败（不计入缓存，稍后会重试）：%s", exc)
+            return False
 
     # -- 抓取 -------------------------------------------------------------
 

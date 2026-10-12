@@ -13,6 +13,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -29,6 +30,10 @@ log = get_logger(__name__)
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 # 分页默认页大小
 DEFAULT_PER_PAGE = 50
+# 被限流时的默认等待上限（秒）。平台给的 `Retry-After` / `X-RateLimit-Reset`
+# 可能是个巨大的值（GitHub 的 reset 常常在一小时之后），照等会让整条流水线
+# 表现为「莫名卡住」。覆盖项见 Settings.platforms.max_retry_after_seconds。
+DEFAULT_MAX_RETRY_AFTER = 300.0
 # 幂等的 HTTP 方法：失败可以安全重放（重放不会产生第二份副作用）。
 # POST/PATCH 不在其中——它们可能已经在上游执行成功，只是响应丢在回来的路上。
 _IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
@@ -55,12 +60,18 @@ class PlatformAdapter(ABC):
         max_retries: int = 4,
         timeout: httpx.Timeout | None = None,
         label_cache_ttl: float | None = None,
+        max_retry_after: float | None = None,
     ) -> None:
         self.token = token
         self.api_base = (api_base or self.default_api_base).rstrip("/")
         self.per_page = per_page
         self.max_retries = max_retries
         self.timeout = timeout or DEFAULT_TIMEOUT
+        #: 被限流时单次最多等多久（秒）。平台给的 `Retry-After` / `X-RateLimit-Reset`
+        #: 是「建议值」，照等没有上限——最坏能把整条流水线按住一小时。
+        self.max_retry_after = float(
+            DEFAULT_MAX_RETRY_AFTER if max_retry_after is None else max_retry_after
+        )
         self._client: httpx.AsyncClient | None = None
         #: 仓库标签名缓存的存活时长（秒）。``<= 0`` 表示不缓存，每次都拉。
         self.label_cache_ttl: float = (
@@ -226,21 +237,36 @@ class PlatformAdapter(ABC):
             # 锁内重读：等锁期间可能已有别的协程建好并回填了缓存（TTL 可能已到点）。
             current = self._label_entry(key) or existing
             created = False
+            failed: list[str] = []
             for lbl in wanted:
                 if lbl in current:
                     continue
-                await self._create_label(repo, lbl, color=color, description=description)
-                current.add(lbl)
-                created = True
+                if await self._create_label(repo, lbl, color=color, description=description):
+                    current.add(lbl)
+                    created = True
+                else:
+                    failed.append(lbl)
             if created:
                 # 回填并续期：刚 ensure 过的那批标签在 TTL 内无须再查。
                 self._store_label_entry(key, current)
+            if failed:
+                # 失败的标签**绝不能**写进「已存在」缓存：写进去等于接下来整个 TTL
+                # 都认为它存在、不再尝试创建，于是随后的每一次打标签都静默失败，
+                # 而打标签正是「结论落地」的那一步。
+                log.warning(
+                    "[%s] %d 个标签未能确保存在（不计入缓存，稍后会重试）：%s",
+                    self.platform.value, len(failed), "、".join(failed[:5]),
+                )
 
     async def _create_label(
         self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
-    ) -> None:
-        """创建单个标签（子类实现）。基类无标签能力时为空操作。"""
-        return None
+    ) -> bool:
+        """创建单个标签（子类实现），返回**「该标签现在确实存在」**。
+
+        基类无标签能力时视作空操作，返回 True。子类务必不要吞掉失败后返回
+        True——调用方正是据此决定要不要写入「已存在」缓存。
+        """
+        return True
 
     async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         """给条目加标签。"""
@@ -285,9 +311,16 @@ class PlatformAdapter(ABC):
             return f"https://{self.token_user}:{self.token}@{self.web_host}/{repo.owner}/{repo.name}.git"
         return f"https://{self.web_host}/{repo.owner}/{repo.name}.git"
 
+    #: 短于此长度的「令牌」不参与脱敏。真实平台令牌都是二三十字符起步，而把
+    #: 一两个字符当令牌做全局替换，会把正常文本打成筛子——例如 token="t" 时
+    #: `truststore` 会变成 `***rus***ore`，日志反而读不懂了。
+    MIN_REDACT_LEN = 8
+
     def sanitize(self, text: str) -> str:
         """把日志/报告里可能出现的令牌抹掉。"""
-        if self.token and self.token in text:
+        if not self.token or len(self.token) < self.MIN_REDACT_LEN:
+            return text
+        if self.token in text:
             return text.replace(self.token, "***")
         return text
 
@@ -358,24 +391,32 @@ class PlatformAdapter(ABC):
                 # 否则会白等 4 轮退避（约 8 秒）才报同一个错。
                 if is_ssl_error(exc):
                     raise PlatformError(
-                        f"{self.platform.display} 连接失败（{method} {url}）：{exc}\n{ssl_help_text()}"
+                        self.sanitize(
+                            f"{self.platform.display} 连接失败（{method} {url}）：{exc}\n{ssl_help_text()}"
+                        )
                     ) from exc
                 if not idempotent and not self._is_connect_phase_error(exc):
                     return await self._settle_ambiguous_write(
                         method, url, exc, probe=probe, platform=self.platform
                     )
-                log.warning("[%s] 请求异常（第 %d 次）：%s %s -> %s", self.platform.value, attempt, method, url, exc)
+                log.warning(
+                    "[%s] 请求异常（第 %d 次）：%s %s -> %s",
+                    self.platform.value, attempt, method, url, self.sanitize(str(exc)),
+                )
                 await asyncio.sleep(self._backoff(attempt))
                 continue
 
-            if resp.status_code == 429 or (
-                resp.status_code == 403 and "rate limit" in resp.text.lower()
-            ):
-                retry_after = _parse_retry_after(resp)
+            if self._is_rate_limited(resp):
+                retry_after = _parse_retry_after(resp, max_seconds=self.max_retry_after)
                 if attempt >= self.max_retries:
-                    raise RateLimitError(f"{self.platform.display} 触发限流：{url}", retry_after)
+                    raise RateLimitError(
+                        self.sanitize(f"{self.platform.display} 触发限流：{url}"), retry_after
+                    )
                 # 限流是服务端**明确拒绝**了这次请求，写操作没有被执行 → 重放安全。
-                log.warning("[%s] 限流，%.1fs 后重试", self.platform.value, retry_after)
+                log.warning(
+                    "[%s] 限流，%.1fs 后重试（上限 %.0fs）",
+                    self.platform.value, retry_after, self.max_retry_after,
+                )
                 await asyncio.sleep(retry_after)
                 continue
 
@@ -390,7 +431,10 @@ class PlatformAdapter(ABC):
 
             if resp.status_code >= 400:
                 raise PlatformError(
-                    f"{self.platform.display} API 错误 {resp.status_code}：{method} {url} -> {resp.text[:500]}"
+                    self.sanitize(
+                        f"{self.platform.display} API 错误 {resp.status_code}："
+                        f"{method} {url} -> {resp.text[:500]}"
+                    )
                 )
 
             if not expect_json:
@@ -400,9 +444,13 @@ class PlatformAdapter(ABC):
             try:
                 return resp.json()
             except ValueError as exc:
-                raise PlatformError(f"{self.platform.display} 返回非 JSON：{resp.text[:300]}") from exc
+                raise PlatformError(
+                    self.sanitize(f"{self.platform.display} 返回非 JSON：{resp.text[:300]}")
+                ) from exc
 
-        raise PlatformError(f"{self.platform.display} 请求最终失败：{method} {url}（{last_exc}）")
+        raise PlatformError(
+            self.sanitize(f"{self.platform.display} 请求最终失败：{method} {url}（{last_exc}）")
+        )
 
     @staticmethod
     def _is_connect_phase_error(exc: BaseException) -> bool:
@@ -412,6 +460,35 @@ class PlatformAdapter(ABC):
         因此上游不可能已经执行过。
         """
         return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+    @staticmethod
+    def _is_rate_limited(resp: httpx.Response) -> bool:
+        """这次响应算不算「被限流」。
+
+        不能只看 429：GitHub/Gitee 都会用 **403 + 正文说明**表示限流，而正文
+        可能被本地化；配额用尽时 GitHub 还会给出 `X-RateLimit-Remaining: 0`。
+        少认一种信号，就会把它当成普通硬错误——既不退避也不重试，直接抛错。
+        """
+        if resp.status_code == 429:
+            return True
+        if resp.status_code != 403:
+            return False
+        if resp.headers.get("x-ratelimit-remaining") == "0":
+            return True
+        if resp.headers.get("retry-after"):
+            return True
+        text = (resp.text or "").lower()
+        return "rate limit" in text or "rate_limit" in text or "限流" in text
+
+    @staticmethod
+    def _is_already_exists(exc: BaseException) -> bool:
+        """平台是否明确告知「这东西已经存在」。
+
+        `_request` 的错误文本统一带上了状态码，409/422 都表示已存在。这类
+        「失败」其实等价于成功（标签确实在那儿），不该被记成创建失败。
+        """
+        text = str(exc)
+        return "API 错误 409" in text or "API 错误 422" in text
 
     async def _settle_ambiguous_write(
         self,
@@ -432,17 +509,22 @@ class PlatformAdapter(ABC):
             try:
                 existing = await probe()
             except Exception as probe_exc:      # 探测本身失败 → 当作没探测到
-                log.warning("[%s] 写请求幂等探测失败（%s）：%s", platform.value, method, probe_exc)
+                log.warning(
+                    "[%s] 写请求幂等探测失败（%s）：%s",
+                    platform.value, method, self.sanitize(str(probe_exc)),
+                )
                 existing = None
             if existing is not None:
                 log.info(
                     "[%s] 写请求 %s 未收到响应（%s），但探测到已生效，按成功返回（不重发）",
-                    platform.value, method, exc,
+                    platform.value, method, self.sanitize(str(exc)),
                 )
                 return existing
         raise PlatformError(
-            f"{self.platform.display} 写请求失败且无法确认是否已生效（{method} {url}）：{exc}。"
-            "为避免重复创建，本次不再重试；请到平台确认后手工处理。"
+            self.sanitize(
+                f"{self.platform.display} 写请求失败且无法确认是否已生效（{method} {url}）：{exc}。"
+                "为避免重复创建，本次不再重试；请到平台确认后手工处理。"
+            )
         ) from exc
 
     async def _get(self, url: str, **params: Any) -> Any:
@@ -495,18 +577,50 @@ class PlatformAdapter(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _parse_retry_after(resp: httpx.Response) -> float:
+def _parse_retry_after(resp: httpx.Response, *, max_seconds: float | None = None) -> float:
+    """解析「过多久再来」，并做上限封顶。
+
+    三种形态都要认，否则就会在仍被限流时过早重试，或干脆卡住：
+
+    * `Retry-After: 30`（秒）；
+    * `Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`（HTTP-date）——此前解析不了，
+      会退化成固定 5 秒；
+    * `X-RateLimit-Reset`（unix 时间戳）——**唯一**可能算出超长等待的分支，
+      GitHub 的 reset 常常在一小时之后，照等会让流水线表现为「莫名卡住」。
+    """
     raw = resp.headers.get("retry-after") or resp.headers.get("x-ratelimit-reset")
+    seconds: float | None = None
     if raw:
+        text = raw.strip()
         try:
-            value = float(raw)
-            # GitHub 的 reset 是 unix 时间戳
-            if value > 1_000_000_000:
-                return max(1.0, value - datetime.now(timezone.utc).timestamp())
-            return max(1.0, min(value, 60.0))
+            value = float(text)
         except ValueError:
-            pass
-    return 5.0
+            seconds = _http_date_delay(text)
+        else:
+            seconds = (
+                value - datetime.now(timezone.utc).timestamp()
+                if value > 1_000_000_000     # unix 时间戳
+                else value
+            )
+    if seconds is None:
+        seconds = 5.0
+    seconds = max(1.0, seconds)
+    if max_seconds is not None:
+        seconds = min(seconds, max(1.0, float(max_seconds)))
+    return seconds
+
+
+def _http_date_delay(text: str) -> float | None:
+    """HTTP-date 形式的 `Retry-After` → 还需要等多少秒；解析不了返回 None。"""
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp() - datetime.now(timezone.utc).timestamp()
 
 
 def parse_dt(value: Any) -> datetime | None:

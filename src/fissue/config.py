@@ -415,6 +415,10 @@ class PlatformConfig(BaseModel):
     #: 打标签的并发上限；留空（None）跟随 ``llm.concurrency``——
     #: 打标签是纯平台 HTTP、不消耗 token，语义上不该被 LLM 并发数绑死。
     label_concurrency: int | None = None
+    #: 被限流时**单次最多等多久**（秒）。`Retry-After` 与 `X-RateLimit-Reset`
+    #: 是平台给的「建议等多久」，直接照等没有上限——最坏能把整条流水线按住一小时，
+    #: 而且日志上只表现为「卡住」。超出上限一律按此值封顶；封顶后仍被限流就报错。
+    max_retry_after_seconds: float = 300.0
 
 
 class Settings(BaseModel):

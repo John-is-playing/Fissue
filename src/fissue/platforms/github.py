@@ -57,8 +57,8 @@ class GitHubAdapter(PlatformAdapter):
 
     async def _create_label(
         self, repo: RepoRef, label: str, *, color: str = "0e8a16", description: str = "Fissue AI"
-    ) -> None:
-        """创建单个标签。是否已存在由基类的 :meth:`ensure_labels` 统一判定（带缓存）。"""
+    ) -> bool:
+        """创建单个标签，返回「该标签现在确实存在」。"""
         try:
             await self._request(
                 "POST",
@@ -66,10 +66,15 @@ class GitHubAdapter(PlatformAdapter):
                 json={"name": label, "color": color, "description": description},
             )
             log.info("[github] 已创建标签 %s", label)
+            return True
         except RateLimitError:
             raise
         except PlatformError as exc:
-            log.warning("[github] 创建标签失败（忽略）：%s", exc)
+            if self._is_already_exists(exc):
+                log.info("[github] 标签 %s 已存在", label)
+                return True
+            log.warning("[github] 创建标签失败（不计入缓存，稍后会重试）：%s", exc)
+            return False
 
     # -- 抓取 -------------------------------------------------------------
 

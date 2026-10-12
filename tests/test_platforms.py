@@ -73,8 +73,11 @@ def test_parse_repo_ref_variants() -> None:
 
 
 def test_registry_build_and_urls(settings) -> None:
+    # 用真实长度的令牌：`sanitize` 对过短的「令牌」不做替换（否则会把正常文本
+    # 打成筛子），拿 "tok" 这类短串根本测不出脱敏是否生效。
+    realistic_token = "ghp_0123456789abcdefghijklmnopqrstuv"
     for plat, cls in ADAPTERS.items():
-        a = build_adapter(settings, platform=plat, token="tok")
+        a = build_adapter(settings, platform=plat, token=realistic_token)
         assert isinstance(a, cls)
         assert a.item_url(RepoRef(platform=plat, owner="o", name="n"), 3, ItemType.PR).startswith("https://")
         assert "***" in a.sanitize(a.clone_url(RepoRef(platform=plat, owner="o", name="n"), use_token=True))
@@ -878,3 +881,114 @@ async def test_fetch_items_marks_degraded_when_comments_fail(
     assert len(items) == 1
     assert items[0].comments == []
     assert items[0].degraded, "评论没拉到的条目必须标记为残缺"
+
+
+# ---------------------------------------------------------------------------
+# P1：令牌卫生、限流识别与等待上限、标签缓存
+# ---------------------------------------------------------------------------
+
+
+def test_gitlab_uses_authorization_header(gl) -> None:
+    """GitLab 也必须走 `Authorization`。
+
+    httpx 在跨域重定向时**只**会剥掉 `Authorization`；`PRIVATE-TOKEN` 这类自定义
+    头会被原样转发给跳转目标，自建实例挂在反代/SSO 后面就会把令牌漏出去。
+    """
+    headers = gl._headers()
+    assert headers.get("Authorization", "").startswith("Bearer ")
+    assert "PRIVATE-TOKEN" not in headers
+
+
+def test_sanitize_redacts_realistic_token_only() -> None:
+    """脱敏：真实长度的令牌要抹掉；过短的「令牌」不能把正常文本打烂。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    token = "ghp_0123456789abcdefghijklmnopqrstuv"
+    a = GitHubAdapter(token=token)
+    out = a.sanitize(f"clone https://x:{token}@github.com/o/r.git 失败")
+    assert token not in out
+    assert "***" in out
+
+    short = GitHubAdapter(token="t")
+    message = "连接失败：请安装 truststore"
+    assert short.sanitize(message) == message, "1 个字符的令牌参与替换会把文本打成筛子"
+
+
+def test_parse_retry_after_supports_http_date() -> None:
+    """`Retry-After` 的 HTTP-date 形式要认，否则会退化成固定 5 秒、在仍被限流时重试。"""
+    from datetime import datetime, timedelta, timezone
+    from email.utils import format_datetime
+
+    from fissue.platforms.base import _parse_retry_after
+
+    when = datetime.now(timezone.utc) + timedelta(seconds=120)
+    resp = httpx.Response(429, headers={"retry-after": format_datetime(when, usegmt=True)})
+    value = _parse_retry_after(resp)
+    assert 100 < value <= 125, f"HTTP-date 应解析成约 120 秒，实际 {value}"
+
+
+def test_parse_retry_after_is_capped() -> None:
+    """epoch 形式的 reset 能算出接近一小时的等待，必须被上限封顶。"""
+    from datetime import datetime, timedelta, timezone
+
+    from fissue.platforms.base import _parse_retry_after
+
+    reset = (datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()
+    resp = httpx.Response(403, headers={"x-ratelimit-reset": str(int(reset))})
+
+    assert _parse_retry_after(resp) > 3000, "未封顶时应能算出接近一小时的等待"
+    assert _parse_retry_after(resp, max_seconds=300.0) == 300.0, "超过上限必须封顶"
+
+
+def test_rate_limit_detected_beyond_english_body() -> None:
+    """403 也要能认出限流：正文可能被本地化，或改用 X-RateLimit-Remaining 表示。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    a = GitHubAdapter(token="t")
+    assert a._is_rate_limited(httpx.Response(429)) is True
+    assert a._is_rate_limited(httpx.Response(403, headers={"x-ratelimit-remaining": "0"})) is True
+    assert a._is_rate_limited(httpx.Response(403, text="您已被限流")) is True
+    assert a._is_rate_limited(httpx.Response(403, text="forbidden")) is False
+    assert a._is_rate_limited(httpx.Response(404, text="not found")) is False
+
+
+@respx.mock
+async def test_label_not_cached_when_creation_fails(settings) -> None:
+    """建标签失败的标签**不能**被当成「已存在」写进缓存。
+
+    写进去等于接下来整个 TTL 都认为它存在、不再创建，随后每次打标签都静默失败——
+    而打标签正是「结论落地」的那一步。
+    """
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=1)
+    respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+
+    await adapter.ensure_labels(REPO, ["need-label"])
+    assert create.call_count == 1
+
+    await adapter.ensure_labels(REPO, ["need-label"])
+    assert create.call_count == 2, "失败的标签被缓存成了「已存在」，后续不再尝试创建"
+
+
+@respx.mock
+async def test_label_creation_success_is_cached(settings) -> None:
+    """对照组：创建成功的标签要进缓存，否则同一批打标签会反复建标签。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=1)
+    respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[{"name": "bug"}])
+    )
+    create = respx.post(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={"name": "new-label"})
+    )
+
+    await adapter.ensure_labels(REPO, ["new-label"])
+    await adapter.ensure_labels(REPO, ["new-label"])
+    assert create.call_count == 1, "建成功之后不该再建"

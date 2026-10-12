@@ -60,6 +60,7 @@ def build_adapter(
         max_retries=settings.llm.max_retries,
         # 标签缓存 TTL 由配置决定（常驻服务长跑时缓存必须能过期，见 PlatformConfig）
         label_cache_ttl=settings.platforms.label_cache_ttl_seconds,
+        max_retry_after=settings.platforms.max_retry_after_seconds,
     )
 
 

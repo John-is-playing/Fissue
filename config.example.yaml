@@ -290,3 +290,7 @@ platforms:
   # 打标签的并发上限；留空（null）跟随 llm.concurrency。
   # 打标签是纯平台 HTTP、不消耗 token，语义上不必与 LLM 并发数绑死。
   label_concurrency: null
+  # 被限流时**单次最多等多久**（秒）。平台给的 Retry-After / X-RateLimit-Reset
+  # 是「建议值」，照等没有上限——GitHub 的 reset 常常在一小时之后，直接照等会让
+  # 整条流水线表现为「莫名卡住」。超出的部分一律封顶到这个值。
+  max_retry_after_seconds: 300
