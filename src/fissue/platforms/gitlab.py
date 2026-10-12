@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
-from ..errors import PlatformError
+from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
 from ..models import AuthorKind, Comment, FileChange, ItemType, Platform, RawItem, RepoRef
 from .base import PlatformAdapter, extract_linked_issues, guess_author_kind, parse_dt
@@ -79,6 +79,8 @@ class GitLabAdapter(PlatformAdapter):
                 json={"name": label, "color": color if color.startswith("#") else f"#{color}"},
             )
             log.info("[gitlab] 已创建标签 %s", label)
+        except RateLimitError:
+            raise
         except PlatformError as exc:
             log.warning("[gitlab] 创建标签失败（忽略）：%s", exc)
 
@@ -293,11 +295,17 @@ class GitLabAdapter(PlatformAdapter):
 
     async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
-        await self._request(
-            "POST",
-            f"{self._project(repo)}/{segment}/{number}/notes",
-            json={"body": body},
-        )
+        notes_url = f"{self._project(repo)}/{segment}/{number}/notes"
+
+        async def _probe() -> Any:
+            """已存在逐字相同的评论 → 说明这次写其实已经生效了。"""
+            data = await self._get(notes_url, sort="desc", per_page=100)
+            for n in data or []:
+                if isinstance(n, dict) and (n.get("body") or "") == body:
+                    return n
+            return None
+
+        await self._request("POST", notes_url, json={"body": body}, probe=_probe)
 
     async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
@@ -356,8 +364,21 @@ class GitLabAdapter(PlatformAdapter):
             if isinstance(target, dict) and target.get("id"):
                 payload["target_project_id"] = target["id"]
 
+        async def _probe() -> Any:
+            """上游已存在同一个 source_branch 的 MR → 返回它，绝不重复创建。"""
+            found = await self._get(
+                f"{self._project(upstream)}/merge_requests",
+                source_branch=source_branch,
+                state="all",
+                per_page=20,
+            )
+            for mr in found or []:
+                if isinstance(mr, dict):
+                    return {"number": mr.get("iid") or mr.get("id"), "url": mr.get("web_url")}
+            return None
+
         data = await self._request(
-            "POST", f"{self._project(source_repo)}/merge_requests", json=payload
+            "POST", f"{self._project(source_repo)}/merge_requests", json=payload, probe=_probe
         )
         if not isinstance(data, dict):
             raise PlatformError(f"创建 MR 返回异常：{data}")

@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator, Iterable
 from datetime import datetime
 from typing import Any
 
-from ..errors import PlatformError
+from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
 from ..models import AuthorKind, Comment, FileChange, ItemType, Platform, RawItem, RepoRef
 from .base import (
@@ -66,6 +66,8 @@ class GitHubAdapter(PlatformAdapter):
                 json={"name": label, "color": color, "description": description},
             )
             log.info("[github] 已创建标签 %s", label)
+        except RateLimitError:
+            raise
         except PlatformError as exc:
             log.warning("[github] 创建标签失败（忽略）：%s", exc)
 
@@ -239,10 +241,22 @@ class GitHubAdapter(PlatformAdapter):
         )
 
     async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
+        async def _probe() -> Any:
+            """已存在一条逐字相同的评论 → 说明这次写其实已经生效了。"""
+            data = await self._get(
+                f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues/{number}/comments",
+                per_page=100,
+            )
+            for c in data or []:
+                if isinstance(c, dict) and (c.get("body") or "") == body:
+                    return c
+            return None
+
         await self._request(
             "POST",
             f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues/{number}/comments",
             json={"body": body},
+            probe=_probe,
         )
 
     async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
@@ -272,10 +286,26 @@ class GitHubAdapter(PlatformAdapter):
         body: str,
         draft: bool = False,
     ) -> dict[str, Any]:
+        head_ref = head if ":" in head else f"{upstream.owner}:{head}"
+
+        async def _probe() -> Any:
+            """同一个 head 上已经有 PR → 返回它，绝不重复创建。"""
+            data = await self._get(
+                f"{self.api_base}/repos/{upstream.owner}/{upstream.name}/pulls",
+                head=head_ref,
+                state="all",
+                per_page=20,
+            )
+            for pr in data or []:
+                if isinstance(pr, dict):
+                    return {"number": pr.get("number"), "url": pr.get("html_url")}
+            return None
+
         data = await self._request(
             "POST",
             f"{self.api_base}/repos/{upstream.owner}/{upstream.name}/pulls",
             json={"title": title, "head": head, "base": base, "body": body, "draft": draft},
+            probe=_probe,
         )
         return {"number": (data or {}).get("number"), "url": (data or {}).get("html_url")}
 

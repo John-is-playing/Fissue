@@ -13,7 +13,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Iterable
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -29,6 +29,9 @@ log = get_logger(__name__)
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=15.0)
 # 分页默认页大小
 DEFAULT_PER_PAGE = 50
+# 幂等的 HTTP 方法：失败可以安全重放（重放不会产生第二份副作用）。
+# POST/PATCH 不在其中——它们可能已经在上游执行成功，只是响应丢在回来的路上。
+_IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "OPTIONS", "PUT", "DELETE"})
 # 仓库标签名缓存的默认 TTL（秒）。覆盖项见 Settings.platforms.label_cache_ttl_seconds。
 LABEL_CACHE_TTL_SECONDS = 600.0
 # 标签缓存条目数上限：长跑进程里仓库数只增不减，需封顶（过期者优先淘汰）。
@@ -327,9 +330,23 @@ class PlatformAdapter(ABC):
         data: Any = None,
         headers: dict[str, str] | None = None,
         expect_json: bool = True,
+        probe: Callable[[], Awaitable[Any]] | None = None,
     ) -> Any:
-        """带重试与限流处理的请求。"""
+        """带重试与限流处理的请求。
+
+        **重试只对「能确定没生效」的失败执行**：
+
+        * 幂等方法（GET/HEAD/PUT/DELETE…）任何可重试失败都重放；
+        * 非幂等写方法（POST/PATCH）只在**连接阶段**失败（请求根本没发出去、
+          例如连不上或建连超时）才重放。读超时与服务端 5xx 都可能「上游其实
+          已经执行成功了，只是响应没回来」，此时先调用 ``probe`` 确认是否已
+          生效：已生效就直接返回其结果，否则抛错——**绝不再发一次**。
+
+        否则，一次网关 502 或者慢 POST 的读超时，就会在真实仓库上多出一个
+        重复的 PR 或重复的评论，公开且撤不回来。
+        """
         last_exc: Exception | None = None
+        idempotent = method.upper() in _IDEMPOTENT_METHODS
         for attempt in range(1, self.max_retries + 1):
             try:
                 resp = await self.client.request(
@@ -343,6 +360,10 @@ class PlatformAdapter(ABC):
                     raise PlatformError(
                         f"{self.platform.display} 连接失败（{method} {url}）：{exc}\n{ssl_help_text()}"
                     ) from exc
+                if not idempotent and not self._is_connect_phase_error(exc):
+                    return await self._settle_ambiguous_write(
+                        method, url, exc, probe=probe, platform=self.platform
+                    )
                 log.warning("[%s] 请求异常（第 %d 次）：%s %s -> %s", self.platform.value, attempt, method, url, exc)
                 await asyncio.sleep(self._backoff(attempt))
                 continue
@@ -353,12 +374,17 @@ class PlatformAdapter(ABC):
                 retry_after = _parse_retry_after(resp)
                 if attempt >= self.max_retries:
                     raise RateLimitError(f"{self.platform.display} 触发限流：{url}", retry_after)
+                # 限流是服务端**明确拒绝**了这次请求，写操作没有被执行 → 重放安全。
                 log.warning("[%s] 限流，%.1fs 后重试", self.platform.value, retry_after)
                 await asyncio.sleep(retry_after)
                 continue
 
             if resp.status_code in (500, 502, 503, 504):
                 last_exc = PlatformError(f"{self.platform.display} 服务端错误 {resp.status_code}")
+                if not idempotent:
+                    return await self._settle_ambiguous_write(
+                        method, url, last_exc, probe=probe, platform=self.platform
+                    )
                 await asyncio.sleep(self._backoff(attempt))
                 continue
 
@@ -377,6 +403,47 @@ class PlatformAdapter(ABC):
                 raise PlatformError(f"{self.platform.display} 返回非 JSON：{resp.text[:300]}") from exc
 
         raise PlatformError(f"{self.platform.display} 请求最终失败：{method} {url}（{last_exc}）")
+
+    @staticmethod
+    def _is_connect_phase_error(exc: BaseException) -> bool:
+        """请求是否**根本没送到服务端**（只有这类写请求失败可以安全重放）。
+
+        连不上 / 建连超时 / 连接池取不到连接，都发生在请求体发出之前，
+        因此上游不可能已经执行过。
+        """
+        return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout))
+
+    async def _settle_ambiguous_write(
+        self,
+        method: str,
+        url: str,
+        exc: BaseException,
+        *,
+        probe: Callable[[], Awaitable[Any]] | None,
+        platform: Platform,
+    ) -> Any:
+        """写请求失败且**可能已经生效**时的收尾：先查，再决定。
+
+        ``probe`` 返回非 None 表示「这次写其实已经生效了」，直接把它当作响应
+        返回；返回 None 或压根没给 probe，则抛错让人看到——宁可报错，也不
+        盲目重发一个可能已经生效的写请求。
+        """
+        if probe is not None:
+            try:
+                existing = await probe()
+            except Exception as probe_exc:      # 探测本身失败 → 当作没探测到
+                log.warning("[%s] 写请求幂等探测失败（%s）：%s", platform.value, method, probe_exc)
+                existing = None
+            if existing is not None:
+                log.info(
+                    "[%s] 写请求 %s 未收到响应（%s），但探测到已生效，按成功返回（不重发）",
+                    platform.value, method, exc,
+                )
+                return existing
+        raise PlatformError(
+            f"{self.platform.display} 写请求失败且无法确认是否已生效（{method} {url}）：{exc}。"
+            "为避免重复创建，本次不再重试；请到平台确认后手工处理。"
+        ) from exc
 
     async def _get(self, url: str, **params: Any) -> Any:
         clean = {k: v for k, v in params.items() if v is not None}

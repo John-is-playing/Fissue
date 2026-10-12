@@ -606,3 +606,118 @@ def test_setup_script_tls_verify_is_usable() -> None:
         assert value is not False, "默认不该关闭 TLS 校验"
     finally:
         sys.modules.pop("_demo_setup_github", None)
+
+
+# ---------------------------------------------------------------------------
+# P0：非幂等写请求不得盲目重放
+#
+# 一次网关 502 或慢 POST 的读超时，上游可能**已经执行成功**，只是响应没回来。
+# 无脑重试就会在真实仓库上多出一个重复的 PR / 重复的评论——公开且撤不回来。
+# ---------------------------------------------------------------------------
+
+
+class _Recorder:
+    """按脚本返回响应或抛异常，并记录被调用了几次。"""
+
+    def __init__(self, *outcomes) -> None:  # noqa: ANN002
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def request(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        self.calls += 1
+        item = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _no_sleep(monkeypatch) -> None:  # noqa: ANN001
+    async def _sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("fissue.platforms.base.asyncio.sleep", _sleep)
+
+
+async def test_write_not_retried_after_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST 读超时：请求可能已经被执行 → 不重发，直接报错让人看到。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=4)
+    fake = _Recorder(httpx.ReadTimeout("read timed out"))
+    adapter._client = fake  # type: ignore[assignment]
+    _no_sleep(monkeypatch)
+
+    with pytest.raises(PlatformError) as exc:
+        await adapter._request("POST", "https://api.github.com/x", json={})
+
+    assert fake.calls == 1, f"写请求读超时不得重发，实际 {fake.calls} 次"
+    assert "无法确认是否已生效" in str(exc.value)
+
+
+async def test_write_retried_when_request_never_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    """对照组：连接阶段失败（请求根本没发出去）可以安全重放。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=4)
+    fake = _Recorder(
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectError("connection refused"),
+        httpx.Response(201, json={"number": 7}),
+    )
+    adapter._client = fake  # type: ignore[assignment]
+    _no_sleep(monkeypatch)
+
+    assert await adapter._request("POST", "https://api.github.com/x", json={}) == {"number": 7}
+    assert fake.calls == 3, "连不上属于「确定没生效」，应当重试"
+
+
+async def test_write_502_uses_probe_instead_of_resending(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST 撞 502：先探测；探测到已生效就按成功返回，绝不重发。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=4)
+    fake = _Recorder(httpx.Response(502, text="bad gateway"))
+    adapter._client = fake  # type: ignore[assignment]
+    _no_sleep(monkeypatch)
+
+    probed: list[int] = []
+
+    async def probe():  # noqa: ANN202
+        probed.append(1)
+        return {"number": 42, "url": "https://github.com/o/r/pull/42"}
+
+    data = await adapter._request("POST", "https://api.github.com/x", json={}, probe=probe)
+
+    assert data == {"number": 42, "url": "https://github.com/o/r/pull/42"}
+    assert fake.calls == 1, "探测到已生效后不得重发"
+    assert probed == [1], "应当真的探测了一次"
+
+
+async def test_write_502_without_probe_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST 撞 502 且没有探测手段 → 报错，而不是盲目重发。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=4)
+    fake = _Recorder(httpx.Response(502, text="bad gateway"))
+    adapter._client = fake  # type: ignore[assignment]
+    _no_sleep(monkeypatch)
+
+    with pytest.raises(PlatformError):
+        await adapter._request("POST", "https://api.github.com/x", json={})
+    assert fake.calls == 1
+
+
+async def test_get_still_retries_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
+    """对照组：幂等的 GET 遇到 5xx 仍要重试（别把该重试的也一起砍了）。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    adapter = GitHubAdapter(token="t", max_retries=4)
+    fake = _Recorder(httpx.Response(502, text="x"), httpx.Response(200, json={"ok": True}))
+    adapter._client = fake  # type: ignore[assignment]
+    _no_sleep(monkeypatch)
+
+    assert await adapter._request("GET", "https://api.github.com/x") == {"ok": True}
+    assert fake.calls == 2

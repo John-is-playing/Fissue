@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterable
 from datetime import datetime
-from typing import Any
+from typing import Any, Awaitable, Callable
 
-from ..errors import PlatformError
+from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
 from ..models import Comment, FileChange, ItemType, Platform, RawItem, RepoRef
 from .base import PlatformAdapter, extract_linked_issues, guess_author_kind, parse_dt
@@ -63,10 +63,12 @@ class V5Adapter(PlatformAdapter):
         merged = {**self._auth_params(), **{k: v for k, v in params.items() if v is not None}}
         return await self._request("GET", url, params=merged)
 
-    async def _post(self, url: str, payload: dict[str, Any]) -> Any:
+    async def _post(
+        self, url: str, payload: dict[str, Any], *, probe: Callable[[], Awaitable[Any]] | None = None
+    ) -> Any:
         params = self._auth_params()
         body = {**payload, **params} if params else payload
-        return await self._request("POST", url, json=body, params=params or None)
+        return await self._request("POST", url, json=body, params=params or None, probe=probe)
 
     async def _patch(self, url: str, payload: dict[str, Any]) -> Any:
         params = self._auth_params()
@@ -101,6 +103,8 @@ class V5Adapter(PlatformAdapter):
         try:
             await self._post(f"{self._repo_api(repo)}/labels", {"name": label, "color": color.replace("#", "")})
             log.info("[%s] 已创建标签 %s", self.platform.value, label)
+        except RateLimitError:
+            raise
         except PlatformError as exc:
             log.warning("[%s] 创建标签失败（忽略）：%s", self.platform.value, exc)
 
@@ -299,7 +303,17 @@ class V5Adapter(PlatformAdapter):
         await self._post(f"{self._repo_api(repo)}/issues/{number}/labels", {"labels": labels})
 
     async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
-        await self._post(f"{self._repo_api(repo)}/issues/{number}/comments", {"body": body})
+        url = f"{self._repo_api(repo)}/issues/{number}/comments"
+
+        async def _probe() -> Any:
+            """已存在逐字相同的评论 → 说明这次写其实已经生效了。"""
+            data = await self._get(url, per_page=100)
+            for c in data or []:
+                if isinstance(c, dict) and (c.get("body") or "") == body:
+                    return c
+            return None
+
+        await self._post(url, {"body": body}, probe=_probe)
 
     async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
         await self._patch(f"{self._repo_api(repo)}/issues/{number}", {"state": "closed"})
@@ -332,9 +346,28 @@ class V5Adapter(PlatformAdapter):
         body: str,
         draft: bool = False,
     ) -> dict[str, Any]:
+        head_ref = head if ":" in head else f"{upstream.owner}:{head}"
+
+        async def _probe() -> Any:
+            """同一个 head 上已经有 PR → 返回它，绝不重复创建。"""
+            found = await self._get(
+                f"{self._repo_api(upstream)}/pulls",
+                head=head_ref,
+                state="all",
+                per_page=20,
+            )
+            for pr in found or []:
+                if isinstance(pr, dict):
+                    return {
+                        "number": pr.get("number") or pr.get("id"),
+                        "url": pr.get("html_url") or pr.get("url"),
+                    }
+            return None
+
         data = await self._post(
             f"{self._repo_api(upstream)}/pulls",
             {"title": title, "head": head, "base": base, "body": body, "draft": draft},
+            probe=_probe,
         )
         if not isinstance(data, dict):
             raise PlatformError(f"创建 PR 返回异常：{data}")
