@@ -179,9 +179,14 @@ class VerifierConfig(BaseModel):
     #: 验证器自身写错由 runner 内部的修正回路处理，不走这里。
     item_retries: int = 2
     # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
-    # off | warn | strict。默认 warn：上线首日没人知道仓库绿不绿，
-    # strict 会在本就失败/跳过的老仓库上大面积误杀。
-    regression_gate: str = "warn"
+    # off | warn | strict。默认 strict：这是本项目对外的招牌主张——「修好目标
+    # 却弄坏别处」的补丁不该被自动提 PR，默认只提醒等于招牌不生效。
+    #
+    # 原先默认 warn 是担心「本就失败/跳过的老仓库被大面积误杀」，但那个顾虑
+    # 已经由 judge_regression 的安全底线挡住了：base 阶段测试不绿、跑不通或
+    # 超时，一律**放行**（本门不可信，不据此拒绝）。所以 strict 只在
+    # 「改之前是绿的、改完之后红了」这一种情形下拦人，那正是它该拦的。
+    regression_gate: str = "strict"
     regression_command: str | None = None  # 留空则取仓库级 test_hint，再探测
     regression_timeout_seconds: int = 900  # 独立预算，通常远大于单测验证器
 
@@ -278,7 +283,9 @@ class PRStrategy(BaseModel):
     label: str = "ai-generated"
     extra_labels: list[str] = Field(default_factory=lambda: ["fissue"])
     draft: bool = False
-    auto_submit: bool = True
+    # 这里曾有一个 `auto_submit` 开关：文档建议「首次使用设成 false」，但代码
+    # 从来没读过它——设了照样自动提 PR，是个会给人虚假安全感的空开关，已删除。
+    # 要「只出补丁、不提 PR」请用 `mode: patch_only` 或 `fissue fix --dry-run`。
 
 
 class AutoFixConfig(BaseModel):

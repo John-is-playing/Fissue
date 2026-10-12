@@ -347,7 +347,7 @@ E    +  where True = should_retry(ValueError('x'), attempt=2)   # attempts=2，�
 |---|---|
 | **`pipekit` 的 Issue 侧自动修复（`fissue fix`）** | **从未运行**（`fix_attempts` = 0、无 patch 产物），10 条 tier1/tier2 全部停在 `fix_queued`。注意：PR 侧 5 个 PR 中 4 个**已完整测量**（#18 为纯文档 PR，按设计不验证），详见 [§4.1](#41-pipekit-的-base-error已定位瞬态环境故障非能力问题) |
 | `lockkit`（15 Issue + 5 PR） | **从未运行**。夹具与 5 个 `fix/*` 分支已就绪、基线 87 passed 全绿；但 Fissue 只支持从平台 API 抓取（无本地导入），该仓库尚未推送到 GitHub，故无法进入 fetch→eval→verify→fix 链路 |
-| 真实提 PR（`mode: fork` + `auto_submit: true`） | **从未运行**。所有修复均为 dry-run |
+| 真实提 PR（`mode: fork`） | **从未运行**。所有修复均为 dry-run |
 | Gitee / AtomGit / GitLab 平台 | 仅单测覆盖，**无端到端实测** |
 | PostgreSQL 后端 | 开发期使用 SQLite |
 | 冻结版本的可复现跑分 | **工具已就绪**（`fissue bench`），但**尚未冻结任何正式基线**。`bench capture` 会记录 git commit + 是否有未提交改动、模型与采样参数、关键配置指纹，以及各阶段结果；`bench diff` 先判**可比性**再给逐项增量。缺的只是一次「commit 干净 + 参数固定」的正式测量——见 [§6](#6-如何复现)。 |

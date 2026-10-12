@@ -111,8 +111,8 @@ fissue eval --all
 fissue verify --repo psf/requests
 
 # 7. 手动 flush 队列（也可等数量阈值 / 空闲超时自动触发）
-fissue flush --queue verify
-fissue flush --queue fix
+fissue flush --queue verify        # Issue-BUG 的验证队列
+fissue flush --queue fix_bug       # PR-BUG 的合并验证队列（FEATURE 用 fix_feature）
 
 # 8. 自动修复「低难度 + 高重要性」的 Issue 并提 PR
 fissue fix --plan

@@ -118,8 +118,9 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
 | ERROR/TIMEOUT | — | ⚠️ 同「不绿」，不可归咎于修复 |
 
 > **第 3 行是安全底线**：老仓库普遍存在本来就失败/跳过的测试。若把
-> 「base 不绿」当成修复的错，会把**所有**条目误杀。故 `regression_gate`
-> 默认 `warn`，`off | warn | strict` 三档，配置项见 `config.example.yaml`。
+> 「base 不绿」当成修复的错，会把**所有**条目误杀。因此 `regression_gate`
+> 只在「base 绿、fix 红」时才拦人，默认取 `strict`（`off | warn | strict` 三档，
+> 配置项见 `config.example.yaml`）。
 
 ## 5. 安全模型
 

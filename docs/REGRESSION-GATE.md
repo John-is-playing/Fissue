@@ -84,15 +84,20 @@ issue #1 正文写明「**其余用例不受影响**」，但验证器只把列�
 `VerifierConfig`（`src/fissue/config.py`）新增：
 
 ```python
-regression_gate: str = "warn"        # off | warn | strict
+regression_gate: str = "strict"      # off | warn | strict
 regression_command: str | None = None  # 留空则取仓库级 test_hint
 regression_timeout_seconds: int = 900  # 单独预算，通常远大于单测验证器
 ```
 
-* **默认必须是 `warn`**：上线首日谁也不知道仓库绿不绿，`strict` 会在老仓库上大面积误杀。
-* `warn`：跑、记录、在报告里标注，但**不改变** F2P 结论。
+* **默认 `strict`**：「修好目标却弄坏别处」的补丁不该被自动提 PR；默认只提醒，
+  等于本门对外宣称的作用根本不生效。
 * `strict`：按 §3.3 判定，base 绿而 fix 不绿时**拒绝**。
+* `warn`：跑、记录、在报告里标注，但**不改变** F2P 结论（想先统计一批「不绿率」时用）。
 * `off`：完全不跑（零开销）。
+
+> 不必担心 `strict` 会误杀老仓库：§3.3 的安全底线已经兜住了——base 阶段不绿、
+> 跑不通或超时，一律**放行**（本门不可信，不据此拒绝）。因此 `strict` 只在
+> 「改之前是绿的、改完之后红了」这一种情形下拦人，那正是它该拦的。
 
 同步更新 `config.example.yaml` 与 `docs/USAGE.md` 的配置说明。
 
@@ -262,7 +267,7 @@ regression_timeout_seconds: int = 900  # 单独预算，通常远大于单测验
 
 | 风险 | 说明 | 处置 |
 |---|---|---|
-| 老仓库普遍不绿 | `strict` 会大面积误杀 | 默认 `warn`；先用它统计「不绿率」再决定 |
+| 老仓库普遍不绿 | `strict` 本会大面积误杀 | §3.3 安全底线已兜住：base 不绿/跑不通/超时一律放行，故默认取 `strict` 不会误杀；仍想先观察可改 `warn` |
 | 套件很慢 | 每 Issue 2 次全量运行 | 独立超时预算 + 到点放弃；可选结果缓存 |
 | 依赖装不全 | 沙盒禁网，仓库依赖可能装不上 | base 红即判不可信、不阻断（§3.3 第 3 行） |
 | 测试发现机制扫到验证器文件 | base 阶段误失败 | §4.3 临时移出 + 基于 `git ls-files` 限定 |

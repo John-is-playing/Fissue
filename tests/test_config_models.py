@@ -178,3 +178,40 @@ def test_enums_have_expected_members() -> None:
     assert Action.FIX_NOW.value == "fix_now"
     assert Priority.TIER1.value == "tier1"
     assert AuthorKind.AI_AGENT.value == "ai_agent"
+
+
+# ---------------------------------------------------------------------------
+# P1：回归门默认档、已删除的空开关
+# ---------------------------------------------------------------------------
+
+
+def test_regression_gate_defaults_to_strict() -> None:
+    """回归门默认必须**真拦**。
+
+    「修好目标却弄坏别处」的补丁不该被自动提 PR；默认只提醒等于本门对外宣称的
+    作用根本不生效。误杀顾虑由「base 不绿一律放行」的安全底线兜住。
+    """
+    from fissue.config import VerifierConfig
+
+    assert VerifierConfig().regression_gate == "strict"
+
+
+def test_pr_strategy_no_longer_has_auto_submit() -> None:
+    """那个空开关不能再回来。
+
+    `auto_submit` 曾被文档当成安全阀（「首次使用建议设成 false」），但代码从未
+    读取它——设了照样自动提 PR。要只出补丁请用 `mode: patch_only` 或 `--dry-run`。
+    """
+    from fissue.config import PRStrategy
+
+    assert not hasattr(PRStrategy(), "auto_submit")
+    # 老配置文件里残留的那一行不该让加载直接报错（多余键被忽略）
+    assert PRStrategy(auto_submit=False).mode == "fork"
+
+
+def test_platform_max_retry_after_default() -> None:
+    """限流单次等待上限有默认值，且能按平台覆盖。"""
+    from fissue.config import PlatformConfig
+
+    assert PlatformConfig().max_retry_after_seconds == 300.0
+    assert PlatformConfig(max_retry_after_seconds=30.0).max_retry_after_seconds == 30.0

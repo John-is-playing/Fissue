@@ -102,9 +102,10 @@ verifier:
   # -- 既有测试回归门（见 docs/REGRESSION-GATE.md）------------------------
   # F2P 只证明「目标用例修好了」，证明不了「没弄坏别的」。本门补上 pass-to-pass：
   # 在 base 与 fix 两个代码状态上各跑一次仓库自己的测试套件。
-  # 默认 warn 而非 strict：上线首日没人知道仓库绿不绿，strict 会在本就
-  # 失败/跳过的老仓库上大面积误杀（base 不绿一律视为「本门不可信」并放行）。
-  regression_gate: warn               # off（不跑，零开销）| warn（跑+告警，不阻断）| strict（拒坏修复）
+  # 默认 strict：「修好目标却弄坏别处」的补丁不该被自动提 PR。不必担心误杀老
+  # 仓库——base 阶段测试不绿/跑不通/超时，一律视为「本门不可信」并放行，
+  # 所以 strict 只在「改之前是绿的、改完之后红了」时拦人。
+  regression_gate: strict             # off（不跑，零开销）| warn（跑+告警，不阻断）| strict（拒坏修复）
   regression_command: null            # 留空 → 仓库级 test_hint → 探测（pytest/npm test/go test…）
   regression_timeout_seconds: 900     # 独立预算，通常远大于单测验证器（后者默认 600）
 
@@ -192,7 +193,9 @@ auto_fix:
     label: ai-generated               # 自动打的 AI 标签
     extra_labels: [fissue]
     draft: false
-    auto_submit: true                 # Q13:C 全自动提交，靠 AI 标签标识
+    # 注：曾有 `auto_submit` 开关，但代码从未读取它（设 false 照样自动提 PR，
+    # 文档却建议首次使用设成 false），已删除。要只出补丁不提 PR，请用上面的
+    # `mode: patch_only`，或命令行上的 `fissue fix --dry-run`。
 
 # ---------------------------------------------------------------------------
 # Issue-BUG 自动修复准入（Q1 的优先级规则）

@@ -186,10 +186,9 @@ auto_fix:
   pr_strategy:
     mode: fork                # fork | direct | patch_only
     label: ai-generated       # 自动打的 AI 标识标签
-    auto_submit: true         # 全自动提交（靠 AI 标签标识）
 ```
 
-> **首次使用建议**：先 `mode: patch_only` + `auto_submit: false`，只产出补丁人工审阅，
+> **首次使用建议**：先 `mode: patch_only`（或命令行加 `--dry-run`），只产出补丁供人工审阅，
 > 观察几轮任务质量后再放开自动提 PR。
 
 ### 4.4 阈值与队列（默认合理，可按需调）
@@ -215,7 +214,7 @@ F2P（fail-to-pass）只证明**目标用例**被修好了；证明不了「没�
 ```yaml
 verifier:
   # off / warn / strict
-  regression_gate: warn
+  regression_gate: strict             # 默认档：base 绿而 fix 红 → 拒绝该修复
   regression_command: null            # 留空 → 仓库 test_hint → 自动探测
   regression_timeout_seconds: 900     # 独立预算，全量套件通常比单测慢很多
 ```
@@ -225,10 +224,12 @@ verifier:
 | 档位 | 行为 | 适用 |
 |---|---|---|
 | `off` | 完全不跑，零开销 | 不关心回归 / 仓库没测试 |
-| `warn`（默认） | 跑、记录日志、报告里标注，但**不改变**结论 | **上线首日** |
-| `strict` | base 绿而 fix 不绿 → **拒绝**修复并转人工 | 仓库套件稳定全绿之后 |
+| `warn` | 跑、记录日志、报告里标注，但**不改变**结论 | 想先观察「本就红」的比例时 |
+| `strict`（默认） | base 绿而 fix 不绿 → **拒绝**修复并转人工 | 默认档 |
 
-**推荐姿势**：先 `warn` 跑几天，看日志/报告里有多少仓库「本就红」。
+**推荐姿势**：保持默认的 `strict`——它只在「改之前绿、改之后红」时拦人，而
+「base 本来就不绿」的情形已被安全底线放行。想统计有多少仓库本来就红，可临时
+切到 `warn` 观察几天。
 
 > ⚠️ 若 base 阶段既有测试就不通过（老仓库普遍如此），回归门一律视为
 > **不可信并放行**——绝不据此拒绝，否则会大面积误杀。同理，沙盒禁网导致
@@ -724,7 +725,6 @@ fissue report --repo psf/requests --out data/exports/first.md
 auto_fix:
   pr_strategy:
     mode: patch_only      # 只产出补丁，不建分支不提 PR
-    auto_submit: false
 ```
 
 ```bash
@@ -738,7 +738,6 @@ fissue fetch && fissue eval --all && fissue verify && fissue flush && fissue fix
 auto_fix:
   pr_strategy:
     mode: fork            # fork → 分支 → 上游 PR
-    auto_submit: true
 ```
 
 ### 9.3 多仓库批量托管
