@@ -137,6 +137,136 @@ def test_fetcher_cursor_fallback(settings, ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
+# P0：增量游标口径
+#
+# 此前游标写的是 wall-clock now()：等于宣告「这段时间我都抓过了」，而实际上
+# 没抓到的条目再也不会被增量碰到。现在改为「本轮实际入库条目的最大 updated_at」，
+# 并在数据不完整 / 一条都没入库时**原地不动**。
+# ---------------------------------------------------------------------------
+
+
+class _StubFetchAdapter:
+    """只按脚本产出条目，用于验证游标口径。"""
+
+    def __init__(self, items: list[RawItem], *, error: Exception | None = None) -> None:
+        self.items = items
+        self.error = error
+
+    async def fetch_items(self, ref, *, item_types=None, since=None, limit=None):  # noqa: ANN001, ANN201
+        if self.error is not None:
+            raise self.error
+        for idx, item in enumerate(self.items):
+            if limit is not None and idx >= limit:
+                return
+            yield item
+
+
+def _wire_adapter(ctx, monkeypatch, adapter) -> Fetcher:  # noqa: ANN001
+    async def _fake(repo_cfg):  # noqa: ANN001
+        return adapter
+
+    monkeypatch.setattr(ctx, "adapter_for_repo", _fake)
+    return Fetcher(ctx)
+
+
+def _fetched_item(number: int, updated: str) -> RawItem:
+    from datetime import datetime
+
+    return RawItem(
+        platform=Platform.GITHUB, repo="psf/requests", number=number, item_type=ItemType.ISSUE,
+        title=f"t{number}", body="b", updated_at=datetime.fromisoformat(updated),
+    )
+
+
+def _repo_cfg():  # noqa: ANN202
+    from fissue.config import RepoConfig
+
+    return RepoConfig(platform=Platform.GITHUB, owner="psf", name="requests", since_days=30)
+
+
+def _seed_cursor(ctx, cfg, value: str) -> None:  # noqa: ANN001
+    """预置游标：必须先建仓库行——``set_repo_cursor`` 在行不存在时会静默 no-op。"""
+    ctx.ensure_repo_row(cfg)
+    ctx.repo.set_repo_cursor(cfg.slug, {"last_updated_at": value})
+
+
+async def test_cursor_uses_max_updated_at_not_wall_clock(settings, ctx, monkeypatch) -> None:
+    """游标写的是本轮入库条目的最大 updated_at，而不是 now()。"""
+    cfg = _repo_cfg()
+    adapter = _StubFetchAdapter([
+        _fetched_item(1, "2026-01-02T00:00:00+00:00"),
+        _fetched_item(2, "2026-01-05T00:00:00+00:00"),
+    ])
+    fetcher = _wire_adapter(ctx, monkeypatch, adapter)
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.created == 2
+    assert stats.incomplete is False
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-05")
+
+
+async def test_cursor_frozen_when_data_incomplete(settings, ctx, monkeypatch) -> None:
+    """条目被标残缺时游标必须原地不动，否则那段缺口永久留在库里。"""
+    cfg = _repo_cfg()
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    item = _fetched_item(1, "2026-01-09T00:00:00+00:00")
+    item.mark_degraded("comments_unavailable#1")
+    fetcher = _wire_adapter(ctx, monkeypatch, _StubFetchAdapter([item]))
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.incomplete is True
+    assert stats.incomplete_reasons, "应当留下不完整的原因"
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
+async def test_cursor_frozen_when_nothing_stored(settings, ctx, monkeypatch) -> None:
+    """一条都没入库时不得把游标推到 now()（那会跳过中间所有更新）。"""
+    cfg = _repo_cfg()
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    fetcher = _wire_adapter(ctx, monkeypatch, _StubFetchAdapter([]))
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.fetched == 0
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
+async def test_cursor_frozen_on_early_stop(settings, ctx, monkeypatch) -> None:
+    """早停在 --limit 上说明后面还有没抓到的旧条目，不能推进游标。"""
+    cfg = _repo_cfg()
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    fetcher = _wire_adapter(ctx, monkeypatch, _StubFetchAdapter([
+        _fetched_item(1, "2026-01-09T00:00:00+00:00"),
+        _fetched_item(2, "2026-01-08T00:00:00+00:00"),
+    ]))
+
+    stats = await fetcher.fetch_repo(cfg, limit=1)
+
+    assert stats.fetched == 1
+    assert stats.incomplete is True
+    assert "early_stop" in "；".join(stats.incomplete_reasons)
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
+async def test_cursor_frozen_on_rate_limit(settings, ctx, monkeypatch) -> None:
+    """限流不再被吞：本轮记为失败，游标不推进（下一轮会重抓这一段）。"""
+    from fissue.errors import RateLimitError
+
+    cfg = _repo_cfg()
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    fetcher = _wire_adapter(
+        ctx, monkeypatch, _StubFetchAdapter([], error=RateLimitError("触发限流"))
+    )
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.error, "限流必须体现为本轮错误"
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
+# ---------------------------------------------------------------------------
 # 队列
 # ---------------------------------------------------------------------------
 

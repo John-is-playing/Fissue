@@ -134,10 +134,16 @@ class V5Adapter(PlatformAdapter):
                     if is_pr and ItemType.PR not in wanted:
                         continue
                     item_type = ItemType.PR if is_pr else ItemType.ISSUE
+                    detail_note = ""
                     if is_pr:
-                        payload = await self._merge_pr_detail(repo, payload)
+                        payload, detail_note = await self._merge_pr_detail(repo, payload)
                     try:
-                        yield await self._build_item(repo, payload, item_type)
+                        item = await self._build_item(repo, payload, item_type)
+                        if detail_note:
+                            item.mark_degraded(detail_note)
+                        yield item
+                    except RateLimitError:
+                        raise
                     except PlatformError as exc:
                         log.warning("[%s] 构造条目失败 #%s：%s", self.platform.value, payload.get("number"), exc)
                         continue
@@ -156,6 +162,8 @@ class V5Adapter(PlatformAdapter):
                     try:
                         detail = await self._get(f"{self._repo_api(repo)}/pulls/{number}") or payload
                         yield await self._build_item(repo, detail, ItemType.PR)
+                    except RateLimitError:
+                        raise
                     except PlatformError as exc:
                         log.warning("[%s] 构造 PR 失败 #%s：%s", self.platform.value, number, exc)
                         continue
@@ -163,18 +171,28 @@ class V5Adapter(PlatformAdapter):
                     if limit is not None and count >= limit:
                         return
 
-    async def _merge_pr_detail(self, repo: RepoRef, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _merge_pr_detail(
+        self, repo: RepoRef, payload: dict[str, Any]
+    ) -> tuple[dict[str, Any], str]:
+        """把 PR 详情合并进列表载荷；返回 ``(载荷, 残缺原因)``。
+
+        详情拉不到时条目仍然可用（缺的是分支名、变更统计等字段），但必须记为
+        残缺——验证阶段据此判断「是否只改了文档」时会用到这些字段。
+        """
         number = payload.get("number")
         if number is None:
-            return payload
+            return payload, ""
         try:
             detail = await self._get(f"{self._repo_api(repo)}/pulls/{number}")
             if isinstance(detail, dict):
                 merged = {**payload, **detail}
-                return merged
+                return merged, ""
+        except RateLimitError:
+            raise
         except PlatformError as exc:
-            log.debug("[%s] 拉 PR 详情失败 #%s：%s", self.platform.value, number, exc)
-        return payload
+            log.warning("[%s] 拉 PR 详情失败 #%s（记为数据残缺）：%s", self.platform.value, number, exc)
+            return payload, f"pr_detail_unavailable#{number}"
+        return payload, ""
 
     async def _build_item(self, repo: RepoRef, payload: dict[str, Any], item_type: ItemType) -> RawItem:
         number = int(payload.get("number") or payload.get("id") or 0)
@@ -217,8 +235,14 @@ class V5Adapter(PlatformAdapter):
             # （无代码变更 → 明确不建议合并），而验证阶段必须离线可跑，不能在那儿现拉。
             try:
                 raw.files = await self.fetch_files(repo, number)
+            except RateLimitError:
+                raise
             except Exception as exc:      # 取不到不影响主流程：验证阶段会保守放行
-                log.warning("[%s] 拉取 PR #%s 文件清单失败：%s", self.platform.value, number, exc)
+                log.warning(
+                    "[%s] 拉取 PR #%s 文件清单失败（记为数据残缺）：%s",
+                    self.platform.value, number, exc,
+                )
+                raw.mark_degraded(f"files_unavailable#{number}")
             raw.linked_issues = extract_linked_issues(title, body)
             # v5 提供 PR 关联 Issue 的专用端点
             try:
@@ -226,12 +250,19 @@ class V5Adapter(PlatformAdapter):
                 if isinstance(linked, list):
                     nums = {int(x.get("number")) for x in linked if isinstance(x, dict) and x.get("number")}
                     raw.linked_issues = sorted(nums | set(raw.linked_issues))
-            except PlatformError:
-                pass
+            except RateLimitError:
+                raise
+            except PlatformError as exc:
+                log.warning("[%s] 拉 PR 关联 Issue 失败 #%s（记为数据残缺）：%s", self.platform.value, number, exc)
+                raw.mark_degraded(f"linked_issues_unavailable#{number}")
         else:
             raw.linked_issues = extract_linked_issues(title, body)
 
-        raw.comments = await self._fetch_comments(repo, number, item_type=item_type, limit=100)
+        raw.comments, comments_note = await self._fetch_comments(
+            repo, number, item_type=item_type, limit=100
+        )
+        if comments_note:
+            raw.mark_degraded(comments_note)
         raw.author_kind = guess_author_kind(
             author, body=body, labels=labels, maintainers=(repo.owner,)
         )
@@ -239,30 +270,42 @@ class V5Adapter(PlatformAdapter):
 
     async def _fetch_comments(
         self, repo: RepoRef, number: int, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
-    ) -> list[Comment]:
+    ) -> tuple[list[Comment], str]:
+        """拉评论，返回 ``(评论, 残缺原因)``；原因非空表示数据不完整。
+
+        限流向上抛（理由见 ``GithubAdapter._fetch_comments``）；并补上分页——
+        此前只取一页，``limit=100`` 形同虚设。
+        """
         # v5：Issue 与 PR 的评论都走 issues 端点
         url = f"{self._repo_api(repo)}/issues/{number}/comments"
         comments: list[Comment] = []
+        truncated = False
         try:
-            data = await self._get(url, per_page=min(limit, self.per_page))
+            max_pages = max(1, (limit + self.per_page - 1) // self.per_page)
+            async for batch in self._paginate(url, max_pages=max_pages):
+                for c in batch:
+                    if not isinstance(c, dict):
+                        continue
+                    author = _login(c.get("user"))
+                    comments.append(
+                        Comment(
+                            author=author,
+                            author_kind=guess_author_kind(author, body=c.get("body") or ""),
+                            body=c.get("body") or "",
+                            created_at=parse_dt(c.get("created_at")),
+                        )
+                    )
+                    if len(comments) >= limit:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        except RateLimitError:
+            raise
         except PlatformError as exc:
-            log.debug("[%s] 拉评论失败 #%s：%s", self.platform.value, number, exc)
-            return comments
-        for c in data or []:
-            if not isinstance(c, dict):
-                continue
-            author = _login(c.get("user"))
-            comments.append(
-                Comment(
-                    author=author,
-                    author_kind=guess_author_kind(author, body=c.get("body") or ""),
-                    body=c.get("body") or "",
-                    created_at=parse_dt(c.get("created_at")),
-                )
-            )
-            if len(comments) >= limit:
-                break
-        return comments
+            log.warning("[%s] 拉评论失败 #%s（本条记为数据残缺）：%s", self.platform.value, number, exc)
+            return comments, f"comments_unavailable#{number}"
+        return comments, (f"comments_may_be_truncated#{number}" if truncated else "")
 
     async def fetch_files(
         self, repo: RepoRef, number: int, *, with_patch: bool = False, max_files: int = 100
@@ -270,9 +313,13 @@ class V5Adapter(PlatformAdapter):
         files: list[FileChange] = []
         try:
             data = await self._get(f"{self._repo_api(repo)}/pulls/{number}/files")
+        except RateLimitError:
+            raise
         except PlatformError as exc:
-            log.debug("[%s] 拉 PR 文件失败 #%s：%s", self.platform.value, number, exc)
-            return files
+            # 不在这里返回空列表：调用方（_build_item）需要知道「拉失败了」才能
+            # 把条目标成残缺，否则「没有文件」与「没拉到文件」无法区分。
+            log.warning("[%s] 拉 PR 文件失败 #%s：%s", self.platform.value, number, exc)
+            raise
         for f in data or []:
             if not isinstance(f, dict):
                 continue

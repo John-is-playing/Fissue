@@ -185,6 +185,11 @@ class FileChange(BaseModel):
     patch: str | None = None       # 需要评代码质量时才拉取（Q1 分层）
 
 
+#: ``RawItem.raw`` 里记录「数据残缺原因」的保留键。下划线前缀避免与平台
+#: 原始载荷的字段撞名（``raw`` 同时用来放 html_url 等平台字段）。
+DEGRADED_KEY = "_fissue_degraded"
+
+
 class RawItem(BaseModel):
     """从平台抓取到的 Issue / PR 统一表示。"""
 
@@ -237,6 +242,26 @@ class RawItem(BaseModel):
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+    # -- 数据完整性 --------------------------------------------------------
+
+    def mark_degraded(self, reason: str) -> None:
+        """标记这条数据的某一部分没拉全（如评论/文件清单请求失败）。
+
+        承载在 ``raw`` 这个已入库的 JSON 列里，因此不需要改表结构就能让
+        「残缺」这件事跟着条目一起落库，供评测侧与游标判定使用。
+        """
+        marks = self.raw.setdefault(DEGRADED_KEY, [])
+        if isinstance(marks, list) and reason not in marks:
+            marks.append(reason)
+
+    @property
+    def degraded(self) -> list[str]:
+        """残缺原因列表；**空列表才表示这条数据完整**。"""
+        marks = self.raw.get(DEGRADED_KEY)
+        if not isinstance(marks, list):
+            return []
+        return [str(m) for m in marks]
 
 
 # ---------------------------------------------------------------------------

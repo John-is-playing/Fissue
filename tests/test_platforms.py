@@ -787,3 +787,94 @@ async def test_gitlab_and_v5_reuse_base_cache(gitee, gl) -> None:
     await gl.ensure_labels(REPO, ["bug"])
     assert gl_labels.call_count == 1
     assert gl_create.call_count == 0   # 已存在
+
+
+# ---------------------------------------------------------------------------
+# P0：评论必须翻页；限流不得被吞；残缺必须显式标记
+#
+# 此前评论只取一页（per_page 上限 50），limit=100 永远达不到；而限流被
+# `except PlatformError` 吞成「这条没有评论」后，评测会基于残缺数据下结论、
+# 结论又回写平台，且增量抓取永远不会再碰这条——错误就此固化。
+# ---------------------------------------------------------------------------
+
+
+def _c(i: int) -> dict:
+    return {"user": {"login": f"u{i}"}, "body": f"c{i}", "created_at": "2026-01-01T00:00:00Z"}
+
+
+@respx.mock
+async def test_github_comments_span_multiple_pages(gh) -> None:
+    """超过一页的评论必须全部取回（此前只有第一页 50 条）。"""
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments", params={"page": "1"}).mock(
+        return_value=httpx.Response(200, json=[_c(i) for i in range(50)])
+    )
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments", params={"page": "2"}).mock(
+        return_value=httpx.Response(200, json=[_c(50)])
+    )
+
+    comments, note = await gh._fetch_comments(REPO, 1, limit=100)
+
+    assert len(comments) == 51, "评论应当跨页取全"
+    assert note == "", "没有截断就不该标残缺"
+
+
+@respx.mock
+async def test_github_comments_marked_truncated_at_limit(gh) -> None:
+    """取满 limit 时如实标记「可能被截断」，而不是假装完整。"""
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments", params={"page": "1"}).mock(
+        return_value=httpx.Response(200, json=[_c(i) for i in range(50)])
+    )
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments", params={"page": "2"}).mock(
+        return_value=httpx.Response(200, json=[_c(50)])
+    )
+
+    comments, note = await gh._fetch_comments(REPO, 1, limit=51)
+
+    assert len(comments) == 51
+    assert "truncated" in note
+
+
+@respx.mock
+async def test_github_comment_ratelimit_is_not_swallowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """评论限流必须向上抛，绝不能变成「这条没有评论」。"""
+    from fissue.errors import RateLimitError
+    from fissue.platforms.github import GitHubAdapter
+
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments").mock(
+        return_value=httpx.Response(429, headers={"retry-after": "0"}, text="rate limit")
+    )
+
+    adapter = GitHubAdapter(token="t", max_retries=1)
+    with pytest.raises(RateLimitError):
+        await adapter._fetch_comments(REPO, 1)
+
+
+@respx.mock
+async def test_fetch_items_marks_degraded_when_comments_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """评论拉取失败（非限流）→ 条目仍产出，但必须标记为数据残缺。"""
+    from fissue.platforms.github import GitHubAdapter
+
+    respx.get(f"{GH}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": 1, "title": "i", "body": "", "state": "open", "labels": [],
+             "user": {"login": "a"}, "created_at": "2026-01-01T00:00:00Z",
+             "updated_at": "2026-01-02T00:00:00Z"},
+        ])
+    )
+    respx.get(f"{GH}/repos/psf/requests/issues/1/comments").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+
+    async def _sleep(seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("fissue.platforms.base.asyncio.sleep", _sleep)
+
+    adapter = GitHubAdapter(token="t", max_retries=1)
+    items = [i async for i in adapter.fetch_items(REPO, item_types=[ItemType.ISSUE])]
+
+    assert len(items) == 1
+    assert items[0].comments == []
+    assert items[0].degraded, "评论没拉到的条目必须标记为残缺"

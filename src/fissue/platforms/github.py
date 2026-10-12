@@ -102,6 +102,10 @@ class GitHubAdapter(PlatformAdapter):
                     continue
                 try:
                     item = await self._build_item(repo, payload, item_type)
+                except RateLimitError:
+                    # 限流绝不能吞：吞掉就等价于「这条条目不存在」，而游标照推，
+                    # 于是它再也不会被增量抓取碰到（除非 --full）。
+                    raise
                 except PlatformError as exc:
                     log.warning("[github] 构造条目失败 #%s：%s", payload.get("number"), exc)
                     continue
@@ -117,7 +121,7 @@ class GitHubAdapter(PlatformAdapter):
         labels = [l.get("name", "") for l in payload.get("labels", []) if isinstance(l, dict)]
         author = (payload.get("user") or {}).get("login", "")
 
-        comments = await self._fetch_comments(repo, number, limit=100)
+        comments, comments_note = await self._fetch_comments(repo, number, limit=100)
 
         raw = RawItem(
             platform=self.platform,
@@ -136,6 +140,8 @@ class GitHubAdapter(PlatformAdapter):
             is_draft=bool(payload.get("draft")),
             raw={"html_url": payload.get("html_url")},
         )
+        if comments_note:
+            raw.mark_degraded(comments_note)
 
         if item_type is ItemType.PR:
             await self._enrich_pr(repo, number, raw)
@@ -170,8 +176,11 @@ class GitHubAdapter(PlatformAdapter):
         # 无网络的环境（单测）里发请求而卡住。
         try:
             raw.files = await self.fetch_files(repo, number)
+        except RateLimitError:
+            raise
         except Exception as exc:      # 取不到不影响主流程：验证阶段会保守放行
-            log.warning("拉取 PR #%s 文件清单失败：%s", number, exc)
+            log.warning("拉取 PR #%s 文件清单失败（记为数据残缺）：%s", number, exc)
+            raw.mark_degraded(f"files_unavailable#{number}")
         # 关联 Issue：优先用 API 的 timeline 提取（此处用正文正则兜底，省一次请求）
         raw.linked_issues = extract_linked_issues(pr.get("title") or "", pr.get("body") or "")
 
@@ -205,29 +214,49 @@ class GitHubAdapter(PlatformAdapter):
             expect_json=False,
         )
 
-    async def _fetch_comments(self, repo: RepoRef, number: int, *, limit: int = 100) -> list[Comment]:
+    async def _fetch_comments(
+        self, repo: RepoRef, number: int, *, limit: int = 100
+    ) -> tuple[list[Comment], str]:
+        """拉评论，返回 ``(评论, 残缺原因)``。
+
+        原因非空表示这条数据的评论没拉全，调用方**必须**据此标记条目残缺。
+
+        **限流一律向上抛**（不被 ``except PlatformError`` 吞掉）：吞掉的话条目会
+        以「零评论」入库，评测基于残缺数据下结论、结论又被回写到平台，而增量
+        抓取永远不会再碰这条——错误就此固化。
+
+        分页：此前只取一页（``per_page`` 上限 50），``limit=100`` 永远达不到，
+        高讨论量条目最关键的讨论被静默截断。
+        """
+        url = f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues/{number}/comments"
         comments: list[Comment] = []
+        truncated = False
         try:
-            data = await self._get(
-                f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues/{number}/comments",
-                per_page=min(limit, self.per_page),
-            )
+            max_pages = max(1, (limit + self.per_page - 1) // self.per_page)
+            async for batch in self._paginate(url, max_pages=max_pages):
+                for c in batch:
+                    if not isinstance(c, dict):
+                        continue
+                    author = (c.get("user") or {}).get("login", "")
+                    comments.append(
+                        Comment(
+                            author=author,
+                            author_kind=guess_author_kind(author, body=c.get("body") or ""),
+                            body=c.get("body") or "",
+                            created_at=parse_dt(c.get("created_at")),
+                        )
+                    )
+                    if len(comments) >= limit:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        except RateLimitError:
+            raise
         except PlatformError as exc:
-            log.debug("[github] 拉评论失败 #%s：%s", number, exc)
-            return comments
-        for c in data or []:
-            author = (c.get("user") or {}).get("login", "")
-            comments.append(
-                Comment(
-                    author=author,
-                    author_kind=guess_author_kind(author, body=c.get("body") or ""),
-                    body=c.get("body") or "",
-                    created_at=parse_dt(c.get("created_at")),
-                )
-            )
-            if len(comments) >= limit:
-                break
-        return comments
+            log.warning("[github] 拉评论失败 #%s（本条记为数据残缺）：%s", number, exc)
+            return comments, f"comments_unavailable#{number}"
+        return comments, (f"comments_may_be_truncated#{number}" if truncated else "")
 
     # -- 写操作 -----------------------------------------------------------
 

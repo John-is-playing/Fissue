@@ -112,6 +112,8 @@ class GitLabAdapter(PlatformAdapter):
                 for payload in batch:
                     try:
                         yield await self._build_item(repo, payload, ItemType.ISSUE)
+                    except RateLimitError:
+                        raise
                     except PlatformError as exc:
                         log.warning("[gitlab] 构造 Issue 失败 #%s：%s", payload.get("iid"), exc)
                         continue
@@ -132,6 +134,8 @@ class GitLabAdapter(PlatformAdapter):
                 for payload in batch:
                     try:
                         yield await self._build_item(repo, payload, ItemType.PR)
+                    except RateLimitError:
+                        raise
                     except PlatformError as exc:
                         log.warning("[gitlab] 构造 MR 失败 #%s：%s", payload.get("iid"), exc)
                         continue
@@ -172,8 +176,11 @@ class GitLabAdapter(PlatformAdapter):
                     sp = await self._get(f"{self.api_base}/projects/{source_project_id}")
                     if isinstance(sp, dict):
                         raw.head_repo = sp.get("path_with_namespace")
-                except PlatformError:
-                    pass
+                except RateLimitError:
+                    raise
+                except PlatformError as exc:
+                    log.warning("[gitlab] 拉源项目信息失败 %s（记为数据残缺）：%s", source_project_id, exc)
+                    raw.mark_degraded(f"head_repo_unavailable#{number}")
             raw.merged = bool(payload.get("merged_at")) or payload.get("state") == "merged"
             raw.mergeable = payload.get("merge_status") in ("can_be_merged", "mergeable")
             # 变更统计：changes 端点一次性给出。顺带把文件清单落库——
@@ -198,8 +205,11 @@ class GitLabAdapter(PlatformAdapter):
                         for c in (changes.get("changes") or [])
                         if isinstance(c, dict) and (c.get("new_path") or c.get("old_path"))
                     ]
-            except PlatformError:
-                pass
+            except RateLimitError:
+                raise
+            except PlatformError as exc:
+                log.warning("[gitlab] 拉 MR 变更失败 #%s（记为数据残缺）：%s", number, exc)
+                raw.mark_degraded(f"files_unavailable#{number}")
             closable = payload.get("closes_issue_iid")
             raw.linked_issues = extract_linked_issues(title, body)
             if closable:
@@ -211,7 +221,9 @@ class GitLabAdapter(PlatformAdapter):
         else:
             raw.linked_issues = extract_linked_issues(title, body)
 
-        raw.comments = await self._fetch_notes(repo, number, item_type=item_type)
+        raw.comments, comments_note = await self._fetch_notes(repo, number, item_type=item_type)
+        if comments_note:
+            raw.mark_degraded(comments_note)
         raw.author_kind = guess_author_kind(
             author, body=body, labels=labels, maintainers=(repo.owner,)
         )
@@ -219,39 +231,53 @@ class GitLabAdapter(PlatformAdapter):
 
     async def _fetch_notes(
         self, repo: RepoRef, number: int, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
-    ) -> list[Comment]:
+    ) -> tuple[list[Comment], str]:
+        """拉 MR/Issue 评论，返回 ``(评论, 残缺原因)``；原因非空表示数据不完整。
+
+        限流向上抛（理由见 ``GithubAdapter._fetch_comments``）；并补上分页——
+        此前只取一页，``limit=100`` 形同虚设。
+        """
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
         comments: list[Comment] = []
+        truncated = False
         try:
-            data = await self._get(
+            max_pages = max(1, (limit + self.per_page - 1) // self.per_page)
+            async for batch in self._paginate(
                 f"{self._project(repo)}/{segment}/{number}/notes",
-                sort="asc",
-                per_page=min(limit, self.per_page),
-            )
+                params={"sort": "asc"},
+                max_pages=max_pages,
+            ):
+                for n in batch:
+                    if not isinstance(n, dict) or n.get("system"):
+                        continue  # system 是系统事件（如"关闭了 issue"），跳过
+                    author = (n.get("author") or {}).get("username", "")
+                    comments.append(
+                        Comment(
+                            author=author,
+                            author_kind=guess_author_kind(author, body=n.get("body") or ""),
+                            body=n.get("body") or "",
+                            created_at=parse_dt(n.get("created_at")),
+                        )
+                    )
+                    if len(comments) >= limit:
+                        truncated = True
+                        break
+                if truncated:
+                    break
+        except RateLimitError:
+            raise
         except PlatformError as exc:
-            log.debug("[gitlab] 拉评论失败 #%s：%s", number, exc)
-            return comments
-        for n in data or []:
-            if not isinstance(n, dict) or n.get("system"):
-                continue  # system 是系统事件（如"关闭了 issue"），跳过
-            author = (n.get("author") or {}).get("username", "")
-            comments.append(
-                Comment(
-                    author=author,
-                    author_kind=guess_author_kind(author, body=n.get("body") or ""),
-                    body=n.get("body") or "",
-                    created_at=parse_dt(n.get("created_at")),
-                )
-            )
-            if len(comments) >= limit:
-                break
-        return comments
+            log.warning("[gitlab] 拉评论失败 #%s（本条记为数据残缺）：%s", number, exc)
+            return comments, f"comments_unavailable#{number}"
+        return comments, (f"comments_may_be_truncated#{number}" if truncated else "")
 
     async def fetch_files(
         self, repo: RepoRef, number: int, *, with_patch: bool = False, max_files: int = 100
     ) -> list[FileChange]:
         try:
             data = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
+        except RateLimitError:
+            raise
         except PlatformError as exc:
             log.debug("[gitlab] 拉 MR 变更失败 #%s：%s", number, exc)
             return []
@@ -272,6 +298,8 @@ class GitLabAdapter(PlatformAdapter):
         """拼接 MR 各文件的 diff 文本。"""
         try:
             data = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
+        except RateLimitError:
+            raise
         except PlatformError as exc:
             raise PlatformError(f"拉取 GitLab MR diff 失败 #{number}：{exc}") from exc
         parts: list[str] = []

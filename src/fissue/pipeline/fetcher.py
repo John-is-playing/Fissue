@@ -39,6 +39,10 @@ class FetchStats:
     duration_seconds: float = 0.0
     new_keys: list[str] = field(default_factory=list)
     changed_keys: list[str] = field(default_factory=list)
+    #: 本轮数据是否不完整（条目被标残缺 / 早停在 limit / 写入失败）。
+    #: 不完整时**不得推进游标**：缺掉的那一段再也不会被增量抓到。
+    incomplete: bool = False
+    incomplete_reasons: list[str] = field(default_factory=list)
 
     def merge(self, other: "FetchStats") -> "FetchStats":
         self.fetched += other.fetched
@@ -51,14 +55,21 @@ class FetchStats:
         self.duration_seconds = round(self.duration_seconds + other.duration_seconds, 3)
         if other.error:
             self.error = other.error
+        if other.incomplete:
+            self.incomplete = True
+            self.incomplete_reasons.extend(other.incomplete_reasons)
         return self
 
     @property
     def summary(self) -> str:
-        return (
+        text = (
             f"{self.repo}：拉取 {self.fetched}，新增 {self.created}，"
             f"更新 {self.updated}，未变 {self.unchanged}，过滤 {self.skipped}"
         )
+        if self.incomplete:
+            detail = "；".join(self.incomplete_reasons[:2]) or "原因未知"
+            text += f"（数据不完整，游标未推进：{detail}）"
+        return text
 
 
 class Fetcher:
@@ -93,6 +104,8 @@ class Fetcher:
 
         since = self._compute_since(repo, full=full)
         repo_id = self.ctx.ensure_repo_row(repo)
+        #: 本轮**实际入库**条目的最大 updated_at，作为新的游标水位。
+        watermark: datetime | None = None
 
         try:
             async for item in adapter.fetch_items(ref, item_types=types, since=since, limit=limit):
@@ -105,7 +118,20 @@ class Fetcher:
                 except Exception as exc:
                     log.warning("写入条目失败 %s：%s", item.key, exc)
                     stats.skipped += 1
+                    self._mark_incomplete(stats, f"write_failed:{item.key}")
                     continue
+
+                # 适配器把「评论/文件清单没拉全」记在条目上；带着残缺的轮次不能
+                # 推进游标，否则那段缺口就永久留在库里了。
+                if item.degraded:
+                    self._mark_incomplete(
+                        stats, ";".join(f"{item.key}:{r}" for r in item.degraded)
+                    )
+
+                if item.updated_at is not None:
+                    watermark = (
+                        item.updated_at if watermark is None else max(watermark, item.updated_at)
+                    )
 
                 if created:
                     stats.created += 1
@@ -122,6 +148,10 @@ class Fetcher:
             stats.error = f"{type(exc).__name__}: {exc}"
             log.exception("抓取 %s 出现未预期错误", repo.slug)
 
+        # 早停在 --limit 上意味着后面还有没抓到的旧条目，不能把游标推过去。
+        if limit is not None and stats.fetched >= limit:
+            self._mark_incomplete(stats, f"early_stop:limit={limit}")
+
         stats.duration_seconds = round(time.monotonic() - started, 3)
         self.ctx.repo.finish_scan(
             scan_id,
@@ -131,10 +161,16 @@ class Fetcher:
             unchanged=stats.unchanged,
             error=stats.error,
         )
-        if not stats.error:
-            self._save_cursor(repo, types)
+        self._save_cursor(repo, types, stats=stats, watermark=watermark)
         log.info(stats.summary + f"（{stats.duration_seconds:.1f}s）")
         return stats
+
+    @staticmethod
+    def _mark_incomplete(stats: FetchStats, reason: str) -> None:
+        """记录一处「本轮数据不完整」的原因（去重，便于日志与断言）。"""
+        stats.incomplete = True
+        if reason not in stats.incomplete_reasons:
+            stats.incomplete_reasons.append(reason)
 
     # -- 多仓库 -----------------------------------------------------------
 
@@ -187,11 +223,44 @@ class Fetcher:
         # 没有游标 → 首次抓取，按 since_days
         return since_default(repo.since_days)
 
-    def _save_cursor(self, repo: RepoConfig, types: Sequence[ItemType]) -> None:
+    def _save_cursor(
+        self,
+        repo: RepoConfig,
+        types: Sequence[ItemType],
+        *,
+        stats: FetchStats,
+        watermark: datetime | None,
+    ) -> None:
+        """推进增量游标。
+
+        三道闸门，任一不满足就**原地不动**：
+
+        1. 本轮无错误——出错说明有条目根本没抓到；
+        2. 本轮数据完整——条目被标残缺、或早停在 ``--limit`` 上，都说明后面还有；
+        3. 本轮确实入库了条目——一条都没入库时若把游标推到 ``now()``，会把
+           这中间发生的所有更新一次性跳过。
+
+        写回的是**本轮实际入库条目的最大 ``updated_at``**，而不是 wall-clock
+        ``now()``：后者等于宣告「这段时间我都抓过了」，而实际上没抓到的那几条
+        再也不会被增量抓取碰到（除非 ``--full``）。
+        """
+        if stats.error:
+            log.warning("本轮抓取有错误（%s），不推进游标：%s", stats.error, repo.slug)
+            return
+        if stats.incomplete:
+            log.warning(
+                "本轮数据不完整（%s），不推进游标 %s：下一轮会重抓这一段",
+                "；".join(stats.incomplete_reasons[:3]) or "原因未知",
+                repo.slug,
+            )
+            return
+        if watermark is None:
+            log.info("本轮未入库任何条目，游标保持不变：%s", repo.slug)
+            return
         self.ctx.repo.set_repo_cursor(
             repo.slug,
             {
-                "last_updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_updated_at": watermark.isoformat(),
                 "item_types": [t.value for t in types],
             },
         )
