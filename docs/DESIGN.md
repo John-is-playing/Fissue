@@ -136,12 +136,15 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
                                                      隔离容器
 ```
 
-* 调用方**不持有 Docker 句柄**，只走受控的本地 socket 通道。
+* `server` 模式下调用方**不持有 Docker 句柄**，只走受控的本地 socket 通道；
+  `inline` 模式下 Docker 句柄就在调用方进程内。默认是 `inline`（没起
+  `fissue sandbox serve` 时），所以这条保证**有条件**，别当无条件事实用。
 * 容器以 `--network=none`、`--read-only`、`--cap-drop=ALL`、
   `--security-opt no-new-privileges`、非 root（1000:1000）运行。
 * 限 CPU / 内存 / PID 数 / 执行时长。
 * 只挂载**隔离工作区**（临时目录，可选 loopback 虚拟盘），绝不挂宿主普通目录。
-* Docker 不可用时降级为本地子进程并**显式告警**——没有隔离，只应本地开发用。
+* Docker 不可用时**默认拒绝执行**（不再静默降级）；确需降级要显式打开
+  `sandbox.allow_local_fallback`，降级后没有任何隔离，且环境变量按白名单透传。
 
 ### 5.2 自动修复的护栏
 
@@ -192,7 +195,7 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
 
 ## 7. 存储
 
-PostgreSQL 为主库，11 张表：
+PostgreSQL 为主库，12 张表：
 
 | 表 | 作用 |
 |---|---|

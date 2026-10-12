@@ -82,7 +82,7 @@ Fissue 把这一整套「分诊（triage）→ 验证 → 修复」流程自动�
 | 抓取平台 | GitHub · Gitee · AtomGit · GitLab（含自建实例） |
 | AI | 任意 OpenAI 兼容端点（DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM…） |
 | 存储 | PostgreSQL（可导出 JSON / Markdown） |
-| 沙盒 | Docker：禁网、限 CPU/内存/PID/时长、非 root、只读根、虚拟盘挂载、转发组件通道 |
+| 沙盒 | Docker：禁网、限 CPU/内存/PID/时长、非 root、只读根、只挂隔离工作区、转发组件通道 |
 | 配置 | `.env`（密钥）+ `config.yaml`（业务配置） |
 
 ---
@@ -207,7 +207,8 @@ Fissue 是否可靠，而且夹具是这个项目最重要的资产。
 ## 安全说明
 
 沙盒默认 **禁网**、**非 root**、**只读根文件系统**、**限制 CPU/内存/PID/时长**，
-且只挂载独立的隔离虚拟盘；宿主与沙盒之间通过受控的转发组件通信，避免不可信 PR
+且只挂载独立的隔离工作区（默认是普通临时目录，可选 loopback 虚拟盘）；起转发组件
+（`fissue sandbox serve`）后，宿主与沙盒之间的执行走受控通道，避免不可信 PR
 代码污染宿主机。
 
 ---

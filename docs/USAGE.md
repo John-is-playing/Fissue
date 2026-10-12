@@ -54,11 +54,11 @@ pip install -e ".[dev]"
 fissue --help
 ```
 
-`fissue --help` 应列出 12 个命令与 2 个命令组：
+`fissue --help` 应列出 10 个命令与 3 个命令组：
 
 ```
-fetch   eval   verify   flush   fix   report
-export  status serve    web     db    sandbox
+fetch   eval   verify   flush   fix    report
+export  status serve    web     db     sandbox   bench
 ```
 
 ---
