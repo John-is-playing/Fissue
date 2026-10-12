@@ -313,6 +313,9 @@ def evaluation_prompt(
 
 def pr_quality_prompt(item: RawItem, *, diff: str) -> list[dict[str, str]]:
     """仅在需要深度评 PR 代码质量时调用（Q1 分层：按需升级）。"""
+    # f-string 的表达式部分不能含反斜杠（Python ≤3.11 的限制），故先拼好这一行。
+    linked = ", ".join("#" + str(n) for n in item.linked_issues)
+    linked_line = "\n关联 Issue：" + linked if linked else ""
     user = f"""请评估下面这个 Pull Request 的**代码质量**与**是否解决其声称的问题**。
 
 重点关注：
@@ -323,7 +326,7 @@ def pr_quality_prompt(item: RawItem, *, diff: str) -> list[dict[str, str]]:
 5. 是否有刷量特征（几乎无实质改动、仅改注释/README、复制粘贴的样板）。
 
 {render_item(item, include_comments=True)}
-{("\n关联 Issue：" + ", ".join('#' + str(n) for n in item.linked_issues)) if item.linked_issues else ""}
+{linked_line}
 
 变更内容（diff）：
 {diff}
