@@ -15,11 +15,15 @@
                                             ▼
                                     隔离容器（禁网/非 root/只读根/限额）
 
-* 调用方**永远不直接持有 Docker 句柄**，也不接触宿主路径。
+* ``server`` 模式下调用方**不持有 Docker 句柄**，也不接触宿主路径；但 ``inline``
+  模式下 DockerRuntime 就在**调用方进程内**，这条保证不成立（见下面的模式说明）。
 * 工作区是转发组件为每次执行单独创建的临时目录（可选 loopback 镜像），执行完即销毁。
 * 支持两种模式：
   - ``server``：常驻进程监听 socket，宿主上跑一次即可（生产）。
   - ``inline``：进程内直接调用 DockerRuntime（本机开发 / 测试，免去起服务）。
+    它是**默认**：转发组件关闭、非 POSIX 平台、或 socket 文件不存在（即没起
+    ``fissue sandbox serve``）都会走它。因此「调用方不持有 Docker 句柄」这条
+    只在真的起了转发组件时才成立；容器本身的隔离参数两种模式一致。
 """
 
 from __future__ import annotations
@@ -141,7 +145,9 @@ class Workspace:
             raise SandboxError("工作区尚未创建")
         for rel, content in files.items():
             target = (self.root / rel).resolve()
-            if not str(target).startswith(str(self.root.resolve())):
+            # 用 is_relative_to 而不是字符串前缀比较：后者少一个目录分隔符，
+            # 会把 `/tmp/ws-x` 判成在 `/tmp/ws` 之内。
+            if not target.is_relative_to(self.root.resolve()):
                 raise SandboxError(f"拒绝写入工作区之外的路径：{rel}")
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8", newline="")
@@ -189,9 +195,12 @@ class Executor:
                 return ExecResult(ok=False, error=f"工作区不存在：{ws}")
 
             if req.files:
+                base = ws.resolve()
                 for rel, content in req.files.items():
-                    target = (ws / rel).resolve()
-                    if not str(target).startswith(str(ws.resolve())):
+                    target = (base / rel).resolve()
+                    # 同 materialize：按目录成分判断，避免 `/tmp/ws-x` 这类
+                    # 同前缀的兄弟目录被误判为「在工作区内」。
+                    if not target.is_relative_to(base):
                         return ExecResult(ok=False, error=f"非法路径：{rel}")
                     target.parent.mkdir(parents=True, exist_ok=True)
                     # newline="" 保持字节原样，避免 Windows 上把 \n 变成 \r\n

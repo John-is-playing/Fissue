@@ -102,7 +102,7 @@ class RepoWorkspace:
 
     # -- git 基础 ---------------------------------------------------------
 
-    def _git(self, args: Sequence[str], *, cwd: str | Path | None = None, timeout: int = GIT_TIMEOUT) -> GitResult:
+    def _git(self, args: Sequence[str], *, cwd: str | Path | None = None, timeout: int = GIT_TIMEOUT, extra_env: dict[str, str] | None = None) -> GitResult:
         workdir = str(cwd) if cwd is not None else (str(self.root) if self.root.exists() else None)
         env = {
             **os.environ,
@@ -110,6 +110,8 @@ class RepoWorkspace:
             "GIT_ASKPASS": "echo",
             "GCM_INTERACTIVE": "never",
         }
+        if extra_env:
+            env.update(extra_env)
         try:
             proc = subprocess.run(
                 list(args),
@@ -290,14 +292,36 @@ class RepoWorkspace:
             ]
         )
 
-    def push(self, url_with_token: str, branch: str, *, force: bool = False) -> GitResult:
-        """推送分支。``url_with_token`` 只在本次命令中使用，不写入配置。"""
+    #: 传给 git 凭据助手的环境变量名。令牌只经它传递，绝不写进命令行参数——
+    #: 命令行对同机所有用户可见（`ps`、`/proc/<pid>/cmdline`），环境变量只有本用户可读。
+    PUSH_TOKEN_ENV = "FISSUE_GIT_PUSH_TOKEN"
+
+    def push(self, url: str, branch: str, *, force: bool = False, token: str = "") -> GitResult:
+        """推送分支。
+
+        ``url`` **不带令牌**；令牌由 ``token`` 参数提供，经**子进程环境变量 +
+        凭据助手**交给 git。这样它不会出现在命令行参数里（那是同机任何用户都能
+        看到的），也不会被写进 git 配置或 remote。
+        """
         args = ["git", "push", "--quiet"]
         if force:
             args.append("--force-with-lease")
-        args += [url_with_token, f"HEAD:refs/heads/{branch}"]
-        result = self._git(args, timeout=900)
-        # 结果里可能带 token，必须过滤
+
+        extra_env: dict[str, str] = {}
+        if token:
+            # 助手脚本里只出现**环境变量名**，令牌本身不在命令行上。
+            # 这里用普通字符串拼接而不是 f-string：脚本末尾有字面量 `}`，在 f-string
+            # 里得写成 `}}`，容易看错。
+            helper = (
+                "!f(){ printf 'username=%s\\npassword=%s\\n' oauth2 "
+                '"$' + self.PUSH_TOKEN_ENV + '"; };f'
+            )
+            args += ["-c", f"credential.helper={helper}"]
+            extra_env[self.PUSH_TOKEN_ENV] = token
+
+        args += [url, f"HEAD:refs/heads/{branch}"]
+        result = self._git(args, timeout=900, extra_env=extra_env)
+        # 兜底：万一 git 把凭据回显进了输出
         result.stdout = self.sanitize(result.stdout)
         result.stderr = self.sanitize(result.stderr)
         return result

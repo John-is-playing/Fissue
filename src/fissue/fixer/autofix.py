@@ -263,8 +263,12 @@ class PRCreator:
                 return False, "没有产生任何改动，无法提交"
             return False, f"提交失败：{commit.stderr[:300]}"
 
-        push_url = adapter.clone_url(ref, use_token=True)
-        pushed = await asyncio.to_thread(workspace.push, push_url, branch, force=True)
+        # 用**不带令牌**的 URL：令牌改由 workspace.push 经子进程环境 + 凭据助手递进去，
+        # 免得它出现在命令行参数里被同机其他用户看到（见 RepoWorkspace.push）。
+        push_url = adapter.clone_url(ref)
+        pushed = await asyncio.to_thread(
+            workspace.push, push_url, branch, force=True, token=adapter.token
+        )
         if not pushed.ok:
             return False, adapter.sanitize(pushed.stderr)[:400]
         return True, ""
