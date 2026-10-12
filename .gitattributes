@@ -1,0 +1,24 @@
+# 统一换行符：仓库内一律 LF，检出后也一律 LF。
+#
+# 背景：本项目曾出现 Windows 侧编辑器把 60 个已跟踪文件整体改成 CRLF 的事故，
+# 由于这些文件在索引里都是 LF，纯换行差异产生了一份 ±19989 行的假 diff。
+# 这条规则用来兜住它：无论编辑器怎么写，提交进去的与检出来的都是 LF。
+* text=auto eol=lf
+
+# 显式声明二进制，禁止任何行尾转换
+*.db binary
+*.sqlite binary
+*.sqlite3 binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.whl binary
+*.so binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
