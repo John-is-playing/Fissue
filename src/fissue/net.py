@@ -37,6 +37,28 @@ log = get_logger(__name__)
 ENV_CA_BUNDLE = "FISSUE_CA_BUNDLE"
 ENV_INSECURE = "FISSUE_INSECURE_SKIP_VERIFY"
 
+#: 从 .env 文件读到的值，由 :func:`fissue.config.load_settings` 登记。
+#:
+#: 为什么不直接写进 ``os.environ``：本进程里会跑模型生成的验证器与不可信 PR 代码
+#: （虽然沙盒现在按白名单传环境变量），但「有人在 .env 里写了一行 CA 路径」不该
+#: 顺带把 LLM key、平台 token 也散进进程环境。所以只登记、不导出。
+#:
+#: 修的是这个坑：``net`` 原本只用 ``os.getenv`` 读，而 .env 是用 ``dotenv_values``
+#: 读成字典的（不导出）——于是文档里写明的「设 FISSUE_CA_BUNDLE 就能解决 TLS」
+#: 写进 .env 完全无效，只有 ``export`` 到 shell 才行。
+_env_file_values: dict[str, str] = {}
+
+
+def register_env_file_values(values: dict[str, str]) -> None:
+    """登记 .env 里的值（``load_settings`` 读取 .env 后调用）。"""
+    _env_file_values.clear()
+    _env_file_values.update(values)
+
+
+def _lookup(name: str) -> str | None:
+    """按与配置加载一致的优先级取值：**进程环境变量 > .env 文件**。"""
+    return os.environ.get(name) or _env_file_values.get(name)
+
 # SSL 证书校验失败的典型特征（用于快速失败，避免无意义重试）
 _SSL_ERROR_HINTS = (
     "certificate verify failed",
@@ -73,14 +95,42 @@ def is_ssl_error(exc: BaseException | str) -> bool:
 
 
 def ssl_help_text() -> str:
-    """给出可操作的 TLS 排查建议。"""
-    return (
-        "TLS 证书校验失败。常见原因是环境里有 HTTPS 中间人代理"
-        "（企业网关 / 本机抓包工具），其根证书在系统信任库里但不在 certifi 里。\n"
-        "  方案 1（推荐）：pip install truststore —— Fissue 会自动改用系统信任库\n"
-        "  方案 2：把代理的根证书导出为 PEM，然后设 FISSUE_CA_BUNDLE=/path/to/ca.pem\n"
-        "  方案 3（仅排查用，有中间人风险）：临时设 FISSUE_INSECURE_SKIP_VERIFY=1"
-    )
+    """给出可操作的 TLS 排查建议——**按当前实际生效的信任链**来说。
+
+    原先是写死的三条建议，不看用户处在哪种情形。实测最坑的一种是：truststore
+    已经装好、也确实在生效，但中间人的根证书**连操作系统信任库都没有**——此时
+    「请 pip install truststore」纯属误导，用户会去装一个早就装好的包。
+    """
+    lines = [
+        "TLS 证书校验失败。常见原因是环境里有 HTTPS 中间人"
+        "（企业网关 / 公司自签 CA / 本机抓包代理）。",
+        f"  当前生效的信任链：{ca_bundle_hint()}",
+    ]
+
+    if _lookup(ENV_CA_BUNDLE):
+        lines.append(
+            "  已指定 FISSUE_CA_BUNDLE 仍失败 → 确认这个 PEM 就是签发该证书的那个根；"
+            "代理套代理时不止一张根证书，需要把它们**合并**进同一个文件"
+        )
+    elif _truststore_available():
+        lines.append(
+            "  truststore 已在生效，说明这张根证书**连操作系统信任库也没有**"
+            "（浏览器打得开，只是因为浏览器装过它）。"
+            "做法：把该根证书导出为 PEM，再设 FISSUE_CA_BUNDLE=/path/to/root.pem"
+            "（写进 .env 即可，不必每次 export）"
+        )
+    else:
+        lines.append(
+            "  方案 1（推荐）：pip install truststore —— 改用操作系统信任库，"
+            "「浏览器能打开的站点，Fissue 也能打开」"
+        )
+        lines.append(
+            "  方案 2：把根证书导出为 PEM，设 FISSUE_CA_BUNDLE=/path/to/root.pem"
+        )
+
+    lines.append("  备选：把根证书装进操作系统信任库（需管理员权限），此后无需任何配置")
+    lines.append("  仅排查用（有中间人风险）：临时设 FISSUE_INSECURE_SKIP_VERIFY=1")
+    return "\n".join(lines)
 
 
 @lru_cache(maxsize=1)
@@ -90,7 +140,7 @@ def build_ssl_context() -> ssl.SSLContext | bool:
     返回 ``ssl.SSLContext``（正常）或 ``False``（显式关闭校验）。
     """
     # 1) 显式关闭校验（仅排查）
-    if _truthy(os.getenv(ENV_INSECURE)):
+    if _truthy(_lookup(ENV_INSECURE)):
         log.warning(
             "已通过 %s 关闭 TLS 证书校验——存在中间人攻击风险，仅限本地排查使用",
             ENV_INSECURE,
@@ -98,7 +148,7 @@ def build_ssl_context() -> ssl.SSLContext | bool:
         return False
 
     # 2) 显式指定 CA 文件
-    bundle = os.getenv(ENV_CA_BUNDLE)
+    bundle = _lookup(ENV_CA_BUNDLE)
     if bundle:
         if not os.path.exists(bundle):
             log.error("%s 指向的文件不存在：%s（将回退到系统信任库）", ENV_CA_BUNDLE, bundle)
@@ -142,16 +192,22 @@ def httpx_verify() -> Any:
 
 def ca_bundle_hint() -> str:
     """当前生效的 CA 来源描述（日志/诊断用）。"""
-    if _truthy(os.getenv(ENV_INSECURE)):
+    if _truthy(_lookup(ENV_INSECURE)):
         return "已关闭校验（FISSUE_INSECURE_SKIP_VERIFY）"
-    if bundle := os.getenv(ENV_CA_BUNDLE):
+    if bundle := _lookup(ENV_CA_BUNDLE):
         return f"自定义 CA：{bundle}"
+    if _truststore_available():
+        return "操作系统信任库（truststore）"
+    return "certifi 默认 CA 列表（建议 pip install truststore）"
+
+
+def _truststore_available() -> bool:
+    """truststore 是否可用（可用即意味着走操作系统信任库）。"""
     try:
         import truststore  # noqa: F401
-
-        return "操作系统信任库（truststore）"
     except ImportError:
-        return "certifi 默认 CA 列表（建议 pip install truststore）"
+        return False
+    return True
 
 
 def reset_cache() -> None:

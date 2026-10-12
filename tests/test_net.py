@@ -37,6 +37,9 @@ def _clean_net_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """每个用例都从干净的网络环境变量开始，并清掉 TLS 上下文缓存。"""
     monkeypatch.delenv(ENV_CA_BUNDLE, raising=False)
     monkeypatch.delenv(ENV_INSECURE, raising=False)
+    # .env 的登记表也是模块级状态：不清的话，某个用例加载过的 .env 会渗到后面
+    # 的用例里，让「当前信任链」的断言变得不可靠。
+    monkeypatch.setattr(net, "_env_file_values", {}, raising=True)
     net.reset_cache()
     yield
     net.reset_cache()
@@ -721,3 +724,115 @@ async def test_get_still_retries_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert await adapter._request("GET", "https://api.github.com/x") == {"ok": True}
     assert fake.calls == 2
+
+
+# ---------------------------------------------------------------------------
+# 7. .env 里的 TLS 配置必须真的生效（它曾静默无效）
+# ---------------------------------------------------------------------------
+
+
+def _write_env(tmp_path, **values) -> Path:
+    """写一个只含给定键的 .env。"""
+    env = tmp_path / ".env"
+    env.write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
+    return env
+
+
+def _load_env_file(tmp_path, env_path):
+    """走真实的 ``load_settings``，让 .env 被登记——这正是被测的那条链路。"""
+    from fissue.config import load_settings
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("repos: []\n", encoding="utf-8")
+    return load_settings(cfg, env_path)
+
+
+def test_ca_bundle_from_env_file_actually_applies(tmp_path) -> None:
+    """`.env` 里写的 FISSUE_CA_BUNDLE 必须生效。
+
+    原先 ``net`` 只用 ``os.getenv`` 读，而 .env 是被 ``dotenv_values`` 读成字典的
+    （不导出到进程环境）——于是文档里写明的「设 FISSUE_CA_BUNDLE 解决 TLS」写进
+    .env 会**静默无效**，只有 ``export`` 到 shell 才管用。
+    """
+    pem = _write_self_signed_pem(tmp_path / "ca.pem")
+    env = _write_env(tmp_path, **{ENV_CA_BUNDLE: str(pem)})
+
+    _load_env_file(tmp_path, env)
+    net.reset_cache()
+
+    assert str(pem) in ca_bundle_hint(), "写进 .env 的 CA 没有被 net 看到"
+    assert isinstance(build_ssl_context(), ssl.SSLContext)
+
+
+def test_env_file_values_are_not_exported_to_process_env(tmp_path) -> None:
+    """登记 .env 的值 ≠ 把它导出到进程环境。
+
+    本进程里会跑模型生成的验证器与不可信 PR 代码，不该因为「有人在 .env 里写了
+    一行 CA 路径」就把 LLM key、平台 token 一起散进 ``os.environ``。
+    """
+    import os
+
+    pem = _write_self_signed_pem(tmp_path / "ca.pem")
+    env = _write_env(
+        tmp_path,
+        **{ENV_CA_BUNDLE: str(pem), "FISSUE_LLM_API_KEY": "sk-should-not-leak"},
+    )
+
+    before = set(os.environ)
+    _load_env_file(tmp_path, env)
+    added = set(os.environ) - before
+
+    assert ENV_CA_BUNDLE not in added
+    assert "FISSUE_LLM_API_KEY" not in added
+
+
+def test_process_env_wins_over_env_file_for_ca_bundle(tmp_path, monkeypatch) -> None:
+    """优先级：进程环境变量 > .env 文件（与 config 的取值口径一致）。"""
+    from_env_file = _write_self_signed_pem(tmp_path / "from-env-file.pem")
+    from_shell = _write_self_signed_pem(tmp_path / "from-shell.pem")
+    env = _write_env(tmp_path, **{ENV_CA_BUNDLE: str(from_env_file)})
+    monkeypatch.setenv(ENV_CA_BUNDLE, str(from_shell))
+
+    _load_env_file(tmp_path, env)
+    net.reset_cache()
+
+    assert str(from_shell) in ca_bundle_hint()
+
+
+# ---------------------------------------------------------------------------
+# 8. TLS 报错文案要按「当前实际生效的信任链」给建议
+# ---------------------------------------------------------------------------
+
+
+def test_ssl_help_text_says_truststore_wont_help_when_root_is_missing(monkeypatch) -> None:
+    """truststore 已在生效却仍失败 → 不能再让人去装 truststore（它早就装了）。
+
+    实测踩过这个坑：中间人的根证书连操作系统信任库都没有，被这句写死的文案误导
+    去装 truststore，白折腾一轮。
+    """
+    monkeypatch.setattr(net, "_truststore_available", lambda: True)
+    text = ssl_help_text()
+
+    assert "操作系统信任库（truststore）" in text, "要说清当前实际用的是哪条链路"
+    assert "连操作系统信任库也没有" in text
+    assert ENV_CA_BUNDLE in text
+
+
+def test_ssl_help_text_suggests_truststore_when_absent(monkeypatch) -> None:
+    """truststore 真的不可用时，才是「装 truststore」该出场的时候。"""
+    monkeypatch.setattr(net, "_truststore_available", lambda: False)
+    text = ssl_help_text()
+
+    assert "pip install truststore" in text
+    assert "certifi" in text
+
+
+def test_ssl_help_text_warns_about_multiple_roots_when_bundle_already_set(tmp_path) -> None:
+    """已指定 CA 仍失败 → 提示可能是多张根证书没合并，而不是再让人装包。"""
+    pem = _write_self_signed_pem(tmp_path / "ca.pem")
+    net.register_env_file_values({ENV_CA_BUNDLE: str(pem)})
+    net.reset_cache()
+
+    text = ssl_help_text()
+    assert "合并" in text
+    assert "pip install truststore" not in text

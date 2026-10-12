@@ -24,6 +24,7 @@ import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from . import net
 from .errors import ConfigError
 from .logging_setup import setup_logging
 from .models import Platform
@@ -628,6 +629,10 @@ def load_settings(
         raise ConfigError(f"配置文件不存在：{cfg_path}")
 
     env_values = _read_env_file(env_file)
+    # .env 的值必须让 TLS 判定也能看到：``net`` 读的是 ``os.getenv``，而 .env 是
+    # ``dotenv_values`` 读成的字典（不导出到进程环境），不登记的话「在 .env 里设
+    # FISSUE_CA_BUNDLE 解决 TLS」会**静默无效**——只有 export 到 shell 才管用。
+    net.register_env_file_values(env_values)
     raw = _apply_env_overrides(raw, env_values)
     if overrides:
         raw = _deep_merge(raw, overrides)

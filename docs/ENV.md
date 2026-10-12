@@ -324,25 +324,49 @@ unable to get local issuer certificate (_ssl.c:1082)
 | 企业安全网关 | Zscaler、Netskope、深信服、Palo Alto… |
 | 本机代理 / 抓包工具 | Fiddler、Charles、**SteamTools**、Clash(部分模式) |
 
-它们会用自己的根证书**重签**所有 HTTPS 证书。因为该根证书装进了
-**操作系统信任库**，所以浏览器访问正常；但 httpx 默认只信 **certifi** 的
-CA 列表，没有这张证书 → 校验失败。
+它们会用自己的根证书**重签**所有 HTTPS 证书。浏览器访问正常，是因为浏览器装了
+这张根证书；Python 这边认不认，取决于它查的是哪套信任库——**所以要先分清是哪种
+情况，再对症下药**（无脑装 truststore 是最常见的白折腾）。
+
+#### 先看当前实际走的是哪条信任链
+
+```bash
+python -c "from fissue import net; print(net.ca_bundle_hint())"
+```
+
+（TLS 报错信息里也会直接写出这一行。）
+
+| 实际走的链路 | 说明 | 该怎么办 |
+|---|---|---|
+| `certifi 默认 CA 列表` | truststore 没装上 | 装 `truststore` → 方案 1 |
+| `操作系统信任库（truststore）` | 装了，但**这张根证书连系统信任库也没有**（浏览器打得开只因它自己装过） | 导出该根证书为 PEM → 方案 2 |
+| `自定义 CA：…` | 已经指定了却仍失败 | 多半是根证书不止一张（代理套代理），把它们**合并**进同一个 PEM → 方案 2 |
 
 #### 解决方案（按推荐顺序）
 
-**方案 1（默认已启用）：用系统信任库**
+**方案 1：用系统信任库（默认已启用）**
 
 Fissue 依赖里已包含 [`truststore`](https://pypi.org/project/truststore/)，
 它会自动把 TLS 后端切到操作系统信任库。装好依赖即可，无需配置。
 
 > 如果你的旧环境没装：`pip install truststore`
+>
+> ⚠️ 这一招**只在「根证书确实装进了操作系统信任库」时才有效**。若上表查到已经是
+> `操作系统信任库（truststore）` 却仍失败，装它再多遍也没用，请走方案 2。
 
 **方案 2：显式指定根证书**
 
-把代理/企业的根证书导出成 PEM，然后：
+把代理/企业的根证书导出成 PEM，写进 `.env` 即可（进程环境变量优先于 `.env`，
+临时调试也可以 `FISSUE_CA_BUNDLE=/path/root.pem fissue fetch …`）：
 
 ```bash
-FISSUE_CA_BUNDLE=E:/certs/corp-root-ca.pem
+FISSUE_CA_BUNDLE=/path/to/root-ca.pem
+```
+
+若中间人不止一层，根证书就不止一张，要**合并**成一个 PEM：
+
+```bash
+cat corp-root.pem another-root.pem > combined.pem   # 顺序无所谓
 ```
 
 **方案 3：临时关闭校验（仅排查）**

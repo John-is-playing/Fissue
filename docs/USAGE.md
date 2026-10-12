@@ -908,7 +908,7 @@ fissue status            # 条目/队列/用量/沙盒 全景
 | `数据库不存在` | 没建库 | `createdb -U fissue fissue` 后 `fissue db init` |
 | `401 / Bad credentials` | Token 过期或权限不足 | 重新生成 Token，检查 scope |
 | `触发限流` | 未配 Token 或调用过密 | 配 Token；调小 `--concurrency` |
-| `SSL: CERTIFICATE_VERIFY_FAILED` | 环境里有 HTTPS 中间人（企业网关 / 抓包工具），根证书在系统信任库但不在 certifi | 装 `truststore`（Fissue 默认依赖）；或 `FISSUE_CA_BUNDLE` 指定根证书；详见 [ENV.md §3.7](ENV.md#37-tls-证书fissue_ca_bundle--fissue_insecure_skip_verify) |
+| `SSL: CERTIFICATE_VERIFY_FAILED` | 环境里有 HTTPS 中间人（企业网关 / 抓包工具）。**先看报错里的「当前生效的信任链」**：显示 `certifi` → 装 truststore；显示 `操作系统信任库（truststore）` → 说明根证书连系统信任库也没有，要导出它并设 `FISSUE_CA_BUNDLE`（写进 `.env` 即可） | 详见 [ENV.md §3.7](ENV.md#37-tls-证书fissue_ca_bundle--fissue_insecure_skip_verify) |
 | `未找到 docker 命令` | 没装 Docker / 不在 PATH | 装 Docker Desktop；或 `runtime: local` 降级（无隔离） |
 | `镜像不可用` | 没构建基础镜像 | `docker build -t fissue/sandbox-base:latest docker/sandbox` |
 | `无法连接转发组件` | Linux 上没起 `sandbox serve` | 起它，或确认 socket 路径与配置一致 |
