@@ -115,6 +115,26 @@ sandbox:
   enabled: true
   image: fissue/sandbox-base:latest   # 基础镜像（含 python/node/go/java 运行时）
   runtime: docker                     # docker | local（local 仅供本机开发，隔离弱）
+  # Docker 不可用时是否允许降级为**无隔离**的本地执行。默认关闭：
+  # 被执行的验证器由模型生成、PR 代码来自上游，静默降级等于把隔离承诺整套架空。
+  allow_local_fallback: false
+  # 本地执行放行给子进程的环境变量白名单。宿主环境里有 LLM key 与各平台 token，
+  # 整份 os.environ 透传等于把密钥交给上面那段代码；按需追加即可。
+  local_env_allowlist:
+    - PATH
+    - HOME
+    - LANG
+    - LC_ALL
+    - LC_CTYPE
+    - TMPDIR
+    - TMP
+    - TEMP
+    - SYSTEMROOT
+    - PATHEXT
+    - COMSPEC
+    - PYTHONIOENCODING
+    - PYTHONUNBUFFERED
+    - PYTHONDONTWRITEBYTECODE
   network: none                       # none=禁网（默认，最安全）
   read_only_root: true                # 根文件系统只读
   user: "1000:1000"                   # 非 root

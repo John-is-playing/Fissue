@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..config import SandboxConfig
+from ..config import DEFAULT_LOCAL_ENV_ALLOWLIST, SandboxConfig
 from ..errors import SandboxError
 from ..logging_setup import get_logger
 from .protocol import ExecResult, MountSpec
@@ -139,7 +139,13 @@ class DockerRuntime:
         user: str = "1000:1000",
         label: str = "",
     ) -> ExecResult:
-        """执行一次命令。Docker 不可用则降级本地执行。"""
+        """执行一次命令。
+
+        两条路径：``runtime: docker`` 走容器；``runtime: local`` 明确要求本机执行。
+        Docker 不可用时**默认拒绝执行**（见 :attr:`SandboxConfig.allow_local_fallback`）：
+        降级到本地会绕过全部容器隔离，而被执行的却是模型生成的验证器与不可信
+        PR 代码，静默降级等于把 SECURITY.md 的隔离承诺整套架空。
+        """
         start = time.monotonic()
         mount_list = list(mounts or [])
 
@@ -162,7 +168,22 @@ class DockerRuntime:
                     label=label,
                     start=start,
                 )
-            log.warning("Docker 不可用（%s），降级为本地执行——**无容器隔离**", reason)
+            if not self.cfg.allow_local_fallback:
+                return ExecResult(
+                    ok=False,
+                    error=(
+                        f"Docker 不可用（{reason}），已拒绝执行。"
+                        "本地降级没有任何容器隔离（不禁网、非只读根、无资源上限），"
+                        "而验证器由模型生成、代码来自不可信 PR，故不默认降级。"
+                        "确需在本机执行请显式设置 sandbox.allow_local_fallback: true；"
+                        "只想用本机做开发可设 sandbox.runtime: local。"
+                    ),
+                    duration_seconds=round(time.monotonic() - start, 3),
+                )
+            log.warning(
+                "Docker 不可用（%s），按 sandbox.allow_local_fallback 降级为本地执行——**无容器隔离**",
+                reason,
+            )
         return self._run_local(
             command=command,
             workdir=workdir,
@@ -252,21 +273,34 @@ class DockerRuntime:
     ) -> ExecResult:
         """无容器执行：把第一个挂载当工作目录。
 
-        注意：**没有隔离**。仅用于 CI 沙盒不可用的降级路径与本地开发。
+        注意：**没有隔离**。仅用于 CI 沙盒不可用的降级路径与本地开发
+        （降级路径需显式开启 ``sandbox.allow_local_fallback``）。
 
         命令一律按 POSIX shell 语义执行（与容器内一致），因为在 Windows 上装了
         Git Bash 也很常见，而 cmd.exe 会把引号/重定向处理得面目全非，导致
         「docker 里能跑、本机跑不了」的诡异差异。
+
+        环境变量**只放行白名单**：没有容器挡着，被执行的验证器/PR 代码可以任意
+        组包外发，把宿主整份 ``os.environ``（含 LLM key 与各平台 token）交给它
+        等于直接交出密钥。
         """
         cwd = mounts[0].source if mounts else tempfile.gettempdir()
         if not Path(cwd).exists():
             return ExecResult(ok=False, error=f"工作目录不存在：{cwd}")
 
         shell = self._local_shell(command)
-        environ = {**os.environ, **(env or {})}
+        environ = self._local_env(env)
         return self._spawn(
             shell, timeout_seconds=timeout_seconds, start=start, mode="local", cwd=cwd, env=environ
         )
+
+    def _local_env(self, extra: dict[str, str] | None) -> dict[str, str]:
+        """本地执行的子进程环境：白名单放行，调用方显式传入的 ``extra`` 优先。"""
+        allow = self.cfg.local_env_allowlist or list(DEFAULT_LOCAL_ENV_ALLOWLIST)
+        allowed = set(allow)
+        environ = {k: v for k, v in os.environ.items() if k in allowed}
+        environ.update(extra or {})
+        return environ
 
     @staticmethod
     def _local_shell(command: str) -> list[str]:

@@ -214,10 +214,43 @@ class SandboxLimits(BaseModel):
     timeout_seconds: int = 600
 
 
+#: 本地执行时默认放行的环境变量。宿主环境里带着 LLM key 与各平台 token，
+#: 若把整份 ``os.environ`` 透传给模型生成的验证器与不可信 PR 代码，等于直接
+#: 交出这些密钥（本地执行没有容器隔离，被执行的代码能任意组包外发）。
+#: 这里只留「把命令跑起来」所必需的几项。
+DEFAULT_LOCAL_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",                    # 找到 python / git 等可执行文件
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SYSTEMROOT",              # Windows 必需
+    "PATHEXT",
+    "COMSPEC",
+    "PYTHONIOENCODING",
+    "PYTHONUNBUFFERED",
+    "PYTHONDONTWRITEBYTECODE",
+)
+
+
 class SandboxConfig(BaseModel):
     enabled: bool = True
     image: str = "fissue/sandbox-base:latest"
     runtime: str = "docker"                # docker | local
+    #: Docker 不可用时是否允许降级为**无隔离**的本地执行。默认关闭。
+    #: 降级会绕过全部容器隔离（禁网、只读根、非 root、CPU/内存/PID 限额），
+    #: 被执行的却是模型生成的验证器与不可信 PR 代码——静默降级等于把
+    #: SECURITY.md 的隔离承诺整套架空，因此必须由用户显式开启。
+    allow_local_fallback: bool = False
+    #: 本地执行（含显式 ``runtime: local``）放行给子进程的环境变量白名单。
+    #: 宿主环境里有 LLM key 与各平台 token，整份 ``os.environ`` 透传等于把
+    #: 密钥交给上面那段代码；默认只留跑测试所必需的几项。
+    local_env_allowlist: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_LOCAL_ENV_ALLOWLIST)
+    )
     network: str = "none"
     read_only_root: bool = True
     user: str = "1000:1000"

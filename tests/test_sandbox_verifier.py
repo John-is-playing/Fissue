@@ -745,3 +745,87 @@ def test_regression_assertion_accepts_a_correct_fix(settings) -> None:
         _run("base", _sandbox_outcome(settings, {"mod.py": _IMPL_BASE, "check.py": both}), 1),
         _run("fix", _sandbox_outcome(settings, {"mod.py": good, "check.py": both}), 0),
     ).f2p_satisfied is True
+
+
+# ---------------------------------------------------------------------------
+# P0：Docker 不可用时不得静默降级为无隔离的本地执行
+#
+# 降级会绕过全部容器隔离（禁网、只读根、非 root、资源限额），而被执行的却是
+# 模型生成的验证器与不可信 PR 代码，同时还能读到宿主的全部环境变量。
+# ---------------------------------------------------------------------------
+
+
+def _docker_missing(monkeypatch) -> None:  # noqa: ANN001
+    from fissue.sandbox.runtime import DockerRuntime
+
+    monkeypatch.setattr(DockerRuntime, "available", lambda self: (False, "未找到 docker 命令"))
+
+
+def test_docker_unavailable_refuses_local_fallback(monkeypatch) -> None:
+    """默认配置下 Docker 不可用必须**拒绝执行**，绝不在宿主机上跑。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    _docker_missing(monkeypatch)
+    executed: list[list[str]] = []
+
+    def boom(cmd, **kwargs):  # noqa: ANN001
+        executed.append(list(cmd))
+        raise AssertionError("拒绝执行时不该真的起进程")
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", boom)
+
+    rt = DockerRuntime(SandboxConfig(runtime="docker"))
+    res = rt.run(image="img", command="python checker.py", mounts=[])
+
+    assert res.ok is False
+    assert "allow_local_fallback" in (res.error or ""), "报错要指出如何显式开启"
+    assert executed == [], "拒绝执行时不得起任何进程"
+
+
+def test_docker_unavailable_falls_back_when_opted_in(monkeypatch) -> None:
+    """显式开启 allow_local_fallback 后，才降级为本地执行。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    _docker_missing(monkeypatch)
+
+    class _Proc:
+        returncode, stdout, stderr = 0, "hi\n", ""
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        return _Proc()
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        DockerRuntime, "_local_shell", staticmethod(lambda cmd: ["/bin/sh", "-lc", cmd])
+    )
+
+    rt = DockerRuntime(SandboxConfig(runtime="docker", allow_local_fallback=True))
+    res = rt.run(image="img", command="echo hi", mounts=[])
+
+    assert res.exit_code == 0
+    assert calls == [["/bin/sh", "-lc", "echo hi"]], "显式开启后应真的在本地执行"
+
+
+def test_local_env_only_passes_allowlist(monkeypatch) -> None:
+    """本地执行只放行白名单：宿主密钥绝不能交给被执行的代码。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    monkeypatch.setenv("FISSUE_GITHUB_TOKEN", "ghp_supersecret")
+    monkeypatch.setenv("FISSUE_LLM_API_KEY", "sk-supersecret")
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    rt = DockerRuntime(SandboxConfig(runtime="local"))
+    env = rt._local_env({})
+
+    assert "FISSUE_GITHUB_TOKEN" not in env
+    assert "FISSUE_LLM_API_KEY" not in env
+    assert env["PATH"] == "/usr/bin", "PATH 必须保留，否则连 pytest 都跑不起来"
+
+    # 调用方显式传入的变量优先（例如验证器需要的专项配置）
+    assert rt._local_env({"EXTRA": "1"})["EXTRA"] == "1"

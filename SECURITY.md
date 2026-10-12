@@ -64,7 +64,7 @@ Fissue 的信任边界画在**沙盒**上。以下内容一律视为**不可信*
 | 约束 | 默认值 | 作用 |
 |---|---|---|
 | `network` | `none` | 断网，杜绝外联与回连 |
-| `read_only_root` | `true` | 根文件系统只读，仅 `/tmp` 为受限可写层 |
+| `read_only_root` | `true` | 根文件系统只读，仅 `/tmp` 与 `/run` 为受限可写层（`noexec,nosuid`） |
 | `user` | `1000:1000` | 非 root |
 | capabilities | `--cap-drop=ALL` | 丢弃全部 Linux capabilities |
 | | `no-new-privileges` | 禁止提权 |
@@ -74,9 +74,19 @@ Fissue 的信任边界画在**沙盒**上。以下内容一律视为**不可信*
 
 调用方**不持有 Docker 句柄**，只能通过受控的本地 socket 通道（转发组件）发起执行请求。
 
-> ⚠️ **降级路径是已知的弱化点**：Docker 不可用时 `sandbox.runtime: local` 会
-> 降级为本地子进程并打印显式告警，**此时没有任何隔离**。
-> 仅限本机开发。在跑不可信代码的场景下这是**不安全配置**，请勿在生产使用。
+> ⚠️ **本地执行没有任何隔离**（不禁网、非只读根、无资源上限），所以它必须由人
+> 显式选择，绝不静默发生：
+>
+> - `runtime: docker`（默认）：Docker 不可用时**直接拒绝执行**并报错，不会降级。
+>   确需降级须显式设 `sandbox.allow_local_fallback: true`。
+> - `runtime: local`：明确要求在本机执行，仅限本机开发。
+>
+> 两条本地路径都**只按白名单透传环境变量**（`sandbox.local_env_allowlist`，
+> 默认只含 `PATH`/`HOME`/`TMPDIR` 等运行必需项）。没有容器挡着时，被执行的
+> 验证器与不可信 PR 代码可以任意组包外发，把宿主的 LLM key 与各平台 token
+> 一并交给它等于直接交出密钥。
+>
+> 在跑不可信代码的场景下，本地执行都是**不安全配置**，请勿在生产使用。
 
 详细的架构与安全模型见 [`docs/DESIGN.md`](docs/DESIGN.md) §5。
 
@@ -106,7 +116,8 @@ Fissue 的信任边界画在**沙盒**上。以下内容一律视为**不可信*
 如果你要对外提供服务或处理他人仓库：
 
 - [ ] 打开 `.env` 里的 `FISSUE_API_TOKEN` 鉴权（留空 = 不鉴权，仅限本地）
-- [ ] 不要用 `sandbox.runtime: local` 处理不可信代码
+- [ ] 不要用 `sandbox.runtime: local`、也不要打开 `sandbox.allow_local_fallback`
+      处理不可信代码——本地执行没有任何隔离
 - [ ] 用最小权限的 Token：抓取只读即可；仅自动修复需要写权限
 - [ ] 限制 Web 监听地址（默认 `127.0.0.1`；对外暴露必须开鉴权）
 - [ ] 定期轮换平台 Token 与 LLM Key
