@@ -3,8 +3,8 @@
 策略（按用户选择）
 ------------------
 * ``pr_strategy.mode = fork``（Q11 选 A）：优先 fork 上游 → 在 fork 上开分支推送 →
-  向上游提 PR。
-* ``auto_submit = true``（Q13 选 C）：修复成功即全自动提交，靠 **AI 标签** 标识身份；
+  向上游提 PR。``patch_only`` 则只落补丁不提 PR；``direct`` 直推上游仓库。
+* 修复成功即自动提交，靠 **AI 标签** 标识身份；
   失败/超轮次则**不提 PR**，转而生成「需人工」报告（Q12 选 B）。
 * 保护路径、改动规模、验证器 F2P 全部通过才允许提 PR。
 
@@ -147,12 +147,24 @@ class PRCreator:
         branch = branch_name(strategy.branch_prefix, item)
 
         # 1) 决定推送目标
+        head_repo = repo_cfg
         if strategy.mode == "fork":
             fork = await self._ensure_fork(item, repo_cfg)
-            head_repo = fork or repo_cfg
+            if fork is None:
+                # 配置写的是 fork，就只往 fork 推。fork 建不出来时**停手**：
+                # 原先这里会静默降级成「直接推上游仓库」，等于在别人的仓库里
+                # 凭空多出一个分支，而唯一的痕迹是一行 warning 日志。
+                attempt.outcome = FixOutcome.NEEDS_MANUAL
+                attempt.patch_path = self._save_patch(item, diff)
+                attempt.error = (
+                    "fork 失败：已按 pr_strategy.mode=fork 停手，未推送任何分支，补丁已留存。"
+                    "若确实想直接推上游仓库，请显式把 mode 改成 direct"
+                )
+                log.warning("fork 失败，按 mode=fork 停手（不推送）：%s", item.key)
+                return attempt
+            head_repo = fork
             head_prefix = f"{head_repo.owner}:{branch}"
         else:
-            head_repo = repo_cfg
             head_prefix = branch
 
         # 2) 提交并推送
@@ -212,7 +224,8 @@ class PRCreator:
                 api_base=repo_cfg.api_base,
             )
         except Exception as exc:
-            log.warning("fork 失败（回退为直接推送上游分支）：%s", exc)
+            # 这里不选替代方案：调用方会停手、把补丁与原因留给人看。
+            log.warning("fork 失败：%s", exc)
             return None
 
     # -- git 操作 ---------------------------------------------------------

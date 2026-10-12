@@ -1025,3 +1025,59 @@ async def test_real_run_after_dry_run_still_finds_candidate(fixer_ctx, repo, sam
 
     candidates = FlushProcessor(fixer_ctx).fix_candidates(repo_slug=sample_issue.repo, limit=10)
     assert sample_issue.key in {c.key for c in candidates}
+
+
+# ---------------------------------------------------------------------------
+# P1：fork 失败要停手，不能改换推送目标
+# ---------------------------------------------------------------------------
+
+
+async def test_fork_failure_stops_without_pushing_upstream(
+    fixer_ctx, repo, sample_issue, monkeypatch
+) -> None:
+    """配了 fork 就只往 fork 推；fork 建不出来时停手，绝不改去推上游仓库。
+
+    原先这里会静默降级成「直接推上游」，等于在别人的仓库里凭空多出一个分支，
+    而唯一的痕迹是一行 warning 日志。
+    """
+    from fissue.config import RepoConfig
+    from fissue.models import FixAttempt
+    from fissue.platforms.base import PlatformError
+
+    _register(repo, sample_issue)
+    creator = PRCreator(fixer_ctx)
+    repo_cfg = RepoConfig(platform=Platform.GITHUB, owner="psf", name="requests")
+    adapter = await fixer_ctx.adapter_for_repo(repo_cfg)
+
+    async def fake_fork(ref):
+        raise PlatformError("fork 被拒绝")
+
+    pushed: list[int] = []
+
+    async def fake_push(*args, **kwargs):
+        pushed.append(1)
+        raise AssertionError("fork 失败时不该推送任何分支")
+
+    async def fake_text(item, *, trace, spec, f2p_ok):
+        return "标题", "正文"
+
+    monkeypatch.setattr(adapter, "fork_repo", fake_fork)
+    monkeypatch.setattr(creator, "_commit_and_push", fake_push)
+    monkeypatch.setattr(creator, "_compose_pr_text", fake_text)
+    monkeypatch.setattr(creator, "_save_patch", lambda item, diff: "/tmp/fork-fail.patch")
+
+    attempt = await creator.submit(
+        attempt=FixAttempt(item_key=sample_issue.key),
+        trace=AgentTrace(rounds=1),
+        item=sample_issue,
+        workspace=_FakeWS(),
+        repo_cfg=repo_cfg,
+        spec=VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"),
+        f2p_ok=True,
+        diff="diff --git a/app.py b/app.py\n",
+    )
+
+    assert attempt.outcome is FixOutcome.NEEDS_MANUAL
+    assert attempt.patch_path == "/tmp/fork-fail.patch", "修复成果不该白费，补丁要留给人"
+    assert "fork" in (attempt.error or "")
+    assert pushed == [], "绝不改换推送目标"
