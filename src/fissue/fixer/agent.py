@@ -236,6 +236,13 @@ class FixAgent:
         """执行模型的文件写入请求，带全部策略检查。"""
         written: list[str] = []
 
+        if not self.cfg.allow_file_write:
+            # 配置层禁止改动工作区：一个文件都不写。补丁仍由 workspace.diff() 产出，
+            # 所以「只出补丁、不动工作区」这条配置依然能给人一份可采用的产物。
+            reason = "auto_fix.allow_file_write=false：按配置不改动工作区"
+            trace.rejected.append(reason)
+            return [], reason
+
         for raw_path, content in files.items():
             path = str(raw_path).replace("\\", "/").lstrip("/")
             if not isinstance(content, str):

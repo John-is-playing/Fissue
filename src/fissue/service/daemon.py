@@ -121,13 +121,19 @@ class FissueService:
             "（含 Web）" if self.with_web else "",
         )
 
-        tasks: list[asyncio.Task] = [
-            asyncio.create_task(self._scan_loop(), name="fissue-scan"),
-        ]
-        if self.settings.queues.manual_flush_enabled:
-            tasks.append(asyncio.create_task(self._flush_loop(), name="fissue-flush"))
-        if self.settings.auto_fix.enabled:
-            tasks.append(asyncio.create_task(self._fix_loop(), name="fissue-fix"))
+        tasks: list[asyncio.Task] = []
+        if not self.settings.schedule.enabled:
+            # 关掉调度：不自动扫描 / flush / 修复。想手动跑一轮用 `fissue serve --once`，
+            # 或直接用 CLI 子命令（fetch / eval / verify / flush / fix）。
+            log.warning(
+                "schedule.enabled=false：不启动定时循环（扫描 / flush / 修复都不会自动跑）"
+            )
+        else:
+            tasks.append(asyncio.create_task(self._scan_loop(), name="fissue-scan"))
+            if self.settings.queues.manual_flush_enabled:
+                tasks.append(asyncio.create_task(self._flush_loop(), name="fissue-flush"))
+            if self.settings.auto_fix.enabled:
+                tasks.append(asyncio.create_task(self._fix_loop(), name="fissue-fix"))
 
         web_task = None
         if self.with_web:

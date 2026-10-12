@@ -158,16 +158,15 @@ def test_sandbox_forwarder_socket(tmp_path: Path) -> None:
 
 
 def test_sandbox_socket_does_not_clobber_other_forwarder_fields(tmp_path: Path) -> None:
-    """只改 socket，不该把 forwarder 的其它字段（enabled/protocol）弄丢。"""
+    """只改 socket，不该把 forwarder 的其它字段（如 enabled）弄丢。"""
     cfg = _write(
         tmp_path / "config.yaml",
-        yaml.safe_dump({"sandbox": {"forwarder": {"enabled": False, "protocol": "tcp"}}}),
+        yaml.safe_dump({"sandbox": {"forwarder": {"enabled": False}}}),
     )
     env = _write(tmp_path / ".env", "FISSUE_SANDBOX_RUNNER_SOCKET=/run/x.sock\n")
     s = load_settings(cfg, env, overrides=BASE_OVERRIDES)
     assert s.sandbox.forwarder.socket == "/run/x.sock"
     assert s.sandbox.forwarder.enabled is False
-    assert s.sandbox.forwarder.protocol == "tcp"
 
 
 def test_web_host_and_port(tmp_path: Path) -> None:

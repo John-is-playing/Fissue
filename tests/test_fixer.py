@@ -1081,3 +1081,44 @@ async def test_fork_failure_stops_without_pushing_upstream(
     assert attempt.patch_path == "/tmp/fork-fail.patch", "修复成果不该白费，补丁要留给人"
     assert "fork" in (attempt.error or "")
     assert pushed == [], "绝不改换推送目标"
+
+
+# ---------------------------------------------------------------------------
+# P2：allow_file_write 开关（此前从未被代码读取）
+# ---------------------------------------------------------------------------
+
+
+def test_allow_file_write_false_blocks_all_writes(settings, workspace) -> None:
+    """`auto_fix.allow_file_write=false` 时一个文件都不写。
+
+    这个开关原先写在示例配置里、文档也提它，但代码从未读取——设成 false 照样改
+    工作区，是个会给人虚假安全感的空开关。
+    """
+    settings.auto_fix.allow_file_write = False
+    agent = _agent(settings)
+    existing = workspace.root / "app.py"
+    original = existing.read_text(encoding="utf-8")
+
+    written, reason = agent._apply_writes(
+        workspace,
+        {"app.py": "改坏了\n", "new_file.py": "x = 1\n"},
+        locked=set(),
+        trace=AgentTrace(),
+    )
+
+    assert written == []
+    assert "allow_file_write" in (reason or "")
+    assert existing.read_text(encoding="utf-8") == original, "配置禁止时不该改动已有文件"
+    assert not (workspace.root / "new_file.py").exists(), "配置禁止时不该新建文件"
+
+
+def test_allow_file_write_true_still_writes(settings, workspace) -> None:
+    """对照组：开关为 true（默认）时照常写入，别把闸门做成焊死的。"""
+    agent = _agent(settings)
+
+    written, _reason = agent._apply_writes(
+        workspace, {"app.py": "x = 1\n"}, locked=set(), trace=AgentTrace()
+    )
+
+    assert written == ["app.py"]
+    assert (workspace.root / "app.py").read_text(encoding="utf-8") == "x = 1\n"

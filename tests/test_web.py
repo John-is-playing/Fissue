@@ -224,3 +224,18 @@ def test_approve_merge_404(client) -> None:
     r = client.post("/api/v1/actions/approve-merge",
                     params={"key": "github:a/b#12345"}, json={})
     assert r.status_code == 404
+
+
+def test_api_disabled_registers_no_rest_routes(settings) -> None:
+    """`api.enabled=false` 时 REST 路由真的不注册（此前这个开关从未被读取）。
+
+    关的是 API，不是整个 Web——仪表盘页面仍然在。
+    """
+    from fastapi.testclient import TestClient
+
+    s = settings.model_copy(deep=True)
+    s.api.enabled = False
+    with TestClient(create_app(s)) as c:
+        assert c.get(f"{s.api.prefix}/health").status_code == 404
+        assert c.get(f"{s.api.prefix}/stats").status_code == 404
+        assert c.get("/").status_code == 200, "页面不该被一起关掉"

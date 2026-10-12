@@ -4,10 +4,8 @@
 # ============================================================================
 
 app:
-  name: fissue
   log_level: info            # debug | info | warning | error
   data_dir: ./data           # 本地数据目录（克隆缓存、报告、patch 产物）
-  timezone: Asia/Shanghai
 
 # ---------------------------------------------------------------------------
 # 数据库：主存储 PostgreSQL，支持导出 JSON / Markdown
@@ -77,19 +75,16 @@ classification:
 # 评估（Q3: 四维评分 + 标签建议 + 反刷子）
 # ---------------------------------------------------------------------------
 evaluation:
-  dimensions:
-    - authenticity        # 真实性
-    - importance          # 重要性
-    - feasibility         # 可行性
-    - pr_quality          # PR 质量（仅 PR）
-  score_range: [0, 100]
+  # 四个维度（真实性 / 重要性 / 可行性 / PR 质量）与 0~100 的评分区间是**固定口径**，
+  # 硬编码在 ai/evaluator.py，不通过配置切换。
   # 阈值（0-100）：决定自动修复与告警
   thresholds:
     importance_high: 70               # 重要性 >= 此值视为高
     difficulty_low: 40                # 修复难度 <= 此值视为低
     authenticity_min: 40              # 真实性低于此值 → 疑似误报/刷子
     alert_importance: 80              # >= 此值触发告警（Q4C）
-  anti_spam: true                     # 反刷子/误报识别
+  # 反刷子（重复 / AI 生成 / 刷量）恒开、不可关闭——它是本项目「别信模型自述」的
+  # 核心主张，不是一个可以关掉的选项。
 
 # ---------------------------------------------------------------------------
 # 验证器（Q7）
@@ -152,7 +147,6 @@ sandbox:
   forwarder:
     enabled: true
     socket: /var/run/fissue-runner.sock
-    protocol: unix
   keep_artifacts: true                # 保留容器日志以便出报告
 
 # ---------------------------------------------------------------------------
@@ -166,7 +160,6 @@ queues:
     flush_size: 10
     idle_flush_seconds: 300
   manual_flush_enabled: true          # CLI / API 可手动 flush
-  max_attempts: 3
 
 # ---------------------------------------------------------------------------
 # 自动修复（Q10: Agent 循环；Q11: fork 提 PR；Q12: 失败标人工）
@@ -179,8 +172,8 @@ auto_fix:
   # 实测 pipekit #8 连续 10 轮输出逐字节相同、耗时同为 1.4s，
   # 白烧 10 轮 LLM 调用与沙盒执行，最后还报出误导性的「仍未通过验证器」。
   stall_rounds: 4
+  # 是否允许 Agent 改动仓库文件；设 false 则只出补丁、不动工作区
   allow_file_write: true
-  run_tests_in_loop: true
   # 允许修改的文件范围（glob），敏感文件默认排除
   protected_paths: [".github/**", ".gitlab/**", "LICENSE", "**/*.lock"]
   max_changed_files: 20
@@ -266,7 +259,7 @@ web:
   host: 127.0.0.1
   port: 8000
   read_only: false                    # false = 允许重评 / flush / 批准提 PR / 批准合并
-  allow_repo_management: false        # 仓库与密钥管理界面（Q14:C），默认关闭
+                                      # （仓库与密钥管理界面尚未实现，故此处无对应开关）
 
 api:
   enabled: true
@@ -277,7 +270,7 @@ api:
 # 导出（Q2: 支持导出 JSON / Markdown）
 # ---------------------------------------------------------------------------
 export:
-  default_format: json                # json | markdown
+  # 导出格式由命令行决定（`fissue report --format markdown|json`），故此处不设默认值。
   output_dir: ./data/exports
 
 # ---------------------------------------------------------------------------
@@ -297,3 +290,6 @@ platforms:
   # 是「建议值」，照等没有上限——GitHub 的 reset 常常在一小时之后，直接照等会让
   # 整条流水线表现为「莫名卡住」。超出的部分一律封顶到这个值。
   max_retry_after_seconds: 300
+  # 平台 HTTP 的重试次数。与 llm.max_retries 无关：两者此前共用一个数，
+  # 「调 LLM 重试」会顺手改变平台行为（写请求重试尤其敏感）。
+  max_retries: 4

@@ -4,7 +4,9 @@
 ----------------------------
 * **只读**：列表、筛选、详情、评分理由、统计、导出。
 * **操作**：手动重评、flush 队列、批准提 PR、批准合并、触发扫描。
-* 仓库与密钥管理界面（Q14:C）默认关闭，需显式打开 ``web.allow_repo_management``。
+* 仓库与密钥管理界面（Q14:C）**尚未实现**。原先这里写着「默认关闭，需显式打开
+  ``web.allow_repo_management``」，但那个开关背后没有任何路由——属于「配置写了却
+  不生效」，已随 P2 清理一并删除（要做得另开一个特性，而不是留个空开关）。
 
 鉴权：``api.auth_required=true`` 时所有 ``/api`` 请求必须带
 ``Authorization: Bearer <FISSUE_API_TOKEN>``。
@@ -184,6 +186,11 @@ def _ctx(request: Request):
 
 
 def _register_api(app: FastAPI, settings: Settings) -> None:
+    if not settings.api.enabled:
+        # api.enabled=false：不注册任何 REST 路由（页面仍在，只是没有 /api/v1/*）。
+        log.info("api.enabled=false：不注册 REST API 路由")
+        return
+
     prefix = settings.api.prefix
     auth = _auth_dependency(settings)
 

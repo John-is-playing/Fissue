@@ -215,3 +215,47 @@ def test_platform_max_retry_after_default() -> None:
 
     assert PlatformConfig().max_retry_after_seconds == 300.0
     assert PlatformConfig(max_retry_after_seconds=30.0).max_retry_after_seconds == 30.0
+
+
+@pytest.mark.parametrize(
+    "cls_name,field",
+    [
+        ("AppConfig", "name"),
+        ("AppConfig", "timezone"),
+        ("EvaluationConfig", "dimensions"),
+        ("EvaluationConfig", "score_range"),
+        ("EvaluationConfig", "anti_spam"),
+        ("SandboxForwarderConfig", "protocol"),
+        ("QueuesConfig", "max_attempts"),
+        ("AutoFixConfig", "run_tests_in_loop"),
+        ("WebConfig", "allow_repo_management"),
+        ("ExportConfig", "default_format"),
+    ],
+)
+def test_dead_config_keys_are_gone(cls_name: str, field: str) -> None:
+    """这些键曾写在示例配置里却**从未被代码读取**，已删除。
+
+    留着比没有更危险：用户以为配上就生效。跟之前那个 `auto_submit` 是同一类问题。
+    """
+    import fissue.config as cfg
+
+    instance = getattr(cfg, cls_name)()
+    assert not hasattr(instance, field), f"{cls_name}.{field} 又回来了，但它没人读"
+
+
+def test_deleted_keys_in_old_config_files_do_not_break_loading() -> None:
+    """老配置文件里残留这些键不该让加载报错（多余键被忽略）。"""
+    from fissue.config import SandboxForwarderConfig, WebConfig
+
+    assert SandboxForwarderConfig(protocol="unix").enabled is True
+    assert WebConfig(allow_repo_management=True).read_only is False
+
+
+def test_switches_that_are_read_have_their_defaults() -> None:
+    """这几个开关是真生效的（各自有行为测试守着）。"""
+    from fissue.config import APIConfig, AutoFixConfig, PlatformConfig, ScheduleConfig
+
+    assert AutoFixConfig().allow_file_write is True
+    assert ScheduleConfig().enabled is True
+    assert APIConfig().enabled is True
+    assert PlatformConfig().max_retries == 4

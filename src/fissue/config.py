@@ -42,10 +42,8 @@ DEFAULT_ENV_FILE = ".env"
 
 
 class AppConfig(BaseModel):
-    name: str = "fissue"
     log_level: str = "info"
     data_dir: str = "./data"
-    timezone: str = "Asia/Shanghai"
 
 
 class DatabaseConfig(BaseModel):
@@ -149,19 +147,18 @@ class Thresholds(BaseModel):
 
 
 class EvaluationConfig(BaseModel):
-    dimensions: list[str] = Field(
-        default_factory=lambda: ["authenticity", "importance", "feasibility", "pr_quality"]
-    )
-    score_range: tuple[int, int] = (0, 100)
-    thresholds: Thresholds = Field(default_factory=Thresholds)
-    anti_spam: bool = True
+    """评测行为。
 
-    @field_validator("score_range", mode="before")
-    @classmethod
-    def _as_tuple(cls, v: Any) -> Any:
-        if isinstance(v, list):
-            return tuple(v)
-        return v
+    这里有两处**刻意不可配置**的口径（原先有对应的配置键，但代码从未读取，
+    已于 P2 清理时删除，免得给人「可以调」的错觉）：
+
+    * 四个维度（真实性 / 重要性 / 可行性 / PR 质量）与 0~100 的评分区间硬编码在
+      ``ai/evaluator.py``；
+    * 反刷子（重复 / AI 生成 / 刷量）恒开——它是本项目「别信模型自述」的核心主张，
+      不是一个可以关掉的选项。
+    """
+
+    thresholds: Thresholds = Field(default_factory=Thresholds)
 
 
 class VerifierConfig(BaseModel):
@@ -205,7 +202,6 @@ class VerifierConfig(BaseModel):
 class SandboxForwarderConfig(BaseModel):
     enabled: bool = True
     socket: str = "/var/run/fissue-runner.sock"
-    protocol: str = "unix"
 
 
 class SandboxMountConfig(BaseModel):
@@ -275,7 +271,8 @@ class QueuesConfig(BaseModel):
     verify_queue: QueueSpec = Field(default_factory=lambda: QueueSpec(flush_size=10, idle_flush_seconds=300))
     fix_queue: QueueSpec = Field(default_factory=lambda: QueueSpec(flush_size=10, idle_flush_seconds=300))
     manual_flush_enabled: bool = True
-    max_attempts: int = 3
+    # 这里曾有 `max_attempts`，但代码从未读取它（重试次数是 `Repository.claim_next`
+    # 自己的方法参数，且该方法在生产代码里没有调用者），已删除。
 
 
 class PRStrategy(BaseModel):
@@ -298,8 +295,10 @@ class AutoFixConfig(BaseModel):
     #: 白烧 10 轮 LLM 调用与沙盒执行，最后还报出误导性的「仍未通过验证器」
     #: （真相是「卡住了」，不是「修了 12 次没修好」）。设 0 关闭该闸门。
     stall_rounds: int = 4
+    #: 是否允许 Agent 改动仓库文件。设 false 时只出补丁不改工作区（见
+    #: ``fixer.agent._apply_writes``）。注意这不是安全边界——真正的边界是
+    #: 下面的 ``protected_paths`` 与沙盒隔离。
     allow_file_write: bool = True
-    run_tests_in_loop: bool = True
     protected_paths: list[str] = Field(
         default_factory=lambda: [".github/**", ".gitlab/**", "LICENSE", "**/*.lock"]
     )
@@ -378,7 +377,9 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
     read_only: bool = False
-    allow_repo_management: bool = False
+    # 这里曾有 `allow_repo_management`（文档说它控制「仓库与密钥管理界面」），
+    # 但那个界面从未实现、背后没有任何路由，属于「配置写了不生效」，已删除。
+    # 真正的写操作闸门是上面的 `read_only`（见 web/app.py 的 _require_writable）。
 
 
 class APIConfig(BaseModel):
@@ -389,7 +390,8 @@ class APIConfig(BaseModel):
 
 
 class ExportConfig(BaseModel):
-    default_format: str = "json"
+    # 这里曾有 `default_format`，但代码从未读取它（`fissue report/export` 的格式
+    # 由命令行 `--format` 决定），已删除。
     output_dir: str = "./data/exports"
 
 
@@ -427,6 +429,10 @@ class PlatformConfig(BaseModel):
     #: 是平台给的「建议等多久」，直接照等没有上限——最坏能把整条流水线按住一小时，
     #: 而且日志上只表现为「卡住」。超出上限一律按此值封顶；封顶后仍被限流就报错。
     max_retry_after_seconds: float = 300.0
+    #: 平台 HTTP 的重试次数。此前是直接借用 ``llm.max_retries``——于是「把 LLM 的
+    #: 重试调成 0」会顺手关掉平台重试，「调大 LLM 重试」又会放大写请求的风险，
+    #: 两个不相干的旋钮被绑在了一个数上。
+    max_retries: int = 4
 
 
 class Settings(BaseModel):
