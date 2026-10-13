@@ -313,6 +313,24 @@ class GitHubAdapter(PlatformAdapter):
             raise PlatformError(f"fork 返回异常：{data}")
         return RepoRef(platform=self.platform, owner=owner, name=name or repo.name)
 
+    async def find_open_pr(self, upstream: RepoRef, *, head: str) -> dict[str, Any] | None:
+        """按 head 查已有 PR（含已关闭）。
+
+        两个用途：创建 PR 前先去重；**已有 PR 时不再推送分支**（见
+        ``PRCreator.submit``）。
+        """
+        head_ref = head if ":" in head else f"{upstream.owner}:{head}"
+        data = await self._get(
+            f"{self.api_base}/repos/{upstream.owner}/{upstream.name}/pulls",
+            head=head_ref,
+            state="all",
+            per_page=20,
+        )
+        for pr in data or []:
+            if isinstance(pr, dict):
+                return {"number": pr.get("number"), "url": pr.get("html_url")}
+        return None
+
     async def create_pr(
         self,
         upstream: RepoRef,
@@ -323,20 +341,9 @@ class GitHubAdapter(PlatformAdapter):
         body: str,
         draft: bool = False,
     ) -> dict[str, Any]:
-        head_ref = head if ":" in head else f"{upstream.owner}:{head}"
-
         async def _probe() -> Any:
             """同一个 head 上已经有 PR → 返回它，绝不重复创建。"""
-            data = await self._get(
-                f"{self.api_base}/repos/{upstream.owner}/{upstream.name}/pulls",
-                head=head_ref,
-                state="all",
-                per_page=20,
-            )
-            for pr in data or []:
-                if isinstance(pr, dict):
-                    return {"number": pr.get("number"), "url": pr.get("html_url")}
-            return None
+            return await self.find_open_pr(upstream, head=head)
 
         data = await self._request(
             "POST",

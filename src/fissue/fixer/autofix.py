@@ -167,6 +167,23 @@ class PRCreator:
         else:
             head_prefix = branch
 
+        # 已经有开放 PR 时**不要推送**：分支名是「条目 + 内容哈希」的确定性名字，
+        # 同名即同内容，那个 PR 已经覆盖了这次修复。此时强推会被远端正确拒绝
+        # （`--force-with-lease` 报 stale info），而报成「推送失败 / 需人工」会误导
+        # 复核——真相是「这条修复早就有 PR 了」。实测：envkit 九个条目在 10-09 那次
+        # 真跑里都建过 PR，之后每次重跑都撞在这个假失败上。
+        existing_pr = await adapter.find_open_pr(ref, head=head_prefix)
+        if existing_pr:
+            attempt.branch = branch
+            attempt.pr_number = existing_pr.get("number")
+            attempt.pr_url = existing_pr.get("url")
+            attempt.outcome = FixOutcome.SUCCESS
+            log.info(
+                "该修复已有开放 PR #%s，跳过推送与重复创建：%s",
+                existing_pr.get("number"), item.key,
+            )
+            return attempt
+
         # 2) 提交并推送
         pushed, push_err = await self._commit_and_push(
             workspace, item=item, branch=branch, head_repo=head_repo, trace=trace

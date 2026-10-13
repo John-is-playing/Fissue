@@ -1083,6 +1083,58 @@ async def test_fork_failure_stops_without_pushing_upstream(
     assert pushed == [], "绝不改换推送目标"
 
 
+async def test_existing_pr_is_reused_without_pushing(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """已有开放 PR → 复用、不推送、如实报成功。
+
+    分支名是「条目 + 内容哈希」的**确定性**名字，同名即同内容，那个 PR 已经覆盖了
+    这次修复。此时强推会被远端正确拒绝（``--force-with-lease`` 报 stale info），
+    而把它报成「推送失败 / 需人工」是误导——真相是这条修复早就有 PR 了。
+
+    实测：envkit 九个条目在 10-09 那次真跑里都建过 PR，此后每次重跑都撞在这个
+    假失败上（Agent 明明修好了，验证器与回归门都过）。
+    """
+    from fissue.config import RepoConfig
+    from fissue.models import FixAttempt
+
+    _register(repo, sample_issue)
+    creator = PRCreator(fixer_ctx)
+    fixer_ctx.settings.auto_fix.pr_strategy.mode = "direct"     # 不涉及 fork
+    repo_cfg = RepoConfig(platform=Platform.GITHUB, owner="psf", name="requests")
+    adapter = await fixer_ctx.adapter_for_repo(repo_cfg)
+
+    async def fake_find(ref, *, head):
+        return {"number": 21, "url": "https://github.com/psf/requests/pull/21"}
+
+    pushed: list[int] = []
+
+    async def fake_push(*args, **kwargs):
+        pushed.append(1)
+        raise AssertionError("已有开放 PR 时不该推送任何分支")
+
+    async def fake_text(item, *, trace, spec, f2p_ok):
+        return "标题", "正文"
+
+    monkeypatch.setattr(adapter, "find_open_pr", fake_find)
+    monkeypatch.setattr(creator, "_commit_and_push", fake_push)
+    monkeypatch.setattr(creator, "_compose_pr_text", fake_text)
+
+    attempt = await creator.submit(
+        attempt=FixAttempt(item_key=sample_issue.key),
+        trace=AgentTrace(rounds=2),
+        item=sample_issue,
+        workspace=_FakeWS(),
+        repo_cfg=repo_cfg,
+        spec=VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"),
+        f2p_ok=True,
+        diff="diff --git a/app.py b/app.py\n",
+    )
+
+    assert pushed == [], "已有 PR 时绝不该再推送"
+    assert attempt.outcome is FixOutcome.SUCCESS, "已有 PR 说明修复早已完成，不该报需人工"
+    assert attempt.pr_number == 21
+    assert attempt.pr_url and "/pull/21" in attempt.pr_url
+
+
 # ---------------------------------------------------------------------------
 # P2：allow_file_write 开关（此前从未被代码读取）
 # ---------------------------------------------------------------------------
