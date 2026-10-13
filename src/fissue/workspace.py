@@ -316,10 +316,11 @@ class RepoWorkspace:
         凭据助手**交给 git。这样它不会出现在命令行参数里（那是同机任何用户都能
         看到的），也不会被写进 git 配置或 remote。
         """
-        args = ["git", "push", "--quiet"]
-        if force:
-            args.append("--force-with-lease")
-
+        # `-c` 是 **git 本体**的选项，必须排在子命令**之前**。
+        # 这里曾写成 `git push --quiet --force-with-lease -c credential.helper=…`，
+        # 于是 git 直接报「未知开关 `c'」——推送全线失败、PR 一个也建不出来。
+        # 真提 PR 时实测撞到：Agent 明明修好了（验证器与回归门都通过），死在推送。
+        args = ["git"]
         extra_env: dict[str, str] = {}
         if token:
             # 助手脚本里只出现**环境变量名**，令牌本身不在命令行上。
@@ -332,6 +333,9 @@ class RepoWorkspace:
             args += ["-c", f"credential.helper={helper}"]
             extra_env[self.PUSH_TOKEN_ENV] = token
 
+        args += ["push", "--quiet"]
+        if force:
+            args.append("--force-with-lease")
         args += [url, f"HEAD:refs/heads/{branch}"]
         result = self._git(args, timeout=900, extra_env=extra_env)
         # 兜底：万一 git 把凭据回显进了输出
