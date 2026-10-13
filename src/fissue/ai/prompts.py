@@ -55,6 +55,35 @@ SYSTEM_FIX = """你是资深软件工程师，正在修复一个真实的开源�
 5. 输出必须是**合法 JSON**，不要输出任何 JSON 之外的解释文字。"""
 
 
+#: 修复 Agent 循环专用（与上面的 ``SYSTEM_FIX`` 分开：那个还被 PR 文案生成共用）。
+#:
+#: 重写动机来自真跑：pipekit 上模型连续 12 轮**只读不写**，把整个轮次预算烧光。
+#: 复盘发现它并不缺信息——仓库上下文里已有文件树、README、**公开 API 契约**与
+#: **跨模块调用链**，验证器也在手上——缺的是「信息够了就该动手」这条纪律。
+#: 所以这版把重点放在**逼出判断**：把验证器指成最便宜的信息源、把「写一版去验证」
+#: 立成正路，并把「继续读」明确定性为耗轮次而不是求证。
+SYSTEM_FIX_AGENT = """你是资深软件工程师，正在修复一个真实的开源项目 Issue。
+
+你有一个**有限的轮次预算**，每轮只能选一个动作。请把预算花在推进上，而不是反复看同样的文件。
+
+三条工作纪律：
+
+1. **验证器是你的目标，也是最便宜的信息源。** 它跑一次就会告诉你「还差什么」——
+   比再读十个文件都管用。不确定时：先写一版最接近的改动（`write`），
+   写完系统会**自动**跑一次验证器，并把输出直接给你。
+2. **够了就动手。** 当你能说出「改哪个文件、改成什么」时，立刻 `write`，不要再读。
+   重读同一批文件不会带来任何新信息；信息还不够时，正确做法是**写一版去验证**，
+   而不是继续读。
+3. **最小必要修改。** 不要顺手重构、不要改格式、不要动与问题无关的文件；
+   也不要为了「让验证器通过」去改库的公开契约或既有行为——回归门会拦住这类改动。
+
+硬性约束：
+- 不得修改验证器文件、CI 配置、LICENSE、锁文件。
+- 只改与问题相关的文件；一次最多 20 个文件、总 diff 不超过 800 行。
+- 输出必须是**合法 JSON**，不要输出任何 JSON 之外的解释文字。
+- 若确实超出能力范围，用 `give_up` 明确说明——**不要用「继续读」把轮次耗光**。"""
+
+
 # ---------------------------------------------------------------------------
 # 渲染辅助
 # ---------------------------------------------------------------------------
@@ -577,45 +606,76 @@ def fix_agent_step_prompt(
     round_index: int,
     max_rounds: int,
     read_files: dict[str, str] | None = None,
+    verifier_files: dict[str, str] | None = None,
 ) -> list[dict[str, str]]:
     """Agent 循环中的单步提示：让模型决定「读哪些文件 / 改哪些文件」。
 
     模型只需输出结构化的动作，实际文件读写与命令执行由我们（受控地）完成，
     这样沙盒与权限边界始终在我们手里。
+
+    ``verifier_files``：验证器自带的测试文件，也就是**验收标准**。它**每一轮都摆在
+    最前面**：这是「要满足什么」的规格，而实测（pipekit）模型宁可反复读仓库文件，
+    也没主动去读它。规格直接放到眼前，就不存在「想不起来去读」这一步。
     """
-    file_blocks = ""
+    blocks: list[str] = []
+
+    # 1) 验收标准——规格放最前面，且每轮都给
+    head = f"## 验收标准\n运行命令：`{verifier_command}`（退出码 0 = 问题已解决；非 0 = 还没解决）"
+    if verifier_files:
+        parts: list[str] = []
+        budget = 12000
+        for path, content in list(verifier_files.items())[:10]:
+            piece = f"--- {path} ---\n{_truncate(content, 8000)}"
+            if budget - len(piece) < 0:
+                parts.append("（验收标准过长，其余已截断）")
+                break
+            parts.append(piece)
+            budget -= len(piece)
+        head += "\n它的测试文件（**不得修改**）：\n\n" + "\n\n".join(parts)
+    blocks.append(head)
+
+    # 2) 上一轮验证器输出——模型当下最可靠的信息
+    if last_test_output:
+        blocks.append("## 上一轮验证器输出\n```\n" + _truncate(last_test_output, 4000) + "\n```")
+
+    # 3) 已读到的文件
     if read_files:
         parts = []
         for path, content in list(read_files.items())[:20]:
             parts.append(f"--- {path} ---\n{_truncate(content, 6000)}")
-        file_blocks = "\n\n已读取的文件内容：\n" + "\n\n".join(parts)
+        blocks.append("## 已读到的文件内容\n" + "\n\n".join(parts))
 
-    last_output = ""
-    if last_test_output:
-        last_output = f"\n上一轮验证器执行输出：\n```\n{_truncate(last_test_output, 4000)}\n```\n"
+    blocks.append("## 仓库上下文\n" + repo_context)
+    blocks.append("## 问题\n" + render_item(item, include_comments=False))
 
-    user = f"""你正在第 {round_index}/{max_rounds} 轮修复中。
+    # 先拼好再插值：f-string 的表达式部分不能含与定界符相同的引号（Python ≤3.11 的限制），
+    # 所以不能在 `f"""…"""` 里直接写字符串字面量。
+    body = "\n\n".join(blocks)
 
-验证器运行命令：`{verifier_command}`
-{last_output}
-仓库上下文：
-{repo_context}
-{file_blocks}
+    user = f"""你正在第 {round_index}/{max_rounds} 轮修复中（预算有限，别用它反复看同样的文件）。
 
-请决定下一步动作。可选动作：
-- `read`：读取若干文件（给出 paths）。
-- `write`：写入文件（给出 files：路径 → 完整内容）。
-- `run`：运行验证器（命令由系统固定，你只需说 run）。
-- `done`：你认为已修复（系统会跑一次验证器确认）。
-- `give_up`：问题超出能力范围，放弃并说明原因。
+{body}
+
+## 现在决定下一步动作
+
+可选动作：
+- `read`：读取若干文件（给出 paths）。**只读你还没读过的**——重读同一批不会带来新信息。
+- `write`：写入文件（给出 files：路径 → 完整内容）。写完系统会**自动**跑一次验证器，
+  并把它这次的输出直接给你。
+- `run`：让系统再跑一次验证器（命令固定，你只需说 run）。
+- `done`：你认为已修复（系统会跑验证器确认）。
+- `give_up`：超出能力范围，放弃并说明原因。
+
+**每轮都要推进**，判据：
+- 能说出「改哪个文件、改成什么」→ 立刻 `write`，不要再读；
+- 还不能，但仓库里还有**没读过**的相关文件 → `read` 它们；
+- 信息已收集够却仍不确定 → **先写一版最接近的改动**再 `run`，让验证器告诉你差在哪；
+- 确实做不了 → `give_up`，不要用「继续读」把轮次耗光。
 
 约束：
 - 只允许修改与问题相关的文件；**禁止**修改验证器文件、CI 配置、LICENSE、锁文件。
 - 一次最多改 20 个文件、总 diff 不超过 800 行。
 - 给出 `files` 时必须是**完整文件内容**（不是片段）。
-
-问题：
-{render_item(item, include_comments=False)}
 
 只输出 JSON：
 {{
@@ -626,7 +686,7 @@ def fix_agent_step_prompt(
   "summary": "若 done：修复要点；若 give_up：原因"
 }}"""
     return [
-        {"role": "system", "content": SYSTEM_FIX},
+        {"role": "system", "content": SYSTEM_FIX_AGENT},
         {"role": "user", "content": user},
     ]
 

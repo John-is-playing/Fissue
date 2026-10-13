@@ -538,6 +538,77 @@ def test_evaluation_prompt_pr_variant_keeps_guidance() -> None:
     assert "≤40" in user
 
 
+# ---------------------------------------------------------------------------
+# 修复 Agent 的单步提示（重写：验收标准前置 + 逼出判断）
+# ---------------------------------------------------------------------------
+
+
+def _an_issue() -> RawItem:
+    from fissue.models import ItemType, Platform, RawItem
+
+    return RawItem(platform=Platform.GITHUB, repo="x/y", number=1,
+                   item_type=ItemType.ISSUE, title="t", body="b")
+
+
+def _fix_step(**over) -> str:
+    """取单步提示的 user 正文（各用例共用）。"""
+    from fissue.ai.prompts import fix_agent_step_prompt
+
+    kwargs: dict = dict(
+        repo_context="（仓库上下文占位）",
+        verifier_command="python -m pytest tests/test_reproduce.py -q",
+        last_test_output=None,
+        round_index=1,
+        max_rounds=12,
+        read_files=None,
+        verifier_files=None,
+    )
+    kwargs.update(over)
+    return fix_agent_step_prompt(_an_issue(), **kwargs)[1]["content"]
+
+
+def test_fix_step_puts_acceptance_criteria_up_front() -> None:
+    """验证器自带的测试文件必须**第 1 轮**就摆在提示里，且排在仓库上下文之前。
+
+    实测：模型宁可反复读仓库文件，也不主动去读验证器自带的那份测试——而它正是
+    「要满足什么」的规格。所以每轮直接给，别指望它「想起来去读」。
+    """
+    text = _fix_step(
+        verifier_files={"tests/test_reproduce.py": "def test_x():\n    assert 1 == 2\n"}
+    )
+
+    assert "验收标准" in text
+    assert "tests/test_reproduce.py" in text
+    assert "assert 1 == 2" in text, "规格内容本身也要给到"
+    assert text.index("验收标准") < text.index("仓库上下文"), "先看目标，再看素材"
+
+
+def test_fix_step_tells_the_model_to_write_when_it_knows_enough() -> None:
+    """把「重读同一批＝耗轮次」「不确定就先写一版」这两条纪律写进提示。
+
+    实测 12 轮只读不写就卡在这里：它不缺信息、也不缺动作，缺的是「够了就动手」。
+    """
+    text = _fix_step()
+
+    assert "只读你还没读过的" in text
+    assert "先写一版" in text
+    assert "give_up" in text
+
+
+def test_fix_agent_uses_its_own_system_prompt() -> None:
+    """修复 Agent 用独立系统提示词：`SYSTEM_FIX` 还被 PR 文案生成共用，不能串。"""
+    from fissue.ai.prompts import SYSTEM_FIX, SYSTEM_FIX_AGENT, fix_agent_step_prompt
+
+    msgs = fix_agent_step_prompt(
+        _an_issue(), repo_context="x", verifier_command="pytest",
+        last_test_output=None, round_index=1, max_rounds=12,
+    )
+
+    assert msgs[0]["content"] == SYSTEM_FIX_AGENT
+    assert msgs[0]["content"] != SYSTEM_FIX
+    assert "轮次预算" in msgs[0]["content"]
+
+
 def sample_platform():
     from fissue.models import Platform
 

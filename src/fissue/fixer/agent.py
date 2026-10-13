@@ -164,6 +164,9 @@ class FixAgent:
                     round_index=round_index,
                     max_rounds=rounds_limit,
                     read_files=read_files,
+                    # 验收标准（验证器自带的测试文件）每轮直接摆在提示最前面：
+                    # 实测模型宁可反复读仓库文件、也不主动去读它，那就别让它「想起来」。
+                    verifier_files=spec.files,
                 ),
                 purpose=f"agent@{item.repo}",
                 default={},
