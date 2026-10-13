@@ -1136,6 +1136,37 @@ async def test_existing_pr_is_reused_without_pushing(fixer_ctx, repo, sample_iss
 
 
 # ---------------------------------------------------------------------------
+# P2：一次修复尝试的用量只记一次（逐轮明细 + 汇总会重复）
+# ---------------------------------------------------------------------------
+
+
+def test_fix_usage_is_recorded_only_per_call(fixer_ctx, repo, sample_issue) -> None:
+    """不该额外写汇总行——逐轮记账已经把它写全了。
+
+    实测：Agent 每一轮的调用都由 `LLMClient` 的 usage_sink 逐次写进 `llm_usage`
+    （purpose=`agent@<仓库>`），而 `_record_usage` 又把整次尝试的**累加量**写成一行
+    `agent`——同一批 token 记两遍。量化过：那批汇总行让全表用量虚高 **14.6%**，
+    而 `llm.budget` 的每日闸门正是按这张表算的，虚高会让它在没超预算时提前硬停。
+    """
+    from fissue.ai.client import Usage
+    from fissue.fixer.agent import AgentTrace
+
+    before = repo.usage_today(repo_key=sample_issue.repo)["calls"]
+
+    fixer = AutoFixer(fixer_ctx)
+    record = getattr(fixer, "_record_usage", None)     # 方法被删掉也算通过：无行可记
+    if record is not None:
+        record(
+            sample_issue,
+            AgentTrace(usage=Usage(prompt_tokens=999, completion_tokens=999, model="m")),
+        )
+
+    after = repo.usage_today(repo_key=sample_issue.repo)
+    assert after["calls"] == before, "不该写任何汇总行：逐轮调用已经记过账了"
+    assert after["prompt_tokens"] == 0, "更不该把那 999 的累加量再记一遍"
+
+
+# ---------------------------------------------------------------------------
 # P2：allow_file_write 开关（此前从未被代码读取）
 # ---------------------------------------------------------------------------
 

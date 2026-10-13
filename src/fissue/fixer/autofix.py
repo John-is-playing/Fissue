@@ -438,7 +438,11 @@ class AutoFixer:
                 verifier_id=verifier_id,
                 max_rounds=max_rounds,
             )
-            self._record_usage(item, trace)
+            # 这里**不再**把 trace.usage 记一次账：Agent 每一轮的调用都已经由
+            # `LLMClient` 的 usage_sink 逐次写进 llm_usage（purpose=`agent@<仓库>`），
+            # 再把整次尝试的累加量写一行 `agent` 等于把同一批 token 记两遍。
+            # 实测：那批汇总行让全表用量虚高 14.6%，而 `llm.budget` 的每日闸门正是
+            # 按这张表算的——虚高会让它在没超预算时提前硬停。
 
             if attempt.outcome is not FixOutcome.SUCCESS:
                 return await self._handle_failure(item, attempt, trace, spec)
@@ -762,14 +766,8 @@ class AutoFixer:
             return item.key
 
     def _record_usage(self, item: RawItem, trace: AgentTrace) -> None:
-        if not trace.usage.prompt_tokens and not trace.usage.completion_tokens:
-            return
-        repo_key = item.repo
-        self.ctx.repo.record_usage(
-            repo_key=repo_key,
-            purpose="agent",
-            model=trace.usage.model,
-            prompt_tokens=trace.usage.prompt_tokens,
-            completion_tokens=trace.usage.completion_tokens,
-            cost_usd=trace.usage.cost_usd,
-        )
+        """**已弃用**：逐轮记账已由 `LLMClient` 的 usage_sink 完成，这里再记一次是重复。
+
+        保留这个空壳只为让「它不记账」这件事有个明确出处，避免日后有人以为漏记而加回来。
+        """
+        return None
