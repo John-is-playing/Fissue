@@ -181,7 +181,8 @@ auto_fix:
   protected_paths: [".github/**", ".gitlab/**", "LICENSE", "**/*.lock"]
   max_changed_files: 20
   max_diff_lines: 800
-  on_failure: report_manual           # 标记「需人工」并生成报告（Q12:B）
+  on_failure: report_manual           # 标记「需人工」并生成报告（Q12:B）；另一取值为
+                                      # discard（只记录失败、不出报告）
   # 提 PR 策略（Q11: A=fork 提 PR）
   pr_strategy:
     mode: fork                        # fork | direct | patch_only

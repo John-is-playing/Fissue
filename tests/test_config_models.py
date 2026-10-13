@@ -259,3 +259,28 @@ def test_switches_that_are_read_have_their_defaults() -> None:
     assert ScheduleConfig().enabled is True
     assert APIConfig().enabled is True
     assert PlatformConfig().max_retries == 4
+
+
+@pytest.mark.parametrize("value", ["report_manual", "discard"])
+def test_on_failure_accepts_documented_values(tmp_path: Path, value: str) -> None:
+    """两个「真的实现了」的取值都要能配上。"""
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(yaml.safe_dump({"auto_fix": {"on_failure": value}}), encoding="utf-8")
+
+    assert load_settings(cfg).auto_fix.on_failure == value
+
+
+@pytest.mark.parametrize("value", ["retry_then_report", "retry", "report-manual", ""])
+def test_on_failure_rejects_undocumented_values(tmp_path: Path, value: str) -> None:
+    """写错的值必须报错，而不是被**静默**当成 report_manual。
+
+    `retry_then_report` 这个取值曾经存在，但它与 `report_manual` 行为完全一致
+    （只写人工报告、**不重试**）——名字承诺了重试而代码没做，属于「配置说了没
+    做到」，已移除。原先没有任何校验，任何拼错的值都会被静默吞掉。
+    """
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(yaml.safe_dump({"auto_fix": {"on_failure": value}}), encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc:
+        load_settings(cfg)
+    assert "on_failure" in str(exc.value), str(exc.value)

@@ -313,8 +313,28 @@ class AutoFixConfig(BaseModel):
     )
     max_changed_files: int = 20
     max_diff_lines: int = 800
-    on_failure: str = "report_manual"      # report_manual | discard | retry_then_report
+    on_failure: str = "report_manual"      # report_manual | discard
     pr_strategy: PRStrategy = Field(default_factory=PRStrategy)
+
+    @field_validator("on_failure")
+    @classmethod
+    def _check_on_failure(cls, v: str) -> str:
+        """只接受代码**真的实现了**的取值。
+
+        这里曾有第三个取值 ``retry_then_report``，但它与 ``report_manual`` 行为
+        完全一致（都是只写人工报告、**不重试**）——名字承诺了重试而代码没做，属于
+        「配置说了没做到」。与其留一个说谎的选项，不如删掉它。
+
+        顺带把另一个坑也堵上：原先没有任何校验，写错的值会被**静默**当成
+        ``report_manual``（照 ``verifier.regression_gate`` 的做法加校验）。
+        """
+        allowed = {"report_manual", "discard"}
+        if v not in allowed:
+            raise ConfigError(
+                f"auto_fix.on_failure 只接受 report_manual|discard，当前为 {v!r}"
+                "（retry_then_report 已移除：它与 report_manual 行为一致，并不会重试）"
+            )
+        return v
 
 
 class FixTier(BaseModel):

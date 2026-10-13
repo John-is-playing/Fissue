@@ -606,7 +606,7 @@ class AutoFixer:
             self.ctx.repo.save_fix_attempt(attempt)
             return attempt
 
-        # report_manual / retry_then_report：生成「需人工」报告
+        # report_manual：生成「人工复核报告」（discard 已在上方返回）
         attempt.outcome = FixOutcome.NEEDS_MANUAL
         try:
             path = self._write_manual_report(
