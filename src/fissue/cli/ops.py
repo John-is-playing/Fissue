@@ -90,6 +90,13 @@ def fix(
                     )
                     emit(report.summary)
                     rows.extend(_attempt_row(a, dry_run=dry_run) for a in report.attempts)
+                    if not report.attempts:
+                        # 一条都没取到时要说清卡在哪一步，否则用户只看到「修复尝试 0」，
+                        # 无从区分「本来就没有值得自动修的条目」和「中间漏跑了一步」。
+                        # 实测就因此在 verify 之后漏掉了 flush，白跑一趟。
+                        hint = _explain_no_fix(ctx, cfg.slug)
+                        if hint:
+                            emit(hint, style="yellow")
 
         if json_out:
             emit_json(rows)
@@ -102,6 +109,45 @@ def fix(
         return 0
 
     run_async(main())
+
+
+def _explain_no_fix(ctx: Any, repo_slug: str) -> str | None:
+    """`fix` 一条候选都没取到时，说清卡在哪一步。
+
+    `fix` 只认 ``status=fix_queued``（理由见 ``FlushProcessor.fix_candidates`` 的
+    注释：priority 修完也不清，拿它当依据会导致反复重修第一批）。而把条目提升到
+    该状态的是 **flush**——漏跑它时条目会静静停在 ``queued``，输出却只有一句
+    「修复尝试 0」，没有任何线索指向那一步。
+    """
+    items = [
+        it
+        for prio in (Priority.TIER1, Priority.TIER2)
+        for it in ctx.repo.list_items(
+            repo_slug=repo_slug, item_type=ItemType.ISSUE, priority=prio, limit=500
+        )
+    ]
+    if not items:
+        return (
+            f"[{repo_slug}] 没有 tier1/tier2 的 Issue——没有可自动修复的条目"
+            "（优先级由评测 + fix_policy 阈值决定）"
+        )
+
+    counts: dict[str, int] = {}
+    for it in items:
+        counts[it.status.value] = counts.get(it.status.value, 0) + 1
+    breakdown = "，".join(f"{k} {v} 条" for k, v in sorted(counts.items()))
+    head = f"[{repo_slug}] {len(items)} 条 tier1/tier2 Issue 都不在可修状态（{breakdown}）"
+
+    if counts.get(ItemStatus.QUEUED.value) and ctx.repo.queue_unflushed(QueueName.VERIFY, limit=1):
+        return (
+            f"{head}。它们在等批量 flush——**只有 flush** 会把「值得修」的条目提升为"
+            "待修复，先跑 `fissue flush --queue verify`"
+        )
+    if counts.get(ItemStatus.FIXING.value):
+        return f"{head}。有卡在 fixing 的残留（上次中途中断），重跑一次会自动放回待修队列"
+    if counts.get(ItemStatus.EVALUATED.value):
+        return f"{head}。它们还没生成验证器，先跑 `fissue verify`"
+    return f"{head}。可看 `fissue status` 与 data/manual/ 下的报告确认原因"
 
 
 def _attempt_row(attempt, *, dry_run: bool = False) -> dict[str, Any]:

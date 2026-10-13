@@ -26,6 +26,7 @@ from fissue.models import (
     Evaluation,
     FixAttempt,
     FixOutcome,
+    ItemStatus,
     ItemType,
     Platform,
     Priority,
@@ -289,3 +290,74 @@ def test_sandbox_check_runs(cli_env: dict[str, str]) -> None:
     result = runner.invoke(app, ["sandbox", "check", "--config", cli_env["config"], "--env", cli_env["env"]])
     assert result.exit_code == 0, result.output
     assert "执行后端" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 2. fix 一条候选都取不到时，必须说清卡在哪一步
+# ---------------------------------------------------------------------------
+
+
+def _seed_verified_tier2_issue(repo, sample_issue) -> None:
+    """造出「已验证可复现、等批量 flush 提升」的 tier2 Issue。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    repo.set_item_status(sample_issue.key, ItemStatus.QUEUED, priority=Priority.TIER2)
+    entry = repo.enqueue(QueueName.VERIFY, sample_issue.key, payload={"stage": "verify"})
+    repo.finish_queue_entry(entry, status="done", result={"verified": True})
+
+
+def test_explain_no_fix_points_at_flush(repo, sample_issue) -> None:
+    """卡在 `queued` 且验证结论尚未 flush 时，必须明确指出缺的是 flush。
+
+    `fix` 只取 `fix_queued`，而把条目提升到该状态的是 **flush**。漏跑 flush 时
+    输出只有「修复尝试 0」，用户无从判断是「没有值得修的条目」还是「漏了中间
+    一步」——实测就这么白跑了一趟。
+    """
+    from types import SimpleNamespace
+
+    from fissue.cli.ops import _explain_no_fix
+
+    _seed_verified_tier2_issue(repo, sample_issue)
+
+    msg = _explain_no_fix(SimpleNamespace(repo=repo), "psf/requests")
+
+    assert msg, "应当给出说明"
+    assert "flush" in msg
+    assert "fissue flush --queue verify" in msg, msg
+
+
+def test_explain_no_fix_without_tier_items(repo) -> None:
+    """一条 tier1/tier2 都没有时，说的是「没有可修条目」，不该误报成缺 flush。"""
+    from types import SimpleNamespace
+
+    from fissue.cli.ops import _explain_no_fix
+
+    msg = _explain_no_fix(SimpleNamespace(repo=repo), "psf/requests")
+
+    assert msg and "没有" in msg
+    assert "flush" not in msg, msg
+
+
+def test_explain_no_fix_points_at_verify_when_only_evaluated(repo, sample_issue) -> None:
+    """已评测、还没生成验证器时，指向 verify 这一步。"""
+    from types import SimpleNamespace
+
+    from fissue.cli.ops import _explain_no_fix
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    repo.set_item_status(sample_issue.key, ItemStatus.EVALUATED, priority=Priority.TIER2)
+
+    msg = _explain_no_fix(SimpleNamespace(repo=repo), "psf/requests")
+
+    assert msg and "verify" in msg, msg
+
+
+def test_fix_without_candidates_explains_why(cli_env: dict[str, str]) -> None:
+    """接线测试：空库上跑 fix，也要把「为什么没候选」打出来，而不是只报「修复尝试 0」。"""
+    _run(["db", "init"], cli_env)
+    result = _run(["fix", "--dry-run", "--limit", "1"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "修复尝试 0" in result.output
+    assert "没有可自动修复的条目" in result.output, result.output
