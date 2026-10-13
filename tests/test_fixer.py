@@ -1270,3 +1270,47 @@ async def test_non_transient_error_is_not_retried(fixer_ctx, repo, sample_issue,
 
     assert len(calls) == 1
     assert attempt.outcome is FixOutcome.FAILED
+
+
+# ---------------------------------------------------------------------------
+# P2：提交时只暂存 Agent 改过的文件（验证器文件绝不能进 PR）
+# ---------------------------------------------------------------------------
+
+
+def test_stage_paths_excludes_verifier_files(settings, workspace) -> None:
+    """提交修复分支只暂存 Agent 改过的文件，验证器文件绝不能进 PR。
+
+    验证器（含它生成的测试文件）在**本地执行时会被写进工作区**。提交若用
+    ``git add -A``，它们会被一起暂存、提交、推送——等于把「判定用的标尺」公开到
+    上游仓库。dry-run 暴露不了这个问题：补丁走 ``git diff``，而 git diff 不含
+    未跟踪文件。
+    """
+    # 模拟本地执行器把验证器自带的测试文件写进工作区（未跟踪）
+    (workspace.root / "tests" / "test_reproduce.py").write_text(
+        "def test_x():\n    assert False\n", encoding="utf-8"
+    )
+    # 模拟 Agent 真正改动的文件
+    (workspace.root / "registry.py").write_text("import copy\n", encoding="utf-8")
+
+    assert workspace.stage_paths(["registry.py"]) is True
+
+    staged = workspace._git(["git", "diff", "--cached", "--name-only"]).stdout
+    assert "registry.py" in staged
+    assert "test_reproduce.py" not in staged, "验证器文件绝不能被提交进 PR"
+
+
+def test_stage_all_would_have_included_verifier_files(settings, workspace) -> None:
+    """对照：这正是当初不能用 ``git add -A`` 的原因（留作回归证据）。"""
+    (workspace.root / "tests" / "test_reproduce.py").write_text(
+        "def test_x():\n    assert True\n", encoding="utf-8"
+    )
+
+    assert workspace.stage_all() is True
+
+    staged = workspace._git(["git", "diff", "--cached", "--name-only"]).stdout
+    assert "test_reproduce.py" in staged, "git add -A 会把未跟踪的验证器文件一起带上"
+
+
+def test_stage_paths_rejects_empty_list(workspace) -> None:
+    """没有改动时如实返回 False，让调用方给出「没有可提交的改动」。"""
+    assert workspace.stage_paths([]) is False

@@ -281,6 +281,19 @@ class RepoWorkspace:
     def stage_all(self) -> bool:
         return self._git(["git", "add", "-A"]).ok
 
+    def stage_paths(self, paths: list[str]) -> bool:
+        """只暂存**指定**路径。
+
+        提交修复分支时不能用 ``git add -A``：验证器（含它生成的测试文件）在本地
+        执行时会**写进工作区**，``-A`` 会把它们一起暂存、提交、推送进 PR——等于把
+        判定用的标尺公开到上游仓库。dry-run 暴露不了这个问题：补丁走 ``git diff``，
+        而 git diff 不含未跟踪文件（``git status --porcelain`` 才会列出来）。
+        """
+        clean = [p for p in paths if p]
+        if not clean:
+            return False
+        return self._git(["git", "add", "--", *clean]).ok
+
     def commit(self, message: str, *, author: str = "Fissue Bot <bot@fissue.local>") -> GitResult:
         return self._git(
             [

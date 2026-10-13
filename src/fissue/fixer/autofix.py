@@ -247,9 +247,14 @@ class PRCreator:
         if not ok:
             return False, f"创建分支 {branch} 失败"
 
-        staged = await asyncio.to_thread(workspace.stage_all)
+        # 只暂存 Agent **真正改过**的文件。
+        #
+        # 这里曾用 `git add -A`，而验证器（含它生成的测试文件）在本地执行时会写进
+        # 工作区——`-A` 会把它们一起提交并推送进 PR，等于把「判定用的标尺」公开到
+        # 上游仓库。dry-run 看不到这个问题：补丁走 `git diff`，不含未跟踪文件。
+        staged = await asyncio.to_thread(workspace.stage_paths, list(trace.written_files))
         if not staged:
-            return False, "git add 失败（没有可提交的改动？）"
+            return False, "没有可提交的改动（Agent 未改动任何文件）"
 
         message = (
             f"fix: 修复 #{item.number} {item.title[:60]}\n\n"
