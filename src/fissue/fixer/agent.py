@@ -123,7 +123,7 @@ class FixAgent:
 
         for round_index in range(1, rounds_limit + 1):
             trace.rounds = round_index
-            read_files = self._pick_context(workspace, read_files)
+            read_files = self._pick_context(workspace, read_files, locked_files=spec.files)
 
             data, usage = await self.client.chat_json(
                 prompts.fix_agent_step_prompt(
@@ -146,7 +146,7 @@ class FixAgent:
             if action == "read":
                 paths = [str(p) for p in (data.get("paths") or []) if str(p).strip()]
                 for p in paths[:10]:
-                    content = self._safe_read(workspace, p, trace)
+                    content = self._safe_read(workspace, p, trace, locked_files=spec.files)
                     if content is not None:
                         read_files[p] = content
                 continue
@@ -349,7 +349,14 @@ class FixAgent:
 
     # -- 上下文选择 -------------------------------------------------------
 
-    def _pick_context(self, workspace: RepoWorkspace, current: dict[str, str], *, limit: int = 6) -> dict[str, str]:
+    def _pick_context(
+        self,
+        workspace: RepoWorkspace,
+        current: dict[str, str],
+        *,
+        locked_files: dict[str, str] | None = None,
+        limit: int = 6,
+    ) -> dict[str, str]:
         """给模型一个最小上下文：优先 README 与变更相关文件。"""
         if len(current) >= limit:
             return dict(list(current.items())[:limit])
@@ -358,13 +365,35 @@ class FixAgent:
         for name in ("README.md", "README.rst", "CONTRIBUTING.md", "pyproject.toml", "setup.py", "package.json"):
             if name in chosen or len(chosen) >= limit:
                 continue
-            content = self._safe_read(workspace, name, None)
+            content = self._safe_read(workspace, name, None, locked_files=locked_files)
             if content:
                 chosen[name] = content[:6000]
         return chosen
 
-    def _safe_read(self, workspace: RepoWorkspace, path: str, trace: AgentTrace | None) -> str | None:
+    def _safe_read(
+        self,
+        workspace: RepoWorkspace,
+        path: str,
+        trace: AgentTrace | None,
+        *,
+        locked_files: dict[str, str] | None = None,
+    ) -> str | None:
+        """读工作区文件；验证器自带的文件从 ``locked_files`` 供给。
+
+        验证器（含它生成的测试文件）是 verify 阶段**生成**的：只存在库里，且只在
+        跑验证器时注入沙盒；被测仓库里根本没有这些文件。可它们恰恰是「要满足什么」
+        的规格，Agent 必须看得到——不从这里供给，它就只能去磁盘找，而磁盘上永远
+        没有：实测 12 轮全在重读 ``tests/test_reproduce.py``，一个文件都没改就耗尽
+        轮次、被判定需人工。
+
+        内存供给还有个好处：这些文件不落盘，因此不会被算进 ``changed_files``、
+        也不会混进最终补丁（它们本来就是锁定只读的，见 ``run`` 里的 ``locked``）。
+        """
         try:
+            if locked_files:
+                norm = path.replace("\\", "/").removeprefix("./").lstrip("/")
+                if norm in locked_files:
+                    return str(locked_files[norm])[:120_000]
             if not workspace.exists(path):
                 if trace is not None:
                     trace.note(f"读文件失败：{path} 不存在")

@@ -1122,3 +1122,57 @@ def test_allow_file_write_true_still_writes(settings, workspace) -> None:
 
     assert written == ["app.py"]
     assert (workspace.root / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+# ---------------------------------------------------------------------------
+# P2：验证器自带的测试文件必须能被 Agent 读到
+# ---------------------------------------------------------------------------
+
+
+def _spec_with_files() -> VerifierSpec:
+    """带生成文件的验证器（verify 阶段产物：只存在库里，不在被测仓库里）。"""
+    return VerifierSpec(
+        kind=VerifierKind.EXECUTABLE,
+        command="python -m pytest tests/test_reproduce.py -q",
+        files={"tests/test_reproduce.py": "def test_snapshot():\n    assert 1 == 2\n"},
+    )
+
+
+def test_agent_reads_verifier_files_from_spec(settings, workspace) -> None:
+    """验证器文件不在工作区，但 Agent 必须读得到。
+
+    envkit 实跑时，Agent 连续 12 轮都在读 ``tests/test_reproduce.py``——那是验证器
+    自己生成的测试文件，磁盘上从来没有它，于是每轮都「读文件失败：不存在」，
+    一个文件都没改就耗尽轮次被判需人工。它恰恰是「要满足什么」的规格。
+    """
+    spec = _spec_with_files()
+    agent = _agent(settings)
+
+    content = agent._safe_read(
+        workspace, "tests/test_reproduce.py", AgentTrace(), locked_files=spec.files
+    )
+
+    assert content is not None and "assert 1 == 2" in content
+    assert not (workspace.root / "tests" / "test_reproduce.py").exists(), "不该落盘"
+
+
+def test_agent_still_returns_none_for_genuinely_missing_file(settings, workspace) -> None:
+    """对照：真不存在的文件仍然读不到，别把兜底做成万能。"""
+    agent = _agent(settings)
+
+    assert agent._safe_read(workspace, "nope.py", None, locked_files={"tests/t.py": "x"}) is None
+
+
+async def test_verifier_file_content_reaches_next_round_prompt(settings, workspace, sample_issue) -> None:
+    """读到的验证器内容必须进下一轮提示——只「读得到」但没送进上下文就白搭。"""
+    spec = _spec_with_files()
+    steps = [
+        {"action": "read", "paths": ["tests/test_reproduce.py"]},
+        {"action": "done"},
+    ]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    await agent.run(item=sample_issue, workspace=workspace, spec=spec, repo_context="")
+
+    second_round = "\n".join(m["content"] for m in llm.history[1])
+    assert "test_snapshot" in second_round, "验证器内容应进入第二轮上下文"
