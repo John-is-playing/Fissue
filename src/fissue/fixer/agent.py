@@ -76,6 +76,9 @@ class AgentTrace:
     #: Agent 根本不会触发验证器执行**——那条判据永远成立不了，于是它能把全部轮次
     #: 空烧完（实测 envkit #1：12 轮只发 read、一个文件没写）。
     barren_streak: int = 0
+    #: 已读到的**唯一**文件路径。用来判断一轮有没有取得「信息上的进展」——
+    #: 判据只数写入会误杀真正的多轮探查（见 `run` 里空转闸门的说明）。
+    read_paths: set[str] = field(default_factory=set)
     usage: Usage = field(default_factory=Usage)
     summary: str = ""
     give_up_reason: str | None = None
@@ -127,17 +130,25 @@ class FixAgent:
         read_files: dict[str, str] = {}
         last_output: str | None = None
         written_seen = 0                          # 上一轮结束时的写入文件数（判空转用）
+        read_seen = 0                             # 上一轮结束时的已读文件数（同上）
 
         for round_index in range(1, rounds_limit + 1):
             trace.rounds = round_index
             # 空转闸门。必须在**调用模型之前**判：否则每轮都先白烧一次 LLM 调用才发现。
-            # 判据是「上一轮结束时写入文件数有没有变多」——写入被拒绝（命中保护路径
-            # 等）同样算不上进展，故一并计入空转。
-            if len(trace.written_files) > written_seen:
+            #
+            # 判据是「上一轮有没有取得任何进展」——**写入**算，**读到新文件**也算。
+            # 只看写入会误杀真正的探查：pipekit 是「跨模块调用链」夹具，定位根因本来
+            # 就要连着读好几轮不同文件（实测 r1 读 5 个 → r2 读 6 个 → r3 读 8 个，
+            # 每轮都在扩大范围），而这个判据最初只看写入，于是在第 4 轮把这种正当
+            # 探查判成「空转」、直接收工。真正该拦的是**反复看同一批文件**的那种。
+            wrote = len(trace.written_files) > written_seen
+            read_new = len(trace.read_paths) > read_seen
+            if wrote or read_new:
                 trace.barren_streak = 0
             else:
                 trace.barren_streak += 1
             written_seen = len(trace.written_files)
+            read_seen = len(trace.read_paths)
             barren = self._barren_stop(attempt, trace, workspace)
             if barren is not None:
                 return barren
@@ -168,6 +179,7 @@ class FixAgent:
                     content = self._safe_read(workspace, p, trace, locked_files=spec.files)
                     if content is not None:
                         read_files[p] = content
+                        trace.read_paths.add(p)
                         # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
                         # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
                         # 一行提示，读成功反而没有，信息最不对称。
@@ -565,13 +577,17 @@ class FixAgent:
         trace: AgentTrace,
         workspace: RepoWorkspace,
     ) -> tuple[FixAttempt, AgentTrace] | None:
-        """连续多轮**没有任何写入动作** → 判定空转，提前收工。
+        """连续多轮**既没有写入、也没有读到新文件** → 判定空转，提前收工。
 
         为什么需要它：``_stall_stop`` 只在模型回 ``done`` 时被检查，判据又是「验证器
         跑过了但失败用例数没减少」。而**从不写入的 Agent 根本不会触发验证器执行**，
         那条判据永远成立不了——它足以把全部轮次空烧完。实测 envkit #1：连续 12 轮只
         发 ``read``、一个文件没写，白烧 12 次 LLM 调用，最后报的还是「达到最大轮次仍
         未通过验证器」——真相是它**一次都没尝试修改**，那句话会误导人工复核。
+
+        **判据里「读到新文件」也算进展**（见 ``run`` 里的说明）：只看写入会把「跨模块
+        定位根因」那种正当的多轮探查误判成停滞——实测 pipekit 就是被这个误判在第 4 轮
+        直接砍掉的，而它每轮都在读新的文件。
 
         与 ``_stall_stop`` 一样，这里必须把「空转」与「修了很多次没修好」在 error 里
         区分开。
@@ -580,9 +596,9 @@ class FixAgent:
         if limit <= 1 or trace.barren_streak < limit:
             return None
         reason = (
-            f"连续 {trace.barren_streak} 轮没有任何写入动作（只读不写），判定为空转"
+            f"连续 {trace.barren_streak} 轮既没有写入、也没有读到任何新文件，判定为空转"
             f"（第 {trace.rounds} 轮提前收工，上限 {limit} 轮）——"
-            "模型始终没有给出可执行的文件改动，并非「修了很多次没修好」"
+            "模型反复看同一批文件却始终没给出可执行的改动，并非「修了很多次没修好」"
         )
         trace.give_up_reason = reason
         trace.summary = reason

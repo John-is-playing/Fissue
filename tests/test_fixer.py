@@ -1388,11 +1388,35 @@ async def test_barren_read_only_loop_stops_early(settings, workspace, sample_iss
 
     attempt, trace = await agent.run(item=sample_issue, workspace=workspace, spec=spec, repo_context="")
 
-    assert llm.calls == 3, "第 4 轮的空转判定发生在调用模型之前，故只烧了 3 次调用"
-    assert attempt.rounds == 4, "收工在「第 4 轮」这个名义轮次上"
+    assert llm.calls == 5, "反复重读同一文件不算进展；首轮读取后尚需一轮才累计到阈值"
+    assert attempt.rounds == 6, "收工在「第 6 轮」这个名义轮次上"
     assert "空转" in (attempt.error or "")
-    assert "只读不写" in (attempt.error or "")
+    assert "没有读到任何新文件" in (attempt.error or "")
     assert runner.runs == 0, "从未写入，验证器不该被执行"
+
+
+async def test_barren_guard_does_not_punish_exploration(settings, workspace, sample_issue) -> None:
+    """每轮都读到**新文件** → 不算空转（别把多轮探查砍成停滞）。
+
+    回归：`pipekit` 是「跨模块调用链」夹具，定位根因本来就要连着读好几轮不同文件
+    （实测 r1 读 5 个 → r2 读 6 个 → r3 读 8 个，每轮都在扩大范围）。而这个判据最初
+    只看「有没有写入」，于是在第 4 轮把这种正当探查判成空转、直接收工——两个 pipekit
+    条目都因此被判要人工，而问题其实出在判据上。
+    """
+    settings.auto_fix.stall_rounds = 4
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
+    for i in range(6):
+        (workspace.root / f"mod{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
+    steps = [{"action": "read", "paths": [f"mod{i}.py"]} for i in range(6)]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=spec, repo_context=""
+    )
+
+    assert llm.calls >= 6, "每轮都读到新文件，不该被空转闸门提前砍掉（旧判据第 4 轮就砍）"
+    # 读完 6 个新文件后确实没有新信息了 → 仍应正常收工，而不是烧满 12 轮
+    assert "没有读到任何新文件" in (attempt.error or ""), attempt.error
 
 
 async def test_barren_streak_resets_after_a_write(settings, workspace, sample_issue) -> None:
