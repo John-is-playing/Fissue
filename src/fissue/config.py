@@ -295,6 +295,15 @@ class AutoFixConfig(BaseModel):
     #: 白烧 10 轮 LLM 调用与沙盒执行，最后还报出误导性的「仍未通过验证器」
     #: （真相是「卡住了」，不是「修了 12 次没修好」）。设 0 关闭该闸门。
     stall_rounds: int = 4
+    #: 克隆工作区的重试次数（0 = 不重试）。
+    #:
+    #: 克隆是整条修复链路上唯一「纯网络」的一步，也最容易因网关抖动 / 中间人抽风
+    #: 而失败：实测 envkit #1 一次 `GnuTLS recv error (-110)` 抖动就把条目打成
+    #: ``failed``，而 ``fix_candidates`` 只取 ``fix_queued``——它从此再也不会被修。
+    #: verify 侧早有 ``verifier.item_retries`` 应对「克隆/网络抖动」，这里补齐同一
+    #: 处理；但**只重试克隆这一步**：整条 Agent 循环重跑一次要烧十几轮 LLM，
+    #: 那个代价不该由一次网络抖动来决定。
+    clone_retries: int = 2
     #: 是否允许 Agent 改动仓库文件。设 false 时只出补丁不改工作区（见
     #: ``fixer.agent._apply_writes``）。注意这不是安全边界——真正的边界是
     #: 下面的 ``protected_paths`` 与沙盒隔离。

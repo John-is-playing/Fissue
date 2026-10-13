@@ -40,7 +40,7 @@ from ..models import (
 from ..platforms.registry import parse_repo_ref
 from ..verifier.regression import REGRESSION_STAGE_BASE
 from ..verifier.runner import VerifyContext, judge_regression
-from ..workspace import RepoWorkspace
+from ..workspace import GitError, RepoWorkspace
 from ..pipeline.context import RuntimeContext
 from .agent import AgentTrace, FixAgent, branch_name
 
@@ -404,7 +404,7 @@ class AutoFixer:
         workspace: RepoWorkspace | None = None
 
         try:
-            workspace = await self.ctx.clone_workspace(repo_cfg)
+            workspace = await self._clone_with_retry(repo_cfg, item)
             repo_context = self._repo_context(workspace, repo_cfg)
 
             # 1) Agent 循环修复
@@ -488,6 +488,38 @@ class AutoFixer:
                     workspace.cleanup()
                 except Exception:  # pragma: no cover
                     pass
+
+    # -- 工作区 -----------------------------------------------------------
+
+    async def _clone_with_retry(self, repo_cfg: RepoConfig, item: RawItem) -> RepoWorkspace:
+        """克隆工作区，对**瞬时**失败做有限重试。
+
+        克隆是整条修复链路上唯一「纯网络」的一步，也最容易被网关抖动 / 中间人抽风
+        打掉。实测 envkit #1：一次 ``GnuTLS recv error (-110)`` 抖动就让整条修复尝试
+        以 ``failed`` 收场，而 ``fix_candidates`` 只取 ``fix_queued``——条目从此再也
+        不会被修，也没有任何命令能放它回去（只能靠 ``--key`` 手工捞回来）。
+
+        verify 侧早有 ``verifier.item_retries`` 应对「克隆/网络抖动」，这里补齐同一
+        处理。但**只重试克隆这一步**：整条 Agent 循环重跑一次要烧十几轮 LLM，那个
+        代价不该由一次网络抖动来决定。
+        """
+        attempts = max(1, self.settings.auto_fix.clone_retries + 1)
+        last: GitError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self.ctx.clone_workspace(repo_cfg)
+            except GitError as exc:                 # 克隆失败：网络 / 远端 / 中间人
+                last = exc
+                if attempt >= attempts:
+                    break
+                delay = min(2 ** (attempt - 1), 8.0)
+                log.warning(
+                    "克隆 %s 失败（第 %d/%d 次）：%s；%.0fs 后重试",
+                    item.repo, attempt, attempts, exc, delay,
+                )
+                await asyncio.sleep(delay)
+        assert last is not None                     # 走到这里必然是重试耗尽
+        raise last
 
     # -- 批量 -------------------------------------------------------------
 

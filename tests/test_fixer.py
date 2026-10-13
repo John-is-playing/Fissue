@@ -1176,3 +1176,97 @@ async def test_verifier_file_content_reaches_next_round_prompt(settings, workspa
 
     second_round = "\n".join(m["content"] for m in llm.history[1])
     assert "test_snapshot" in second_round, "验证器内容应进入第二轮上下文"
+
+
+# ---------------------------------------------------------------------------
+# P2：克隆的瞬时失败要重试（一次网络抖动不该让条目永久退出待修队列）
+# ---------------------------------------------------------------------------
+
+
+def _ready_for_fix(repo, sample_issue) -> None:
+    """把条目铺到「能走到克隆那一步」的状态。"""
+    _register(repo, sample_issue)
+    repo.save_evaluation(
+        sample_issue.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s")
+    )
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key, VerifierSpec(kind=VerifierKind.EXECUTABLE, command="pytest"))
+
+
+def _no_sleep(monkeypatch) -> None:
+    async def _skip(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("fissue.fixer.autofix.asyncio.sleep", _skip)
+
+
+@pytest.mark.parametrize("clone_retries,expected_calls", [(2, 3), (0, 1), (1, 2)])
+async def test_clone_retries_transient_failure(
+    fixer_ctx, repo, sample_issue, monkeypatch, clone_retries: int, expected_calls: int
+) -> None:
+    """克隆遇到 ``GitError`` 要按 ``auto_fix.clone_retries`` 重试。
+
+    实测 envkit #1：一次 ``GnuTLS recv error (-110)`` 抖动就让整条修复尝试以
+    ``failed`` 收场，而 ``fix_candidates`` 只取 ``fix_queued``——条目从此再也不会
+    被修。verify 侧早有用 ``item_retries`` 应对同类抖动的先例。
+    """
+    from fissue.workspace import GitError
+
+    _no_sleep(monkeypatch)
+    fixer_ctx.settings.auto_fix.clone_retries = clone_retries
+    _ready_for_fix(repo, sample_issue)
+
+    calls: list[int] = []
+
+    async def _always_transient(repo_cfg, **kwargs):
+        calls.append(1)
+        raise GitError("克隆失败：GnuTLS recv error (-110)")
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _always_transient)
+
+    attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
+
+    assert len(calls) == expected_calls
+    assert attempt.outcome is FixOutcome.FAILED, "重试耗尽后仍要如实报失败，不掩盖"
+    assert "克隆失败" in (attempt.error or "")
+
+
+async def test_clone_retry_gets_past_transient_failure(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """前两次抖动、第三次通过 → 流程继续往下走，而不是整条被判失败。"""
+    from fissue.workspace import GitError
+
+    _no_sleep(monkeypatch)
+    _ready_for_fix(repo, sample_issue)
+
+    calls: list[int] = []
+
+    async def _flaky(repo_cfg, **kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            raise GitError("克隆失败：TLS 抖动")
+        raise RuntimeError("哨兵：已越过克隆")
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _flaky)
+
+    attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
+
+    assert len(calls) == 3, "应当重试到第 3 次"
+    assert "哨兵" in (attempt.error or ""), "第 3 次确实被调用、并越过了克隆"
+
+
+async def test_non_transient_error_is_not_retried(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """非克隆类异常不重试——重试只针对网络/克隆抖动，别把真错误也拖三遍。"""
+    _ready_for_fix(repo, sample_issue)
+
+    calls: list[int] = []
+
+    async def _logic_error(repo_cfg, **kwargs):
+        calls.append(1)
+        raise RuntimeError("配置/逻辑错误，重试也没用")
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _logic_error)
+
+    attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
+
+    assert len(calls) == 1
+    assert attempt.outcome is FixOutcome.FAILED
