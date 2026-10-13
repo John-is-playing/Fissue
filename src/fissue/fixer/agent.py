@@ -70,6 +70,12 @@ class AgentTrace:
     best_failure_count: int | None = None
     #: 连续多少轮**没有刷新最少失败数**。这是判定停滞的主判据。
     no_progress_streak: int = 0
+    #: 连续多少轮**没有任何写入动作**（只读不写）。这是判定「空转」的判据。
+    #:
+    #: 为什么另立一个：`no_progress_streak` 依赖验证器真的跑过，而**从不写入的
+    #: Agent 根本不会触发验证器执行**——那条判据永远成立不了，于是它能把全部轮次
+    #: 空烧完（实测 envkit #1：12 轮只发 read、一个文件没写）。
+    barren_streak: int = 0
     usage: Usage = field(default_factory=Usage)
     summary: str = ""
     give_up_reason: str | None = None
@@ -120,9 +126,22 @@ class FixAgent:
         locked = set(spec.files.keys())          # 验证器文件在修复期间锁定
         read_files: dict[str, str] = {}
         last_output: str | None = None
+        written_seen = 0                          # 上一轮结束时的写入文件数（判空转用）
 
         for round_index in range(1, rounds_limit + 1):
             trace.rounds = round_index
+            # 空转闸门。必须在**调用模型之前**判：否则每轮都先白烧一次 LLM 调用才发现。
+            # 判据是「上一轮结束时写入文件数有没有变多」——写入被拒绝（命中保护路径
+            # 等）同样算不上进展，故一并计入空转。
+            if len(trace.written_files) > written_seen:
+                trace.barren_streak = 0
+            else:
+                trace.barren_streak += 1
+            written_seen = len(trace.written_files)
+            barren = self._barren_stop(attempt, trace, workspace)
+            if barren is not None:
+                return barren
+
             read_files = self._pick_context(workspace, read_files, locked_files=spec.files)
 
             data, usage = await self.client.chat_json(
@@ -149,6 +168,10 @@ class FixAgent:
                     content = self._safe_read(workspace, p, trace, locked_files=spec.files)
                     if content is not None:
                         read_files[p] = content
+                        # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
+                        # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
+                        # 一行提示，读成功反而没有，信息最不对称。
+                        trace.note(f"    读了 {p}")
                 continue
 
             if action == "write":
@@ -528,6 +551,38 @@ class FixAgent:
             f"连续 {trace.no_progress_streak} 轮没有任何进展（失败用例数未再减少，"
             f"仍为 {len(trace.failed_tests)} 条：{stuck}），判定为停滞"
             f"（第 {trace.rounds} 轮提前收工，上限 {limit} 轮）"
+        )
+        trace.give_up_reason = reason
+        trace.summary = reason
+        attempt.outcome = FixOutcome.FAILED
+        attempt.rounds = trace.rounds
+        attempt.error = reason
+        return self._finalize(attempt, trace, workspace)
+
+    def _barren_stop(
+        self,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        workspace: RepoWorkspace,
+    ) -> tuple[FixAttempt, AgentTrace] | None:
+        """连续多轮**没有任何写入动作** → 判定空转，提前收工。
+
+        为什么需要它：``_stall_stop`` 只在模型回 ``done`` 时被检查，判据又是「验证器
+        跑过了但失败用例数没减少」。而**从不写入的 Agent 根本不会触发验证器执行**，
+        那条判据永远成立不了——它足以把全部轮次空烧完。实测 envkit #1：连续 12 轮只
+        发 ``read``、一个文件没写，白烧 12 次 LLM 调用，最后报的还是「达到最大轮次仍
+        未通过验证器」——真相是它**一次都没尝试修改**，那句话会误导人工复核。
+
+        与 ``_stall_stop`` 一样，这里必须把「空转」与「修了很多次没修好」在 error 里
+        区分开。
+        """
+        limit = self._stall_rounds()
+        if limit <= 1 or trace.barren_streak < limit:
+            return None
+        reason = (
+            f"连续 {trace.barren_streak} 轮没有任何写入动作（只读不写），判定为空转"
+            f"（第 {trace.rounds} 轮提前收工，上限 {limit} 轮）——"
+            "模型始终没有给出可执行的文件改动，并非「修了很多次没修好」"
         )
         trace.give_up_reason = reason
         trace.summary = reason

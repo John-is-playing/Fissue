@@ -1314,3 +1314,54 @@ def test_stage_all_would_have_included_verifier_files(settings, workspace) -> No
 def test_stage_paths_rejects_empty_list(workspace) -> None:
     """没有改动时如实返回 False，让调用方给出「没有可提交的改动」。"""
     assert workspace.stage_paths([]) is False
+
+
+# ---------------------------------------------------------------------------
+# P2：只读不写的空转要早停，且说清真因
+# ---------------------------------------------------------------------------
+
+
+async def test_barren_read_only_loop_stops_early(settings, workspace, sample_issue) -> None:
+    """连续只读不写 → 提前收工，且 error 说清是空转、不是修了很多次。
+
+    实测 envkit #1：连续 12 轮只发 ``read``、一个文件没写，白烧 12 次 LLM 调用，
+    最后却报「达到最大轮次仍未通过验证器」——真相是它**一次都没尝试修改**，
+    那句话会误导人工复核。旧判据（验证器失败用例数没减少）对这种情况永远不成立：
+    从不写入就不会触发验证器执行。
+    """
+    settings.auto_fix.stall_rounds = 4
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
+    steps = [{"action": "read", "paths": ["README.md"]} for _ in range(12)]
+    agent, llm, runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    attempt, trace = await agent.run(item=sample_issue, workspace=workspace, spec=spec, repo_context="")
+
+    assert llm.calls == 3, "第 4 轮的空转判定发生在调用模型之前，故只烧了 3 次调用"
+    assert attempt.rounds == 4, "收工在「第 4 轮」这个名义轮次上"
+    assert "空转" in (attempt.error or "")
+    assert "只读不写" in (attempt.error or "")
+    assert runner.runs == 0, "从未写入，验证器不该被执行"
+
+
+async def test_barren_streak_resets_after_a_write(settings, workspace, sample_issue) -> None:
+    """对照：中途真的写了文件就不算空转（别把正常的多轮阅读误判成空转）。"""
+    from fissue.models import VerifierOutcome
+
+    settings.auto_fix.stall_rounds = 3
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
+    steps = [
+        {"action": "write", "files": {"app.py": "x = 2\n"}},   # r1 写 → 计数归零
+        {"action": "read", "paths": ["README.md"]},            # r2 空转 1
+        {"action": "read", "paths": ["README.md"]},            # r3 空转 2
+        {"action": "read", "paths": ["README.md"]},            # r4 空转 3 → 到此才停
+    ]
+    agent, llm, _runner = _agent_with_runner(
+        settings, steps, _StubRunner(VerifierOutcome.FAIL)
+    )
+
+    attempt, _trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=spec, repo_context=""
+    )
+
+    assert llm.calls > 3, "r1 的写入应当把空转计数清零，否则第 3 轮就被误判为空转"
+    assert "空转" in (attempt.error or "")
