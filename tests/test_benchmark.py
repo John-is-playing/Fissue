@@ -250,7 +250,12 @@ def test_save_load_roundtrip_writes_lf_and_utf8(tmp_path: Path) -> None:
 
 
 def _rec(label="x", *, commit="a" * 40, dirty=False, dirty_files=0,
-         model="m1", total=1, base_fail=0, base_error=0, fix_pass=0) -> dict:
+         model="m1", total=1, base_fail=0, base_error=0, fix_pass=0,
+         repos: list[str] | None = None) -> dict:
+    items: dict = {"total": total}
+    if repos is not None:
+        # 只在显式传入时才写入 ``by_repo``——不传即模拟「旧 schema 没有这一项」。
+        items["by_repo"] = {r: 1 for r in repos}
     return {
         "schema_version": bm.SCHEMA_VERSION,
         "label": label,
@@ -260,7 +265,7 @@ def _rec(label="x", *, commit="a" * 40, dirty=False, dirty_files=0,
             "config": {"llm": {"model": model}, "verifier": {"regression_gate": "strict"}},
         },
         "result": {
-            "items": {"total": total},
+            "items": items,
             "verifier": {
                 "base_error_runs": base_error,
                 "by_stage_outcome": {"base/fail": base_fail, "fix/pass": fix_pass},
@@ -317,6 +322,46 @@ def test_diff_reports_result_deltas_and_summary() -> None:
     assert "result.verifier.by_stage_outcome.base/fail" in keys
     delta = next(c for c in d["changed"] if c["key"] == "result.verifier.base_error_runs")
     assert (delta["before"], delta["after"], delta["delta"]) == (0, 2, 2)
+
+
+def test_diff_flags_different_repo_sets() -> None:
+    """覆盖的仓库不同 → 不可比。
+
+    这是最容易被忽略的一条：范围一改，增量里混的是**范围变化**而非能力变化。实测
+    踩过——旧基线含 textkit/ratekit/pipekit，新基线只剩 envkit/lockkit，diff 的增量
+    几乎全是范围差异，而当时只 flag 了 commit 与模型。
+    """
+    old = _rec(repos=["psf/requests", "o/pipekit"])
+    new = _rec(repos=["psf/requests", "o/lockkit"])
+
+    d = bm.diff(old, new)
+
+    assert d["comparable"] is False
+    reasons = " ".join(d["not_comparable_because"])
+    assert "仓库集不同" in reasons
+    assert "o/pipekit" in reasons and "o/lockkit" in reasons     # 说清哪边多出了谁
+
+
+def test_diff_same_repo_set_is_comparable_even_when_counts_grow() -> None:
+    """仓库集一致时不该因「条目变多」判不可比——语料增长是正常的。"""
+    d = bm.diff(
+        _rec(repos=["psf/requests"], total=10),
+        _rec(repos=["psf/requests"], total=25),
+    )
+
+    assert d["comparable"] is True, d["not_comparable_because"]
+
+
+def test_diff_flags_unverifiable_scope_when_one_side_lacks_repo_set() -> None:
+    """只有一侧记录仓库集 → 无法确认范围一致，按不可比处理（宁可保守）。
+
+    「没记录」不等于「没覆盖」：旧 schema 的基线没有 ``by_repo``，此时不能默认可比，
+    否则范围差异会悄悄混进回归结论里。
+    """
+    d = bm.diff(_rec(), _rec(repos=["psf/requests"]))
+
+    assert d["comparable"] is False
+    assert any("未记录仓库集" in r for r in d["not_comparable_because"])
 
 
 def test_diff_detects_config_change_beyond_model() -> None:

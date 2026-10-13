@@ -210,6 +210,9 @@ def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
     return {
         "items": {
             "total": len(items),
+            # 覆盖了哪些仓库——`diff` 判断「两次测量是否同一范围」的依据。
+            # 少了它，范围变化会被读成能力变化（见 `diff` 里的说明）。
+            "by_repo": _counts([i.repo_slug for i in items]),
             "by_item_type": _counts([i.item_type for i in items]),
             "by_category": _counts([i.category for i in items]),
             "by_priority": _counts([i.priority for i in items]),
@@ -319,6 +322,24 @@ def _flat(prefix: str, value: Any, out: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _repo_set(record: dict[str, Any]) -> set[str] | None:
+    """基线覆盖的仓库集合；该基线**没记录**这一项时返回 None。
+
+    「没记录」与「记录为空」必须分开：旧 schema 的基线没有
+    ``result.items.by_repo``，那是无从判断，不是「一个仓库都没覆盖」。
+    """
+    by_repo = ((record.get("result") or {}).get("items") or {}).get("by_repo")
+    if not isinstance(by_repo, dict) or not by_repo:
+        return None
+    return {str(k) for k in by_repo}
+
+
+def _brief(names: list[str], *, limit: int = 3) -> str:
+    """名字列表的简短形式：最多列 ``limit`` 个，其余用「等 N 个」收尾。"""
+    head = "、".join(names[:limit])
+    return head if len(names) <= limit else f"{head} 等 {len(names)} 个"
+
+
 def diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     """对比两份基线，返回逐项增量与「是否可比」的判定。
 
@@ -351,6 +372,29 @@ def diff(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
         reasons.append(
             f"模型不同（{(c_old.get('llm') or {}).get('model')} → {(c_new.get('llm') or {}).get('model')}）"
         )
+
+    # 条目集（覆盖了哪些仓库）——比 commit / 模型更容易被忽略，却同样能让增量失去意义：
+    # 两次测量若覆盖的仓库不同，那么「条目数 ↓47」「fix 通过 ↓55」这类增量里混的是
+    # **范围变化**，不是能力变化。实测踩过：旧基线含 textkit/ratekit/pipekit，新基线
+    # 只剩 envkit/lockkit，增量几乎全是范围差异，而当时只 flag 了 commit 与模型。
+    repos_old = _repo_set(old)
+    repos_new = _repo_set(new)
+    if repos_old is None and repos_new is None:
+        pass                                   # 两侧都没记录 → 无从判断，不妄下结论
+    elif repos_old is None or repos_new is None:
+        # 只有一侧记录 → 无法确认范围一致。宁可保守：判为不可比并说清原因，
+        # 而不是默认可比、让范围差异悄悄混进「回归」结论里。
+        side = "旧" if repos_old is None else "新"
+        reasons.append(f"{side}基线未记录仓库集（schema 较早），无法确认两次测量的范围是否一致")
+    elif repos_old != repos_new:
+        only_old = sorted(repos_old - repos_new)
+        only_new = sorted(repos_new - repos_old)
+        parts = []
+        if only_old:
+            parts.append(f"旧多出 {_brief(only_old)}")
+        if only_new:
+            parts.append(f"新多出 {_brief(only_new)}")
+        reasons.append(f"仓库集不同（{'；'.join(parts)}）")
 
     # 配置指纹里除模型外的差异（这些直接改变判定口径）
     cfg_deltas: list[str] = []
