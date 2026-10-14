@@ -73,7 +73,9 @@ class ItemRow(Base):
     repo_id: Mapped[int] = mapped_column(ForeignKey("repos.id", ondelete="CASCADE"), index=True)
     platform: Mapped[str] = mapped_column(String(16), index=True)
     repo_slug: Mapped[str] = mapped_column(String(511), index=True)
-    number: Mapped[int] = mapped_column(Integer)
+    # 编号存字符串：Gitee 的 Issue 编号是字母编码（`IKKIOZ`），Integer 列放不下语义。
+    # 数字平台的编号照样能存（SQLite 会按亲和性处理），键与 URL 都用 f-string 拼，不受影响。
+    number: Mapped[str] = mapped_column(String)
     item_type: Mapped[str] = mapped_column(String(8), index=True)     # issue | pr
     key: Mapped[str] = mapped_column(String(767), unique=True, index=True)
 

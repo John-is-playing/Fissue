@@ -308,7 +308,14 @@ class FlushProcessor:
             # 一次批量确保标签存在：原来逐个 ensure_label 会为**每个标签**各拉一遍
             # 全量标签列表（还有分页），是 flush 打标阶段的主要耗时来源。
             await adapter.ensure_labels(ref, labels[:6])
-            await adapter.add_labels(ref, int(payload.get("number") or 0), labels, ItemType(payload.get("item_type") or "issue"))
+            # 编号按平台原样传：Gitee 的 Issue 编号是字母编码（`IKKIOZ`），int() 会直接崩，
+            # 而那个编码恰好就是它打标签端点要的标识。
+            await adapter.add_labels(
+                ref,
+                payload.get("number") or 0,
+                labels,
+                ItemType(payload.get("item_type") or "issue"),
+            )
             return True, ""
         except Exception as exc:
             log.warning("打标签失败 %s：%s", payload.get("key"), exc)

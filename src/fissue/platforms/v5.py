@@ -201,7 +201,10 @@ class V5Adapter(PlatformAdapter):
         return payload, ""
 
     async def _build_item(self, repo: RepoRef, payload: dict[str, Any], item_type: ItemType) -> RawItem:
-        number = int(payload.get("number") or payload.get("id") or 0)
+        # 编号**保持平台原样并统一成字符串，不转 int**：Gitee 的 Issue 编号是字母编码
+        # （`IKKIOZ`），强转会在整批抓取里抛 ValueError 并**中止整轮**（实测：一条都没
+        # 落地）。数字平台（GitHub / AtomGit，以及 Gitee 的 PR）转字符串后行为不变。
+        number = str(payload.get("number") or payload.get("id") or 0)
         title = payload.get("title") or ""
         body = payload.get("body") or ""
         labels = _label_names(payload.get("labels"))
@@ -268,8 +271,14 @@ class V5Adapter(PlatformAdapter):
             try:
                 linked = await self._get(f"{self._repo_api(repo)}/pulls/{number}/issues")
                 if isinstance(linked, list):
-                    nums = {int(x.get("number")) for x in linked if isinstance(x, dict) and x.get("number")}
-                    raw.linked_issues = sorted(nums | set(raw.linked_issues))
+                    # 同样不做 int()：Gitee 的关联 Issue 给的是编码。
+                    # 排序键用 str：集合里可能既有数字（GitHub/AtomGit）又有编码（Gitee），
+                    # 直接 sorted 会在混类型上抛 TypeError。
+                    nums = {
+                        x.get("number") for x in linked
+                        if isinstance(x, dict) and x.get("number")
+                    }
+                    raw.linked_issues = sorted(nums | set(raw.linked_issues), key=str)
             except RateLimitError:
                 raise
             except PlatformError as exc:

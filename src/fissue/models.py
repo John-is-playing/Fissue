@@ -195,7 +195,12 @@ class RawItem(BaseModel):
 
     platform: Platform
     repo: str                      # "owner/name"
-    number: int
+    #: 平台内的条目编号。**Gitee 的 Issue 用字母编码**（如 ``IKKIOZ``），而它的详情
+    #: 与评论端点只认这个编码、数字 id 在那些端点上会 404（已实测）——所以这里不能
+    #: 写死 int。GitHub 与 v5（Gitee / AtomGit）适配器会在边界统一成字符串；
+    #: 仍接受 int，是因为库表列是 String（读回来是 str），而其它调用方与测试会直接
+    #: 传数字。比较这类操作请用 ``pipeline.stages._num_key``，别直接比大小。
+    number: int | str
     item_type: ItemType
     title: str
     body: str = ""
@@ -213,7 +218,7 @@ class RawItem(BaseModel):
     base_branch: str | None = None
     head_branch: str | None = None
     head_repo: str | None = None   # fork 的 owner/name
-    linked_issues: list[int] = Field(default_factory=list)
+    linked_issues: list[int | str] = Field(default_factory=list)
     files: list[FileChange] = Field(default_factory=list)
     additions: int = 0
     deletions: int = 0

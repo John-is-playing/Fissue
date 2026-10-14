@@ -370,7 +370,7 @@ class PRCreator:
             ref = parse_repo_ref(item.repo, item.platform)
             # 批量确保：一次拉取标签列表，避免每个标签各拉一遍全量（带分页）。
             await adapter.ensure_labels(ref, labels)
-            await adapter.add_labels(ref, int(pr_number), labels, ItemType.PR)
+            await adapter.add_labels(ref, pr_number, labels, ItemType.PR)
         except Exception as exc:
             log.warning("给 PR #%s 打标签失败：%s", pr_number, exc)
 

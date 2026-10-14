@@ -840,6 +840,21 @@ def _containment(a: set[str], b: set[str]) -> float:
     return len(a & b) / smaller if smaller else 0.0
 
 
+def _num_key(n: int | str) -> tuple[int, int, str]:
+    """编号的比较键：数字按数值排、编码型按字符串排。
+
+    直接比较会踩两件事：数字与字符串混比是 ``TypeError``（Gitee 的 Issue 编号是
+    ``IKKIOZ`` 这种编码，同一仓库里两类编号会共存）；而一律当字符串比，
+    ``"10" < "9"`` 又会给出错的顺序。所以分两段。
+    """
+    if isinstance(n, int):
+        return (0, n, "")
+    text = str(n)
+    if text.isdigit():
+        return (0, int(text), "")
+    return (1, 0, text)
+
+
 def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> list[dict[str, Any]]:
     """挑出最可能重复的条目，作为**候选**交给 LLM 判断。
 
@@ -888,7 +903,7 @@ def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> li
     for other in pool:
         if other.key == item.key:
             continue
-        if other.item_type is not item.item_type or other.number >= item.number:
+        if other.item_type is not item.item_type or _num_key(other.number) >= _num_key(item.number):
             continue
         toks = _title_tokens(other.title)
         if not toks:

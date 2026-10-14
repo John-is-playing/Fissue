@@ -120,7 +120,7 @@ class GitHubAdapter(PlatformAdapter):
                     return
 
     async def _build_item(self, repo: RepoRef, payload: dict[str, Any], item_type: ItemType) -> RawItem:
-        number = int(payload["number"])
+        number = str(payload["number"])
         title = payload.get("title") or ""
         body = payload.get("body") or ""
         labels = [l.get("name", "") for l in payload.get("labels", []) if isinstance(l, dict)]

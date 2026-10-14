@@ -631,7 +631,7 @@ def test_fix_candidates_orders_tier1_first(ctx, repo) -> None:
     repo.set_item_status(t2.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER2)
     repo.set_item_status(t1.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
     candidates = processor.fix_candidates()
-    assert [c.number for c in candidates] == [2, 1]
+    assert [c.number for c in candidates] == ["2", "1"]
 
 
 def test_fix_candidates_only_returns_still_queued(ctx, repo) -> None:
@@ -655,7 +655,7 @@ def test_fix_candidates_only_returns_still_queued(ctx, repo) -> None:
 
     candidates = processor.fix_candidates()
 
-    assert [c.number for c in candidates] == [3]     # 只剩余队条目
+    assert [c.number for c in candidates] == ["3"]     # 只剩余队条目
     assert repo.get_item_row(still.key).status == ItemStatus.FIX_QUEUED.value
 
 
@@ -680,7 +680,7 @@ def test_fix_candidates_advances_to_next_batch_across_rounds(ctx, repo) -> None:
     second = processor.fix_candidates(limit=2)
     assert len(second) == 2
     assert not {c.number for c in first} & {c.number for c in second}   # 不重复处理
-    assert {c.number for c in first} | {c.number for c in second} == {1, 2, 3, 4}  # 全部轮到过
+    assert {c.number for c in first} | {c.number for c in second} == {"1", "2", "3", "4"}  # 全部轮到过
 
 
 # ---------------------------------------------------------------------------
@@ -1808,3 +1808,21 @@ async def test_label_all_concurrency_follows_platform_setting(ctx, repo, monkeyp
     inflight["max"] = 0
     await processor._label_all(items)
     assert inflight["max"] > 1                 # 放开后确实并行
+
+
+def test_num_key_handles_mixed_number_forms() -> None:
+    """编号混合形态（Gitee 的编码 + 各平台的数字）比较时不能崩，且数字仍按数值排。
+
+    直接比较是 ``TypeError``（Gitee 的 Issue 编号是 `IKKIOZ` 这种编码，与数字共存于
+    同一仓库）；而一律当字符串比，又会把 ``"10"`` 排到 ``"9"`` 前面。
+    """
+    from fissue.pipeline.stages import _num_key
+
+    assert _num_key(9) < _num_key(10)
+    assert _num_key("9") < _num_key("10"), "数字形态的字符串也要按数值排"
+    assert _num_key(10) < _num_key("IKKIOZ"), "编码型统一排在数字之后"
+    assert _num_key("IKKIOZ") < _num_key("ILZZZZ")
+    # 混在一起排序不抛异常（原先的 `>=` 直接比较会 TypeError）
+    assert sorted([_num_key("IKKIOZ"), _num_key(3), _num_key("10")]) == [
+        _num_key(3), _num_key("10"), _num_key("IKKIOZ")
+    ]

@@ -142,7 +142,7 @@ async def test_github_fetch_issue_and_pr(gh) -> None:
     assert len(items) == 2
 
     issue = items[0]
-    assert issue.number == 1 and issue.item_type is ItemType.ISSUE
+    assert issue.number == "1" and issue.item_type is ItemType.ISSUE
     assert issue.labels == ["bug"] and issue.author == "reporter"
     assert len(issue.comments) == 1 and issue.comments[0].body == "me too"
 
@@ -165,7 +165,7 @@ async def test_github_item_type_filter(gh) -> None:
     )
     respx.get(f"{GH}/repos/psf/requests/issues/1/comments").mock(return_value=httpx.Response(200, json=[]))
     items = [i async for i in gh.fetch_items(REPO, item_types=[ItemType.ISSUE])]
-    assert [i.number for i in items] == [1]
+    assert [i.number for i in items] == ["1"]
 
 
 @respx.mock
@@ -263,6 +263,28 @@ async def test_gitee_fetch_issue(gitee) -> None:
     items = [i async for i in gitee.fetch_items(REPO, item_types=[ItemType.ISSUE])]
     assert len(items) == 1
     assert items[0].labels == ["bug"] and items[0].author == "u"
+
+
+@respx.mock
+async def test_gitee_issue_with_encoded_number(gitee) -> None:
+    """Gitee 的 Issue 编号是**字母编码**（`IKKIOZ`）——不能强转 int。
+
+    实测：`int("IKKIOZ")` 抛 ValueError，让**整轮抓取中止、一条都没落地**；而 Gitee 的
+    详情与评论端点又**只认编码**（传数字 id 会 404），所以编号必须保持平台原样。
+    """
+    respx.get(f"{GITEE}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(200, json=[{
+            "number": "IKKIOZ", "title": "编码编号", "body": "b", "state": "open",
+        }])
+    )
+    respx.get(f"{GITEE}/repos/psf/requests/issues/IKKIOZ/comments").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    items = [i async for i in gitee.fetch_items(REPO, item_types=[ItemType.ISSUE])]
+
+    assert items[0].number == "IKKIOZ", "编号要原样保留，别强转"
+    assert items[0].key.endswith("#IKKIOZ")
 
 
 @respx.mock
