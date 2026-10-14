@@ -199,9 +199,24 @@ class GitLabAdapter(PlatformAdapter):
             try:
                 changes = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
                 if isinstance(changes, dict):
-                    raw.additions = int(changes.get("additions") or 0)
-                    raw.deletions = int(changes.get("deletions") or 0)
-                    raw.changed_files = len(changes.get("changes") or [])
+                    entries = [c for c in (changes.get("changes") or []) if isinstance(c, dict)]
+                    # GitLab 的 /changes **不返回** additions/deletions 合计（只有
+                    # changes_count 这个字符串，`additions`/`deletions`/`diff_stats`
+                    # 一律为 None），所以这两个数只能从 diff 文本里数。
+                    # 实测：不数的话它们恒为 0，而 render_item 会把 MR 渲染成
+                    # 「+0/-0，10 个文件」——评测据此判 pr_quality 就被喂了错信息。
+                    # `+++`/`---` 是文件头不是内容行，要排除；`too_large` 的 diff 平台
+                    # 不给文本，那种情况下这两个数是**下限**。
+                    plus = minus = 0
+                    for entry in entries:
+                        for line in str(entry.get("diff") or "").splitlines():
+                            if line.startswith("+") and not line.startswith("+++"):
+                                plus += 1
+                            elif line.startswith("-") and not line.startswith("---"):
+                                minus += 1
+                    raw.additions = int(changes.get("additions") or plus)
+                    raw.deletions = int(changes.get("deletions") or minus)
+                    raw.changed_files = len(entries)
                     raw.files = [
                         FileChange(
                             path=str(c.get("new_path") or c.get("old_path") or ""),

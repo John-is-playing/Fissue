@@ -542,6 +542,41 @@ async def test_gitlab_fetch_pr_populates_files(gl) -> None:
 
 
 @respx.mock
+async def test_gitlab_pr_line_counts_are_counted_from_diff(gl) -> None:
+    """GitLab 的 `/changes` **不给**增删行合计 → 得从 diff 文本里数。
+
+    实测依据：MR 对象的 `additions` / `deletions` / `diff_stats` 一律为 `None`
+    （只有 `changes_count` 这个字符串）。不数的话这两个数恒为 0，而 `render_item`
+    会把 MR 渲染成「+0/-0，N 个文件」——**评测据此判 pr_quality 就被喂了错信息**。
+    """
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/merge_requests").mock(
+        return_value=httpx.Response(200, json=[{
+            "iid": 7, "title": "mr", "description": "", "state": "opened",
+            "labels": [], "author": {"username": "d"}, "target_branch": "main",
+            "source_branch": "fix", "merge_status": "can_be_merged",
+        }])
+    )
+    respx.get(f"{GL}/projects/{pid}/merge_requests/7/changes").mock(
+        return_value=httpx.Response(200, json={          # 注意：没有顶层增删行字段
+            "changes": [
+                {"old_path": "a.py", "new_path": "a.py",
+                 "diff": "@@ -1,2 +1,3 @@\n context\n+added\n+added2\n-removed\n"},
+                {"old_path": "b.py", "new_path": "b.py",
+                 "diff": "--- a/b.py\n+++ b/b.py\n+x\n"},
+            ],
+        })
+    )
+    respx.get(f"{GL}/projects/{pid}/merge_requests/7/notes").mock(return_value=httpx.Response(200, json=[]))
+
+    items = [i async for i in gl.fetch_items(REPO, item_types=[ItemType.PR])]
+
+    pr = items[0]
+    # a.py：+2/-1；b.py：+1（`---`/`+++` 是文件头，不算内容行）
+    assert (pr.additions, pr.deletions, pr.changed_files) == (3, 1, 2)
+
+
+@respx.mock
 async def test_v5_fetch_pr_populates_files(atomgit) -> None:
     """v5 系（Gitee/AtomGit）PR 抓取时也要落文件清单。"""
     respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
