@@ -370,6 +370,15 @@ class GitLabAdapter(PlatformAdapter):
         )
 
     async def fork_repo(self, repo: RepoRef) -> RepoRef:
+        # 项目**已经在自己名下**时不要再 fork：GitLab 会返回 409
+        # 「Project namespace name已经被使用」（实测：把自己的 Private 仓库当靶子，
+        # 模型两轮就把 bug 修好了，却死在 fork 这一步）。
+        # 注意这与 GitHub 的行为不同——GitHub 对自己的仓库 fork 会**返回它自己**，
+        # 所以那条路径一直没暴露这个问题。返回仓库自身即可：`create_pr` 支持
+        # 「同仓库 + 分支」的 head 形式。
+        me = await self.whoami()
+        if me and me.lower() == repo.owner.lower():
+            return RepoRef(platform=self.platform, owner=repo.owner, name=repo.name)
         data = await self._request("POST", f"{self._project(repo)}/fork", json={})
         path = (data or {}).get("path_with_namespace") or ""
         owner, _, name = path.partition("/")

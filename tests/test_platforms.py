@@ -542,6 +542,27 @@ async def test_gitlab_fetch_pr_populates_files(gl) -> None:
 
 
 @respx.mock
+async def test_gitlab_fork_skips_when_repo_is_already_ours(gl) -> None:
+    """仓库已在**自己的命名空间**下时不该再 fork —— GitLab 会 409。
+
+    实测：把自己的 Private 仓库当靶子时，模型两轮就修好了，却死在
+    `POST …/fork -> 409 Project namespace name已经被使用`。GitHub 对自己的仓库
+    fork 会返回它自己，所以那条路径没暴露过；返回仓库自身即可，因为 `create_pr`
+    支持「同仓库 + 分支」的 head 形式。
+    """
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/user").mock(return_value=httpx.Response(200, json={"username": "psf"}))
+    fork_route = respx.post(f"{GL}/projects/{pid}/fork").mock(
+        return_value=httpx.Response(409, json={"message": ["名称已经被使用"]})
+    )
+
+    out = await gl.fork_repo(RepoRef(platform=Platform.GITLAB, owner="psf", name="requests"))
+
+    assert (out.owner, out.name) == ("psf", "requests"), "应当返回仓库自身"
+    assert not fork_route.called, "自己名下不该发 fork 请求"
+
+
+@respx.mock
 async def test_gitlab_pr_line_counts_are_counted_from_diff(gl) -> None:
     """GitLab 的 `/changes` **不给**增删行合计 → 得从 diff 文本里数。
 
