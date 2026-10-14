@@ -291,6 +291,62 @@ async def test_atomgit_fetch_pr_with_linked_issues(atomgit) -> None:
     assert pr.linked_issues == [3, 4]
 
 
+def test_resolve_repos_prefers_registered_repo_regardless_of_platform(settings) -> None:
+    """`--repo owner/name` 不带平台时，必须优先匹配**已登记**的仓库。
+
+    回归：原先要求「slug 与平台都相等」，而不带平台的写法会被 `parse_repo_ref` 默认成
+    GitHub——于是配置里登记在 AtomGit / Gitee 上的同名仓库永远匹配不到，回退成一个
+    **GitHub 的临时仓库**。实测后果：想抓 AtomGit 的去请求了 api.github.com 并 404。
+    """
+    from fissue.config import RepoConfig
+
+    settings.repos.append(
+        RepoConfig(platform=Platform.ATOMGIT, owner="atomgit_atomcode", name="atomcode")
+    )
+
+    out = resolve_repos(settings, ["atomgit_atomcode/atomcode"])
+    assert out[0].platform is Platform.ATOMGIT, "不带平台时也该认出它登记在 AtomGit 上"
+    # 显式写了平台时仍按平台匹配（同名登记在多个平台时靠它区分）
+    explicit = resolve_repos(settings, ["atomgit:atomgit_atomcode/atomcode"])
+    assert explicit[0].platform is Platform.ATOMGIT
+
+
+@respx.mock
+async def test_atomgit_pr_line_counts_are_summed_from_files(atomgit) -> None:
+    """AtomGit 的 MR 对象不给增删行 → 用文件清单求和补齐。
+
+    别让 PR 显示成「+0/-0，0 个文件」：`render_item` 拿这三个数渲染给评测环节，
+    缺了它评测判 pr_quality 就被喂了错信息。实测依据：`/pulls/943` 的 payload 里
+    **没有** additions / deletions / changed_files，逐文件行数只在 `/pulls/{n}/files` 里给。
+    """
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[{"number": 9, "title": "pr", "state": "open"}])
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/9").mock(
+        return_value=httpx.Response(200, json={          # 注意：**没有**增删行字段
+            "number": 9, "title": "pr", "body": "fix", "state": "open",
+            "head": {"ref": "f"}, "base": {"ref": "main"}, "merged_at": "",
+        })
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/9/files").mock(
+        return_value=httpx.Response(200, json=[
+            {"filename": "a.py", "additions": 3, "deletions": 1},
+            {"filename": "b.py", "additions": 2, "deletions": 0},
+        ])
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls/9/issues").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/issues/9/comments").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    items = [i async for i in atomgit.fetch_items(REPO, item_types=[ItemType.PR])]
+
+    pr = items[0]
+    assert (pr.additions, pr.deletions, pr.changed_files) == (5, 1, 2)
+
+
 @respx.mock
 async def test_v5_label_and_comment_paths(gitee) -> None:
     respx.get(f"{GITEE}/repos/psf/requests/labels").mock(return_value=httpx.Response(200, json=[]))

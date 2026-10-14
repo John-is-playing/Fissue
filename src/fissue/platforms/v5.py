@@ -249,6 +249,20 @@ class V5Adapter(PlatformAdapter):
                     self.platform.value, number, exc,
                 )
                 raw.mark_degraded(f"files_unavailable#{number}")
+            # v5 平台（Gitee / AtomGit）的 PR 对象**不提供** additions / deletions /
+            # changed_files——实测 AtomGit：#943 的 payload 里这三个字段根本不存在，
+            # 逐文件的行数只在 `/pulls/{n}/files` 里给。于是上面取到的全是 0，而
+            # `render_item` 会把 PR 渲染成「+0/-0，0 个文件」，**评测环节据此判
+            # pr_quality 就被喂了错信息**。所以文件清单到手后用求和补齐。
+            # 只在平台没给时才补（不覆盖平台的真值）；注意 `fetch_files` 有条数上限，
+            # 超大 MR 的总量会偏低，故对外应作「至少这么多」理解。
+            if raw.files:
+                if not payload.get("additions"):
+                    raw.additions = sum(f.additions for f in raw.files)
+                if not payload.get("deletions"):
+                    raw.deletions = sum(f.deletions for f in raw.files)
+                if not payload.get("changed_files"):
+                    raw.changed_files = len(raw.files)
             raw.linked_issues = extract_linked_issues(title, body)
             # v5 提供 PR 关联 Issue 的专用端点
             try:

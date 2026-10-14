@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Callable
 
 from ..config import RepoConfig, Settings
@@ -21,6 +22,8 @@ from .base import PlatformAdapter
 from .gitee import GiteeAdapter
 from .github import GitHubAdapter
 from .gitlab import GitLabAdapter
+
+log = logging.getLogger(__name__)
 
 ADAPTERS: dict[Platform, type[PlatformAdapter]] = {
     Platform.GITHUB: GitHubAdapter,
@@ -94,10 +97,25 @@ def resolve_repos(settings: Settings, specs: list[str] | None = None) -> list[Re
 
     out: list[RepoConfig] = []
     for spec in specs:
-        ref = parse_repo_ref(spec, platform=Platform.GITHUB if ":" not in spec and "/" in spec else None)
-        matched = [
-            r for r in settings.repos if r.slug == ref.slug and r.platform == ref.platform
-        ]
+        explicit_platform = ":" in spec
+        ref = parse_repo_ref(
+            spec, platform=Platform.GITHUB if not explicit_platform and "/" in spec else None
+        )
+        # **先按 slug 匹配，再谈平台**：`--repo owner/name` 不带平台时会被
+        # `parse_repo_ref` 默认成 GitHub，若配置里那条其实登记在 AtomGit / Gitee 上，
+        # 「slug 与平台都相等」就永远匹配不到，于是回退成一个 **GitHub 的临时仓库**。
+        # 实测后果：抓 AtomGit 仓库时去请求了 api.github.com 并 404，而它本意是抓 AtomGit。
+        # 显式写了平台（`atomgit:owner/name` 或 `--platform`）时，才按平台过滤——
+        # 这也让同名仓库登记在多个平台时能有确定的说法。
+        matched = [r for r in settings.repos if r.slug == ref.slug]
+        if explicit_platform:
+            matched = [r for r in matched if r.platform == ref.platform]
+        elif len(matched) > 1:
+            log.warning(
+                "仓库 %s 在多个平台上都有登记，按配置顺序取 %s；"
+                "要指定平台请用 `--platform` 或 `平台:owner/name` 写法",
+                ref.slug, matched[0].platform.value,
+            )
         if matched:
             out.append(matched[0])
             continue
