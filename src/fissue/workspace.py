@@ -68,7 +68,25 @@ class RepoWorkspace:
             target = Path(dest)
             target.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = ["git", "clone", "--quiet", "--no-tags"]
+        # 私有仓库必须递凭据：`clone_url` 不带令牌、`_git` 又写死
+        # `GIT_ASKPASS=echo`（禁止交互式索要），所以原先**从不**带凭据——公开仓库
+        # 匿名克隆照常成功，私有仓库则必然 `HTTP Basic: Access denied`（实测：极狐的
+        # Private 仓库，同一个令牌 `git clone` 直接成功，只有这里失败）。
+        # 递法与 `push` 完全一致：令牌经**子进程环境变量 + 凭据助手**，绝不进命令行。
+        cmd = ["git"]
+        extra_env: dict[str, str] = {}
+        if token:
+            # 助手脚本里只出现**环境变量名**，令牌本身不在命令行上。
+            # 普通字符串拼接（不是 f-string）：脚本末尾有字面量 `}`，f-string 里要写 `}}`。
+            helper = (
+                "!f(){ printf 'username=%s\\npassword=%s\\n' oauth2 "
+                '"$' + cls.PUSH_TOKEN_ENV + '"; };f'
+            )
+            # `-c` 是 **git 本体**的选项，必须排在子命令**之前**——`git clone … -c x`
+            # 会被当成子命令的参数而报「未知开关」。本项目在 push 上踩过一次。
+            cmd += ["-c", f"credential.helper={helper}"]
+            extra_env[cls.PUSH_TOKEN_ENV] = token
+        cmd += ["clone", "--quiet", "--no-tags"]
         if depth > 0:
             cmd += ["--depth", str(depth)]
         if branch:
@@ -76,7 +94,7 @@ class RepoWorkspace:
         cmd += [clone_url, str(target)]
 
         ws = cls(root=target, slug=slug, token=token, default_branch=default_branch)
-        result = ws._git(cmd, cwd=None)
+        result = ws._git(cmd, cwd=None, extra_env=extra_env)
         if not result.ok:
             ws.cleanup()
             raise GitError(f"克隆失败：{ws.sanitize(result.stderr)[:500]}")
