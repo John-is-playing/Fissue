@@ -12,7 +12,7 @@
 │ 编排层                                                            │
 │  pipeline/  fetcher · stages · queue · flush · context            │
 │  fixer/     agent（受控循环）· autofix（提 PR 编排）               │
-│  service/   daemon（扫描/评测/flush/修复循环）· notify            │
+│  service/   daemon（扫描/评测/验证/flush/修复循环）· notify       │
 ├──────────────────────────────────────────────────────────────────┤
 │ 能力层                                                            │
 │  ai/        客户端 · 提示词 · 评估器                               │
@@ -73,6 +73,10 @@ flush 触发条件（三者取或）：
 >
 > 为什么批量而不是逐条？同一批条目的验证输出放在同一上下文里，
 > 模型能横向比较（例如识别出成批的重复提交），也更省钱。
+>
+> **flush 之前会先回收「入队后未收尾」的残留**（`pending` 超龄）：那种行会让第 3 条兜底
+> 永久失效，条目也卡在 `queued` 再也无人碰。批次本身用条件 UPDATE **原子抢占**，
+> 同一批不会被两个写者（daemon / Web / CLI）各跑一次。
 
 ## 4. 验证器与 F2P（Q7）
 
@@ -145,6 +149,10 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
 * 只挂载**隔离工作区**（临时目录，可选 loopback 虚拟盘），绝不挂宿主普通目录。
 * Docker 不可用时**默认拒绝执行**（不再静默降级）；确需降级要显式打开
   `sandbox.allow_local_fallback`，降级后没有任何隔离，且环境变量按白名单透传。
+* `sandbox.runtime` **只接受** `docker` / `local`：拼错（`Docker`、`podman`、带尾空格）在
+  加载配置时就被拒，运行期另有一道 fail-closed——不会再出现「静默落到无隔离的本地执行」。
+* 执行超时后**强制回收容器**（`docker rm -f`），不留后台容器继续吃资源；
+  单流输出保留上限 2MB，超出丢弃并在 stderr 标注「已截断」。
 
 ### 5.2 自动修复的护栏
 
@@ -158,7 +166,9 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
 | 规模上限 | 变更文件数 ≤ `max_changed_files`，diff 行数 ≤ `max_diff_lines`，超出即回滚 |
 | F2P 复核 | 提 PR 前再跑一次完整 F2P，不接受 Agent 自说自话 |
 | 策略闸门 | 仅 Issue、仅 BUG、仅 tier1/tier2、排除疑似刷量/重复 |
-| 令牌卫生 | 推送用一次性内嵌令牌 URL，不写入 git 配置；所有输出过 `sanitize()` |
+| `.git` 加固 | 容器对工作区可写，而 `.git` 是**宿主的执行入口**（`hooks/`、`filter.*.clean` 在 `git add` 时执行、`diff.*.textconv` 在 `git diff` 时执行、`credential.helper` 更直接）。宿主 git 一律带 `-c core.hooksPath=<devnull>`；克隆后与**每次沙盒跑完**都重建 `.git/config`、删掉 `.git/hooks`；`push --no-verify` |
+| 提交内容完整性 | 提交前把索引拉回 HEAD、确认仍在自己的分支、并核对「待提交的文件正好是 Agent 改过的那些」，多出来的**拒绝提交**（`git commit` 提交的是索引，而 `.git` 在容器可写范围内） |
+| 令牌卫生 | 推送用**不带令牌**的 URL，令牌经子进程环境变量 + 凭据助手递给 git——不进命令行、不写入 git 配置；所有输出过 `sanitize()` |
 
 ### 5.3 人工闸门
 
@@ -211,10 +221,19 @@ PostgreSQL 为主库，12 张表：
 | `scan_runs` | 扫描记录 |
 | `notifications` | 通知去重（`dedup_key` 唯一） |
 
-**增量**靠 `items.content_hash`：标题/正文/标签数量/评论数/状态任一变化即视为
-内容变更，需要重新评测；否则跳过（省钱）。
+**增量**分两层口径：
 
-SQLite 亦可运行（本地开发与测试），代码中已对 `with_for_update` 等方言差异做处理。
+* `items.content_hash`（标题 / 正文 / 标签 / **评论条数** / 状态 / merged）判「平台侧这条
+  与库里不一样」——变了就重写字段与评论表；
+* 但**只有实质字段**（`MATERIAL_FIELDS`：标题 / 正文 / 标签 / 状态 / merged）变化才让
+  **已有结论作废**：还没进入执行的条目回落 `new` 重评；修复已开工的
+  （`fix_queued` / `fixing` / `pr_created`）只把「结论过期」留痕（`stale_reasons`，导出与
+  API 可见），由 `fissue requeue --stale` 人工放行。
+  为什么不直接拿 `content_hash` 判过期：它含**评论条数**，那样每来一条评论都要重评测一次，
+  活跃 issue 上等于持续烧 token。
+
+SQLite 亦可运行（本地开发与测试）：已对 `with_for_update` 等方言差异做处理，并开 **WAL** +
+30s busy 超时（驱动默认只有 5s；回滚日志模式下长**读**事务会把写者的提交挡住）。
 
 ## 8. 扩展指南
 

@@ -120,7 +120,7 @@ Fissue 的信任边界画在**沙盒**上。以下内容一律视为**不可信*
 | 规模上限 | 变更文件数 ≤ `max_changed_files`、diff 行数 ≤ `max_diff_lines`，超出即回滚 |
 | F2P 复核 | 提 PR 前重跑一次完整 F2P，不接受 Agent 自说自话 |
 | 策略闸门 | 仅 Issue、仅 BUG、仅 tier1/tier2，排除疑似刷量 / 重复 |
-| 令牌卫生 | 推送使用一次性内嵌令牌 URL，不写入 git 配置；所有输出过 `sanitize()` |
+| 令牌卫生 | 推送用**不带令牌**的 URL，令牌经子进程环境变量 + 凭据助手递给 git——不进命令行、不写入 git 配置；所有输出过 `sanitize()` |
 | **`.git` 加固** | 容器对工作区可写，而容器里跑的是不可信 PR 代码与模型生成的验证器——`.git/hooks` 与 `.git/config`（`filter.*.clean` 在 `git add` 时执行、`diff.*.textconv` 在 `git diff` 时执行、`credential.helper` 更直接）都是**宿主的执行入口**。现在：宿主 git 一律带 `-c core.hooksPath=<devnull>`；克隆后与**每次沙盒跑完**都重建 `.git/config`、删掉 `.git/hooks`、`push --no-verify` |
 | **写操作互斥** | 同一时刻只允许一处写外部仓库：跨进程用 `flock`（`fissue-*.lock`），同进程（`fissue daemon --web`）另有 `WRITE_GATE`；Web 写端点拿不到回 `409`。flush 的批次用条件 UPDATE 原子抢占，同一批不会被两个写者各跑一次 |
 
