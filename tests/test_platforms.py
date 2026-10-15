@@ -58,10 +58,22 @@ def test_guess_author_kind() -> None:
 
 def test_extract_linked_issues() -> None:
     assert extract_linked_issues("fixes #42 and #43") == [42, 43]
-    assert extract_linked_issues("see /issues/7") == [7]
-    assert extract_linked_issues("closes /merge_requests/9") == [9]
     assert extract_linked_issues("nothing here") == []
-    assert extract_linked_issues("#5 and #5") == [5]
+    assert extract_linked_issues("#5 and #5") == [5]           # 去重
+
+
+def test_extract_linked_issues_ignores_cross_repo_urls() -> None:
+    """**不再把 URL 片段当关联 Issue**（只认 `#N`）。
+
+    回归：原先还匹配 `/issues/N` `/merge_requests/N`，于是**指向别的仓库的外链**也被算成
+    关联 Issue。实测一条自动翻译的 MR：正文是 37k 字符的译文清单，全是
+    `](https://gitlab.com/gitlab-org/gitlab/-/issues/328226)` 这种指向上游的链接，
+    一次捞出 23 个编号、落库 13 个——**全是跨仓库外链**，把下游「拉关联 Issue 正文当验证
+    上下文」带偏。要支持 URL 形式也该**锚定同仓库**，而不是放开任意片段。
+    """
+    cross_repo = "见 [译文](https://gitlab.com/gitlab-org/gitlab/-/issues/328226) 与 /merge_requests/9"
+    assert extract_linked_issues(cross_repo) == [], "URL 形式不该再被当成关联 Issue"
+    assert extract_linked_issues("真关联 #12 与外链 https://x/y/-/issues/99") == [12]
 
 
 def test_parse_repo_ref_variants() -> None:

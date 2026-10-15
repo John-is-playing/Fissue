@@ -754,11 +754,23 @@ def guess_author_kind(
 
 
 def extract_linked_issues(*texts: str) -> list[int]:
-    """从标题/正文中解析 ``#123`` / ``fixes #123`` 形式的关联 Issue 号。"""
+    """从标题/正文中解析 ``#123`` / ``fixes #123`` 形式的关联 Issue 号。
+
+    **只认 `#N`，不认 URL**：这里曾同时匹配 ``/issues/N`` ``/pull/N`` ``/merge_requests/N``
+    这类 URL 片段，于是**指向别的仓库的外链**也被当成关联 Issue。实测一条自动翻译的 MR：
+    正文是 37k 字符的译文清单，里面全是
+    ``](https://gitlab.com/gitlab-org/gitlab/-/issues/328226)`` 这种指向上游的链接，
+    一次捞出 23 个编号（落库 13 个）——**全是跨仓库的真外链**，会把下游「拉取关联 Issue
+    正文当验证上下文」带偏。
+
+    本函数 docstring 本来就只承诺 `#N`，所以直接与承诺对齐。若日后要支持**同仓库**的 URL
+    形式，应当把仓库传进来做锚定（只认 ``/{owner}/{repo}/-/issues/N``），而不是放开任意
+    URL 片段。
+    """
     import re
 
     found: list[int] = []
-    pattern = re.compile(r"(?:#|/issues/|/pull/|/pulls/|/merge_requests/)(\d{1,8})")
+    pattern = re.compile(r"#(\d{1,8})")
     for text in texts:
         if not text:
             continue

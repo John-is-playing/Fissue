@@ -1002,3 +1002,21 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
 **补丁产物的处置决定（B-4）**：`data/patches/` 现有 **34 个文件**，其中 **23 个有库记录**
 （另 11 个属更早那套已被替换的库）。**决定保留全部**——它们是「已通过验证器与回归门」的证据，
 删除收益为零、风险非零；且 `data/*` 本就在 `.gitignore` 里，不占版本库、不影响基线干净度。
+
+**C-6（关联 Issue 过度提取）的成因已查明并修掉**：`extract_linked_issues` 的正则原本是
+`(?:#|/issues/|/pull/|/pulls/|/merge_requests/)(\d{1,8})`——**含 URL 分支**，于是正文里
+**指向别的仓库的外链**也会被当成关联 Issue。实测那条 `gitlab-cn/gitlab#4214`：正文是 37k
+字符的自动翻译清单，里面全是 `](https://gitlab.com/gitlab-org/gitlab/-/issues/328226)`
+这种指向上游的链接，一次捞出 **23 个编号**（落库 13 个）。
+
+> **一处更正**：上一版把它归为「`extract_linked_issues` 对超长 manifest 过度提取」并当成结论，
+> 但当时只用 `#\d+` 验过（0 个匹配）就下了判断——**而真实正则还认 URL 形式**，那次验证不成立。
+> 这次用**真实正则**在**真实数据**上跑出 23 个匹配、并打印了匹配处的上下文，才算确认。
+
+修法与函数自己的 docstring 对齐：**只认 `#N`，去掉 URL 分支**（要支持 URL 也该锚定同仓库，
+而不是放开任意片段）。用例改成断言「跨仓库外链不再被当关联 Issue」。
+
+**C-7（三个探针靶子仓库）决定保留**：`John-is-playing/fissue-write-probe`（极狐）、
+`qiaoen_python/fissue-write-probe`（AtomGit）、`ccqtp/fissue-write-probe`（Gitee）。
+都是 **Private**、对外零可见，且各自带着一条真 PR——下次验写操作**可直接复用**，
+重建一次的代价不低。要删随时可删（`atomgit_repo delete` 或平台 UI）。
