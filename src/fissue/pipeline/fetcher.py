@@ -106,9 +106,13 @@ class Fetcher:
         repo_id = self.ctx.ensure_repo_row(repo)
         #: 本轮**实际入库**条目的最大 updated_at，作为新的游标水位。
         watermark: datetime | None = None
+        #: 适配器**交出来**的条目数（在 :meth:`_accept` 过滤之前）。早停判定用这个，
+        #: 不能用过滤后的 ``stats.fetched``：适配器是按 yield 条数早停的（见下方注释）。
+        seen = 0
 
         try:
             async for item in adapter.fetch_items(ref, item_types=types, since=since, limit=limit):
+                seen += 1
                 if not self._accept(item, repo):
                     stats.skipped += 1
                     continue
@@ -155,7 +159,15 @@ class Fetcher:
             self._mark_incomplete(stats, f"item_build_failures={skipped_build}")
 
         # 早停在 --limit 上意味着后面还有没抓到的旧条目，不能把游标推过去。
-        if limit is not None and stats.fetched >= limit:
+        #
+        # 判定必须用**适配器交出来的条数**（`seen`），不能再用 `stats.fetched`：适配器的
+        # 早停是按「yield 了多少条」计的（github/v5/gitlab 三处都是 `count >= limit`），
+        # 而 `stats.fetched` 只在 `_accept` 通过后才自增。配了 labels_include /
+        # labels_exclude（config.example.yaml 默认就带 labels_exclude）时，被滤掉的条目
+        # 不计入 fetched → `fetched >= limit` 不成立 → 这轮不记「数据不完整」→
+        # `_save_cursor` 照常推进 → `limit` 之后那些从未抓到的旧条目永久落在增量窗口外，
+        # 静默不再入库。这是本项目自己定的「不完整就不推游标」那道闸门上的一个洞。
+        if limit is not None and seen >= limit:
             self._mark_incomplete(stats, f"early_stop:limit={limit}")
 
         stats.duration_seconds = round(time.monotonic() - started, 3)

@@ -490,20 +490,14 @@ class V5Adapter(PlatformAdapter):
             head_ref = branch_part
 
         async def _probe() -> Any:
-            """同一个 head 上已经有 PR → 返回它，绝不重复创建。"""
-            found = await self._get(
-                f"{self._repo_api(upstream)}/pulls",
-                head=head_ref,
-                state="open",       # 与 find_open_pr 一致：已关闭的同头 PR 不算「已有」
-                per_page=20,
-            )
-            for pr in found or []:
-                if isinstance(pr, dict):
-                    return {
-                        "number": pr.get("number") or pr.get("id"),
-                        "url": pr.get("html_url") or pr.get("url"),
-                    }
-            return None
+            """同一个 head 上已经有 PR → 返回它，绝不重复创建。
+
+            直接复用 :meth:`find_open_pr`：它在「只认 open」与「必须按分支核对」两件事上
+            都有明确判定。这里原先自己写了另一版——**拿列表第一条充数**：平台若不支持
+            `head=` 过滤就会返回整张列表，于是写请求结果不明时（5xx / 读超时）会把
+            **别人的 PR** 记成自己刚建的，条目记为成功且不再重试。
+            """
+            return await self.find_open_pr(upstream, head=head)
 
         data = await self._post(
             f"{self._repo_api(upstream)}/pulls",

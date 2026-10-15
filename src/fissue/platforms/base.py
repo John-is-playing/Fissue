@@ -533,15 +533,33 @@ class PlatformAdapter(ABC):
         text = (resp.text or "").lower()
         return "rate limit" in text or "rate_limit" in text or "限流" in text
 
+    #: 平台用来说「这东西已经存在」的文本特征（小写比较）。
+    #: GitHub / AtomGit 走 ``errors[].code = already_exists``；GitLab 是
+    #: ``{"message":"Label already exists"}``；Gitee 近似。
+    _ALREADY_EXISTS_MARKERS: tuple[str, ...] = (
+        "already_exists",
+        "already exists",
+        "has already been taken",
+        "name already taken",
+        "已经存在",
+    )
+
     @staticmethod
     def _is_already_exists(exc: BaseException) -> bool:
-        """平台是否明确告知「这东西已经存在」。
+        """平台是否**明确**告知「这东西已经存在」。
 
-        `_request` 的错误文本统一带上了状态码，409/422 都表示已存在。这类
-        「失败」其实等价于成功（标签确实在那儿），不该被记成创建失败。
+        原先的判定是「错误文本里出现 `API 错误 409` 或 `API 错误 422`」——太宽：422 同样会
+        因标签名不合法、颜色格式被拒、数量超限等原因返回（GitHub 的 already_exists 与普通
+        参数错误同为 422）。误判的代价不是「多一次重试」，而是调用方把它理解成「确实已存在」
+        并回填**标签缓存**（``ensure_labels``），于是 TTL 内不再尝试创建，后续打标签
+        ——也就是结论落地那一步——一路静默失败。
+
+        现在要求响应体里真的有「已存在」的特征词。``_request`` 的错误文本里带着
+        ``resp.text[:500]``，所以平台原文看得见。判定刻意偏严：判错的后果只是
+        「警告 + 稍后重试」，而反向误判会让打标签**静默失效**。
         """
-        text = str(exc)
-        return "API 错误 409" in text or "API 错误 422" in text
+        text = str(exc).lower()
+        return any(m in text for m in PlatformAdapter._ALREADY_EXISTS_MARKERS)
 
     async def _settle_ambiguous_write(
         self,

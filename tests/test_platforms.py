@@ -1425,3 +1425,91 @@ def test_platform_retries_come_from_platforms_config(settings) -> None:
     settings.platforms.max_retries = 7
     adapter = build_adapter(settings, platform=Platform.GITHUB, token="t")
     assert adapter.max_retries == 7
+
+
+# ---------------------------------------------------------------------------
+# 建 PR/MR 的幂等探测：只认 open/opened，且必须按分支核对
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_gitlab_find_open_pr_only_opened_and_matching_branch(gl) -> None:
+    """GitLab 也要能查到「已有 MR」，且只认 opened、必须按分支核对。
+
+    回归：GitLab 原先**没有覆写** `find_open_pr`（基类恒返回 None），于是「已经 MR 过了
+    就别再推/建」这条判断永远为假，重跑必然再试一次。
+    """
+    route = respx.get(f"{GL}/projects/psf%2Frequests/merge_requests").mock(
+        return_value=httpx.Response(200, json=[
+            {"iid": 5, "web_url": "u5", "source_branch": "other/branch"},   # 不相干
+            {"iid": 6, "web_url": "u6", "source_branch": "fix/x"},          # 目标
+        ])
+    )
+
+    found = await gl.find_open_pr(REPO, head="psf/requests:fix/x")
+
+    assert found == {"number": 6, "url": "u6"}, f"应命中目标分支那条：{found}"
+    # 只认 opened：已关闭的同源分支 MR 不算「已有」（关 MR 不删分支，重跑必踩）
+    assert route.calls[0].request.url.params["state"] == "opened"
+
+
+@respx.mock
+async def test_gitlab_find_open_pr_refuses_to_guess(gl) -> None:
+    """列表里没有分支字段时不能拿第一条充数——那会谎报「已有 MR」。"""
+    respx.get(f"{GL}/projects/psf%2Frequests/merge_requests").mock(
+        return_value=httpx.Response(200, json=[{"iid": 9, "web_url": "u9"}])
+    )
+
+    assert await gl.find_open_pr(REPO, head="fix/x") is None
+
+
+@respx.mock
+async def test_v5_create_pr_probe_does_not_claim_someone_elses_pr(atomgit) -> None:
+    """写请求结果不明时的探测**不能拿列表第一条充数**。
+
+    回归：`create_pr._probe` 原先自己写了一版「拿到 list 就返回第一条」，而平台若不支持
+    `head=` 过滤就会返回整张列表 → 把一个**别人的 PR** 记成自己刚建的，条目标为成功且不再重试。
+    现在它复用 `find_open_pr`（按分支核对），查不到就把原始错误抛出来让人看见。
+    """
+    from fissue.errors import PlatformError
+
+    respx.post(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    probe = respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": 9, "html_url": "u9", "head": {"ref": "someone/else-branch"}}
+        ])
+    )
+
+    with pytest.raises(PlatformError):
+        await atomgit.create_pr(
+            RepoRef(platform=Platform.ATOMGIT, owner="psf", name="requests"),
+            head="psf:fix/x", base="main", title="t", body="b",
+        )
+
+    assert probe.called, "应当先探测一次"
+    assert probe.calls[0].request.url.params["state"] == "open", "探测必须只认 open"
+
+
+def test_is_already_exists_requires_an_explicit_marker() -> None:
+    """「已存在」必须由平台**明确说出来**，不能凭 409/422 猜。
+
+    回归：原先只要错误文本里有 `API 错误 409`/`API 错误 422` 就算「已存在」。而 422 同样会
+    因标签名不合法、颜色格式被拒、数量超限等原因返回；误判会让调用方把该标签塞进
+    「已存在」缓存（`ensure_labels`），TTL 内不再尝试创建，后续打标签（结论落地那一步）
+    一路静默失败。
+    """
+    from fissue.platforms.base import PlatformAdapter
+
+    assert PlatformAdapter._is_already_exists(
+        Exception('GitHub API 错误 422：POST /labels -> {"errors":[{"code":"already_exists"}]}')
+    ) is True
+    assert PlatformAdapter._is_already_exists(
+        Exception('GitLab API 错误 409：POST /labels -> {"message":"Label already exists"}')
+    ) is True
+    # 只是参数错误的 422/409 —— 绝不能当成「已存在」
+    assert PlatformAdapter._is_already_exists(
+        Exception('GitHub API 错误 422：POST /labels -> {"message":"Validation Failed"}')
+    ) is False
+    assert PlatformAdapter._is_already_exists(Exception("API 错误 409：颜色格式不合法")) is False

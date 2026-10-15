@@ -397,6 +397,32 @@ class GitLabAdapter(PlatformAdapter):
             )
         return RepoRef(platform=self.platform, owner=owner, name=name or repo.name)
 
+    async def find_open_pr(self, upstream: RepoRef, *, head: str) -> dict[str, Any] | None:
+        """按 ``source_branch`` 查**仍开放**的 MR，没有则返回 None。
+
+        原先 GitLab 根本没有覆写这个方法（基类恒返回 None），于是「已经 MR 过了就别再推 /
+        别再建」这条判断在 GitLab 上**永远为假**，重跑必然再建一次；同一提交里
+        ``create_pr._probe`` 又用 ``state="all"``，会把**已关闭**的同源分支 MR 当成「刚建好」
+        ——关 MR 不删分支，重跑必踩，这正是 ``github.py`` 已经修掉的那个坑。
+
+        两点与 GitHub / v5 保持一致：**只认 opened**；平台若不支持 ``source_branch`` 过滤会
+        把整张列表返回，所以**必须按分支核对**，绝不拿第一条充数（那会谎报「已有 MR」）。
+        """
+        branch = head.partition(":")[2] or head
+        data = await self._get(
+            f"{self._project(upstream)}/merge_requests",
+            source_branch=branch,
+            state="opened",
+            per_page=20,
+        )
+        for mr in data or []:
+            if not isinstance(mr, dict):
+                continue
+            if str(mr.get("source_branch") or "") != branch:
+                continue
+            return {"number": mr.get("iid") or mr.get("id"), "url": mr.get("web_url")}
+        return None
+
     async def create_pr(
         self,
         upstream: RepoRef,
@@ -433,17 +459,13 @@ class GitLabAdapter(PlatformAdapter):
                 payload["target_project_id"] = target["id"]
 
         async def _probe() -> Any:
-            """上游已存在同一个 source_branch 的 MR → 返回它，绝不重复创建。"""
-            found = await self._get(
-                f"{self._project(upstream)}/merge_requests",
-                source_branch=source_branch,
-                state="all",
-                per_page=20,
-            )
-            for mr in found or []:
-                if isinstance(mr, dict):
-                    return {"number": mr.get("iid") or mr.get("id"), "url": mr.get("web_url")}
-            return None
+            """上游已存在同一个 source_branch 的**开放** MR → 返回它，绝不重复创建。
+
+            复用 :meth:`find_open_pr`（只认 opened + 按分支核对）。这里原先写死
+            ``state="all"``：已关闭的同源分支 MR 会被当成「刚建好」，写请求结果不明时
+            （5xx / 读超时）就把一个**已关闭**的 MR 记成创建成功。
+            """
+            return await self.find_open_pr(upstream, head=head)
 
         data = await self._request(
             "POST", f"{self._project(source_repo)}/merge_requests", json=payload, probe=_probe
