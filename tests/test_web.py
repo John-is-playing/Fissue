@@ -281,3 +281,29 @@ def test_write_endpoint_409_when_another_writer_holds_the_gate(client, monkeypat
 
     r = client.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
     assert r.status_code == 409, r.text
+
+
+def test_write_endpoint_rejects_a_remote_peer_when_unauthenticated(settings, repo) -> None:
+    """未开鉴权时，**来源不是回环**的写请求一律 403。
+
+    启动检查读的是 `web.host`，把 `create_app()` 嵌进别人的服务器（或换绑定地址、经
+    `docker -p` 暴露）时它看不见；这一道直接看对端地址，把那种情况兜住。读接口不受影响。
+    """
+    from fastapi.testclient import TestClient
+
+    from fissue.web.app import create_app
+
+    with TestClient(create_app(settings), client=("203.0.113.9", 4321)) as c:
+        r = c.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
+        assert r.status_code == 403, r.text
+        assert "FISSUE_API_TOKEN" in r.text
+        assert c.get("/api/v1/stats").status_code == 200, "只读接口不受影响"
+
+
+def test_write_endpoint_allows_an_unparseable_peer(client) -> None:
+    """对端地址解析不出来时**不拦**（测试客户端/UDS 都是这种）。
+
+    「不知道对端是谁」不等于「可疑」——拿这一点去拦会把本机正常用法也挡掉。
+    """
+    r = client.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
+    assert r.status_code == 200, r.text

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import functools
+import ipaddress
 import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -78,9 +79,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     st = settings or load_settings()
     setup_logging(st.app.log_level)
     if st.api.enabled and not st.api.auth_required:
-        # 为什么告警在这里发而不是在 `Settings._validate`：那里是**构造期**，`fissue status
-        # --json` 这种机器可读输出会与 stderr 混流（click 的 CliRunner 默认 mix_stderr），
-        # 一句告警就能把 JSON 打坏。这里才是「即将对外提供 API」的那一刻。
+        # 为什么告警在这里发：这里才是「即将对外提供 API」的那一刻，而 `Settings._validate`
+        # 是每条命令都会走的构造期路径。（这条告警曾经打坏过 `fissue status --json` 的输出，
+        # 根因是日志写到了 stdout；已在 `logging_setup` 修正为一律 stderr。）
         #
         # 为什么必须提醒：启动检查只能看**绑定地址**，看不见反向代理——`web.host=127.0.0.1`
         # + 同机 nginx 转到本端口时，无鉴权的写控制面（打平台标签、推进修复队列）照样对外。
@@ -166,7 +167,7 @@ def _reject_proxied_write(request: Request, settings: Settings) -> None:
     必须说清楚边界：**这是补刀，不是安全边界**。边界是 ``FISSUE_API_TOKEN``——同机代理
     若一个转发头都不设，请求与「本机用户直接访问」在 HTTP 层无法区分，只有令牌能真正
     兜住。转发头命中只是让常见配置（nginx 的 ``proxy_set_header``）从「静默开放」变成
-    「响亮拒绝」。
+    「响亮拒绝」。对端来源见 :func:`_reject_remote_write`，那是另一道。
     """
     if settings.api.auth_required:
         return          # 有鉴权，经不经过代理都无所谓
@@ -177,6 +178,35 @@ def _reject_proxied_write(request: Request, settings: Settings) -> None:
             detail=(
                 f"拒绝写操作：请求带有反向代理转发头（{'、'.join(hit)}），"
                 "而当前未启用 API 鉴权。请设置 FISSUE_API_TOKEN 后再经代理访问。"
+            ),
+        )
+
+
+def _reject_remote_write(request: Request, settings: Settings) -> None:
+    """未启用鉴权时，**来源不是回环**的写请求一律拒绝。
+
+    为什么还需要这一道：「对外可达却没鉴权」本来在启动时就会被拒（见 ``Settings._validate``），
+    但那个检查读的是 ``web.host``——**把 ``create_app()`` 嵌进别人的服务器**（或换个
+    绑定地址、或经 `docker -p` 之类暴露出去）时，配置里写的仍是 `127.0.0.1`，检查就看不见了。
+    这一道直接看**对端地址**，把那种情况兜住。
+
+    拿不到可解析的对端地址时（测试客户端 ``testclient``、Unix socket 等）不在这里判——
+    「不知道」不等于「可疑」，不能因此把本机正常用法也拦掉。
+    """
+    if settings.api.auth_required:
+        return
+    client = request.client
+    host = (client.host if client else "") or ""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if not addr.is_loopback:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"拒绝写操作：请求来自 {host}，不是本机回环地址，而当前未启用 API 鉴权。"
+                "要对外开放请设置 FISSUE_API_TOKEN。"
             ),
         )
 
@@ -203,6 +233,7 @@ def _exclusive_write(fn):
             return await fn(*args, **kwargs)
         settings = _settings(request)
         _reject_proxied_write(request, settings)
+        _reject_remote_write(request, settings)
         try:
             async with WRITE_GATE.hold_or_fail(action="Web/API 写操作"):
                 with single_flight(settings, action="Web/API 写操作"):
