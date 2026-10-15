@@ -250,6 +250,33 @@ async def test_cursor_frozen_on_early_stop(settings, ctx, monkeypatch) -> None:
     assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
 
 
+async def test_early_stop_uses_pre_filter_count(settings, ctx, monkeypatch) -> None:
+    """早停要用「适配器交出来的条数」判，不能用过滤后的 ``fetched``。
+
+    回归：适配器按 **yield 条数**早停（github/v5/gitlab 三处都是 ``count >= limit``），
+    而原先的判定是 ``stats.fetched >= limit``，而 ``stats.fetched`` 只在 ``_accept``
+    通过后自增。配了 ``labels_include`` / ``labels_exclude``（``config.example.yaml``
+    默认就带 ``labels_exclude``）时，被滤掉的条目不计入 fetched → 早停不被识别 →
+    游标照推 → ``limit`` 之后那些从未抓到的旧条目永久落在增量窗口外，静默不再入库。
+    """
+    cfg = _repo_cfg()
+    cfg.labels_exclude = ["duplicate"]
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    items = [
+        _fetched_item(1, "2026-01-09T00:00:00+00:00"),
+        _fetched_item(2, "2026-01-08T00:00:00+00:00"),
+    ]
+    items[1].labels = ["duplicate"]
+    fetcher = _wire_adapter(ctx, monkeypatch, _StubFetchAdapter(items))
+
+    stats = await fetcher.fetch_repo(cfg, limit=2)
+
+    assert stats.fetched == 1, "被标签过滤掉的那条不该计入 fetched"
+    assert stats.incomplete is True, "适配器已在 limit 上停住，必须是「数据不完整」"
+    assert "early_stop" in "；".join(stats.incomplete_reasons)
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
 async def test_cursor_frozen_on_rate_limit(settings, ctx, monkeypatch) -> None:
     """限流不再被吞：本轮记为失败，游标不推进（下一轮会重抓这一段）。"""
     from fissue.errors import RateLimitError
@@ -388,6 +415,96 @@ async def test_flush_handler_error_does_not_lose_entries(ctx, repo) -> None:
     assert "LLM 挂了" in outcome.error
     # 条目仍留在未 flush 状态，等下一轮重试
     assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
+
+
+async def test_flush_missing_conclusion_is_not_marked_flushed(ctx, repo) -> None:
+    """模型漏返回一条结论 → 那条**不能**被标记已 flush（否则结论静默丢失、永不重试）。
+
+    回归：`QueueManager.flush` 原先无条件 `mark_flushed(全部 entries)`，而
+    `evaluator.conclude_batch` 遇到返回结构异常时只记一条 warning 就 `return []`
+    （本地推理模型被 `finish_reason=length` 截断时正是这个形状）。那些条目照样被推进
+    `flushed_at`，而 `queue_unflushed` 只取 `flushed_at IS NULL`：它们再也不会进 flush，
+    状态停在 queued、拿不到结论、打不上标签、也进不了修复队列，整条链路却报成功。
+    """
+    qm = QueueManager(ctx)
+    items = [_seed_issue(repo, n) for n in (1, 2)]
+    for item in items:
+        eid = qm.enqueue(QueueName.VERIFY, item.key)
+        repo.finish_queue_entry(eid, status="done", result={})
+
+    answered: list[str] = []
+
+    async def handler(queue_kind, entries):
+        # 只给第一条结论：模拟模型漏项 / 整批被截断
+        answered.append(entries[0]["key"])
+        return [
+            {"key": entries[0]["key"], "verdict": "fix", "labels": [],
+             "priority": Priority.TIER1, "reason": "r", "confidence": 0.9, "model": "stub"}
+        ]
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=handler, force=True)
+
+    assert outcome.flushed == 1, "只有真拿到结论的那条算已消费"
+    assert outcome.error and "1 条没有拿到结论" in outcome.error, "缺结论必须响亮报出来"
+    left = {e.item_key for e in repo.queue_unflushed(QueueName.VERIFY)}
+    assert left == {i.key for i in items} - set(answered), "缺结论的那条要留在队里等下一轮"
+    assert repo.latest_batch_conclusion(answered[0]) is not None, "拿到结论的要正常落库"
+
+
+async def test_flush_gives_up_on_a_never_concluded_entry(ctx, repo) -> None:
+    """连续 MAX_FLUSH_MISSES 轮都缺结论 → 落成显式 failed，不再无限重试。
+
+    缺结论留在队里能自愈（偶发漏项），但「对模型来说恒不可定论」的条目若无上限重试，
+    每轮 flush 都是白烧一次 LLM；到顶后响亮地失败（报告/看板可见，可人工 --key 重跑）。
+    """
+    from fissue.pipeline.queue import MAX_FLUSH_MISSES
+
+    qm = QueueManager(ctx)
+    item = _seed_issue(repo, 1)
+    eid = qm.enqueue(QueueName.VERIFY, item.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    async def empty(queue_kind, entries):
+        return []
+
+    for _ in range(MAX_FLUSH_MISSES - 1):
+        outcome = await qm.flush(QueueName.VERIFY, handler=empty, force=True)
+        assert outcome.flushed == 0 and outcome.error
+        assert repo.queue_unflushed(QueueName.VERIFY) != [], "还没到上限，应留待下轮"
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=empty, force=True)
+    assert "标记 failed" in (outcome.error or "")
+    assert repo.queue_unflushed(QueueName.VERIFY) == [], "到顶后不再重试"
+
+
+async def test_flush_claims_the_batch_so_a_second_writer_gets_nothing(ctx, repo) -> None:
+    """一批条目被 flush 抢走后，另一个写者只能拿到空批。
+
+    回归：「挑（``flushed_at IS NULL``）→ 调 LLM → 标记已 flush」原先没有任何互斥，
+    于是 `fissue daemon --web` 里 daemon 的 flush 循环与同进程 uvicorn 的 `/queues/flush`
+    会挑到**同一批**：同一批条目被送两次 LLM（重复计费）、平台标签被打两遍。
+    这里在 handler 内部（也就是「已交出、结论还没落库」的窗口）再抢一次来复现它。
+    """
+    qm = QueueManager(ctx)
+    item = _seed_issue(repo, 1)
+    eid = qm.enqueue(QueueName.VERIFY, item.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    stolen: list[int] = []
+
+    async def handler(queue_kind, entries):
+        stolen.append(len(qm.repo.claim_unflushed(QueueName.VERIFY)))
+        return [
+            {"key": e["key"], "verdict": "skip", "labels": [], "priority": Priority.NONE,
+             "reason": "r", "confidence": 0.5, "model": "stub"}
+            for e in entries
+        ]
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=handler, force=True)
+
+    assert outcome.flushed == 1
+    assert stolen == [0], "同批条目不该被第二个写者抢走"
+    assert repo.queue_unflushed(QueueName.VERIFY) == [], "结论已落，批次已消费"
 
 
 async def test_flush_noop_when_nothing_done(ctx) -> None:

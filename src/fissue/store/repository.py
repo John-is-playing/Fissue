@@ -748,6 +748,109 @@ class Repository:
                 s.expunge(r)
             return rows
 
+    #: 条目被抢占为 ``running`` 后，超过这个秒数仍未收尾即视为**崩溃残留**，放回可 flush 池。
+    #: 见 :meth:`claim_unflushed`。
+    CLAIM_STALE_SECONDS = 3600
+
+    def claim_unflushed(self, queue: QueueName, *, limit: int = 50) -> list[QueueEntryRow]:
+        """原子地「挑出并抢占」已完成待定论的条目，返回**归本调用者**的那些。
+
+        为什么必须抢占：「挑（``flushed_at IS NULL``）→ 调 LLM → 标记已 flush」原先
+        之间没有任何互斥，两个写者会挑到同一批——daemon 的 ``_flush_loop`` 与同一进程里
+        uvicorn 的 ``/queues/flush``（`fissue daemon --web`），或独立 serve 进程与 CLI。
+        后果是同一批条目被送两次 LLM（重复计费）、平台标签被打两遍、``batch_conclusions``
+        落两条。
+
+        做法：把 ``status='done'`` 改成 ``'running'``，**逐行带条件更新并看 rowcount**，
+        只有真正抢到那一行（此刻仍是 done 且未 flush）的调用者才认领它。整个过程在一个
+        事务里，SQLite 与 PostgreSQL 的写锁语义都保证 rowcount 的判定是权威的。
+
+        ``synchronize_session=False`` 是刻意的：不让 SQLAlchemy 把 SET 值同步回内存对象
+        （那会把内存对象标脏，随后的 autoflush 会按主键无条件写回，绕过这里的条件判定）。
+        """
+        with self.db.session() as s:
+            self._release_stale_claims(s, queue)
+            rows = list(
+                s.scalars(
+                    select(QueueEntryRow)
+                    .where(
+                        and_(
+                            QueueEntryRow.queue == queue.value,
+                            QueueEntryRow.status == "done",
+                            QueueEntryRow.flushed_at.is_(None),
+                        )
+                    )
+                    .order_by(QueueEntryRow.finished_at.asc())
+                    .limit(limit)
+                )
+            )
+            claimed: list[QueueEntryRow] = []
+            for row in rows:
+                res = s.execute(
+                    update(QueueEntryRow)
+                    .where(
+                        and_(
+                            QueueEntryRow.id == row.id,
+                            QueueEntryRow.status == "done",
+                            QueueEntryRow.flushed_at.is_(None),
+                        )
+                    )
+                    .values(status="running", started_at=_now())
+                    .execution_options(synchronize_session=False)
+                )
+                if res.rowcount == 1:
+                    claimed.append(row)
+            for r in claimed:
+                s.expunge(r)
+            return claimed
+
+    def finish_flush_claim(
+        self,
+        *,
+        concluded_ids: Sequence[int] = (),
+        missing_ids: Sequence[int] = (),
+    ) -> None:
+        """收尾一次 flush 抢占：两边都回到 ``done``，只有拿到结论的落 ``flushed_at``。
+
+        缺结论的**不落** ``flushed_at``（下一轮 flush 还会看到它，可自愈），但必须回
+        ``done``——``queue_unflushed`` 只认 ``done``，停在 ``running`` 等于把条目永久藏起来。
+        handler 抛异常那种失败路径，就是 ``concluded_ids=()`` 的调用。
+        """
+        with self.db.session() as s:
+            if concluded_ids:
+                s.execute(
+                    update(QueueEntryRow)
+                    .where(QueueEntryRow.id.in_([int(i) for i in concluded_ids]))
+                    .values(status="done", flushed_at=_now())
+                )
+            if missing_ids:
+                s.execute(
+                    update(QueueEntryRow)
+                    .where(QueueEntryRow.id.in_([int(i) for i in missing_ids]))
+                    .values(status="done")
+                )
+
+    def _release_stale_claims(self, s: Session, queue: QueueName) -> None:
+        """把崩溃残留的 ``running`` 行放回 ``done``。
+
+        抢占之后进程被 kill（或断电）会让行停在 ``running`` 且未落 ``flushed_at``，而 flush
+        只认 ``done``——这些条目就再无人认领。超龄即放回：代价是「这一轮它被又跑了一次」，
+        好过「永久卡住」。
+        """
+        cutoff = _now() - timedelta(seconds=self.CLAIM_STALE_SECONDS)
+        s.execute(
+            update(QueueEntryRow)
+            .where(
+                and_(
+                    QueueEntryRow.queue == queue.value,
+                    QueueEntryRow.status == "running",
+                    QueueEntryRow.started_at.is_not(None),
+                    QueueEntryRow.started_at < cutoff,
+                )
+            )
+            .values(status="done", started_at=None)
+        )
+
     def mark_flushed(self, entry_ids: Sequence[int]) -> None:
         if not entry_ids:
             return
@@ -757,6 +860,33 @@ class Repository:
                 .where(QueueEntryRow.id.in_(list(entry_ids)))
                 .values(flushed_at=_now())
             )
+
+    def bump_queue_attempts(self, entry_ids: Sequence[int], *, max_attempts: int) -> list[int]:
+        """给「本轮没拿到结论」的条目 +1 次尝试数，返回其中**已达上限**的 id。
+
+        为什么要上限：某条目本轮没定论会被留在队里等下一轮 flush，这能自愈（模型偶发
+        漏项、被截断）。但对模型来说恒不可定论的条目（正文极长、次次撞 max_tokens），
+        无上限重试就是「每轮 flush 都白烧一次 token」。到顶后调用方把它落成显式
+        ``failed``——响亮地失败，比静默丢弃或无限重试都好。
+        """
+        if not entry_ids:
+            return []
+        ids = [int(i) for i in entry_ids]
+        with self.db.session() as s:
+            s.execute(
+                update(QueueEntryRow)
+                .where(QueueEntryRow.id.in_(ids))
+                .values(attempts=QueueEntryRow.attempts + 1)
+            )
+            rows = s.execute(
+                select(QueueEntryRow.id).where(
+                    and_(
+                        QueueEntryRow.id.in_(ids),
+                        QueueEntryRow.attempts >= max_attempts,
+                    )
+                )
+            ).all()
+            return [int(r[0]) for r in rows]
 
     def oldest_unflushed_age(self, queue: QueueName) -> float | None:
         """队首「完成但未 flush」条目距今秒数（用于空闲超时判定）。"""
@@ -983,7 +1113,15 @@ class Repository:
     # -- 通知 -------------------------------------------------------------
 
     def try_claim_notification(self, dedup_key: str, event: str, item_key: str, channel: str, payload: dict) -> bool:
-        """占用一个通知位（同 dedup_key 只发一次）。返回 True 表示本次应发送。"""
+        """占用一个通知位（同 dedup_key 只发一次）。返回 True 表示本次应发送。
+
+        **只有唯一键冲突**才等于「这一条已经发过」，其余异常一律抛出。原先这里是裸
+        ``except Exception: return False``，而调用方把 False 读成「已发过」并把该渠道记成
+        发送成功（见 ``service.notify.Notifier.notify``）——于是一次 SQLite
+        ``database is locked`` 就足以让这条告警**永久消失，还报成成功**。
+        """
+        from sqlalchemy.exc import IntegrityError
+
         with self.db.session() as s:
             row = NotificationRow(
                 event=event,
@@ -995,7 +1133,8 @@ class Repository:
             s.add(row)
             try:
                 s.flush()
-            except Exception:
+            except IntegrityError:
+                # uq_notification_dedup：这个 dedup_key 已被占过位 → 确实已发过
                 s.rollback()
                 return False
             return True

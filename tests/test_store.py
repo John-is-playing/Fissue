@@ -521,3 +521,102 @@ def test_summarize_averages(repo: Repository) -> None:
     stats = exp.summarize(repo)
     assert stats["total"] == 2
     assert stats["avg_scores"]["importance"] == pytest.approx(75.0)   # (70 + 80) / 2
+
+
+def test_summarize_applies_the_same_filters_as_detail(repo: Repository) -> None:
+    """概览必须套用与明细**相同**的过滤条件。
+
+    回归：`summarize` 原先只接 `repo_slug`，于是 `fissue export --status x` 产出的 JSON 里
+    `count`（已过滤）与 `summary.total`（全仓库）互相矛盾，Markdown 的「概览」与「明细」
+    条数也对不上——读者据此会得出错误结论。
+    """
+    from fissue.models import ItemStatus
+
+    _seed(repo, number=1)
+    other = _seed(repo, number=2)
+    repo.set_item_status(other.key, ItemStatus.NEEDS_MANUAL)
+
+    assert exp.summarize(repo)["total"] == 2
+    assert exp.summarize(repo, status=ItemStatus.NEW)["total"] == 1
+
+    payload = json.loads(exp.export_json(repo, status=ItemStatus.NEW))
+    assert payload["count"] == payload["summary"]["total"] == 1, "一份导出里两组数字必须一致"
+
+    md = exp.export_markdown(repo, status=ItemStatus.NEW)
+    assert "| 条目总数 | 1 |" in md, f"Markdown 概览要与明细同口径：{md[:200]}"
+
+
+# ---------------------------------------------------------------------------
+# 队列抢占（同批被两个写者各跑一次 LLM 的根因修复）
+# ---------------------------------------------------------------------------
+
+
+def test_claim_unflushed_is_exclusive(repo: Repository) -> None:
+    """一批条目只有第一个写者能抢到。"""
+    _seed(repo, number=31)
+    eid = repo.enqueue(QueueName.VERIFY, "github:psf/requests#31")
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    assert [r.id for r in repo.claim_unflushed(QueueName.VERIFY)] == [eid]
+    assert repo.claim_unflushed(QueueName.VERIFY) == [], "已被抢走的批次不该再次交出"
+
+
+def test_claim_unflushed_releases_crashed_claims(repo: Repository, monkeypatch) -> None:
+    """抢占后进程被 kill（行停在 running）要能放回，不能永久卡住。
+
+    用「把陈旧窗口设成负数」模拟超龄，避免依赖 SQLite 里 datetime 的存储格式。
+    """
+    _seed(repo, number=32)
+    eid = repo.enqueue(QueueName.VERIFY, "github:psf/requests#32")
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    assert [r.id for r in repo.claim_unflushed(QueueName.VERIFY)] == [eid]
+    assert repo.claim_unflushed(QueueName.VERIFY) == [], "未超龄的抢占不该被重复交出"
+
+    monkeypatch.setattr(repo, "CLAIM_STALE_SECONDS", -1)
+    assert [r.id for r in repo.claim_unflushed(QueueName.VERIFY)] == [eid], "超龄 running 要放回"
+
+
+def test_finish_flush_claim_semantics(repo: Repository) -> None:
+    """收尾：拿到结论的落 flushed_at 并回 done；缺结论的回 done 但**不落** flushed_at。"""
+    _seed(repo, number=33)
+    _seed(repo, number=34)
+    done_id = repo.enqueue(QueueName.VERIFY, "github:psf/requests#33")
+    miss_id = repo.enqueue(QueueName.VERIFY, "github:psf/requests#34")
+    for eid in (done_id, miss_id):
+        repo.finish_queue_entry(eid, status="done", result={})
+
+    assert {r.id for r in repo.claim_unflushed(QueueName.VERIFY)} == {done_id, miss_id}
+
+    repo.finish_flush_claim(concluded_ids=[done_id], missing_ids=[miss_id])
+
+    assert [r.id for r in repo.queue_unflushed(QueueName.VERIFY)] == [miss_id], "缺结论的要留待下轮"
+
+
+# ---------------------------------------------------------------------------
+# 通知去重
+# ---------------------------------------------------------------------------
+
+
+def test_notification_claim_only_unique_conflict_means_already_sent(repo: Repository) -> None:
+    """同一 dedup_key 第二次占位返回 False（真的发过了）。"""
+    assert repo.try_claim_notification("k1", "ev", "item", "console", {}) is True
+    assert repo.try_claim_notification("k1", "ev", "item", "console", {}) is False
+
+
+def test_notification_claim_does_not_swallow_db_errors(repo: Repository, monkeypatch) -> None:
+    """真正的库错误必须抛出。
+
+    回归：原先裸 ``except Exception: return False``，而调用方把 False 读成「已发过」并
+    把该渠道记成发送成功——一次 ``database is locked`` 就能让这条告警永久消失还报成功。
+    """
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session
+
+    def boom(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise OperationalError("INSERT INTO notifications", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(Session, "flush", boom)
+
+    with pytest.raises(OperationalError):
+        repo.try_claim_notification("k2", "ev", "item", "console", {})
