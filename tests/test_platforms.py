@@ -622,6 +622,28 @@ async def test_v5_create_pr_uses_bare_branch_for_same_repo(atomgit) -> None:
 
 
 @respx.mock
+async def test_v5_find_open_pr_matches_bare_branch_only(atomgit) -> None:
+    """v5 查已有 PR 也要用**裸分支名**，且**必须按分支核对**，不能拿列表第一条充数。
+
+    回归：v5 原先没有覆写 `find_open_pr`（基类默认返回 None），AtomGit 上于是永远查不到
+    已存在的 PR → 不走「复用」而直接强推 → 被 `--force-with-lease` 正确拦下，表现为
+    「推送失败」。
+    """
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": 9, "html_url": "u9", "head": {"ref": "other/branch"}},   # 不相干
+            {"number": 1, "html_url": "u1", "head": {"ref": "fix/x"}},          # 目标
+        ])
+    )
+
+    found = await atomgit.find_open_pr(
+        RepoRef(platform=Platform.ATOMGIT, owner="psf", name="requests"), head="psf:fix/x"
+    )
+
+    assert found == {"number": 1, "url": "u1"}, f"应命中目标分支那条：{found}"
+
+
+@respx.mock
 async def test_gitlab_fork_skips_when_repo_is_already_ours(gl) -> None:
     """仓库已在**自己的命名空间**下时不该再 fork —— GitLab 会 409。
 

@@ -426,6 +426,37 @@ class V5Adapter(PlatformAdapter):
             return RepoRef(platform=self.platform, owner=me, name=repo.name)
         return RepoRef(platform=self.platform, owner=owner, name=name or repo.name)
 
+    async def find_open_pr(self, upstream: RepoRef, *, head: str) -> dict[str, Any] | None:
+        """按 head 查已有 PR（含已关闭），没有则返回 None。
+
+        v5 原先**没有覆写**这个方法（基类默认返回 None），于是 Gitee / AtomGit 上永远查不到
+        已存在的 PR → 不走「复用已有 PR」而直接去强推 → 被 `--force-with-lease` 正确拦下，
+        表现为「推送失败」（实测 AtomGit）。
+
+        两个要点：**head 要裸分支名**（与 `create_pr` 同一个坑）；**必须按分支核对**——
+        平台若不支持 `head` 过滤参数，会把整张列表返回，拿第一条充数就会误报「已提 PR」。
+        """
+        owner_part, sep, branch_part = head.partition(":")
+        branch = branch_part if (sep and branch_part and owner_part.lower() == upstream.owner.lower()) else head
+        data = await self._get(
+            f"{self._repo_api(upstream)}/pulls",
+            head=branch,
+            state="all",
+            per_page=20,
+        )
+        for pr in data or []:
+            if not isinstance(pr, dict):
+                continue
+            pr_head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+            ref = str(pr_head.get("ref") or pr.get("source_branch") or "")
+            if ref and ref != branch:
+                continue                      # 不是这条分支 → 不能当作「已有 PR」
+            return {
+                "number": pr.get("number") or pr.get("iid") or pr.get("id"),
+                "url": pr.get("html_url") or pr.get("url"),
+            }
+        return None
+
     async def create_pr(
         self,
         upstream: RepoRef,
