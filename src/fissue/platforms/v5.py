@@ -402,6 +402,13 @@ class V5Adapter(PlatformAdapter):
         await self._patch(f"{self._repo_api(repo)}/issues/{number}", {"state": "closed"})
 
     async def fork_repo(self, repo: RepoRef) -> RepoRef:
+        # 项目**已经在自己名下**时不要再 fork —— 与 GitLab 是同一个坑（那边实测
+        # 409「Project namespace name已经被使用」）：仓库已在我们的命名空间里，
+        # 再 fork 等于要在同一命名空间建同名项目。返回仓库自身即可——
+        # `create_pr` 的 head 支持「同仓库 + 分支」形式。
+        me = await self.whoami()
+        if me and me.lower() == repo.owner.lower():
+            return RepoRef(platform=self.platform, owner=repo.owner, name=repo.name)
         data = await self._post(f"{self._repo_api(repo)}/forks", {})
         full_name = ""
         if isinstance(data, dict):
@@ -429,7 +436,14 @@ class V5Adapter(PlatformAdapter):
         body: str,
         draft: bool = False,
     ) -> dict[str, Any]:
-        head_ref = head if ":" in head else f"{upstream.owner}:{head}"
+        # AtomGit / Gitee 的建 PR 接口要**裸分支名**：调用方按 GitHub 习惯拼的
+        # `owner:branch` 会被拒（实测 AtomGit：`POST /pulls` 返回 400，**错误体还是空的**，
+        # 排查全靠拿真实分支逐个形状去试）。fork 场景的 `namespace/repo:branch` 带着
+        # 别的 owner，不能剥——只剥「前缀正好是上游 owner」那一种。
+        head_ref = head
+        owner_part, sep, branch_part = head.partition(":")
+        if sep and branch_part and owner_part.lower() == upstream.owner.lower():
+            head_ref = branch_part
 
         async def _probe() -> Any:
             """同一个 head 上已经有 PR → 返回它，绝不重复创建。"""
@@ -449,7 +463,7 @@ class V5Adapter(PlatformAdapter):
 
         data = await self._post(
             f"{self._repo_api(upstream)}/pulls",
-            {"title": title, "head": head, "base": base, "body": body, "draft": draft},
+            {"title": title, "head": head_ref, "base": base, "body": body, "draft": draft},
             probe=_probe,
         )
         if not isinstance(data, dict):

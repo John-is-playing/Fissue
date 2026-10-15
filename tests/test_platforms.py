@@ -542,6 +542,86 @@ async def test_gitlab_fetch_pr_populates_files(gl) -> None:
 
 
 @respx.mock
+async def test_atomgit_label_writes_use_form_and_patch(atomgit) -> None:
+    """AtomGit 的标签写接口与 Gitee 形状不同（实测两种都得对）：
+
+    * **建标签**：走 form 表单，且颜色**必须带 `#`**——JSON 体会报
+      `Required request parameter 'name'`，裸十六进制会报
+      `Color must be a valid color code`；
+    * **给条目打标签**：`POST /issues/{n}/labels`（JSON 与表单都试过）一律 400
+      `Request body parsing error`，正确做法是 **PATCH 条目自身**、
+      `labels` 传**逗号分隔的字符串**。
+    """
+    respx.get(f"{ATOMGIT}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    create = respx.post(f"{ATOMGIT}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(201, json={"name": "fissue", "color": "#0e8a16"})
+    )
+    patch = respx.patch(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"number": "7", "labels": []})
+    )
+
+    await atomgit.ensure_label(REPO, "fissue")
+    await atomgit.add_labels(REPO, 7, ["fissue", "ai-generated"])
+
+    req = create.calls[0].request
+    body = req.content.decode()
+    assert req.headers["content-type"].startswith("application/x-www-form-urlencoded")
+    assert "color=%230e8a16" in body, f"颜色必须带 #：{body}"
+    sent = patch.calls[0].request.content.decode()
+    assert "fissue" in sent and "ai-generated" in sent, f"labels 要逗号分隔地传：{sent}"
+
+
+@respx.mock
+async def test_v5_fork_skips_when_repo_is_already_ours(atomgit) -> None:
+    """v5（Gitee / AtomGit）在「仓库已在自己名下」时也不该 fork —— 与 GitLab 同一个坑。
+
+    仓库已在我们的命名空间里时，再 fork 等于要在同一命名空间里建同名项目。
+    返回仓库自身即可（`create_pr` 的 head 支持「同仓库 + 分支」）。
+    """
+    respx.get(f"{ATOMGIT}/user").mock(return_value=httpx.Response(200, json={"login": "psf"}))
+    fork_route = respx.post(f"{ATOMGIT}/repos/psf/requests/forks").mock(
+        return_value=httpx.Response(409, json={"message": "名称已经被使用"})
+    )
+
+    out = await atomgit.fork_repo(RepoRef(platform=Platform.ATOMGIT, owner="psf", name="requests"))
+
+    assert (out.owner, out.name) == ("psf", "requests"), "应当返回仓库自身"
+    assert not fork_route.called, "自己名下不该发 fork 请求"
+
+
+@respx.mock
+async def test_v5_create_pr_uses_bare_branch_for_same_repo(atomgit) -> None:
+    """AtomGit / Gitee 建 PR 要**裸分支名**。
+
+    回归：调用方按 GitHub 习惯拼的是 `owner:branch`，AtomGit 会 400 —— 而且**错误体为空**，
+    只能拿真实分支逐个形状去试才定位到。fork 的 `namespace/repo:branch` 不能剥。
+    """
+    import json as _json
+
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    create = respx.post(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(
+            201, json={"iid": 1, "html_url": "https://atomgit.com/psf/requests/pulls/1"}
+        )
+    )
+
+    await atomgit.create_pr(
+        RepoRef(platform=Platform.ATOMGIT, owner="psf", name="requests"),
+        head="psf:fix/x",
+        base="main",
+        title="t",
+        body="b",
+    )
+
+    body = _json.loads(create.calls[0].request.content.decode())
+    assert body["head"] == "fix/x", f"同仓库要发裸分支名，实际：{body['head']}"
+
+
+@respx.mock
 async def test_gitlab_fork_skips_when_repo_is_already_ours(gl) -> None:
     """仓库已在**自己的命名空间**下时不该再 fork —— GitLab 会 409。
 
