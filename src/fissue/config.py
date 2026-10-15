@@ -557,10 +557,10 @@ class Settings(BaseModel):
                 "建议现在就设置 FISSUE_API_TOKEN",
                 self.web.host,
             )
-        # 注意：「绑本机但 api.enabled 且无鉴权」的告警**不在这里发**。这里构造期就跑，
-        # 而 `fissue status --json` 之类的机器可读输出会与 stderr 混流（click 的
-        # CliRunner 默认 mix_stderr）——一句告警就能把 JSON 打坏。它改在真正开始服务
-        # 的地方发，见 `web.app.create_app`。
+        # 注意：「绑本机但 api.enabled 且无鉴权」的告警**不在这里发**：这里是每条命令都会
+        # 走的构造期路径，而那条告警讲的是「即将对外提供 API」，发在 `web.app.create_app`
+        # 更贴切。（它历史上还额外打坏过 `fissue status --json`——那是日志写到了 stdout
+        # 导致的，根因已在 `logging_setup` 修正：现在日志一律走 stderr。）
         return self
 
 
