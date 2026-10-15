@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import os
 import shutil
 import socket
@@ -46,8 +46,6 @@ from .protocol import (
     ExecRequest,
     ExecResult,
     MountSpec,
-    decode_from,
-    encode,
     recv_frame,
     request_from_dict,
     request_to_dict,
@@ -80,7 +78,7 @@ class Workspace:
         self._loop_device: str | None = None
         self._image_file: Path | None = None
 
-    def __enter__(self) -> "Workspace":
+    def __enter__(self) -> Workspace:
         self.create()
         return self
 
@@ -284,10 +282,8 @@ class ForwarderServer:
     def stop(self) -> None:
         self._stop.set()
         if self._sock is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._sock.close()
-            except OSError:
-                pass
             self._sock = None
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -315,10 +311,8 @@ class ForwarderServer:
     def _cleanup_socket(self) -> None:
         path = self.socket_path
         if os.name != "nt" and path and Path(path).exists():
-            try:
+            with contextlib.suppress(OSError):
                 Path(path).unlink()
-            except OSError:
-                pass
 
     def _serve_forever(self) -> None:
         assert self._sock is not None
@@ -344,10 +338,8 @@ class ForwarderServer:
         except Exception:  # pragma: no cover - 单个连接出错不该带走整个服务
             log.exception("处理请求失败")
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 conn.close()
-            except OSError:
-                pass
 
     def _handle(self, conn: socket.socket) -> None:
         payload = recv_frame(conn)

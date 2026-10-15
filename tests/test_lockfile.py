@@ -22,9 +22,8 @@ def test_single_flight_is_reentrant_in_one_process(settings) -> None:
     `flock` 是**按打开的文件描述符**计的，同进程再开一次真的会失败；所以这个用例
     守的是 `_hold_depth` 那层重入保护。
     """
-    with single_flight(settings, action="外层"):
-        with single_flight(settings, action="内层"):     # 不该抛
-            pass
+    with single_flight(settings, action="外层"), single_flight(settings, action="内层"):     # 不该抛
+        pass
 
 
 def test_lock_file_records_holder_pid(settings) -> None:
@@ -56,9 +55,8 @@ def test_lock_is_refused_when_another_process_holds_it(settings) -> None:
     try:
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "held", "子进程没能先拿到锁"
-        with pytest.raises(FissueError, match="正在别处运行"):
-            with single_flight(settings, action="测试"):
-                pass                                # pragma: no cover - 不该走到
+        with pytest.raises(FissueError, match="正在别处运行"), single_flight(settings, action="测试"):
+            pass                                # pragma: no cover - 不该走到
     finally:
         child.kill()
         child.wait(timeout=10)
@@ -86,9 +84,8 @@ async def test_write_gate_is_reentrant_for_the_same_task() -> None:
     from fissue.lockfile import WriteGate
 
     gate = WriteGate()
-    async with gate.hold_or_fail(action="外层循环"):
-        async with gate.hold_or_fail(action="内层 open"):    # 不该抛
-            pass
+    async with gate.hold_or_fail(action="外层循环"), gate.hold_or_fail(action="内层 open"):    # 不该抛
+        pass
     # 重入计数必须归零：否则之后谁都拿不到
     async with gate.hold_or_fail(action="之后"):
         pass

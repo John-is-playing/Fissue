@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
 from fissue.models import (
-    AuthorKind,
-    BatchConclusion,
     Category,
     Comment,
     DimensionScore,
     Evaluation,
-    FileChange,
     FixAttempt,
     FixOutcome,
     ItemStatus,

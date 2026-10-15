@@ -18,8 +18,9 @@ import hashlib
 import hmac
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import httpx
 
@@ -151,7 +152,7 @@ class DingTalkChannel(Channel):
         if not self.cfg.secret:
             return url
         ts = str(round(time.time() * 1000))
-        raw = f"{ts}\n{self.cfg.secret}".encode("utf-8")
+        raw = f"{ts}\n{self.cfg.secret}".encode()
         sign = base64.b64encode(hmac.new(self.cfg.secret.encode("utf-8"), raw, hashlib.sha256).digest())
         sep = "&" if "?" in url else "?"
         return f"{url}{sep}timestamp={ts}&sign={sign.decode()}"
@@ -194,7 +195,7 @@ class FeishuChannel(Channel):
             )
         if self.cfg.secret:
             ts = str(int(time.time()))
-            raw = f"{ts}\n{self.cfg.secret}".encode("utf-8")
+            raw = f"{ts}\n{self.cfg.secret}".encode()
             body["timestamp"] = ts
             body["sign"] = base64.b64encode(
                 hmac.new(raw, b"", hashlib.sha256).digest()

@@ -8,11 +8,11 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 from ..ai.client import BudgetGuard, LLMClient, Usage
 from ..ai.evaluator import Evaluator
@@ -52,7 +52,7 @@ class RuntimeContext:
     # -- 构造 -------------------------------------------------------------
 
     @classmethod
-    def create(cls, settings: Settings | None = None, *, overrides: dict[str, Any] | None = None) -> "RuntimeContext":
+    def create(cls, settings: Settings | None = None, *, overrides: dict[str, Any] | None = None) -> RuntimeContext:
         st = settings or load_settings(overrides=overrides)
         db = build_database(st)
         repo = Repository(db)
@@ -80,7 +80,7 @@ class RuntimeContext:
     @asynccontextmanager
     async def open(
         cls, settings: Settings | None = None, *, exclusive: bool = False, **kwargs: Any
-    ) -> AsyncIterator["RuntimeContext"]:
+    ) -> AsyncIterator[RuntimeContext]:
         """异步上下文：自动关闭 LLM 客户端与适配器。
 
         ``exclusive=True``：**整段持独占锁**（见 `fissue.lockfile`）。给「会写外部仓库」
@@ -112,10 +112,8 @@ class RuntimeContext:
 
     async def aclose(self) -> None:
         for adapter in self._adapters.values():
-            try:
+            with suppress(Exception):                    # pragma: no cover - 关不掉的适配器不该挡住退出
                 await adapter.aclose()
-            except Exception:  # pragma: no cover
-                pass
         self._adapters.clear()
         await self.llm.aclose()
 

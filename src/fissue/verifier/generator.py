@@ -15,13 +15,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 from ..ai import prompts
 from ..ai.client import LLMClient, Usage
 from ..config import Settings, VerifierConfig
 from ..logging_setup import get_logger
-from ..models import ItemType, RawItem, VerifierKind, VerifierSpec
+from ..models import RawItem, VerifierKind, VerifierSpec
 
 log = get_logger(__name__)
 
@@ -99,9 +99,8 @@ def validate_spec(spec: VerifierSpec) -> list[str]:
                 break
 
     # 3. 结构
-    if spec.kind.is_executable or spec.kind is VerifierKind.SHELL:
-        if not cmd.strip():
-            warnings.append("可执行验证器缺少 command")
+    if (spec.kind.is_executable or spec.kind is VerifierKind.SHELL) and not cmd.strip():
+        warnings.append("可执行验证器缺少 command")
     if spec.kind is VerifierKind.CHECKLIST and not spec.checklist:
         warnings.append("清单验证器缺少 checklist 条目")
 

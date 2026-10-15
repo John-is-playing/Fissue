@@ -20,7 +20,7 @@ import pytest
 
 from fissue import net
 from fissue.errors import LLMError, PlatformError
-from fissue.models import Platform, RepoRef
+from fissue.models import Platform
 from fissue.net import (
     ENV_CA_BUNDLE,
     ENV_INSECURE,
@@ -217,7 +217,7 @@ def test_ca_bundle_expands_user_home(tmp_path, monkeypatch: pytest.MonkeyPatch) 
     回归：``os.path.exists`` 不展开 ``~``，于是「在 .env 里写 ~/ca.pem」恒等于「文件不
     存在」——配合上一条的静默回退，用户完全看不出自己钉的证书压根没生效。
     """
-    pem = _write_self_signed_pem(tmp_path / "ca.pem")
+    _write_self_signed_pem(tmp_path / "ca.pem")
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv(ENV_CA_BUNDLE, "~/ca.pem")
     net.reset_cache()
@@ -505,13 +505,15 @@ def _builds_httpx_client(call: ast.Call) -> bool:
     """
     func = call.func
     # httpx.Client(...) / httpx.AsyncClient(...)
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        if func.value.id == "httpx" and func.attr in ("Client", "AsyncClient"):
-            return True
-    # from httpx import Client  →  Client(...)
-    if isinstance(func, ast.Name) and func.id in ("Client", "AsyncClient"):
+    if (
+        isinstance(func, ast.Attribute)
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "httpx"
+        and func.attr in ("Client", "AsyncClient")
+    ):
         return True
-    return False
+    # from httpx import Client  →  Client(...)
+    return isinstance(func, ast.Name) and func.id in ("Client", "AsyncClient")
 
 
 def _builds_httpx_shortcut(call: ast.Call) -> bool:

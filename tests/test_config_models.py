@@ -13,20 +13,16 @@ from fissue.models import (
     Action,
     AuthorKind,
     Category,
-    DimensionScore,
     Evaluation,
     ItemStatus,
-    ItemType,
     Platform,
     Priority,
     QueueName,
     RawItem,
     RepoRef,
-    Scores,
     VerifierKind,
     VerifierSpec,
 )
-
 
 # ---------------------------------------------------------------------------
 # 配置

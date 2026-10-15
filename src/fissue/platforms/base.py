@@ -11,17 +11,16 @@ import asyncio
 import random
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import httpx
 
-from ..config import RepoConfig
 from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
-from ..models import AuthorKind, FileChange, ItemType, Platform, RawItem, RepoRef
+from ..models import AuthorKind, ItemType, Platform, RawItem, RepoRef
 from ..net import httpx_verify, is_ssl_error, ssl_help_text
 
 log = get_logger(__name__)
@@ -373,7 +372,7 @@ class PlatformAdapter(ABC):
             await self._client.aclose()
             self._client = None
 
-    async def __aenter__(self) -> "PlatformAdapter":
+    async def __aenter__(self) -> PlatformAdapter:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -778,7 +777,7 @@ def guess_author_kind(
     name = (username or "").lower()
     if not name:
         return AuthorKind.UNKNOWN
-    label_set = {str(l).lower() for l in labels}
+    label_set = {str(label).lower() for label in labels}
     if any(k in label_set for k in ("ai-generated", "ai", "generated-by-ai", "fissue")):
         return AuthorKind.AI_AGENT
     body_lower = (body or "")[:2000].lower()

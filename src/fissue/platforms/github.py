@@ -11,7 +11,7 @@ from typing import Any
 
 from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
-from ..models import AuthorKind, Comment, FileChange, ItemType, Platform, RawItem, RepoRef
+from ..models import Comment, FileChange, ItemType, Platform, RawItem, RepoRef
 from .base import (
     PlatformAdapter,
     extract_linked_issues,
@@ -127,7 +127,7 @@ class GitHubAdapter(PlatformAdapter):
         number = str(payload["number"])
         title = payload.get("title") or ""
         body = payload.get("body") or ""
-        labels = [l.get("name", "") for l in payload.get("labels", []) if isinstance(l, dict)]
+        labels = [lb.get("name", "") for lb in payload.get("labels", []) if isinstance(lb, dict)]
         author = (payload.get("user") or {}).get("login", "")
 
         comments, comments_note = await self._fetch_comments(repo, number, limit=100)

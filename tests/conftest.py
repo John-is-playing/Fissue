@@ -11,10 +11,8 @@ LLM 用打桩客户端，平台适配器用 respx 拦截，数据库用临时 SQ
 from __future__ import annotations
 
 import asyncio
-import os
 import socket
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +34,10 @@ from fissue.models import (  # noqa: E402
     Platform,
     Priority,
     RawItem,
-    RepoRef,
     Scores,
 )
 from fissue.store.db import Database  # noqa: E402
 from fissue.store.repository import Repository  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # 全局网络守卫

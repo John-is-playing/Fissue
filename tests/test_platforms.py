@@ -10,6 +10,8 @@ import pytest
 import respx
 
 from fissue.models import AuthorKind, ItemType, Platform, RepoRef
+from fissue.platforms.base import extract_linked_issues, guess_author_kind, parse_dt
+from fissue.platforms.gitlab import GitLabAdapter, _norm_state
 from fissue.platforms.registry import (
     ADAPTERS,
     build_adapter,
@@ -17,8 +19,6 @@ from fissue.platforms.registry import (
     parse_repo_ref,
     resolve_repos,
 )
-from fissue.platforms.base import extract_linked_issues, guess_author_kind, parse_dt
-from fissue.platforms.gitlab import GitLabAdapter, _norm_state
 
 GH = "https://api.github.com"
 GITEE = "https://gitee.com/api/v5"
@@ -80,7 +80,9 @@ def test_parse_repo_ref_variants() -> None:
     assert parse_repo_ref("a/b", Platform.GITHUB).slug == "a/b"
     assert parse_repo_ref("gitee:a/b").platform is Platform.GITEE
     assert parse_repo_ref("atomgit:o/n").platform is Platform.ATOMGIT
-    with pytest.raises(Exception):
+    from fissue.errors import ConfigError
+
+    with pytest.raises(ConfigError):
         parse_repo_ref("invalid")
 
 

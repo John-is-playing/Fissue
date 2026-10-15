@@ -262,7 +262,6 @@ async def test_e2e_full_loop(e2e_ctx, repo, template_repo, monkeypatch) -> None:
     ctx.verifier.client = script
     ctx.evaluator.repo = repo
 
-    import fissue.fixer.agent as agent_mod
 
     # 让 FixAgent 用脚本 LLM
     ev_result = await EvalStage(ctx).run_batch([repo.get_item(key)])

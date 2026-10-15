@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 
@@ -17,11 +17,11 @@ from .main import (
     CONFIG_OPT,
     ENV_OPT,
     JSON_OPT,
-    LIMIT_OPT,
     PLATFORM_OPT,
     REPO_OPT,
     VERBOSE_OPT,
     app,
+    bench_app,
     emit,
     emit_json,
     fail,
@@ -29,9 +29,7 @@ from .main import (
     print_table,
     run_async,
     sandbox_app,
-    bench_app,
 )
-
 
 # ---------------------------------------------------------------------------
 # fix
@@ -41,15 +39,15 @@ from .main import (
 @app.command("fix")
 def fix(
     repo: list[str] = REPO_OPT,
-    platform: Optional[str] = PLATFORM_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    platform: str | None = PLATFORM_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     limit: int = typer.Option(5, "--limit", "-n", help="最多修复多少条"),
-    key: Optional[str] = typer.Option(None, "--key", help="只修复指定条目"),
+    key: str | None = typer.Option(None, "--key", help="只修复指定条目"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只产出补丁与报告，不提 PR"),
     plan: bool = typer.Option(False, "--plan", help="先让 AI 批量规划优先级再修"),
-    rounds: Optional[int] = typer.Option(None, "--rounds", help="Agent 循环最大轮次"),
+    rounds: int | None = typer.Option(None, "--rounds", help="Agent 循环最大轮次"),
     json_out: bool = JSON_OPT,
 ) -> None:
     """自动修复「低难度」Issue 并提 PR（fork → 分支 → PR，带 AI 标签）。"""
@@ -176,7 +174,7 @@ def _attempt_row(attempt, *, dry_run: bool = False) -> dict[str, Any]:
     }
 
 
-def _resolve_repos_safe(settings, repo: list[str], platform: Optional[str]):
+def _resolve_repos_safe(settings, repo: list[str], platform: str | None):
     """解析仓库；失败时回退到配置里的启用仓库。"""
     from ..platforms.registry import resolve_repos
 
@@ -200,11 +198,11 @@ def _resolve_repos_safe(settings, repo: list[str], platform: Optional[str]):
 @app.command("report")
 def report(
     repo: list[str] = REPO_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     fmt: str = typer.Option("markdown", "--format", "-f", help="markdown | json"),
-    out: Optional[str] = typer.Option(None, "--out", "-o", help="输出文件路径"),
+    out: str | None = typer.Option(None, "--out", "-o", help="输出文件路径"),
     limit: int = typer.Option(200, "--limit", help="最多输出多少条"),
     include_body: bool = typer.Option(False, "--with-body", help="包含正文"),
 ) -> None:
@@ -246,15 +244,15 @@ def _numbered(path: str, slug: str):
 
 @app.command("export")
 def export(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     fmt: str = typer.Option("json", "--format", "-f", help="json | markdown"),
-    out: Optional[str] = typer.Option(None, "--out", "-o", help="输出目录或文件"),
+    out: str | None = typer.Option(None, "--out", "-o", help="输出目录或文件"),
     repo: list[str] = REPO_OPT,
     limit: int = typer.Option(1000, "--limit", help="最多导出多少条"),
-    category: Optional[str] = typer.Option(None, "--category", help="过滤：bug/feature/unknown"),
-    status: Optional[str] = typer.Option(None, "--status", help="过滤：new/evaluated/verified/labeled…"),
+    category: str | None = typer.Option(None, "--category", help="过滤：bug/feature/unknown"),
+    status: str | None = typer.Option(None, "--status", help="过滤：new/evaluated/verified/labeled…"),
 ) -> None:
     """全量导出（含评测结论），默认写文件。"""
     settings = load_cfg(config, env, verbose=verbose)
@@ -303,8 +301,8 @@ def export(
 
 @app.command("status")
 def status(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     json_out: bool = JSON_OPT,
 ) -> None:
@@ -366,8 +364,8 @@ def status(
 @app.command("requeue")
 def requeue(
     repo: list[str] = REPO_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     stale: bool = typer.Option(False, "--stale", help="重排队「结论已过期、但修复已开工」的条目"),
     failed: bool = typer.Option(False, "--failed", help="重排队 failed 的条目（按已有结论回退到该走的下一步）"),
@@ -451,10 +449,10 @@ def requeue(
 
 @sandbox_app.command("serve")
 def sandbox_serve(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    socket: Optional[str] = typer.Option(None, "--socket", help="覆盖转发组件 socket 路径"),
+    socket: str | None = typer.Option(None, "--socket", help="覆盖转发组件 socket 路径"),
 ) -> None:
     """启动沙盒转发组件（宿主侧常驻，沙盒执行的唯一通道）。"""
     settings = load_cfg(config, env, verbose=verbose)
@@ -483,8 +481,8 @@ def sandbox_serve(
 
 @sandbox_app.command("check")
 def sandbox_check(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
 ) -> None:
     """检查沙盒环境是否就绪。"""
     settings = load_cfg(config, env)
@@ -510,8 +508,8 @@ def sandbox_check(
 
 @app.command("serve")
 def serve(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     once: bool = typer.Option(False, "--once", help="只跑一轮扫描就退出（适合 cron）"),
     with_web: bool = typer.Option(False, "--with-web", help="同时启动 Web/API"),
@@ -533,11 +531,11 @@ def serve(
 
 @app.command("web")
 def web(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    host: Optional[str] = typer.Option(None, "--host", help="监听地址"),
-    port: Optional[int] = typer.Option(None, "--port", help="监听端口"),
+    host: str | None = typer.Option(None, "--host", help="监听地址"),
+    port: int | None = typer.Option(None, "--port", help="监听端口"),
     reload: bool = typer.Option(False, "--reload", help="开发模式自动重载"),
 ) -> None:
     """启动 Web 仪表盘 + REST API。"""
@@ -580,12 +578,12 @@ def _bench_path(settings, label: str) -> Path:
 
 @bench_app.command("capture")
 def bench_capture(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    repo: Optional[str] = typer.Option(None, "--repo", "-r", help="只统计该仓库（owner/name）"),
+    repo: str | None = typer.Option(None, "--repo", "-r", help="只统计该仓库（owner/name）"),
     label: str = typer.Option("", "--label", help="基线名，如 ratekit-baseline；缺省用时间戳"),
-    out: Optional[str] = typer.Option(None, "--out", "-o", help="输出文件路径（默认 data/benchmarks/<label>.json）"),
+    out: str | None = typer.Option(None, "--out", "-o", help="输出文件路径（默认 data/benchmarks/<label>.json）"),
     json_out: bool = JSON_OPT,
 ) -> None:
     """冻结当前跑分基线（只读数据库，不触发抓取/评测）。
@@ -637,8 +635,8 @@ def bench_capture(
 def bench_diff(
     old: str = typer.Argument(..., help="旧基线文件"),
     new: str = typer.Argument(..., help="新基线文件"),
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     json_out: bool = JSON_OPT,
 ) -> None:
@@ -669,8 +667,8 @@ def bench_diff(
 
 @bench_app.command("list")
 def bench_list(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     json_out: bool = JSON_OPT,
 ) -> None:

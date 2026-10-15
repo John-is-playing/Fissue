@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
 from ..config import RepoConfig, Settings
 from ..errors import ConfigError

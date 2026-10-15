@@ -9,13 +9,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .errors import FissueError
 from .logging_setup import get_logger
@@ -62,7 +64,7 @@ class RepoWorkspace:
         token: str = "",
         dest: str | Path | None = None,
         default_branch: str = "main",
-    ) -> "RepoWorkspace":
+    ) -> RepoWorkspace:
         """浅克隆到临时目录。"""
         if dest is None:
             root = Path(tempfile.mkdtemp(prefix="fissue-repo-"))
@@ -122,7 +124,7 @@ class RepoWorkspace:
         except OSError as exc:  # pragma: no cover
             log.warning("清理工作区失败：%s", exc)
 
-    def __enter__(self) -> "RepoWorkspace":
+    def __enter__(self) -> RepoWorkspace:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -312,10 +314,8 @@ class RepoWorkspace:
                 r = self._git(["git", "apply", "--whitespace=nowarn", patch_file])
             return r.ok, self.sanitize(r.stderr or r.stdout)[:2000]
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 os.unlink(patch_file)
-            except OSError:
-                pass
 
     def diff(self, *, base: str | None = None, staged: bool = False) -> str:
         args = ["git", "--no-pager", "diff", "--no-color"]
@@ -485,7 +485,7 @@ class RepoWorkspace:
         result.stderr = self.sanitize(result.stderr)
         return result
 
-    def clone_url_of(self, clone_url: str, dest_name: str) -> "RepoWorkspace":  # pragma: no cover
+    def clone_url_of(self, clone_url: str, dest_name: str) -> RepoWorkspace:  # pragma: no cover
         """从当前工作区复制一份（多分支并行验证用）。"""
         target = self.root.parent / dest_name
         shutil.copytree(self.root, target, dirs_exist_ok=False)

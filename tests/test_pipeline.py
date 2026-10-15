@@ -886,7 +886,7 @@ def _spec():
 
 
 def _verifier_result(base_outcome, fix_outcome=None):
-    from fissue.models import VerifierKind, VerifierRun, VerifierResult
+    from fissue.models import VerifierKind, VerifierResult, VerifierRun
 
     base = VerifierRun(item_key="k", stage="base", outcome=base_outcome,
                        exit_code=0 if base_outcome.value == "pass" else 1)
@@ -1562,7 +1562,7 @@ async def test_process_repo_routes_feature_pr_to_pr_verify(ctx, repo, monkeypatc
     """
     from fissue.pipeline.stages import BatchResult, Pipeline, StageResult
 
-    pr = _seed_pr(repo, 71, category=Category.FEATURE)
+    _seed_pr(repo, 71, category=Category.FEATURE)
     calls = {"pr": 0}
 
     async def fake_eval(items, *, deep=False, concurrency=3):

@@ -23,7 +23,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from ..ai import prompts
 from ..ai.client import LLMClient, Usage
@@ -33,9 +33,7 @@ from ..logging_setup import get_logger
 from ..models import (
     FixAttempt,
     FixOutcome,
-    ItemStatus,
     RawItem,
-    VerifierOutcome,
     VerifierSpec,
 )
 from ..store.repository import Repository
@@ -678,6 +676,6 @@ class FixAgent:
 
 def branch_name(prefix: str, item: RawItem, *, salt: str = "") -> str:
     """生成分支名（可读 + 防冲突）。"""
-    digest = hashlib.sha1(f"{item.key}:{salt}".encode("utf-8")).hexdigest()[:6]
+    digest = hashlib.sha1(f"{item.key}:{salt}".encode()).hexdigest()[:6]
     slug = item.repo.split("/")[-1][:20]
     return f"{prefix}{item.number}-{slug}-{digest}"

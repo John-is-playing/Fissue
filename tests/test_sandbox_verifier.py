@@ -5,9 +5,6 @@ from __future__ import annotations
 import pytest
 
 from fissue.models import (
-    ItemType,
-    Platform,
-    RawItem,
     VerifierKind,
     VerifierOutcome,
     VerifierRun,
@@ -27,7 +24,6 @@ from fissue.sandbox.protocol import (
 )
 from fissue.verifier.generator import VerifierGenerator, _safe_relpath, validate_spec
 from fissue.verifier.runner import classify_outcome, judge_f2p, verifier_self_error
-
 
 # ---------------------------------------------------------------------------
 # 协议

@@ -31,7 +31,6 @@ from ..errors import VerifierError
 from ..logging_setup import get_logger
 from ..models import (
     ItemStatus,
-    ItemType,
     RawItem,
     VerifierKind,
     VerifierOutcome,
@@ -707,9 +706,7 @@ class VerifierRunner:
     def _persist(self, ctx: VerifyContext, result: VerifierResult, verifier_id: int | None) -> None:
         if verifier_id is not None:
             self.repo.set_verifier_f2p(verifier_id, result.f2p_satisfied)
-        if result.reproducible:
-            self.repo.set_item_status(ctx.item.key, ItemStatus.VERIFIED)
-        elif result.f2p_satisfied:
+        if result.reproducible or result.f2p_satisfied:
             self.repo.set_item_status(ctx.item.key, ItemStatus.VERIFIED)
 
     def _save_artifacts(self, item_key: str, stage: str, exec_result: Any) -> Path:

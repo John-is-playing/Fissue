@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from fissue.ai.client import extract_json, clamp01, clamp_score
+from fissue.ai.client import clamp01, clamp_score, extract_json
 from fissue.ai.evaluator import (
     Evaluator,
     apply_rule_adjustments,
@@ -19,7 +19,6 @@ from fissue.ai.evaluator import (
 )
 from fissue.config import ClassificationConfig, FixPolicyConfig
 from fissue.models import Action, Category, ItemType, Priority, RawItem
-
 
 # ---------------------------------------------------------------------------
 # JSON 提取
@@ -408,7 +407,6 @@ async def test_evaluator_falls_back_to_llm(settings, repo, stub_llm) -> None:
 
 
 async def test_evaluator_evaluate_saves_and_computes_priority(settings, repo, sample_issue, stub_llm) -> None:
-    from fissue.store.repository import Repository
 
     rid = repo.ensure_repo(__import__("fissue.models", fromlist=["RepoRef"]).RepoRef(
         platform=sample_issue.platform, owner="psf", name="requests"))

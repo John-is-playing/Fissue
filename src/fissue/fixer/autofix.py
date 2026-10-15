@@ -10,7 +10,8 @@
 
 安全细节
 --------
-* 推送用**一次性内嵌令牌的 URL**，绝不写入 git remote 配置，输出统一过 :meth:`sanitize`。
+* 推送用**不带令牌**的 URL，令牌经子进程环境变量 + 凭据助手递给 git（不进命令行、
+  不写入 git remote 配置），输出统一过 :meth:`sanitize`。
 * 分支名带内容指纹，避免重复推送冲突。
 * PR 描述明确标注「AI 自动生成 + 验证方式 + 验证结果」，不夸大。
 """
@@ -18,14 +19,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..ai import prompts
-from ..config import RepoConfig, Settings
-from ..errors import PolicyError, FissueError
+from ..config import RepoConfig
 from ..logging_setup import get_logger
 from ..models import (
     FixAttempt,
@@ -37,11 +38,11 @@ from ..models import (
     VerifierKind,
     VerifierSpec,
 )
+from ..pipeline.context import RuntimeContext
 from ..platforms.registry import parse_repo_ref
 from ..verifier.regression import REGRESSION_STAGE_BASE
 from ..verifier.runner import VerifyContext, judge_regression
 from ..workspace import GitError, RepoWorkspace
-from ..pipeline.context import RuntimeContext
 from .agent import AgentTrace, FixAgent, branch_name
 
 log = get_logger(__name__)
@@ -526,10 +527,8 @@ class AutoFixer:
             return attempt
         finally:
             if workspace is not None:
-                try:
+                with contextlib.suppress(Exception):      # pragma: no cover - 清理失败不影响结论
                     workspace.cleanup()
-                except Exception:  # pragma: no cover
-                    pass
 
     # -- 工作区 -----------------------------------------------------------
 

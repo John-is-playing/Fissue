@@ -16,12 +16,13 @@ import asyncio
 import json
 import random
 import re
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
 import httpx
 
-from ..config import BudgetConfig, LLMConfig, PricingConfig
+from ..config import BudgetConfig, LLMConfig
 from ..errors import BudgetExceeded, LLMError
 from ..logging_setup import get_logger
 from ..net import httpx_verify, is_ssl_error, ssl_help_text
@@ -186,7 +187,7 @@ class LLMClient:
             await self._client.aclose()
             self._client = None
 
-    async def __aenter__(self) -> "LLMClient":
+    async def __aenter__(self) -> LLMClient:
         return self
 
     async def __aexit__(self, *exc: Any) -> None:

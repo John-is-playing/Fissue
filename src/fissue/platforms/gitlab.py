@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
-from ..models import AuthorKind, Comment, FileChange, ItemType, Platform, RawItem, RepoRef
+from ..models import Comment, FileChange, ItemType, Platform, RawItem, RepoRef
 from .base import PlatformAdapter, extract_linked_issues, guess_author_kind, parse_dt
 
 log = get_logger(__name__)
@@ -160,7 +160,7 @@ class GitLabAdapter(PlatformAdapter):
         number = int(payload.get("iid") or payload.get("id") or 0)
         title = payload.get("title") or ""
         body = payload.get("description") or ""
-        labels = [str(l) for l in (payload.get("labels") or [])]
+        labels = [str(lb) for lb in (payload.get("labels") or [])]
         author = (payload.get("author") or {}).get("username", "")
 
         raw = RawItem(

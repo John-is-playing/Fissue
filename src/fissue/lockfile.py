@@ -17,8 +17,8 @@ import contextlib
 import errno
 import hashlib
 import os
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import AsyncIterator, Iterator
 
 from .config import Settings
 from .errors import FissueError
@@ -81,7 +81,7 @@ def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterat
         # 把持有者写进锁文件：拿不到锁的人由此能看到「是谁在跑」，便于判断。
         os.lseek(handle, 0, os.SEEK_SET)
         os.ftruncate(handle, 0)
-        os.write(handle, f"pid={os.getpid()}\n".encode("utf-8"))
+        os.write(handle, f"pid={os.getpid()}\n".encode())
         try:
             yield
         finally:

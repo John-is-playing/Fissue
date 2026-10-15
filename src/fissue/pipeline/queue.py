@@ -21,8 +21,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any
 
 from ..logging_setup import get_logger
 from ..models import Priority, QueueName

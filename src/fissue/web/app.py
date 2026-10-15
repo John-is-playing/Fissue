@@ -16,13 +16,13 @@ from __future__ import annotations
 
 import functools
 import ipaddress
-import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -412,7 +412,6 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
 
     @app.get(f"{prefix}/queues")
     async def queues(request: Request, _: None = Depends(auth)) -> dict[str, Any]:
-        from ..pipeline.context import RuntimeContext
         from ..pipeline.queue import QueueManager
 
         ctx = _ctx(request)

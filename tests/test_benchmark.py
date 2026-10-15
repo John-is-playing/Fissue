@@ -12,8 +12,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 from fissue import benchmark as bm
 from fissue.models import (
     Category,
@@ -32,7 +30,6 @@ from fissue.models import (
     VerifierRun,
     VerifierSpec,
 )
-
 
 # ---------------------------------------------------------------------------
 # 夹具
@@ -105,7 +102,6 @@ def test_git_state_survives_missing_repo(tmp_path: Path) -> None:
 
 def test_config_fingerprint_has_decision_fields_and_no_secrets(settings) -> None:
     """指纹要含判定口径字段，且**不得**把 api_key / 完整 base_url 写进去。"""
-    from fissue.config import Settings
 
     cfg = settings.model_copy(deep=True)
     cfg.llm.api_key = "sk-super-secret-value"
@@ -238,7 +234,7 @@ def test_save_load_roundtrip_writes_lf_and_utf8(tmp_path: Path) -> None:
 
     assert path.exists()
     raw = path.read_bytes()
-    assert "\r\n".encode() not in raw          # 不能出现 CRLF
+    assert b"\r\n" not in raw          # 不能出现 CRLF
     assert raw.endswith(b"\n")                 # 末尾换行（git diff 友好）
     assert json.loads(raw.decode("utf-8")) == rec
     assert bm.load(path) == rec

@@ -24,8 +24,6 @@ from fissue.models import (
     Category,
     DimensionScore,
     Evaluation,
-    FixAttempt,
-    FixOutcome,
     ItemStatus,
     ItemType,
     Platform,

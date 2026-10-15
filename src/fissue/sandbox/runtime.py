@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -29,7 +28,6 @@ from pathlib import Path
 from typing import Any
 
 from ..config import DEFAULT_LOCAL_ENV_ALLOWLIST, SandboxConfig
-from ..errors import SandboxError
 from ..logging_setup import get_logger
 from .protocol import ExecResult, MountSpec
 
@@ -377,9 +375,9 @@ class DockerRuntime:
         lowered = str(p).lower()
         if "windowsapps" in lowered:                       # 应用执行别名垫片
             return False
-        if p.parent.name.lower() == "system32" and p.name.lower() in ("bash.exe", "wsl.exe"):
-            return False
-        return True
+        return not (
+            p.parent.name.lower() == "system32" and p.name.lower() in ("bash.exe", "wsl.exe")
+        )
 
     # -- 进程封装 ---------------------------------------------------------
 

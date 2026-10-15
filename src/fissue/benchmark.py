@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from .logging_setup import get_logger
-from .models import FixOutcome, ItemStatus, ItemType, Platform, VerifierOutcome
+from .models import VerifierOutcome
 from .store.db import Database
 from .store.tables import (
     BatchConclusionRow,

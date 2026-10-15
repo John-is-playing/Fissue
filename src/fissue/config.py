@@ -376,7 +376,7 @@ class FixPolicyConfig(BaseModel):
         return v
 
     @model_validator(mode="after")
-    def _check_custom_tier(self) -> "FixPolicyConfig":
+    def _check_custom_tier(self) -> FixPolicyConfig:
         # custom 模式没有判定函数等于没有策略，配置期直接报错，别等到运行时才发现。
         if self.tier_strategy == "custom" and not (self.custom_tier or "").strip():
             raise ConfigError(
@@ -515,7 +515,7 @@ class Settings(BaseModel):
         return [r for r in self.repos if r.enabled]
 
     @model_validator(mode="after")
-    def _validate(self) -> "Settings":
+    def _validate(self) -> Settings:
         if not self.repos:
             # 空仓库列表是合法的（允许只用 CLI 临时指定仓库），不报错。
             pass

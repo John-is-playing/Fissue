@@ -18,8 +18,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from ..logging_setup import get_logger
 from ..models import (
@@ -141,7 +142,7 @@ class FlushProcessor:
             results = await self._label_all(
                 [(p["payload"], p["labels"]) for p in prepared]
             )
-            for p, (ok, err) in zip(prepared, results):
+            for p, (ok, err) in zip(prepared, results, strict=True):
                 if not p["labels"]:
                     continue
                 if ok:
@@ -267,7 +268,7 @@ class FlushProcessor:
             async with sem:
                 return await self._safe_label(payload, labels)
 
-        return list(await asyncio.gather(*(one(p, l) for p, l in items)))
+        return list(await asyncio.gather(*(one(p, labels) for p, labels in items)))
 
     def _repo_config_for(self, payload: dict[str, Any]) -> Any:
         """从队列载荷解析出仓库配置（未登记则按载荷里的平台临时构造）。"""
@@ -290,7 +291,7 @@ class FlushProcessor:
                 # 未登记仓库 + 载荷未带平台：沿用配置里的默认平台（与旧行为一致）
                 platform = self.ctx.settings.repos[0].platform if self.ctx.settings.repos else None
             if platform is None:
-                raise ValueError(f"无法确定仓库平台：{repo_slug}")
+                raise ValueError(f"无法确定仓库平台：{repo_slug}") from None
             return RepoConfig(platform=platform, owner=owner, name=name)
 
     async def _safe_label(self, payload: dict[str, Any], labels: list[str]) -> tuple[bool, str]:

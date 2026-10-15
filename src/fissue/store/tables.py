@@ -59,7 +59,7 @@ class RepoRow(Base):
     extra: Mapped[dict] = _json_col()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
-    items: Mapped[list["ItemRow"]] = relationship(back_populates="repo", cascade="all, delete-orphan")
+    items: Mapped[list[ItemRow]] = relationship(back_populates="repo", cascade="all, delete-orphan")
 
     __table_args__ = (UniqueConstraint("platform", "owner", "name", name="uq_repo_identity"),)
 
@@ -112,13 +112,13 @@ class ItemRow(Base):
     raw: Mapped[dict] = _json_col()
 
     repo: Mapped[RepoRow] = relationship(back_populates="items")
-    comments: Mapped[list["CommentRow"]] = relationship(
+    comments: Mapped[list[CommentRow]] = relationship(
         back_populates="item", cascade="all, delete-orphan"
     )
-    evaluations: Mapped[list["EvaluationRow"]] = relationship(
+    evaluations: Mapped[list[EvaluationRow]] = relationship(
         back_populates="item", cascade="all, delete-orphan"
     )
-    verifiers: Mapped[list["VerifierRow"]] = relationship(
+    verifiers: Mapped[list[VerifierRow]] = relationship(
         back_populates="item", cascade="all, delete-orphan"
     )
 
@@ -188,7 +188,7 @@ class VerifierRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     item: Mapped[ItemRow] = relationship(back_populates="verifiers")
-    runs: Mapped[list["VerifierRunRow"]] = relationship(
+    runs: Mapped[list[VerifierRunRow]] = relationship(
         back_populates="verifier", cascade="all, delete-orphan"
     )
 

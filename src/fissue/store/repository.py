@@ -6,8 +6,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from sqlalchemy import Select, and_, delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -864,10 +865,11 @@ class Repository:
                 .order_by(QueueEntryRow.enqueued_at.asc())
                 .limit(1)
             )
-            if self.db.is_sqlite:
-                stmt = stmt.with_for_update()
-            else:
-                stmt = stmt.with_for_update(skip_locked=True)
+            stmt = (
+                stmt.with_for_update()
+                if self.db.is_sqlite
+                else stmt.with_for_update(skip_locked=True)
+            )
             row = s.scalar(stmt)
             if row is None:
                 return None

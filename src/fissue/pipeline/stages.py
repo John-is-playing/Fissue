@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from ..logging_setup import get_logger
 from ..models import (
@@ -25,7 +26,6 @@ from ..models import (
     Evaluation,
     ItemStatus,
     ItemType,
-    Priority,
     QueueName,
     RawItem,
     VerifierKind,
@@ -33,8 +33,7 @@ from ..models import (
     VerifierResult,
     VerifierRun,
 )
-from ..sandbox.protocol import MountSpec
-from ..verifier.runner import CONTAINER_WORKDIR, VerifyContext, judge_regression
+from ..verifier.runner import VerifyContext, judge_regression
 from ..workspace import RepoWorkspace
 from .context import RuntimeContext
 from .queue import QueueManager

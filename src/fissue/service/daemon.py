@@ -23,21 +23,22 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import signal
-import time
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any, Sequence
+from typing import Any
 
 from ..config import RepoConfig, Settings
-from ..errors import BudgetExceeded, FissueError
+from ..errors import BudgetExceeded
 from ..logging_setup import get_logger
 from ..models import Category, ItemStatus, ItemType, Priority, QueueName, RawItem
 from ..pipeline.context import RuntimeContext
-from ..pipeline.fetcher import Fetcher, FetchStats
+from ..pipeline.fetcher import Fetcher
 from ..pipeline.flush import FlushProcessor
 from ..pipeline.queue import QueueManager
 from ..pipeline.stages import EvalStage
-from .notify import Notification, Notifier
+from .notify import Notifier
 
 log = get_logger(__name__)
 
@@ -172,10 +173,8 @@ class FissueService:
                 loop.add_signal_handler(sig, self.request_stop)
             except (NotImplementedError, AttributeError, ValueError):
                 # Windows 不支持 add_signal_handler → 退回 KeyboardInterrupt
-                try:
+                with contextlib.suppress(ValueError, OSError):  # pragma: no cover
                     signal.signal(sig, lambda *_: self.request_stop())
-                except (ValueError, OSError):  # pragma: no cover
-                    pass
 
     # -- 循环 -------------------------------------------------------------
 
@@ -233,10 +232,8 @@ class FissueService:
 
     async def _sleep(self, seconds: float) -> None:
         """可被停止事件唤醒的 sleep。"""
-        try:
+        with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self.stop_event.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            pass
 
     # -- 子流程 -----------------------------------------------------------
 

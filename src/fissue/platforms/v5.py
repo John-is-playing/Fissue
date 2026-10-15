@@ -6,13 +6,13 @@ Gitee 开放 API 与 AtomGit OpenAPI 的路径结构一致（``/repos/:owner/:re
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
-from ..models import Comment, FileChange, ItemType, Platform, RawItem, RepoRef
+from ..models import Comment, FileChange, ItemType, RawItem, RepoRef
 from .base import PlatformAdapter, extract_linked_issues, guess_author_kind, parse_dt
 
 log = get_logger(__name__)
@@ -21,11 +21,13 @@ log = get_logger(__name__)
 def _label_names(labels: Any) -> list[str]:
     """v5 的 labels 可能是字符串数组或对象数组。"""
     out: list[str] = []
-    for l in labels or []:
-        if isinstance(l, dict):
-            name = l.get("name") or l.get("title") or ""
-        else:
-            name = str(l)
+    for label in labels or []:
+        # 对象数组取 name/title，字符串数组直接 str——写成一行三元，省掉 if/else 分支
+        name = (
+            (label.get("name") or label.get("title") or "")
+            if isinstance(label, dict)
+            else str(label)
+        )
         if name:
             out.append(name)
     return out

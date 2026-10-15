@@ -25,17 +25,15 @@ from __future__ import annotations
 
 import asyncio
 import random
-import sys
 import time
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import typer
 
 from ..config import Settings, load_settings
 from ..errors import FissueError
 from ..logging_setup import get_logger, setup_logging
-from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
+from ..models import ItemStatus, ItemType, Platform, QueueName
 
 log = get_logger(__name__)
 
@@ -137,8 +135,8 @@ def print_table(rows: list[dict[str, Any]], columns: list[str], *, title: str | 
 
 @db_app.command("init")
 def db_init(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     drop: bool = typer.Option(False, "--drop", help="先删除所有表（危险）"),
 ) -> None:
@@ -161,8 +159,8 @@ def db_init(
 
 @db_app.command("check")
 def db_check(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
 ) -> None:
     """检查数据库连通性。"""
     settings = load_cfg(config, env)
@@ -186,7 +184,7 @@ def _open_ctx(settings: Settings):
     return RuntimeContext.create(settings)
 
 
-def _resolve_repos(settings: Settings, repo: list[str], platform: Optional[str]):
+def _resolve_repos(settings: Settings, repo: list[str], platform: str | None):
     """把 CLI 的 --repo / --platform 解析成 RepoConfig 列表。"""
     from ..platforms.registry import resolve_repos
 
@@ -217,12 +215,12 @@ LIMIT_OPT = typer.Option(None, "--limit", "-n", help="最多处理多少条")
 @app.command("fetch")
 def fetch(
     repo: list[str] = REPO_OPT,
-    platform: Optional[str] = PLATFORM_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    platform: str | None = PLATFORM_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
     full: bool = typer.Option(False, "--full", help="全量抓取（忽略增量游标）"),
-    limit: Optional[int] = LIMIT_OPT,
+    limit: int | None = LIMIT_OPT,
     concurrency: int = typer.Option(2, "--concurrency", help="并发仓库数"),
 ) -> None:
     """从平台抓取 Issue/PR（默认增量）。"""
@@ -256,11 +254,11 @@ def fetch(
 @app.command("eval")
 def evaluate(
     repo: list[str] = REPO_OPT,
-    platform: Optional[str] = PLATFORM_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    platform: str | None = PLATFORM_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    limit: Optional[int] = LIMIT_OPT,
+    limit: int | None = LIMIT_OPT,
     all_items: bool = typer.Option(False, "--all", help="评测所有未评测条目（而不只是新的）"),
     deep: bool = typer.Option(False, "--deep", help="对 PR 追加 diff 深度评审（更贵更准）"),
     concurrency: int = typer.Option(3, "--concurrency", help="并发评测数"),
@@ -271,9 +269,9 @@ def evaluate(
     repos = _resolve_repos(settings, repo, platform)
 
     async def main() -> int:
+        from ..models import ItemStatus as _S
         from ..pipeline.context import RuntimeContext
         from ..pipeline.stages import EvalStage
-        from ..models import ItemStatus as _S
 
         async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
@@ -327,16 +325,16 @@ def evaluate(
 @app.command("verify")
 def verify(
     repo: list[str] = REPO_OPT,
-    platform: Optional[str] = PLATFORM_OPT,
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    platform: str | None = PLATFORM_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    limit: Optional[int] = LIMIT_OPT,
-    key: Optional[str] = typer.Option(None, "--key", help="只验证指定条目，如 github:owner/name#12"),
-    concurrency: Optional[int] = typer.Option(
+    limit: int | None = LIMIT_OPT,
+    key: str | None = typer.Option(None, "--key", help="只验证指定条目，如 github:owner/name#12"),
+    concurrency: int | None = typer.Option(
         None, "--concurrency", help="条目级并发数（默认取 config.yaml 的 verifier.concurrency）"
     ),
-    retries: Optional[int] = typer.Option(
+    retries: int | None = typer.Option(
         None, "--retries", help="单条失败（如克隆/网络抖动）后的重试次数（默认取 verifier.item_retries）"
     ),
     json_out: bool = JSON_OPT,
@@ -350,9 +348,9 @@ def verify(
     settings = load_cfg(config, env, verbose=verbose, require_llm=True)
 
     async def main() -> int:
-        from ..pipeline.context import RuntimeContext
-        from ..pipeline.stages import VerifyStage, PRVerifyStage
         from ..models import Category as _C
+        from ..pipeline.context import RuntimeContext
+        from ..pipeline.stages import PRVerifyStage, VerifyStage
 
         async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
@@ -548,12 +546,7 @@ def _verify_progress(result, elapsed: float) -> str:
     kind = result.verifier_kind.value if result.verifier_kind else "-"
     if vr is None:
         return f"？  {result.key}（{kind}）无结果"
-    if vr.reproducible:
-        mark = "✅"
-    elif vr.f2p_satisfied:
-        mark = "✅"
-    else:
-        mark = "⚠️ "
+    mark = "✅" if vr.reproducible or vr.f2p_satisfied else "⚠️ "
     note = (result.notes[-1] if result.notes else vr.conclusion or "")[:40]
     return f"{mark} {result.key}（{kind}）复现={vr.reproducible} f2p={vr.f2p_satisfied} {note}"
 
@@ -565,10 +558,10 @@ def _verify_progress(result, elapsed: float) -> str:
 
 @app.command("flush")
 def flush(
-    config: Optional[str] = CONFIG_OPT,
-    env: Optional[str] = ENV_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
     verbose: bool = VERBOSE_OPT,
-    queue: Optional[str] = typer.Option(None, "--queue", help="只 flush 指定队列：verify/fix_bug/fix_feature"),
+    queue: str | None = typer.Option(None, "--queue", help="只 flush 指定队列：verify/fix_bug/fix_feature"),
     force: bool = typer.Option(True, "--force/--auto", help="手动强制 flush（默认）或按触发条件判断"),
     limit: int = typer.Option(50, "--limit", help="单批最多处理多少条"),
     json_out: bool = JSON_OPT,

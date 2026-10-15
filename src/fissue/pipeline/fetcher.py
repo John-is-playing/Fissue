@@ -11,14 +11,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Sequence
 
 from ..config import RepoConfig
-from ..errors import FissueError, PlatformError
+from ..errors import PlatformError
 from ..logging_setup import get_logger
-from ..models import ItemStatus, ItemType, RawItem
+from ..models import ItemType, RawItem
 from ..platforms.base import since_default
 from .context import RuntimeContext
 
@@ -44,7 +44,7 @@ class FetchStats:
     incomplete: bool = False
     incomplete_reasons: list[str] = field(default_factory=list)
 
-    def merge(self, other: "FetchStats") -> "FetchStats":
+    def merge(self, other: FetchStats) -> FetchStats:
         self.fetched += other.fetched
         self.created += other.created
         self.updated += other.updated
@@ -211,7 +211,7 @@ class Fetcher:
                 return await self.fetch_repo(r, full=full, limit=limit)
 
         results = await asyncio.gather(*(one(r) for r in repos), return_exceptions=True)
-        for r, res in zip(repos, results):
+        for r, res in zip(repos, results, strict=True):
             if isinstance(res, Exception):
                 total.error = f"{r.slug}: {res}"
                 log.error("抓取 %s 异常：%s", r.slug, res)
@@ -286,13 +286,13 @@ class Fetcher:
     @staticmethod
     def _accept(item: RawItem, repo: RepoConfig) -> bool:
         """按仓库配置过滤条目。"""
-        labels = {l.lower() for l in item.labels}
+        labels = {label.lower() for label in item.labels}
         if repo.labels_include:
-            wanted = {l.lower() for l in repo.labels_include}
+            wanted = {label.lower() for label in repo.labels_include}
             if not (labels & wanted):
                 return False
         if repo.labels_exclude:
-            unwanted = {l.lower() for l in repo.labels_exclude}
+            unwanted = {label.lower() for label in repo.labels_exclude}
             if labels & unwanted:
                 return False
         if repo.assignee and item.author.lower() != repo.assignee.lower():

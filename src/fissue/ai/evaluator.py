@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import importlib
 import re as _re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from ..config import ClassificationConfig, EvaluationConfig, FixPolicyConfig, FixTier, Settings
 from ..logging_setup import get_logger
@@ -34,7 +35,7 @@ from ..models import (
 )
 from ..store.repository import Repository
 from . import prompts
-from .client import LLMClient, Usage, clamp01, clamp_score, extract_json
+from .client import LLMClient, Usage, clamp01, clamp_score
 
 log = get_logger(__name__)
 
@@ -407,15 +408,6 @@ def apply_rule_adjustments(
         if any(m in text for m in question_markers) and evaluation.importance < th.importance_high:
             evaluation.action = Action.ANSWER
 
-    return evaluation
-
-
-def merge_checklist_result(evaluation: Evaluation, result: dict[str, Any]) -> Evaluation:
-    """把清单判定结果合并进评测（清单通过说明问题可复现）。"""
-    passed = bool(result.get("passed"))
-    conclusion = str(result.get("conclusion") or "")
-    if conclusion:
-        evaluation.summary = (evaluation.summary + "｜" + conclusion)[:4000]
     return evaluation
 
 

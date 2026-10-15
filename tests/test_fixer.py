@@ -7,12 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from fissue.config import load_settings
-from fissue.fixer.agent import FixAgent, AgentTrace, branch_name
+from fissue.fixer.agent import AgentTrace, FixAgent, branch_name
 from fissue.fixer.autofix import AutoFixer, FixReport, PRCreator
 from fissue.models import (
     Category,
-    DimensionScore,
     Evaluation,
     FixOutcome,
     ItemStatus,
@@ -21,7 +19,6 @@ from fissue.models import (
     Priority,
     RawItem,
     RepoRef,
-    Scores,
     VerifierKind,
     VerifierSpec,
 )
