@@ -1,0 +1,90 @@
+"""单实例锁：同一时刻只允许一个「会写外部仓库」的进程在跑。
+
+为什么需要：daemon 与 CLI 同跑（或两个 CLI 同跑）会重复评测（白烧 token），并在同一个
+SQLite 上互相写冲突。注意唯一键、确定性分支名与「只认 open 的复用」已经挡住了**重复条目
+与重复 PR**，但**重复花钱**和写冲突它们挡不住。
+
+为什么用文件锁而不是标记位 / pidfile：进程被 `kill -9` 时 `flock` 由内核释放，不会留下
+需要人工清理的陈旧锁；pidfile 会。
+
+锁的身份取自**数据库地址**：两个进程写同一个库才互斥，写不同库互不打扰。
+"""
+
+from __future__ import annotations
+
+import contextlib
+import errno
+import hashlib
+import os
+from pathlib import Path
+from typing import Iterator
+
+from .config import Settings
+from .errors import FissueError
+from .logging_setup import get_logger
+
+log = get_logger(__name__)
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows 上不存在
+    fcntl = None  # type: ignore[assignment]
+
+
+#: 进程内的持有深度。**同进程重入不该再去抢同一把锁**——`flock` 是按「打开的文件描述符」
+#: 计的，同一进程再开一次会真的失败，于是 daemon 的「外层循环 + 内层某操作」会把自己挡住。
+_hold_depth = 0
+
+
+def _lock_path(settings: Settings) -> Path:
+    """锁文件放数据目录，文件名带上库地址的短哈希。"""
+    key = hashlib.sha1(str(settings.database.url).encode("utf-8")).hexdigest()[:12]
+    return settings.data_dir / f"fissue-{key}.lock"
+
+
+@contextlib.contextmanager
+def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterator[None]:
+    """独占执行；拿不到锁**立即报错**，不排队、也不静默等待。"""
+    global _hold_depth
+
+    if _hold_depth:  # 本进程已经持有同一把锁 → 直接放行（重入，不重复抢）
+        _hold_depth += 1
+        try:
+            yield
+        finally:
+            _hold_depth -= 1
+        return
+
+    if fcntl is None:  # pragma: no cover - Windows
+        log.warning("当前平台没有 flock：跳过互斥（并发跑只会重复评测、白烧开销）")
+        yield
+        return
+
+    path = _lock_path(settings)
+    handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                raise
+            os.lseek(handle, 0, os.SEEK_SET)
+            holder = os.read(handle, 200).decode("utf-8", "replace").strip()
+            detail = f"（当前持有者：{holder}）" if holder else ""
+            raise FissueError(
+                f"{action}正在别处运行，本次不再并发执行{detail}。"
+                f"锁文件：{path}。同一时刻只允许一个会写仓库的进程——"
+                "请等它结束，或先停掉常驻服务（fissue daemon）。"
+            ) from exc
+        _hold_depth = 1
+        # 把持有者写进锁文件：拿不到锁的人由此能看到「是谁在跑」，便于判断。
+        os.lseek(handle, 0, os.SEEK_SET)
+        os.ftruncate(handle, 0)
+        os.write(handle, f"pid={os.getpid()}\n".encode("utf-8"))
+        try:
+            yield
+        finally:
+            _hold_depth = 0
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        os.close(handle)

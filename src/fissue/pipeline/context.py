@@ -78,13 +78,30 @@ class RuntimeContext:
 
     @classmethod
     @asynccontextmanager
-    async def open(cls, settings: Settings | None = None, **kwargs: Any) -> AsyncIterator["RuntimeContext"]:
-        """异步上下文：自动关闭 LLM 客户端与适配器。"""
+    async def open(
+        cls, settings: Settings | None = None, *, exclusive: bool = False, **kwargs: Any
+    ) -> AsyncIterator["RuntimeContext"]:
+        """异步上下文：自动关闭 LLM 客户端与适配器。
+
+        ``exclusive=True``：**整段持独占锁**（见 `fissue.lockfile`）。给「会写外部仓库」
+        的入口用（fetch / eval / verify / flush / fix / daemon 的一轮）——daemon 与 CLI
+        同跑会重复评测（白烧 token）并在同一个 SQLite 上互相写冲突，这两样唯一键和
+        「只认 open 的复用」都挡不住。**读命令不要加**：看板/`status` 不该被常驻服务挡住。
+        """
         ctx = cls.create(settings, **kwargs)
-        try:
-            yield ctx
-        finally:
-            await ctx.aclose()
+        if not exclusive:
+            try:
+                yield ctx
+            finally:
+                await ctx.aclose()
+            return
+        from ..lockfile import single_flight
+
+        with single_flight(ctx.settings, action="抓取/评测/修复"):
+            try:
+                yield ctx
+            finally:
+                await ctx.aclose()
 
     async def aclose(self) -> None:
         for adapter in self._adapters.values():

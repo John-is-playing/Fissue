@@ -61,7 +61,7 @@ def fix(
         from ..pipeline.context import RuntimeContext
         from ..pipeline.flush import FlushProcessor
 
-        async with RuntimeContext.open(settings) as ctx:
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
             fixer = AutoFixer(ctx)
             rows: list[dict[str, Any]] = []

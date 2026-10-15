@@ -233,7 +233,7 @@ def fetch(
         from ..pipeline.context import RuntimeContext
         from ..pipeline.fetcher import Fetcher
 
-        async with RuntimeContext.open(settings) as ctx:
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
             stats = await Fetcher(ctx).fetch_many(
                 repos, full=full, limit=limit, concurrency=concurrency
@@ -275,7 +275,7 @@ def evaluate(
         from ..pipeline.stages import EvalStage
         from ..models import ItemStatus as _S
 
-        async with RuntimeContext.open(settings) as ctx:
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
             stage = EvalStage(ctx)
             rows: list[dict[str, Any]] = []
@@ -354,7 +354,7 @@ def verify(
         from ..pipeline.stages import VerifyStage, PRVerifyStage
         from ..models import Category as _C
 
-        async with RuntimeContext.open(settings) as ctx:
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
             ok, reason = ctx.sandbox.available
             emit(f"沙盒：{reason}")
@@ -581,7 +581,7 @@ def flush(
         from ..pipeline.flush import FlushProcessor
         from ..pipeline.queue import QueueManager
 
-        async with RuntimeContext.open(settings) as ctx:
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
             qm = QueueManager(ctx)
             processor = FlushProcessor(ctx)

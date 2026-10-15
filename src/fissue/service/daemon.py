@@ -57,7 +57,7 @@ class FissueService:
         """跑完整的一轮：扫描 → 评测 → flush → 修复。"""
         from ..pipeline.context import RuntimeContext
 
-        async with RuntimeContext.open(self.settings) as ctx:
+        async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
             ctx.init_db()
             notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
             result: dict[str, Any] = {}
@@ -179,7 +179,7 @@ class FissueService:
         interval = max(10, self.settings.schedule.queue_flush_interval_seconds)
         while not self.stop_event.is_set():
             try:
-                async with RuntimeContext.open(self.settings) as ctx:
+                async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
                     notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
                     await self._flush_queues(ctx, notifier)
             except Exception:
@@ -194,7 +194,7 @@ class FissueService:
             if self.stop_event.is_set():
                 return
             try:
-                async with RuntimeContext.open(self.settings) as ctx:
+                async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
                     notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
                     await self._run_fixes(ctx, notifier)
             except Exception:
