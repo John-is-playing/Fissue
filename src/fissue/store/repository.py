@@ -82,6 +82,12 @@ def _material_differs(row: ItemRow, item: RawItem) -> bool:
     )
 
 
+def _has_stale_mark(raw: Any) -> bool:
+    """``raw`` 里有没有「结论已过期」的留痕（见 ``models.STALE_KEY``）。"""
+    marks = raw.get(STALE_KEY) if isinstance(raw, dict) else None
+    return isinstance(marks, list) and bool(marks)
+
+
 # 尚未进入后续流程的状态：批量定论可以把它们推进到 labeled。
 # 其余（fix_queued / fixing / pr_created / needs_manual / skipped / failed）表示
 # 已经走到了更靠后的环节，不应被「打标签」这一步回退覆盖。
@@ -500,6 +506,23 @@ class Repository:
 
     #: 队列行停在 ``pending`` 超过多久算「阶段中断残留」。见 :meth:`reclaim_stuck_queue_entries`。
     STUCK_QUEUE_ENTRY_SECONDS = 3600
+
+    def items_with_stale_conclusions(self, *, repo_slug: str | None = None) -> list[str]:
+        """列出「结论已过期、但当时已在执行」因而**没有自动重评**的条目 key。
+
+        这类条目只剩留痕（``RawItem.stale_reasons``）：内容实质变化时它们的修复已开工，
+        自动回落重评会给「重复修复 / 重复建 PR」再开一道口子（见 :meth:`_mark_conclusion_stale`），
+        所以留给人工显式重排队——入口是 ``fissue requeue --stale``。
+
+        只查「已在执行」的那几个状态（数量天然很小）再在 Python 里过滤留痕：
+        ``raw`` 是 JSON 列，跨 SQLite / PostgreSQL 的 JSON 查询写法不值得为这点量去写。
+        """
+        stmt = select(ItemRow).where(ItemRow.status.in_(sorted(IN_FLIGHT_STATUSES)))
+        if repo_slug:
+            stmt = stmt.where(ItemRow.repo_slug == repo_slug)
+        with self.db.session() as s:
+            rows = list(s.scalars(stmt))
+            return [str(r.key) for r in rows if _has_stale_mark(r.raw)]
 
     def reclaim_stuck_queue_entries(self, *, stale_seconds: int | None = None) -> list[str]:
         """回收「阶段中断」留下的队列残留，返回被放回重做的条目 key。

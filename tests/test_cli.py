@@ -138,6 +138,22 @@ def test_read_only_commands_do_not_require_llm_key(cli_env: dict[str, str]) -> N
     assert result.exit_code == 0, result.output
 
 
+def test_llm_commands_fail_fast_without_a_key(cli_env: dict[str, str]) -> None:
+    """要用 LLM 的命令缺 key 时**当场**报错，而不是跑到一半才炸。
+
+    覆盖面（都走 `load_cfg(..., require_llm=True)`）：`eval` / `verify` / `flush` / `fix` /
+    `serve`。`web` 刻意不在此列——只读浏览不该被 key 挡住。
+    这里用 `eval` 代表这一组：报错要指明怎么补 key。
+    """
+    Path(cli_env["env"]).write_text("FISSUE_LLM_API_KEY=\n", encoding="utf-8")
+
+    result = _run(["eval", "--limit", "1"], cli_env)
+
+    assert result.exit_code != 0, result.output
+    detail = f"{result.exception or ''}{result.output}"
+    assert "FISSUE_LLM_API_KEY" in detail, f"要说清怎么补 key：{detail[:200]}"
+
+
 def test_status_json_output(cli_env: dict[str, str]) -> None:
     result = _run(["status", "--json"], cli_env)
 
@@ -145,6 +161,51 @@ def test_status_json_output(cli_env: dict[str, str]) -> None:
     data = json.loads(result.output)
     assert set(data) >= {"repos_config", "sandbox", "items", "queues", "llm_usage_today"}
     assert "psf/requests" in data["repos_config"]
+
+
+def test_status_json_is_clean_in_a_real_process(cli_env: dict[str, str]) -> None:
+    """真进程里 `--json` 的 stdout 只能是 JSON——日志钻进去就立刻不可解析。
+
+    **为什么必须用子进程**：pytest 的 logging 插件会接管根日志器、把日志**捕获**掉，于是
+    进程内跑 CliRunner 根本看不到「日志进了 stdout」这件事，反而会掩盖这个 bug（先写错过
+    一版，就是这么假通过的）。
+
+    回归：`sandbox.runtime: local` 会在加载配置时发一条 WARNING，而 `RichHandler()` 默认
+    自建的 Console 落在 **stdout** 上（回退分支的 `StreamHandler` 才是 stderr），于是
+    ``json.loads(stdout)`` 直接 `JSONDecodeError`。
+    """
+    import os
+    import subprocess
+    import sys
+
+    cfg = Path(cli_env["config"])
+    data = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    data["sandbox"] = {"runtime": "local"}          # 触发那条 WARNING
+    cfg.write_text(yaml.safe_dump(data), encoding="utf-8")
+
+    repo_src = Path(__file__).resolve().parents[1] / "src"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from fissue.cli.ops import cli_main; cli_main()",
+            "status", "--json", "--config", cli_env["config"], "--env", cli_env["env"],
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "PYTHONPATH": str(repo_src),
+        },
+    )
+
+    assert proc.returncode == 0, f"退出码 {proc.returncode}，stderr：{proc.stderr[-500:]}"
+    assert "隔离性弱" not in proc.stdout, "告警不该出现在 stdout"
+    payload = json.loads(proc.stdout)               # 这句不能抛
+    assert "repos_config" in payload
+    assert "隔离性弱" in proc.stderr, "告警应当落在 stderr（否则这条用例是空转）"
 
 
 # ---------------------------------------------------------------------------
@@ -361,3 +422,95 @@ def test_fix_without_candidates_explains_why(cli_env: dict[str, str]) -> None:
     assert result.exit_code == 0, result.output
     assert "修复尝试 0" in result.output
     assert "没有可自动修复的条目" in result.output, result.output
+
+
+# ---------------------------------------------------------------------------
+# requeue：把「只能人工放行」的条目放回流水线
+# ---------------------------------------------------------------------------
+
+
+def _cli_repo(env: dict[str, str]):
+    """打开 CLI 用例那份库（用例里直接改状态用）。"""
+    from fissue.config import load_settings
+    from fissue.store.db import build_database
+    from fissue.store.repository import Repository
+
+    settings = load_settings(env["config"], env["env"])
+    db = build_database(settings)
+    db.create_all()
+    return Repository(db)
+
+
+def test_requeue_requires_a_selector(cli_env: dict[str, str]) -> None:
+    """什么也不指定时要把「能选什么」说清楚，而不是闷头退出。"""
+    result = _run(["requeue"], cli_env)
+
+    assert result.exit_code != 0
+    assert "--stale" in result.output and "--failed" in result.output
+
+
+def test_requeue_stale_puts_item_back(cli_env: dict[str, str]) -> None:
+    """`requeue --stale`：内容变了、结论过期、但修复已开工的条目，由人工放回重评。
+
+    这类条目此前**没有任何入口**：自动回落重评会给「重复修复 / 重复建 PR」再开一道口子，
+    所以那里只留了痕（`stale_reasons`，导出与 API 看得到）。
+    """
+    from fissue.models import ItemStatus, ItemType, Platform, RawItem, RepoRef
+
+    key = _seed(cli_env["config"], cli_env["env"])          # 已评测（evaluated）
+    repo = _cli_repo(cli_env)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.set_item_status(key, ItemStatus.FIXING)            # 修复已开工
+    repo.upsert_item(                                       # 正文变了 → 结论作废，但只留痕
+        rid,
+        RawItem(platform=Platform.GITHUB, repo="psf/requests", number=42,
+                item_type=ItemType.ISSUE, title="程序崩溃", body="boom 改过了",
+                labels=["bug"], author="reporter"),
+    )
+    assert repo.get_item(key).stale_reasons, "前置：应当已留痕"
+    assert repo.get_item_row(key).status == ItemStatus.FIXING.value, "前置：已开工不自动回落"
+
+    result = _run(["requeue", "--stale", "--yes"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "已重排队 1 条" in result.output
+    assert repo.get_item_row(key).status == ItemStatus.NEW.value, "应当放回重评"
+
+
+def test_requeue_failed_falls_back_by_evidence(cli_env: dict[str, str]) -> None:
+    """`requeue --failed`：按已有结论决定回退到哪一步。
+
+    有评测 → `evaluated`（重跑验证）；尚无评测 → `new`（重跑评测）。此前只能逐条
+    `fissue verify --key` 去捞失败条目。
+    """
+    from fissue.models import ItemStatus, ItemType, Platform, RawItem, RepoRef
+
+    evaluated_key = _seed(cli_env["config"], cli_env["env"])     # 42：已有评测
+    repo = _cli_repo(cli_env)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    plain = RawItem(platform=Platform.GITHUB, repo="psf/requests", number=43,
+                    item_type=ItemType.ISSUE, title="另一条", body="b")
+    repo.upsert_item(rid, plain)
+    repo.set_item_status(evaluated_key, ItemStatus.FAILED)
+    repo.set_item_status(plain.key, ItemStatus.FAILED)
+
+    result = _run(["requeue", "--failed", "--yes"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert repo.get_item_row(evaluated_key).status == ItemStatus.EVALUATED.value, "有结论的只重跑验证"
+    assert repo.get_item_row(plain.key).status == ItemStatus.NEW.value, "没有结论的重跑评测"
+
+
+def test_requeue_dry_run_changes_nothing(cli_env: dict[str, str]) -> None:
+    """`--dry-run` 只列计划，不改状态。"""
+    from fissue.models import ItemStatus
+
+    key = _seed(cli_env["config"], cli_env["env"])
+    repo = _cli_repo(cli_env)
+    repo.set_item_status(key, ItemStatus.FAILED)
+
+    result = _run(["requeue", "--failed", "--dry-run"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "未改动" in result.output
+    assert repo.get_item_row(key).status == ItemStatus.FAILED.value, "dry-run 不许动状态"

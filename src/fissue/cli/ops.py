@@ -359,6 +359,92 @@ def status(
 
 
 # ---------------------------------------------------------------------------
+# requeue
+# ---------------------------------------------------------------------------
+
+
+@app.command("requeue")
+def requeue(
+    repo: list[str] = REPO_OPT,
+    config: Optional[str] = CONFIG_OPT,
+    env: Optional[str] = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+    stale: bool = typer.Option(False, "--stale", help="重排队「结论已过期、但修复已开工」的条目"),
+    failed: bool = typer.Option(False, "--failed", help="重排队 failed 的条目（按已有结论回退到该走的下一步）"),
+    limit: int = typer.Option(100, "--limit", help="最多处理多少条"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只列出要做什么，不改状态"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="不询问确认"),
+) -> None:
+    """把「只能人工放行」的条目放回流水线。
+
+    两种此前没有入口的情况：
+
+    * ``--stale``：条目内容**实质变化**后结论已过期，但当时它的修复已开工
+      （``fix_queued`` / ``fixing`` / ``pr_created``）。自动回落重评会给「重复修复 /
+      重复建 PR」再开一道口子，所以那里只留了痕（``RawItem.stale_reasons``，导出与 API
+      都看得到），由人工确认后放到这里。
+    * ``--failed``：状态为 ``failed`` 的条目（评测 / 验证 / 修复中途异常）。此前只能逐条
+      ``fissue verify --key`` 去捞。回退目标按**已有结论**决定：已有评测 → ``evaluated``
+      （重跑验证这一步），尚无评测 → ``new``（重跑评测）。
+
+    两者都会**重新走一遍后续流程**，所以默认先列出计划再询问确认（``--dry-run`` 只看不改）。
+    """
+    if not stale and not failed:
+        fail("请指定要重排队什么：--stale（结论过期但修复已开工）或 --failed（失败条目）")
+
+    settings = load_cfg(config, env, verbose=verbose)
+    slugs = list(repo or []) or [r.slug for r in settings.enabled_repos()]
+    if not slugs:
+        fail("没有可处理的仓库：请用 --repo 指定或在 config.yaml 中登记")
+
+    async def main() -> int:
+        from ..pipeline.context import RuntimeContext
+
+        # 改的是流水线状态，与 fetch / eval / verify / fix 一样走独占执行
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
+            ctx.init_db()
+            plan: list[tuple[str, ItemStatus, str]] = []          # (key, 目标状态, 说明)
+
+            for slug in slugs:
+                if stale:
+                    for key in ctx.repo.items_with_stale_conclusions(repo_slug=slug):
+                        plan.append((key, ItemStatus.NEW, "结论过期（内容已变），重评"))
+                if failed:
+                    for item in ctx.repo.list_items(
+                        repo_slug=slug, status=ItemStatus.FAILED, limit=limit
+                    ):
+                        has_eval = ctx.repo.latest_evaluation(item.key) is not None
+                        plan.append(
+                            (
+                                item.key,
+                                ItemStatus.EVALUATED if has_eval else ItemStatus.NEW,
+                                "失败重试：重跑验证" if has_eval else "失败重试：重跑评测",
+                            )
+                        )
+
+            plan = plan[:limit]
+            if not plan:
+                emit("（没有需要重排队的条目）")
+                return 0
+
+            for key, target, why in plan:
+                emit(f"  {key} → {target.value}　{why}")
+            if dry_run:
+                emit(f"（--dry-run：以上 {len(plan)} 条未改动）", style="yellow")
+                return 0
+            if not yes and not typer.confirm(f"确认把以上 {len(plan)} 条放回流水线？", default=False):
+                emit("已取消（未改动任何条目）", style="yellow")
+                return 0
+
+            for key, target, _why in plan:
+                ctx.repo.set_item_status(key, target)
+            emit(f"✅ 已重排队 {len(plan)} 条", style="green")
+        return 0
+
+    run_async(main())
+
+
+# ---------------------------------------------------------------------------
 # sandbox serve
 # ---------------------------------------------------------------------------
 

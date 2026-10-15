@@ -703,6 +703,24 @@ def test_stale_mark_sticks_until_reeval(repo: Repository) -> None:
     assert repo.get_item(key).stale_reasons == [], "重新出了结论就不再过期"
 
 
+def test_items_with_stale_conclusions_only_lists_in_flight(repo: Repository) -> None:
+    """只列「结论已过期**且**已在执行」的条目。
+
+    已回落成 `new` 的会自己重评，不必列；内容没变过的更不该列。
+    """
+    pending = _seed(repo, number=71)        # 未评测：变了也会自动重评
+    fixing = _seed(repo, number=72)         # 修复已开工：只留痕，需要人工放行
+    untouched = _seed(repo, number=73)
+    repo.set_item_status(fixing.key, ItemStatus.FIXING)
+    repo.set_item_status(untouched.key, ItemStatus.FIXING)
+
+    _upsert_variant(repo, pending, body="改过")
+    _upsert_variant(repo, fixing, body="改过")
+
+    assert repo.items_with_stale_conclusions() == [fixing.key]
+    assert repo.items_with_stale_conclusions(repo_slug="other/repo") == [], "按仓库过滤"
+
+
 # ---------------------------------------------------------------------------
 # 评论残缺：不得覆盖已入库的讨论
 # ---------------------------------------------------------------------------
