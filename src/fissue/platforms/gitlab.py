@@ -106,6 +106,7 @@ class GitLabAdapter(PlatformAdapter):
         state: str = "all",
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
+        self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
         count = 0
         state_param = {"all": "all", "open": "opened", "closed": "closed"}.get(state, state)
 
@@ -124,8 +125,9 @@ class GitLabAdapter(PlatformAdapter):
                         yield await self._build_item(repo, payload, ItemType.ISSUE)
                     except RateLimitError:
                         raise
-                    except PlatformError as exc:
-                        log.warning("[gitlab] 构造 Issue 失败 #%s：%s", payload.get("iid"), exc)
+                    except Exception as exc:
+                        # 单条数据本身的问题不该拖垮整批（原先只接 PlatformError）。
+                        self._note_build_failure("Issue", payload.get("iid"), exc)
                         continue
                     count += 1
                     if limit is not None and count >= limit:
@@ -146,8 +148,9 @@ class GitLabAdapter(PlatformAdapter):
                         yield await self._build_item(repo, payload, ItemType.PR)
                     except RateLimitError:
                         raise
-                    except PlatformError as exc:
-                        log.warning("[gitlab] 构造 MR 失败 #%s：%s", payload.get("iid"), exc)
+                    except Exception as exc:
+                        # 同 Issue 侧：单条数据的问题不该拖垮整批。
+                        self._note_build_failure("MR", payload.get("iid"), exc)
                         continue
                     count += 1
                     if limit is not None and count >= limit:

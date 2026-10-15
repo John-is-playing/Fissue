@@ -126,6 +126,7 @@ class V5Adapter(PlatformAdapter):
         state: str = "all",
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
+        self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
         count = 0
 
         # Issue
@@ -150,8 +151,12 @@ class V5Adapter(PlatformAdapter):
                         yield item
                     except RateLimitError:
                         raise
-                    except PlatformError as exc:
-                        log.warning("[%s] 构造条目失败 #%s：%s", self.platform.value, payload.get("number"), exc)
+                    except Exception as exc:
+                        # 单条数据本身的问题不该拖垮整批——实测 Gitee 的 Issue 编号是
+                        # 字母编码，`int('IKM265')` 抛的是 ValueError，它漏过原先只接
+                        # PlatformError 的处理器，**中止了整个仓库的抓取**。
+                        # 跳过它并计数，由调用方判本轮数据不完整、不推进游标。
+                        self._note_build_failure("条目", payload.get("number"), exc)
                         continue
                     count += 1
                     if limit is not None and count >= limit:
@@ -170,8 +175,9 @@ class V5Adapter(PlatformAdapter):
                         yield await self._build_item(repo, detail, ItemType.PR)
                     except RateLimitError:
                         raise
-                    except PlatformError as exc:
-                        log.warning("[%s] 构造 PR 失败 #%s：%s", self.platform.value, number, exc)
+                    except Exception as exc:
+                        # 同 Issue 侧：单条数据的问题不该拖垮整批（只接 PlatformError 会漏掉）。
+                        self._note_build_failure("PR", number, exc)
                         continue
                     count += 1
                     if limit is not None and count >= limit:
@@ -451,8 +457,11 @@ class V5Adapter(PlatformAdapter):
                 continue
             pr_head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
             ref = str(pr_head.get("ref") or pr.get("source_branch") or "")
-            if ref and ref != branch:
-                continue                      # 不是这条分支 → 不能当作「已有 PR」
+            if ref != branch:
+                # 平台没给分支字段（`ref` 为空）时**不能拿列表第一条充数**——那会谎报
+                # 「已有 PR」，让 `submit` 跳过推送却记成功。宁可查不到：查不到就去推，
+                # 推不动会被 `--force-with-lease` **响亮**拦下，比假装成功好。
+                continue
             return {
                 "number": pr.get("number") or pr.get("iid") or pr.get("id"),
                 "url": pr.get("html_url") or pr.get("url"),

@@ -88,6 +88,7 @@ class GitHubAdapter(PlatformAdapter):
         state: str = "all",
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
+        self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
         # /issues 会同时返回 issue 与 PR（PR 带 pull_request 字段），一次拉全量最省配额
         url = f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues"
         params: dict[str, Any] = {
@@ -111,8 +112,11 @@ class GitHubAdapter(PlatformAdapter):
                     # 限流绝不能吞：吞掉就等价于「这条条目不存在」，而游标照推，
                     # 于是它再也不会被增量抓取碰到（除非 --full）。
                     raise
-                except PlatformError as exc:
-                    log.warning("[github] 构造条目失败 #%s：%s", payload.get("number"), exc)
+                except Exception as exc:
+                    # 单条数据本身的问题不该拖垮整批（原先只接 PlatformError，
+                    # 别的异常会中止整个仓库的抓取）。跳过它，但**记一笔**——
+                    # 调用方据此判本轮数据不完整、不推进游标，条目不会就此消失。
+                    self._note_build_failure("条目", payload.get("number"), exc)
                     continue
                 yield item
                 count += 1

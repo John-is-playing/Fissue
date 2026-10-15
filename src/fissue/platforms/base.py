@@ -311,6 +311,26 @@ class PlatformAdapter(ABC):
     web_host: str = ""          # 例：github.com
     token_user: str = "oauth2"  # 带 token 的 HTTPS 用户名约定
 
+    #: 本轮抓取里因「单条构造失败」被跳过的条目数。适配器在 `fetch_items` 开头清零、
+    #: 每跳一条加一；调用方读到非零就把本轮记为**数据不完整 → 不推进游标**。
+    #: 为什么必须配「不推进游标」：跳过的条目若游标照推，就再也不会被增量抓到
+    #: （除非 `--full`）——那等于把「响亮的失败」换成「静默丢条目」。
+    skipped_build_failures: int = 0
+
+    def _note_build_failure(self, kind: str, ident: Any, exc: BaseException) -> None:
+        """记一处「单条构造失败」：本轮跳过该条目，并让整批记为数据不完整。
+
+        **不能只接 `PlatformError`**：实测 Gitee 的 Issue 编号是字母编码，
+        `int('IKM265')` 抛的是 `ValueError`，它漏过原有处理器，**中止了整个仓库的抓取**
+        （那一次一条都没落地）。凡是单条数据本身的问题，都不该拖垮整批。
+        """
+        import logging
+
+        self.skipped_build_failures += 1
+        logging.getLogger(__name__).warning(
+            "[%s] 构造%s失败 %s：%s", self.platform.value, kind, ident, exc
+        )
+
     def clone_url(self, repo: RepoRef, *, use_token: bool = False) -> str:
         """HTTPS 克隆地址；``use_token`` 为真时内嵌令牌（仅用于本地 git 操作，勿打印）。"""
         if not self.web_host:

@@ -1020,3 +1020,21 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
 `qiaoen_python/fissue-write-probe`（AtomGit）、`ccqtp/fissue-write-probe`（Gitee）。
 都是 **Private**、对外零可见，且各自带着一条真 PR——下次验写操作**可直接复用**，
 重建一次的代价不低。要删随时可删（`atomgit_repo delete` 或平台 UI）。
+
+**同日的 P0/P1 审计与修复**（按「安全/审批边界、数据完整性、崩溃即中止」三类定向查）：
+
+* **P0（已修，fail-open → fail-safe）**：`api.enabled=true` + `web.host` 对外可达 + 无鉴权，
+  原先是能同时成立的——而 `/api/*` 里带着**会写外部仓库**的路由（`/api/flush` 会真去平台上
+  打标签、把条目推进修复队列）。仅有的保险是「设了 `FISSUE_API_TOKEN` 才自动开鉴权」，
+  于是按常见做法放进反向代理（或改 `WEB_HOST`）就等于**把写操作入口对外开放**。
+  现改为在 `_validate` 里拒绝启动；**只绑本机不受影响**；`config.example.yaml` 补了说明。
+* **P1-2（已修）**：抓取的单条隔离原先**只接 `PlatformError`** —— Gitee 那次 `int('IKM265')`
+  抛的是 `ValueError`，漏过处理器、**中止了整个仓库的抓取**（一条都没落地）。现在三个适配器
+  （GitHub / v5 / GitLab，含 PR/MR 侧共 5 处）放宽为 `Exception` + 计数；fetcher 读到非零就记为
+  **数据不完整 → 不推进游标**（配套，免得把「响亮的失败」换成「静默丢条目」）。
+* **P1-1（未修，设计已定）**：**没有并发互斥**（`flock`/`pidfile` 零命中）。挂载点：
+  `service/daemon.py` 的 `run_once` / `_scan_loop` / `_flush_loop` / `_fix_loop`，以及
+  `cli/ops.py` 里各变更命令。建议做一个基于 `fcntl.flock` 的 `single_flight(settings)`
+  上下文管理器，锁文件放数据目录；拿不到锁**立即退出并说明原因**，不要静默等待。
+  （为什么这条不是 P0：唯一键、确定性分支名与「只认 open 的复用」已经挡住了重复条目/重复 PR，
+  剩下的代价是重复评测烧 token 与 SQLite 写冲突。）

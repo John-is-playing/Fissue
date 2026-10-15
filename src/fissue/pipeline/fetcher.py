@@ -148,6 +148,12 @@ class Fetcher:
             stats.error = f"{type(exc).__name__}: {exc}"
             log.exception("抓取 %s 出现未预期错误", repo.slug)
 
+        # 适配器跳过掉的单条（构造失败）——条目没进来，但**不能当它不存在**：
+        # 游标照推的话，它再也不会被增量抓到。所以记成「数据不完整」。
+        skipped_build = getattr(adapter, "skipped_build_failures", 0)
+        if skipped_build:
+            self._mark_incomplete(stats, f"item_build_failures={skipped_build}")
+
         # 早停在 --limit 上意味着后面还有没抓到的旧条目，不能把游标推过去。
         if limit is not None and stats.fetched >= limit:
             self._mark_incomplete(stats, f"early_stop:limit={limit}")

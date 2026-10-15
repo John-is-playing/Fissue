@@ -157,7 +157,7 @@ def parse_spam(raw: Any) -> SpamSignal:
     )
 
 
-def backfill_duplicate_of(spam: SpamSignal, *, exclude: int | None = None) -> SpamSignal:
+def backfill_duplicate_of(spam: SpamSignal, *, exclude: int | str | None = None) -> SpamSignal:
     """``is_duplicate`` 为真但 ``duplicate_of`` 为空时，从 reasons 文本回填编号。
 
     模型常把重复对象写成 reasons 里的文字（如「与 Issue #2 完全重合」）却忘了
@@ -166,11 +166,15 @@ def backfill_duplicate_of(spam: SpamSignal, *, exclude: int | None = None) -> Sp
     """
     if not spam.is_duplicate or spam.duplicate_of:
         return spam
+    # `exclude` 来自 `RawItem.number`，而它现在是 `int | str`（Gitee 的编号是字母编码）。
+    # 这里曾直接 `n != exclude`（n 是 int）——于是 `2 != "2"` **恒真**，「排除自身」
+    # 静默失效，条目会把自己写成重复对象。比较统一按字符串做。
+    exclude_norm = None if exclude is None else str(exclude)
     nums: list[int] = []
     for reason in spam.reasons:
         for found in _DUP_REF.findall(reason):
             n = int(found)
-            if n != exclude and n not in nums:
+            if str(n) != exclude_norm and n not in nums:
                 nums.append(n)
     if nums:
         spam.duplicate_of = nums[:10]

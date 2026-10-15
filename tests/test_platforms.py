@@ -573,6 +573,40 @@ async def test_github_find_open_pr_only_considers_open(gh) -> None:
 
 
 @respx.mock
+async def test_v5_skips_item_whose_build_raises(gitee, monkeypatch) -> None:
+    """单条构造抛**非 PlatformError** 时：跳过它、继续抓后面的，并把跳过的条数记账。
+
+    回归：Gitee 的 Issue 编号是字母编码，`int('IKM265')` 抛的是 `ValueError`，
+    而处理器只接 `PlatformError` → **整个仓库的抓取被中止**（那一次一条都没落地）。
+    记账这一步是配套的：调用方（fetcher）读到非零就判本轮数据不完整、**不推进游标**，
+    否则被跳过的条目会被游标永久跳过。
+    """
+    respx.get(f"{GITEE}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(200, json=[
+            {"number": "BAD", "title": "坏的"},                      # 构造时会炸
+            {"number": "7", "title": "好的", "state": "open"},
+        ])
+    )
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7/comments").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    real_build = gitee._build_item
+
+    async def flaky_build(repo, payload, item_type):
+        if payload.get("number") == "BAD":
+            raise ValueError("模拟坏数据：invalid literal for int() with base 10: 'BAD'")
+        return await real_build(repo, payload, item_type)
+
+    monkeypatch.setattr(gitee, "_build_item", flaky_build)
+
+    items = [i async for i in gitee.fetch_items(REPO, item_types=[ItemType.ISSUE])]
+
+    assert [i.number for i in items] == ["7"], "坏的那条该被跳过，后面的照常抓到"
+    assert gitee.skipped_build_failures == 1, "跳过的条数要记账（调用方据此不推进游标）"
+
+
+@respx.mock
 async def test_atomgit_label_writes_use_form_and_patch(atomgit) -> None:
     """AtomGit 的标签写接口与 Gitee 形状不同（实测两种都得对）：
 
@@ -674,6 +708,22 @@ async def test_v5_find_open_pr_matches_bare_branch_only(atomgit) -> None:
     assert found == {"number": 1, "url": "u1"}, f"应命中目标分支那条：{found}"
     # 只认 open：已关闭的同头 PR 不算「已有 PR」，否则重跑会假装成功
     assert route.calls[0].request.url.params["state"] == "open"
+
+
+@respx.mock
+async def test_v5_find_open_pr_refuses_to_guess_when_branch_is_missing(atomgit) -> None:
+    """平台没给分支字段时**不能拿列表第一条充数**——那会谎报「已有 PR」，
+    让 `submit` 跳过推送却记成功。宁可查不到：查不到就去推，推不动会被响亮拦下。
+    """
+    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[{"number": 9, "html_url": "u9"}])   # 没有 head 字段
+    )
+
+    found = await atomgit.find_open_pr(
+        RepoRef(platform=Platform.ATOMGIT, owner="psf", name="requests"), head="fix/x"
+    )
+
+    assert found is None, f"没有分支字段时不该认作「已有 PR」：{found}"
 
 
 @respx.mock
