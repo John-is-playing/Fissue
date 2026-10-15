@@ -14,6 +14,7 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -161,6 +162,9 @@ class RegressionGate:
             exec_result = await self.sandbox.run(req)
         finally:
             self._restore_workspace(workspace, excluded)
+            # 同上（见 VerifierRunner.run_once）：容器跑过之后、宿主动 git 之前，先把 `.git`
+            # 里容器可能写进去的钩子与配置清掉。
+            await asyncio.to_thread(workspace.harden_git)
 
         outcome = classify_outcome(exec_result, link_ok=True)
         artifacts_dir = None

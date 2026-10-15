@@ -45,6 +45,9 @@ class RepoWorkspace:
     slug: str = ""
     token: str = field(default="", repr=False)
     default_branch: str = "main"
+    #: 克隆时用的**不带令牌**的上游 URL。:meth:`harden_git` 重建 `.git/config` 时用它写回
+    #: `remote.origin.url`，而不是回头去读那份可能已被容器篡改的配置。
+    origin_url: str = ""
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -93,15 +96,22 @@ class RepoWorkspace:
             cmd += ["--branch", branch]
         cmd += [clone_url, str(target)]
 
-        ws = cls(root=target, slug=slug, token=token, default_branch=default_branch)
+        ws = cls(
+            root=target,
+            slug=slug,
+            token=token,
+            default_branch=default_branch,
+            origin_url=clone_url,
+        )
         result = ws._git(cmd, cwd=None, extra_env=extra_env)
         if not result.ok:
             ws.cleanup()
             raise GitError(f"克隆失败：{ws.sanitize(result.stderr)[:500]}")
 
-        # 提高沙盒友好度：容器里以 uid 1000 运行，避免 dubious ownership 报错
-        ws._git(["git", "config", "core.fileMode", "false"])
-        ws._git(["git", "config", "advice.detachedHead", "false"])
+        # 克隆完立刻加固：`.git/hooks` 与 `.git/config` 待会儿就要暴露给沙盒容器。
+        # 顺带解决「容器里以 uid 1000 运行 → dubious ownership」的 fileMode 问题
+        # （原先单独写 `core.fileMode=false`，现在由 :meth:`harden_git` 一并写进重建的配置）。
+        ws.harden_git()
         return ws
 
     def cleanup(self) -> None:
@@ -132,7 +142,7 @@ class RepoWorkspace:
             env.update(extra_env)
         try:
             proc = subprocess.run(
-                list(args),
+                self._harden_argv(args),
                 cwd=workdir,
                 capture_output=True,
                 text=True,
@@ -151,6 +161,89 @@ class RepoWorkspace:
             self.sanitize(proc.stdout),
             self.sanitize(proc.stderr),
         )
+
+    #: 宿主 git 一律把钩子目录指向一个**不是目录**的路径（`os.devnull` 是文件）。
+    #: 用 `-c` 在命令行上给：它的优先级高于仓库级 `core.hooksPath`，因此 `.git/config`
+    #: 里被塞进去的值盖不住它。
+    NO_HOOKS_PATH = os.devnull
+
+    @classmethod
+    def _harden_argv(cls, args: Sequence[str]) -> list[str]:
+        """在 `git` 与子命令之间插入全局选项：禁钩子。
+
+        为什么必须这么做：`.git` 所在的工作区对沙盒容器是**可写**的（验证器要把生成的
+        测试文件写进工作区），而容器里跑的是不可信 PR 代码与模型生成的验证器。它只要写下
+        `.git/hooks/pre-push`，宿主随后的 `git push` 就会执行它——而那次 push 的子进程
+        环境里**正带着平台令牌**（见 :meth:`push`）。那等于容器逃逸到宿主。
+        """
+        items = list(args)
+        if not items or items[0] != "git":
+            return items
+        return ["git", "-c", f"core.hooksPath={cls.NO_HOOKS_PATH}", *items[1:]]
+
+    def harden_git(self) -> None:
+        """把 `.git` 里「容器写得进、宿主会执行」的部分收回自己控制。
+
+        容器以与宿主同一 uid 跑（见 :meth:`clone` 的注释），对挂载给它的工作区可写，于是
+        `.git/hooks`、`.git/config`、`.gitattributes` 都在它的影响范围内——而这些恰好是宿主
+        git 的**执行入口**：
+
+        * `hooks/`（`post-checkout`、`pre-push`…）；
+        * `core.hooksPath` / `core.fsmonitor` / `credential.helper` / `include.path`；
+        * `filter.*.clean|smudge|process`——`git add` 时执行，而宿主正要 `git add`；
+        * `diff.*.textconv` / `diff.external`——`git diff` 时执行，用于产出补丁。
+
+        做法是**重建** `.git/config`：只写由我们决定内容的几项（URL 取克隆时记下的那份，
+        不回头读可能已被篡改的配置），再删掉整个 `.git/hooks`。被塞进来的键一个都活不下来。
+
+        `user.name` / `user.email` 会从原配置带过来——它们是提交元数据、不是执行入口，
+        但提交缺了它们会直接失败。
+
+        调用点两处：克隆之后一次；每次沙盒跑过、要再动宿主 git 之前一次
+        （见 `fixer.autofix.PRCreator._commit_and_push`）。
+        """
+        gitdir = self.root / ".git"
+        # 正常克隆出来的是真目录。若被换成了符号链接，就**什么都别动**：先是顺着链接去写
+        # 会把宿主上别的文件覆盖掉，二是这种状态本身可疑。钩子那条还有 `-c core.hooksPath`
+        # 兜底（见 :meth:`_harden_argv`），不依赖这里。
+        if not gitdir.is_dir() or gitdir.is_symlink():
+            return
+        url = self.origin_url or self._git(
+            ["git", "config", "--local", "--get", "remote.origin.url"]
+        ).stdout.strip()
+        ident = [
+            (k, v)
+            for k in ("user.name", "user.email")
+            if (v := self._git(["git", "config", "--local", "--get", k]).stdout.strip())
+        ]
+
+        hooks = gitdir / "hooks"
+        if hooks.is_symlink():
+            hooks.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(hooks, ignore_errors=True)
+
+        lines = [
+            "# 由 RepoWorkspace.harden_git 重写：只保留我们自己决定内容的项。",
+            "[core]",
+            "\trepositoryformatversion = 0",
+            "\tfilemode = false",
+            "\tbare = false",
+            "\tlogallrefupdates = true",
+        ]
+        if url:
+            lines += [
+                '[remote "origin"]',
+                f"\turl = {url}",
+                "\tfetch = +refs/heads/*:refs/remotes/origin/*",
+            ]
+        if ident:
+            lines.append("[user]")
+            lines += [f"\t{k.split('.', 1)[1]} = {v}" for k, v in ident]
+        config = gitdir / "config"
+        # 先删再写：`write_text` 会跟随符号链接，而 `.git/config` 正是容器碰得到的路径。
+        config.unlink(missing_ok=True)
+        config.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     #: 短于此长度的「令牌」不参与脱敏（理由同平台适配器：把一两个字符做全局
     #: 替换会把 git 的正常报错也打成一堆 `***`）。
@@ -351,7 +444,7 @@ class RepoWorkspace:
             args += ["-c", f"credential.helper={helper}"]
             extra_env[self.PUSH_TOKEN_ENV] = token
 
-        args += ["push", "--quiet"]
+        args += ["push", "--quiet", "--no-verify"]
         if force:
             args.append("--force-with-lease")
         args += [url, f"HEAD:refs/heads/{branch}"]

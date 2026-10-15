@@ -15,6 +15,7 @@ F2P（fail-to-pass）判定逻辑
 
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 import time
@@ -403,7 +404,13 @@ class VerifierRunner:
             label=label or f"{item_key}:{stage}",
         )
 
-        exec_result = await self.sandbox.run(req)
+        try:
+            exec_result = await self.sandbox.run(req)
+        finally:
+            # 沙盒刚在**同一个工作区**里跑过不可信代码（PR 代码 + 模型生成的验证器），而宿主
+            # 随后要在这个工作区里 add/commit/push。动宿主 git 之前先把 `.git` 收回可信状态
+            # ——钩子与 config 里的 filter/textconv/credential.helper 都是执行入口。
+            await asyncio.to_thread(workspace.harden_git)
         outcome = classify_outcome(exec_result, link_ok=True)
 
         artifacts_dir = None
