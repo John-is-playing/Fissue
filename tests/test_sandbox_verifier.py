@@ -829,3 +829,40 @@ def test_local_env_only_passes_allowlist(monkeypatch) -> None:
 
     # 调用方显式传入的变量优先（例如验证器需要的专项配置）
     assert rt._local_env({"EXTRA": "1"})["EXTRA"] == "1"
+
+
+def test_unknown_runtime_is_rejected_at_config_load() -> None:
+    """拼错的 ``runtime`` 必须在加载配置时被拒，而不是静默按「本机无隔离」执行。
+
+    回归：``SandboxConfig.runtime`` 原先是裸 ``str``，而 ``DockerRuntime.run`` 只判
+    ``== "docker"``、否则落到本地执行——于是 ``Docker``（大小写）、``podman``、带尾空格
+    都等于**静默放弃全部容器隔离**，绕开 ``allow_local_fallback`` 这道显式开关。
+    """
+    from pydantic import ValidationError
+
+    from fissue.config import SandboxConfig
+
+    for bad in ("Docker", "podman", "docker ", "docke"):
+        with pytest.raises(ValidationError):
+            SandboxConfig(runtime=bad)
+
+
+def test_unknown_runtime_never_executes_locally(monkeypatch) -> None:
+    """绕过模型校验也要 fail-closed：未知取值一律拒绝执行，不得落到本地。"""
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    rt = DockerRuntime(SandboxConfig.model_construct(runtime="podman"))
+    called: list[list[str]] = []
+
+    def boom(cmd, **kwargs):  # noqa: ANN001
+        called.append(list(cmd))
+        raise AssertionError("未知 runtime 时不该真的起进程")
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", boom)
+
+    res = rt.run(image="img", command="python checker.py", mounts=[])
+
+    assert res.ok is False
+    assert "sandbox.runtime" in (res.error or ""), "报错要点明是 runtime 取值的问题"
+    assert called == [], "拒绝执行时不得起任何进程"

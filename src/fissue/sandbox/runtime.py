@@ -149,6 +149,20 @@ class DockerRuntime:
         start = time.monotonic()
         mount_list = list(mounts or [])
 
+        # 未知取值必须 fail-closed。这里原先只有 `if self.cfg.runtime == "docker"` 一条判定，
+        # 于是任何别的值都会落到函数末尾的 `_run_local`：拼错一个字母（`Docker`、`podman`）
+        # 就等于静默放弃全部容器隔离。配置层已用 `Literal` 拦一道，这一道防的是绕过模型
+        # 校验的构造路径（`model_construct`、测试夹具、运行期改字段）。
+        if self.cfg.runtime not in {"docker", "local"}:
+            return ExecResult(
+                ok=False,
+                error=(
+                    f"未知的 sandbox.runtime={self.cfg.runtime!r}（只支持 docker | local），"
+                    "已拒绝执行：非 docker 的取值会落到**无隔离**的本地执行，"
+                    "而被执行的是模型生成的验证器与不可信 PR 代码。"
+                ),
+                duration_seconds=round(time.monotonic() - start, 3),
+            )
         if self.cfg.runtime == "docker":
             ok, reason = self.available()
             if ok:

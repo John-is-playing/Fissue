@@ -18,7 +18,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import dotenv_values
@@ -241,7 +241,13 @@ DEFAULT_LOCAL_ENV_ALLOWLIST: tuple[str, ...] = (
 class SandboxConfig(BaseModel):
     enabled: bool = True
     image: str = "fissue/sandbox-base:latest"
-    runtime: str = "docker"                # docker | local
+    #: 只能用这两个值。原先这里是裸 `str`，而 `DockerRuntime.run` 的判定是
+    #: `if runtime == "docker"`、否则落到本地执行——于是 `Docker`（大小写）、
+    #: `podman`、带尾空格之类**任何非精确值都会被静默当成「本机执行」**，
+    #: 绕开 `allow_local_fallback` 这道显式开关，把 SECURITY.md 的隔离承诺
+    #: 整套架空（模型生成的验证器 + 不可信 PR 代码，无容器、不禁网）。
+    #: 现在拼错在加载配置时就被拒绝；`sandbox.runtime` 侧另有一道 fail-closed。
+    runtime: Literal["docker", "local"] = "docker"
     #: Docker 不可用时是否允许降级为**无隔离**的本地执行。默认关闭。
     #: 降级会绕过全部容器隔离（禁网、只读根、非 root、CPU/内存/PID 限额），
     #: 被执行的却是模型生成的验证器与不可信 PR 代码——静默降级等于把
@@ -551,6 +557,10 @@ class Settings(BaseModel):
                 "建议现在就设置 FISSUE_API_TOKEN",
                 self.web.host,
             )
+        # 注意：「绑本机但 api.enabled 且无鉴权」的告警**不在这里发**。这里构造期就跑，
+        # 而 `fissue status --json` 之类的机器可读输出会与 stderr 混流（click 的
+        # CliRunner 默认 mix_stderr）——一句告警就能把 JSON 打坏。它改在真正开始服务
+        # 的地方发，见 `web.app.create_app`。
         return self
 
 
