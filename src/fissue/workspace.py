@@ -405,6 +405,37 @@ class RepoWorkspace:
             return False
         return self._git(["git", "add", "--", *clean]).ok
 
+    def reset_index(self) -> bool:
+        """把索引重置回 HEAD，**不动工作区文件**。
+
+        容器对 `.git` 可写，而 `git commit` 提交的是**索引**、不是工作区：它往索引里塞点
+        东西，「只 stage Agent 改过的文件」这条护栏就被绕过了——那些内容会跟着补丁一起被
+        推送出去。先 `read-tree --reset` 把索引拉回 HEAD（不带 `-u`，所以工作区原样保留），
+        随后 `stage_paths` 再按白名单重新 stage。
+        """
+        return self._git(["git", "read-tree", "--reset", "HEAD"]).ok
+
+    def staged_files(self) -> list[str]:
+        """索引里当前有哪些文件（也就是这次 commit 会包含的文件）。取不到时返回空列表。"""
+        r = self._git(["git", "--no-pager", "diff", "--cached", "--name-only"])
+        if not r.ok:
+            return []
+        return [line.strip() for line in r.stdout.splitlines() if line.strip()]
+
+    def assert_on_branch(self, branch: str) -> str | None:
+        """确认当前就在 ``branch`` 上；不在就返回一句可读的报错，在就返回 ``None``。
+
+        为什么提交前必须确认：`.git/HEAD` 也在容器可写范围内，被改成别的分支之后，
+        `git commit` / `git push` 会作用到另一个分支上，而调用方以为推的是自己的修复分支。
+        """
+        current = self.current_branch()
+        if current != branch:
+            return (
+                f"当前分支是 {current or '(未知)'}、不是预期分支 {branch}，拒绝提交"
+                "（.git 可能被沙盒里的代码动过）"
+            )
+        return None
+
     def commit(self, message: str, *, author: str = "Fissue Bot <bot@fissue.local>") -> GitResult:
         return self._git(
             [

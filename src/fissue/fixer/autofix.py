@@ -264,6 +264,15 @@ class PRCreator:
         if not ok:
             return False, f"创建分支 {branch} 失败"
 
+        # 提交前把索引拉回 HEAD：`git commit` 提交的是**索引**，而 `.git` 在容器可写范围内
+        # ——塞进索引的内容会绕过下面那条「只暂存 Agent 改过的文件」的护栏一起被推出去。
+        await asyncio.to_thread(workspace.reset_index)
+
+        # 还要确认还在自己的分支上：`.git/HEAD` 同样可被改写，改掉就会提交/推送到别的分支。
+        off_branch = await asyncio.to_thread(workspace.assert_on_branch, branch)
+        if off_branch:
+            return False, off_branch
+
         # 只暂存 Agent **真正改过**的文件。
         #
         # 这里曾用 `git add -A`，而验证器（含它生成的测试文件）在本地执行时会写进
@@ -272,6 +281,13 @@ class PRCreator:
         staged = await asyncio.to_thread(workspace.stage_paths, list(trace.written_files))
         if not staged:
             return False, "没有可提交的改动（Agent 未改动任何文件）"
+
+        # 最后一道：**将要提交的文件必须正好是 Agent 改过的那些**。多出来的说明索引或工作区
+        # 被别的东西动过（守的是「护栏被悄悄绕过」这件事，不只是上面那一条已知路径）。
+        will_commit = set(await asyncio.to_thread(workspace.staged_files))
+        extras = sorted(will_commit - set(trace.written_files))
+        if extras:
+            return False, f"拒绝提交：待提交内容里出现了 Agent 未改过的文件 {extras}"
 
         message = (
             f"fix: 修复 #{item.number} {item.title[:60]}\n\n"

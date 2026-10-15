@@ -212,3 +212,50 @@ def test_harden_argv_puts_c_before_subcommand() -> None:
     assert argv.index("-c") < argv.index("commit")
     # 非 git 命令原样返回（例如直接调可执行文件）
     assert RepoWorkspace._harden_argv(["/usr/bin/echo", "hi"]) == ["/usr/bin/echo", "hi"]
+
+
+# ---------------------------------------------------------------------------
+# 提交前的完整性校验（索引 / HEAD 都在容器可写范围内）
+# ---------------------------------------------------------------------------
+
+
+def test_reset_index_drops_container_staged_extras(tmp_path: Path) -> None:
+    """容器塞进索引的内容不能跟着补丁被推送出去。
+
+    攻击面：容器对 `.git` 可写，而 `git commit` 提交的是**索引**、不是工作区——把别的内容
+    塞进索引，「只 stage Agent 改过的文件」这条护栏就被绕过了。`reset_index` 只重置索引、
+    不动工作区（`read-tree --reset` 不带 `-u`）。
+    """
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+
+    evil = root / "evil.txt"
+    evil.write_text("注入的内容\n", encoding="utf-8")
+    _run_git(["add", "evil.txt"], cwd=root)          # 模拟容器把它塞进索引
+    assert ws.staged_files() == ["evil.txt"]
+
+    assert ws.reset_index() is True
+
+    assert ws.staged_files() == [], "索引必须被清回 HEAD"
+    assert evil.exists(), "工作区文件不能被删（read-tree 不带 -u）"
+
+
+def test_staged_files_reports_what_will_commit(tmp_path: Path) -> None:
+    """`staged_files` 报出的就是这次 commit 会包含的文件（用于「正好是 Agent 改过的那些」）。"""
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+    (root / "a.txt").write_text("hi\nmore\n", encoding="utf-8")
+
+    assert ws.stage_paths(["a.txt"]) is True
+    assert ws.staged_files() == ["a.txt"]
+
+
+def test_assert_on_branch_catches_redirection(tmp_path: Path) -> None:
+    """`.git/HEAD` 被改到别的分支时必须拒绝提交——否则会推错分支。"""
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+
+    assert ws.assert_on_branch(ws.current_branch()) is None, "在自己的分支上应当放行"
+
+    msg = ws.assert_on_branch("fissue/other")
+    assert msg and "拒绝提交" in msg, f"应当拒绝：{msg}"
