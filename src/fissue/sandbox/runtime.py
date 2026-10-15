@@ -9,8 +9,10 @@
 * 资源限额：CPU、内存、PID 数、执行时长。
 * 只挂载调用方传入的**隔离工作区**，绝不挂载宿主普通目录。
 
-当 Docker 不可用时（未安装 / 守护进程未运行），自动降级为**本地子进程**执行，
-并给出显式警告——本地模式没有容器隔离，只应在可信的本地开发环境使用。
+当 Docker 不可用时（未安装 / 守护进程未运行），**默认拒绝执行**：降级到本地子进程会绕过
+上面列出的全部隔离，而被执行的却是模型生成的验证器与不可信 PR 代码——静默降级等于把隔离
+承诺整套架空。确需本机执行请用 ``sandbox.runtime: local``，或显式开启
+``sandbox.allow_local_fallback``。
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,12 @@ from ..logging_setup import get_logger
 from .protocol import ExecResult, MountSpec
 
 log = get_logger(__name__)
+
+#: 单次执行**每个流**保留的输出上限（字符）。超出部分照读不存，见 :func:`_read_capped`。
+#: 捕获无上限时，验证器里一个打印循环（或 ``yes``）就能吃光宿主内存与 ``data_dir``；
+#: 走转发组件时更糟——超过 64MB 的帧会让它直接抛异常，整条验证 stage 崩掉，
+#: 而不是给出一个「输出过大」的结论。
+MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 
 
 class DockerRuntime:
@@ -233,6 +243,11 @@ class DockerRuntime:
 
         args: list[str] = [self._docker_bin, "run", "--rm"]
 
+        # 容器名：超时后要能把它**真正**杀掉（见 :meth:`_reclaim_container`）。uuid 保证
+        # 不会与上一轮遗留的容器撞名。
+        container = f"fissue-{uuid.uuid4().hex[:12]}"
+        args += ["--name", container]
+
         # 标识
         if label:
             args += ["--label", f"fissue.label={label}"]
@@ -271,7 +286,13 @@ class DockerRuntime:
         args += ["--workdir", workdir]
         args += [image, "sh", "-lc", command]
 
-        return self._spawn(args, timeout_seconds=timeout_seconds, start=start, mode="docker")
+        return self._spawn(
+            args,
+            timeout_seconds=timeout_seconds,
+            start=start,
+            mode="docker",
+            container=container,
+        )
 
     # -- 本地降级 ---------------------------------------------------------
 
@@ -371,27 +392,27 @@ class DockerRuntime:
         mode: str,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        container: str | None = None,
     ) -> ExecResult:
+        """跑子进程：输出**有硬上限**，超时则**真正**回收容器。
+
+        这两件事都必须自己做，不能用 ``subprocess.run`` 一把梭：
+
+        * ``capture_output=True`` 是无上限的——验证器里一个打印循环就能吃光宿主内存与
+          ``data_dir``，转发组件那条路上还会因为超过 64MB 的帧直接抛异常；
+        * ``subprocess.run`` 超时只 kill **宿主上的 docker CLI**，``--rm`` 不会触发，
+          容器仍在后台按限额吃资源（``fissue.managed=true`` 那个标签全仓没人读）。
+        """
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 args,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout_seconds,
                 cwd=cwd,
                 env=env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ExecResult(
-                ok=False,
-                exit_code=None,
-                stdout=_decode(exc.stdout),
-                stderr=_decode(exc.stderr),
-                timed_out=True,
-                error=f"执行超时（{timeout_seconds}s）",
-                duration_seconds=round(time.monotonic() - start, 3),
             )
         except OSError as exc:
             return ExecResult(
@@ -400,14 +421,99 @@ class DockerRuntime:
                 duration_seconds=round(time.monotonic() - start, 3),
             )
 
+        timed_out = False
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            out_f = pool.submit(_read_capped, proc.stdout, MAX_CAPTURE_BYTES)
+            err_f = pool.submit(_read_capped, proc.stderr, MAX_CAPTURE_BYTES)
+            try:
+                proc.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                proc.kill()          # 先结束 CLI：管道才会 EOF，两个读线程才会收工
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:      # pragma: no cover - 杀不掉只能放弃
+                    log.warning("子进程 kill 之后仍未退出：%s", args[:2])
+            stdout, out_cut = out_f.result()
+            stderr, err_cut = err_f.result()
+
+        truncated = out_cut or err_cut
+        if truncated:
+            stderr = f"{stderr}\n[输出已被截断：单流上限 {MAX_CAPTURE_BYTES} 字符]"
+            log.warning(
+                "沙盒输出超过上限已截断（mode=%s，%s）", mode, container or " ".join(args[:2])
+            )
+        duration = round(time.monotonic() - start, 3)
+
+        if timed_out:
+            self._reclaim_container(container)
+            return ExecResult(
+                ok=False,
+                exit_code=None,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=True,
+                error=f"执行超时（{timeout_seconds}s）"
+                + ("，容器已强制回收" if container else ""),
+                duration_seconds=duration,
+            )
+
         return ExecResult(
             ok=True,
             exit_code=proc.returncode,
-            stdout=proc.stdout or "",
-            stderr=proc.stderr or "",
-            duration_seconds=round(time.monotonic() - start, 3),
-            artifacts={"mode": mode},
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=duration,
+            artifacts={"mode": mode, **({"output_truncated": "1"} if truncated else {})},
         )
+
+    def _reclaim_container(self, name: str | None) -> None:
+        """超时后把容器**真正**杀掉。
+
+        ``subprocess`` 超时只 kill 宿主上的 ``docker`` CLI；容器自己还在后台跑，``--rm``
+        也不会触发——它按 ``--cpus/--memory/--pids-limit`` 一直吃资源，重跑还会累积，最后
+        只能人工 ``docker rm -f``。这里显式回收，并把容器名打进日志便于人工核对。
+        """
+        if not name or self._docker_bin is None:
+            return
+        try:
+            subprocess.run(
+                [self._docker_bin, "rm", "-f", name],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            log.warning("沙盒超时：已强制回收容器 %s", name)
+        except Exception as exc:      # pragma: no cover - 回收失败不该盖住原始的超时结论
+            log.warning("回收容器 %s 失败（可人工 docker rm -f %s）：%s", name, name, exc)
+
+
+def _read_capped(pipe: Any, limit: int) -> tuple[str, bool]:
+    """读到 EOF，但只**保留**前 ``limit`` 个字符；返回 ``(文本, 是否被截断)``。
+
+    为什么不干脆停止读取（关掉管道）：那会让写端拿到 EPIPE/SIGPIPE 而提前退出，等于悄悄
+    改掉被执行命令的语义（本该跑完的套件变成「被杀」）。只丢弃、不停止读，内存有上限而
+    进程行为不变。
+    """
+    kept: list[str] = []
+    kept_len = 0
+    truncated = False
+    while True:
+        chunk = pipe.read(65536)
+        if not chunk:
+            break
+        room = limit - kept_len
+        if room <= 0:
+            truncated = True
+            continue
+        if len(chunk) > room:
+            kept.append(chunk[:room])
+            kept_len = limit
+            truncated = True
+        else:
+            kept.append(chunk)
+            kept_len += len(chunk)
+    return "".join(kept), truncated
 
 
 def _decode(data: Any) -> str:

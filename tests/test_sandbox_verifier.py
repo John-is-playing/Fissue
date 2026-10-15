@@ -784,22 +784,42 @@ def test_docker_unavailable_refuses_local_fallback(monkeypatch) -> None:
 
 
 def test_docker_unavailable_falls_back_when_opted_in(monkeypatch) -> None:
-    """显式开启 allow_local_fallback 后，才降级为本地执行。"""
+    """显式开启 allow_local_fallback 后，才降级为本地执行。
+
+    打桩缝是 `Popen` 而不是 `subprocess.run`：`_spawn` 现在自己开进程（有界读取输出、
+    超时后回收容器都要求这样），不再走 `run(...)`。被验的行为没变——真的在本地执行。
+    """
     from fissue.config import SandboxConfig
     from fissue.sandbox.runtime import DockerRuntime
 
     _docker_missing(monkeypatch)
-
-    class _Proc:
-        returncode, stdout, stderr = 0, "hi\n", ""
-
     calls: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):  # noqa: ANN001
-        calls.append(list(cmd))
-        return _Proc()
+    class _Pipe:
+        """假管道：`_spawn` 会在线程里反复 read 直到吃空。"""
 
-    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", fake_run)
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def read(self, _n: int) -> str:
+            chunk, self._text = self._text, ""
+            return chunk
+
+    class _Proc:
+        returncode = 0
+
+        def __init__(self, args, **kwargs):  # noqa: ANN001
+            calls.append(list(args))
+            self.stdout = _Pipe("hi\n")
+            self.stderr = _Pipe("")
+
+        def wait(self, timeout=None):  # noqa: ANN001, ANN202
+            return 0
+
+        def kill(self):  # noqa: ANN202
+            pass
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.Popen", _Proc)
     monkeypatch.setattr(
         DockerRuntime, "_local_shell", staticmethod(lambda cmd: ["/bin/sh", "-lc", cmd])
     )
@@ -807,7 +827,8 @@ def test_docker_unavailable_falls_back_when_opted_in(monkeypatch) -> None:
     rt = DockerRuntime(SandboxConfig(runtime="docker", allow_local_fallback=True))
     res = rt.run(image="img", command="echo hi", mounts=[])
 
-    assert res.exit_code == 0
+    assert res.exit_code == 0 and res.ok is True
+    assert res.stdout == "hi\n", "输出要照原样带回来"
     assert calls == [["/bin/sh", "-lc", "echo hi"]], "显式开启后应真的在本地执行"
 
 
@@ -866,3 +887,208 @@ def test_unknown_runtime_never_executes_locally(monkeypatch) -> None:
     assert res.ok is False
     assert "sandbox.runtime" in (res.error or ""), "报错要点明是 runtime 取值的问题"
     assert called == [], "拒绝执行时不得起任何进程"
+
+
+def test_docker_run_names_the_container(monkeypatch) -> None:
+    """`docker run` 要带 `--name`，并把名字交给 `_spawn`。
+
+    没有名字就没法在超时后回收——`subprocess` 超时只杀得掉宿主上的 docker CLI，
+    容器会留在后台（`--rm` 不触发）。
+    """
+    import time
+
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.protocol import ExecResult
+    from fissue.sandbox.runtime import DockerRuntime
+
+    rt = DockerRuntime(SandboxConfig(runtime="docker"))
+    monkeypatch.setattr(rt, "_docker_bin", "/usr/bin/docker")
+    monkeypatch.setattr(rt, "ensure_image", lambda image: True)
+    captured: dict[str, object] = {}
+
+    def fake_spawn(args, **kwargs):  # noqa: ANN001, ANN202
+        captured["args"] = list(args)
+        captured["kwargs"] = kwargs
+        return ExecResult(ok=True)
+
+    monkeypatch.setattr(rt, "_spawn", fake_spawn)
+
+    rt._run_docker(
+        image="img", command="echo hi", workdir="/workspace", mounts=[], env={},
+        network="none", cpus=1, memory_mb=256, pids=64, timeout_seconds=60,
+        read_only_root=True, user="1000:1000", label="x", start=time.monotonic(),
+    )
+
+    args = captured["args"]
+    assert "--name" in args, "容器必须带名字"
+    name = args[args.index("--name") + 1]
+    assert name.startswith("fissue-")
+    assert captured["kwargs"]["container"] == name, "名字要交给 _spawn，超时才回收得掉"
+
+
+def test_timeout_reclaims_the_container(monkeypatch) -> None:
+    """超时后必须显式回收容器。
+
+    回归：`subprocess.run(timeout=...)` 只 kill 宿主上的 docker CLI，`--rm` 不会触发——
+    容器继续按 `--cpus/--memory/--pids-limit` 吃资源且永不释放，重跑还会累积，
+    只能人工 `docker rm -f`。
+    """
+    import time
+
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    rt = DockerRuntime(SandboxConfig(runtime="docker"))
+    monkeypatch.setattr(rt, "_docker_bin", "/usr/bin/docker")
+    calls: list[list[str]] = []
+
+    class _Ok:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(cmd, **kwargs):  # noqa: ANN001, ANN202
+        calls.append(list(cmd))
+        return _Ok()
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", fake_run)
+
+    res = rt._spawn(
+        ["sh", "-lc", "sleep 5"], timeout_seconds=0, start=time.monotonic(),
+        mode="docker", container="fissue-abc123",
+    )
+
+    assert res.timed_out is True and res.ok is False
+    assert "回收" in (res.error or ""), "结论里要点明容器已被回收"
+    assert calls == [["/usr/bin/docker", "rm", "-f", "fissue-abc123"]], f"实际调用：{calls}"
+
+
+def test_huge_output_is_truncated_instead_of_unbounded(monkeypatch) -> None:
+    """输出超上限必须截断并说明，而不是无限制地吃内存。
+
+    回归：原先 `capture_output=True` 无上限——验证器里一个打印循环就能吃光宿主内存与
+    `data_dir`；走转发组件时超过 64MB 的帧会让它直接抛异常，整条验证 stage 崩掉，
+    而不是给出一个「输出过大」的结论。
+    """
+    import sys
+    import time
+
+    from fissue.config import SandboxConfig
+    from fissue.sandbox import runtime as rt_mod
+
+    monkeypatch.setattr(rt_mod, "MAX_CAPTURE_BYTES", 500)
+    rt = rt_mod.DockerRuntime(SandboxConfig(runtime="local"))
+
+    res = rt._spawn(
+        [sys.executable, "-c", "print('x' * 20000)"],
+        timeout_seconds=60, start=time.monotonic(), mode="local",
+    )
+
+    assert res.ok is True and res.exit_code == 0
+    assert len(res.stdout) <= 500, f"保留量必须有上限，实际 {len(res.stdout)}"
+    assert "截断" in res.stderr, "截断必须说出来，否则读者以为输出是完整的"
+    assert res.artifacts.get("output_truncated") == "1"
+
+
+def test_forwarder_client_uses_per_request_timeout(monkeypatch) -> None:
+    """客户端超时按**本次请求**算，不被第一个请求固化。
+
+    回归：进程内复用的客户端只在构造时设一次 socket 超时，取的是**第一个**请求的值——
+    短验证器（60s → 预算 180s）之后，900s 的回归门会在半途假超时，表现为「回归门没跑通
+    /放行」，而真相是客户端自己先断了。
+    """
+    from fissue.sandbox import forwarder as fw
+    from fissue.sandbox.protocol import ExecRequest, ExecResult
+
+    seen: list[float] = []
+
+    class _Sock:
+        def settimeout(self, value):  # noqa: ANN001, ANN202
+            seen.append(value)
+
+        def connect(self, path):  # noqa: ANN001, ANN202
+            pass
+
+        def close(self):  # noqa: ANN202
+            pass
+
+    monkeypatch.setattr(fw.socket, "socket", lambda *a, **k: _Sock())
+    monkeypatch.setattr(fw, "send_frame", lambda sock, payload: None)
+    monkeypatch.setattr(fw, "recv_frame", lambda sock: fw.result_to_dict(ExecResult(ok=True)))
+
+    client = fw.ForwarderClient("/tmp/nope.sock", timeout=1.0)     # 刻意给个小值
+    res = client.submit(ExecRequest(image="img", command="c", timeout_seconds=900))
+
+    assert res.ok is True
+    assert seen == [900 + fw.ForwarderClient.TIMEOUT_SLACK_SECONDS], f"实际 {seen}"
+
+
+def test_forwarder_server_bounds_the_request_read() -> None:
+    """读请求那一步必须有超时，且无论成败都要关连接。
+
+    回归：`recv` 原先没有任何超时——一条连上却不发数据的连接（或只发了半截长度头的连接）
+    能把常驻服务永久卡住。
+    """
+    from fissue.config import SandboxConfig
+    from fissue.sandbox import forwarder as fw
+
+    server = fw.ForwarderServer(SandboxConfig(runtime="local"), socket_path="/tmp/x.sock")
+    timeouts: list[float] = []
+    closed: list[bool] = []
+    handled: list[object] = []
+
+    class _Conn:
+        def settimeout(self, value):  # noqa: ANN001, ANN202
+            timeouts.append(value)
+
+        def close(self):  # noqa: ANN202
+            closed.append(True)
+
+    conn = _Conn()
+    server._handle = lambda c: handled.append(c)      # type: ignore[method-assign]
+
+    server._handle_conn(conn)
+
+    assert timeouts and timeouts[0] == fw.ForwarderServer.REQUEST_TIMEOUT_SECONDS, "读请求要有超时"
+    assert handled == [conn], "正常路径照旧处理"
+    assert closed == [True], "连接必须在 finally 里关掉"
+
+
+def test_forwarder_server_does_not_block_on_one_connection(monkeypatch) -> None:
+    """accept 循环不能在单个连接上就地阻塞：每个连接交给独立线程。
+
+    回归：原先是 `self._handle(conn)` 就地调用 + `recv` 无超时——一条只连不说的连接就能让
+    服务永远卡在 recv 上，后续请求全堵在 accept 队列里各自超时。
+    """
+    from fissue.config import SandboxConfig
+    from fissue.sandbox import forwarder as fw
+
+    server = fw.ForwarderServer(SandboxConfig(runtime="local"), socket_path="/tmp/x.sock")
+    conn = object()
+    rounds = {"n": 0}
+
+    class _Sock:
+        def accept(self):  # noqa: ANN202
+            rounds["n"] += 1
+            if rounds["n"] == 1:
+                return conn, None
+            server._stop.set()
+            raise OSError("服务已停")            # 跳出 accept 循环
+
+        def close(self):  # noqa: ANN202
+            pass
+
+    spawned: list[tuple] = []
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), name=None, daemon=None):  # noqa: ANN001
+            spawned.append((target, args))
+
+        def start(self):  # noqa: ANN202
+            pass
+
+    monkeypatch.setattr(fw.threading, "Thread", _FakeThread)
+    server._sock = _Sock()          # type: ignore[assignment]
+
+    server._serve_forever()
+
+    assert spawned and spawned[0][1] == (conn,), "连接要交给独立线程，而不是就地阻塞处理"
+    assert spawned[0][0] == server._handle_conn

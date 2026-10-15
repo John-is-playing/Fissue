@@ -252,8 +252,15 @@ class Executor:
 class ForwarderServer:
     """监听本地 socket，接收执行请求并回传结果。
 
-    只支持**单客户端串行**（每个连接一次请求-响应），实现简单、边界清晰。
+    **每个连接一份线程**，且**读请求那一步有超时**。原先 accept 循环是串行、``recv`` 又
+    没有任何超时：一条连上却不发数据的连接（或只发了半截长度头的连接）就能把整个服务永久
+    锁死——后续请求全堵在 accept 队列里，各自超时，常驻服务形同停摆，只能重启进程。
     """
+
+    #: 「读一个请求帧」的时间上限：连上不发数据的最多卡这么久就被踢掉。
+    REQUEST_TIMEOUT_SECONDS = 60.0
+    #: 「回传结果帧」的时间上限（结果可能几 MB，给宽些）。
+    RESPONSE_TIMEOUT_SECONDS = 300.0
 
     def __init__(self, cfg: SandboxConfig, socket_path: str | None = None) -> None:
         self.cfg = cfg
@@ -320,20 +327,35 @@ class ForwarderServer:
                 conn, _ = self._sock.accept()
             except OSError:
                 break
+            # 每个连接一份线程：串行处理时，一个慢请求会把后面的请求全堵在 accept 队列里，
+            # 而客户端的超时是按**各自请求**算的——短请求排在长任务后面必然假超时。
+            threading.Thread(
+                target=self._handle_conn,
+                args=(conn,),
+                name="fissue-forwarder-conn",
+                daemon=True,
+            ).start()
+
+    def _handle_conn(self, conn: socket.socket) -> None:
+        """处理一个连接：**只给「读请求」这一步设短超时**。"""
+        try:
+            conn.settimeout(self.REQUEST_TIMEOUT_SECONDS)
+            self._handle(conn)
+        except Exception:  # pragma: no cover - 单个连接出错不该带走整个服务
+            log.exception("处理请求失败")
+        finally:
             try:
-                self._handle(conn)
-            except Exception:  # pragma: no cover
-                log.exception("处理请求失败")
-            finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                conn.close()
+            except OSError:
+                pass
 
     def _handle(self, conn: socket.socket) -> None:
         payload = recv_frame(conn)
         if payload is None:
             return
+        # 请求已到手，把超时放宽：执行可能很久（回归门 900s），回传的帧也可能很大，
+        # 不能让「读请求」那段的短超时顺带把回传也掐掉。
+        conn.settimeout(self.RESPONSE_TIMEOUT_SECONDS)
         try:
             req = request_from_dict(payload)
         except Exception as exc:
@@ -351,6 +373,9 @@ class ForwarderServer:
 class ForwarderClient:
     """把执行请求发给转发组件。"""
 
+    #: 在请求自己的超时之上额外留的余量：容器启动、镜像拉取、以及排在别人后面等待都要吃时间。
+    TIMEOUT_SLACK_SECONDS = 120.0
+
     def __init__(self, socket_path: str, *, timeout: float = 900.0) -> None:
         self.socket_path = socket_path
         self.timeout = timeout
@@ -359,7 +384,11 @@ class ForwarderClient:
         if os.name == "nt":
             raise SandboxError("Windows 不支持 Unix socket 转发，请使用 inline 模式（sandbox.runtime=local）")
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
+        # 超时**按本次请求**算，不用构造时那个：客户端是被复用的（见 ``SandboxManager.run``），
+        # 而请求之间的超时能差一个数量级（单测验证器 60s vs 回归门 900s）。原先只在构造时设
+        # 一次，于是**第一个请求的超时被固化**——短请求之后的长任务会在半途假超时，
+        # 表现为「回归门没跑通/放行」，而真相是客户端自己先断了。
+        sock.settimeout(float(req.timeout_seconds) + self.TIMEOUT_SLACK_SECONDS)
         try:
             sock.connect(self.socket_path)
         except OSError as exc:
@@ -435,9 +464,8 @@ class SandboxManager:
             return await self._executor.execute_async(req)
 
         if self._client is None:
-            self._client = ForwarderClient(
-                self.cfg.forwarder.socket, timeout=req.timeout_seconds + 120
-            )
+            # 不在构造时固化超时：`submit` 会按**本次请求**重算（见 ForwarderClient.submit）。
+            self._client = ForwarderClient(self.cfg.forwarder.socket)
         return await asyncio.to_thread(self._client.submit, req)
 
     def run_sync(self, req: ExecRequest) -> ExecResult:
@@ -449,5 +477,5 @@ class SandboxManager:
                 self._executor = Executor(self.cfg)
             return self._executor.execute(req)
         if self._client is None:
-            self._client = ForwarderClient(self.cfg.forwarder.socket, timeout=req.timeout_seconds + 120)
+            self._client = ForwarderClient(self.cfg.forwarder.socket)
         return self._client.submit(req)
