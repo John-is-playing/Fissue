@@ -700,19 +700,25 @@ Python 项目 `wtk`（均值 / 中位数 / 百分位），**刻意留了一处�
 4. **v5 从未覆写 `find_open_pr`**（基类默认返回 None）→ 永远查不到已有 PR → 不走
    「复用」而直接强推 → 被 `--force-with-lease` **正确**拦下，表现为「推送失败」。
 
-**Gitee**（Private 靶子 `ccqtp/fissue-write-probe`）——**只走到一半**：
+**Gitee**（Private 靶子 `ccqtp/fissue-write-probe`）——**写操作受阻，但受阻范围已钉准**：
 
 | 写操作 | 结果 |
 |---|---|
 | 建 Private 仓库 / 推代码 | ✅ |
-| **建 Issue（API）** | ❌ **被平台限制挡住**：`POST /repos/{owner}/{repo}/issues` 一律 `404 {"message":"project or enterprise"}`，**公开库同样如此**；而同一个令牌的**读接口 200**、**git 推送正常** |
-| 打标签 / 建分支 / 提 PR | ⏸ 无 Issue 可跑（该账号在 Gitee 的仓库都是 0 Issue） |
+| **克隆私有仓库**（`verify` 的前提） | ✅ 41 秒跑通，验证器生成、`regression:base` pass —— 克隆凭据修复在第四个平台上也成立 |
+| **建分支 + 提 PR** | ✅ **`…/pulls/1`**，分支 `fissue/fix-IKM265-fissue-write-probe-b75b43`；验证器 `[agent]`+`[fix]` 与回归门全过、**2 轮修好**。说明**仓库级**写在 Gitee 上是通的 |
+| **建仓库级标签** | ✅ `[gitee] 已创建标签 ai-generated`（`POST /labels` → 201） |
+| **给条目打标签**（条目级写） | ❌ `POST /issues/{n}/labels` → 400 `Problems parsing JSON`（**七种形状全试过**：JSON 数组 / JSON 字符串 / 表单 / 查询串 / 带与不带令牌…）；`fix` 里给 PR 打标签也是 404 `{"message":"Issue"}` |
+| **建 Issue / 改 Issue**（条目级写） | ❌ 一律 `404 {"message":"project or enterprise"}` |
 
-第 2 行**不是代码问题**：探针是裸 HTTP，请求体形状（JSON / 表单）、令牌位置（表单 / 查询串）、
-目标库（私有 / 公开）都试过，结果一致。所以 Gitee 的写操作验证卡在「**先得有一个 Issue**」
-这一步，需要平台或账号侧的变化（扩展令牌作用域，或确认该账号能否通过 API 建 Issue）。
+**读接口全部正常**（`GET /issues` → 200）、**git 推送正常**、**仓库级写正常**，只有**条目级写**
+一律被拒——这个组合指向**令牌缺少 `issues` 作用域**（Gitee 的返回码不直接说这件事：作用域不足时
+它给的是 404 / 400 这类误导性错误）。需要账号/令牌侧的变化才能继续。
 
-**这一环未验证，就不写成通过。**
+**顺带一个反差值得记**：颜色的格式两个平台**正好相反**——Gitee 要**裸十六进制**
+（带 `#` 报 `Color请输入正确的16进制颜色值`），AtomGit 要**带 `#`**（裸的报
+`Color must be a valid color code`）。所以 v5 的默认 `_create_label`（`color.replace("#","")`）
+对 Gitee 本来就是对的，只有 AtomGit 需要覆写——**同一个字段，两个平台两种口径，谁也别照抄谁**。
 
 ---
 
