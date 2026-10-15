@@ -1032,20 +1032,18 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
   抛的是 `ValueError`，漏过处理器、**中止了整个仓库的抓取**（一条都没落地）。现在三个适配器
   （GitHub / v5 / GitLab，含 PR/MR 侧共 5 处）放宽为 `Exception` + 计数；fetcher 读到非零就记为
   **数据不完整 → 不推进游标**（配套，免得把「响亮的失败」换成「静默丢条目」）。
-* **P1-1（未修，设计已定）**：**没有并发互斥**（`flock`/`pidfile` 零命中）。挂载点：
-  `service/daemon.py` 的 `run_once` / `_scan_loop` / `_flush_loop` / `_fix_loop`，以及
-  `cli/ops.py` 里各变更命令。建议做一个基于 `fcntl.flock` 的 `single_flight(settings)`
-  上下文管理器，锁文件放数据目录；拿不到锁**立即退出并说明原因**，不要静默等待。
-  （为什么这条不是 P0：唯一键、确定性分支名与「只认 open 的复用」已经挡住了重复条目/重复 PR，
-  剩下的代价是重复评测烧 token 与 SQLite 写冲突。）
+* **P1-1（已修，接入口侧）**：原本**没有并发互斥**（`flock`/`pidfile` 零命中），daemon 与
+  CLI 同跑会重复评测（白烧 token）并在同一个 SQLite 上互相写冲突——这两样唯一键、确定性
+  分支名与「只认 open 的复用」都挡不住。现新增 `lockfile.single_flight(settings)`
+  （`fcntl.flock` + `LOCK_NB`，**拿不到锁立即报错**，错误里带锁文件路径与持有者 pid；
+  锁的身份取自数据库地址，写同一个库才互斥），并把 `RuntimeContext.open(..., exclusive=True)`
+  作为**唯一挂载点**，8 个变更入口全接上（CLI 的 fetch / eval / verify / flush / fix、
+  daemon 的 `run_once` 与两个循环）。**读命令不接**——看板 / `status` 不该被常驻服务挡住。
 
-  **接线图（已探明，动手前不必再摸）**：变更操作**没有单一收口**，只有两侧可选——
-  * **入口侧**：`cli/ops.py` 的 `fetch` / `eval` / `verify` / `flush` / `fix` 五个命令；
-    `service/daemon.py` 的 `run_once`（`_scan_loop` / `_flush_loop` / `_fix_loop` 都走它）；
-    以及 `fissue serve` 下 `/api/*` 的写路由（`FlushRequest` / `EvalRequest` 那几条）。
-  * **操作侧**：`pipeline/fetcher.py` 的 `fetch_many`、`pipeline/stages.py` 的 `run_batch`
-    与 `evaluate_items`、`pipeline/flush.py` 的 `FlushProcessor.flush_once`、
-    `fixer/autofix.py` 的 fix 入口。
+  > **未覆盖的一段（如实留档）**：独立 `serve` / `web` 进程**没有持锁**，它们的
+  > `/api/flush`、`/api/eval` 因此不在互斥保护内。不接的理由：这两条与 daemon 同跑本来
+  > 就会撞端口（实践上少见），而给长期进程持锁会把 CLI 的手动操作一起挡掉，代价大于收益。
+  > **别以为「全都互斥了」。**
 
-  **建议接入口侧**（改动少、语义清楚），并把取锁写进**一个装饰器/上下文管理器**，
-  免得日后新增命令漏接。**不要只接一半**：部分入口持锁反而会让人以为「已经互斥了」。
+  （为什么这条不是 P0：唯一键、确定性分支名与「只认 open 的复用」已经挡住了重复条目/
+  重复 PR，剩下的代价是重复评测烧 token 与 SQLite 写冲突。）
