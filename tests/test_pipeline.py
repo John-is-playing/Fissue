@@ -1228,6 +1228,77 @@ async def test_eval_batch_passes_similar_candidates(ctx, repo) -> None:
     assert not seen[a.key]
 
 
+async def test_flush_reclaims_interrupted_residue_first(ctx, repo, settings, monkeypatch) -> None:
+    """flush 先回收中断残留，判定才恢复得了。
+
+    场景：一条已 `done` 待定论 + 一条上一轮中断留下的 `pending`。残留让 `pending_count > 0`，
+    于是「队列已无待处理条目」这条兜底失效——哪怕只剩一条 done 也不肯自动 flush；回收后
+    正常消费掉。
+    """
+    settings.queues.verify_queue.flush_size = 100            # 数量阈值远不可达
+    settings.queues.verify_queue.idle_flush_seconds = 99999  # 空闲兜底也关掉
+    qm = QueueManager(ctx)
+
+    done_item = _seed_issue(repo, 71)
+    eid = qm.enqueue(QueueName.VERIFY, done_item.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    stuck = _seed_issue(repo, 72)
+    repo.set_item_status(stuck.key, ItemStatus.QUEUED)
+    qm.enqueue(QueueName.VERIFY, stuck.key)                  # 中断：没有 finish
+
+    # 回收前：残留把兜底条件废掉
+    assert qm.should_flush(QueueName.VERIFY).should_flush is False
+
+    monkeypatch.setattr(repo, "STUCK_QUEUE_ENTRY_SECONDS", -1)      # 模拟超龄
+
+    async def handler(queue_kind, entries):
+        return [
+            {"key": e["key"], "verdict": "skip", "labels": [], "priority": Priority.NONE,
+             "reason": "r", "confidence": 0.5, "model": "stub"}
+            for e in entries
+        ]
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=handler)
+
+    assert outcome.flushed == 1, "回收后兜底恢复，这唯一一条 done 应当被消费"
+    assert repo.queue_pending_count(QueueName.VERIFY) == 0
+    assert repo.get_item_row(stuck.key).status == ItemStatus.EVALUATED.value, "卡住的条目被放回重验"
+
+
+async def test_eval_skips_items_with_incomplete_comments(ctx, repo) -> None:
+    """评论残缺时不评测。
+
+    在没有讨论上下文的数据上下结论，而那个结论会被**回写到平台**、下一轮又会重抓同一条
+    （游标本轮被冻结）——错误就此固化。跳过它：条目留在 new，等抓到完整评论再评。
+    """
+    from fissue.pipeline.stages import EvalStage
+
+    called: list[str] = []
+
+    class _FakeEval:
+        async def evaluate(self, item, *, similar=None):  # noqa: ANN001, ANN202
+            called.append(item.key)
+            return Evaluation(
+                category=Category.BUG,
+                scores=Scores(importance=DimensionScore(score=80)),
+                model="stub",
+            )
+
+    ctx.evaluator = _FakeEval()
+    incomplete = RawItem(
+        platform=Platform.GITHUB, repo="psf/requests", number=9,
+        item_type=ItemType.ISSUE, title="t", body="b", comments=[],
+    )
+    incomplete.mark_degraded("comments_unavailable#9")
+
+    result = await EvalStage(ctx).run_batch([incomplete])
+
+    assert called == [], "残缺条目不该被送去评测"
+    assert result.evaluated == 0 and result.skipped == 1
+    assert "残缺" in (result.results[0].skipped_reason or ""), "跳过原因要写清是评论残缺"
+
+
 # ---------------------------------------------------------------------------
 # 验证器生成：缺 command 时重生成
 # ---------------------------------------------------------------------------

@@ -160,6 +160,11 @@ class QueueManager:
     ) -> FlushOutcome:
         """执行一次 flush：取出一批已完成条目 → 交给 handler 出结论 → 落库并标记已 flush。"""
         batch_id = uuid.uuid4().hex[:16]
+        # 先回收中断残留：它会让「队列已无待处理条目」这条兜底永久失效（那正是 should_flush
+        # 的判定依据之一），条目也永远重验不了。详见 Repository.reclaim_stuck_queue_entries。
+        reclaimed = self.repo.reclaim_stuck_queue_entries()
+        if reclaimed:
+            log.info("flush 前回收了 %d 条中断残留：%s", len(reclaimed), "、".join(reclaimed[:5]))
         decision = self.should_flush(queue, force=force)
         if not decision.should_flush:
             return FlushOutcome(queue=queue.value, batch_id=batch_id, error=None, flushed=0)

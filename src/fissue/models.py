@@ -189,6 +189,22 @@ class FileChange(BaseModel):
 #: 原始载荷的字段撞名（``raw`` 同时用来放 html_url 等平台字段）。
 DEGRADED_KEY = "_fissue_degraded"
 
+#: ``RawItem.raw`` 里记录「已有结论已过期」的保留键。同样不改表结构。
+STALE_KEY = "_fissue_stale"
+
+#: 判定「结论是否过期」要看的内容字段。
+#:
+#: 为什么不复用 :meth:`RawItem.content_hash`：那个指纹里带着 ``len(comments)``。拿它判
+#: 「这次抓取有没有变化」是对的（评论变了就要重写评论表），但拿它当「结论过期」的依据
+#: 就变成**每来一条评论都重评测一次**——活跃 issue 上等于持续烧 token。评论增长不改变
+#: 标题/正文/标签/状态，也就通常不改变结论。
+MATERIAL_FIELDS: tuple[str, ...] = ("title", "body", "labels", "state", "merged")
+
+#: 「评论没拉全」这类残缺原因的前缀（各适配器产出 ``comments_unavailable#N`` /
+#: ``comments_may_be_truncated#N``）。评论是评测最关键的上下文之一，残缺时既不能拿它
+#: 覆盖已入库的讨论（那是数据丢失），也不该据此下结论（结论会被回写到平台）。
+DEGRADED_COMMENTS_PREFIX = "comments_"
+
 
 class RawItem(BaseModel):
     """从平台抓取到的 Issue / PR 统一表示。"""
@@ -267,6 +283,35 @@ class RawItem(BaseModel):
         if not isinstance(marks, list):
             return []
         return [str(m) for m in marks]
+
+    # -- 结论新鲜度 --------------------------------------------------------
+
+    def mark_stale(self, reason: str) -> None:
+        """标记「这条的已有结论已过期」（内容实质变化，见常量 ``MATERIAL_FIELDS``）。
+
+        与 :meth:`mark_degraded` 同一手法：寄存在 ``raw`` 这个已入库的 JSON 列里，
+        不需要改表结构。清零点在 ``Repository.save_evaluation``——重新出了结论就不再过期。
+        """
+        marks = self.raw.setdefault(STALE_KEY, [])
+        if isinstance(marks, list) and reason not in marks:
+            marks.append(reason)
+
+    @property
+    def stale_reasons(self) -> list[str]:
+        """结论过期原因；**非空表示当前结论不能代表这条内容**。"""
+        marks = self.raw.get(STALE_KEY)
+        if not isinstance(marks, list):
+            return []
+        return [str(m) for m in marks]
+
+    @property
+    def comments_incomplete(self) -> bool:
+        """评论是否没拉全（接口失败 / 被截断）。
+
+        调用方据此**不要**覆盖已入库的评论，也**不要**据此下结论——见
+        ``DEGRADED_COMMENTS_PREFIX``。
+        """
+        return any(r.startswith(DEGRADED_COMMENTS_PREFIX) for r in self.degraded)
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import json
-from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -111,6 +110,9 @@ def item_to_dict(
         "updated_at": _iso(item.updated_at),
         "comments": len(item.comments),
         "linked_issues": item.linked_issues,
+        # 结论是否已过期（内容实质变化后、重新评测前）：让报告 / 看板 / API 都看得见。
+        # 空列表 = 当前结论与内容一致。
+        "conclusion_stale": item.stale_reasons,
     }
     if item.item_type is ItemType.PR:
         data["merge"] = {
@@ -192,12 +194,15 @@ def export_json(
     items = repo.list_items(repo_slug=repo_slug, status=status, category=category, limit=limit)
     keys = [i.key for i in items]
     evals = repo.evaluations_for(keys)
+    # 结论**批量**取：原先 `latest_batch_conclusion(i.key)` 是逐条查、每条还新开一个
+    # session——一万条就是一万次查询（GET /api/export?limit=10000 正好允许这个规模）。
+    batches = repo.latest_batch_conclusions(keys)
     payload = {
         "generated_at": _iso(datetime.now().astimezone()),
         "count": len(items),
         "summary": summarize(repo, repo_slug=repo_slug, status=status, category=category),
         "items": [
-            item_to_dict(i, evals.get(i.key), batch=repo.latest_batch_conclusion(i.key))
+            item_to_dict(i, evals.get(i.key), batch=batches.get(i.key))
             for i in items
         ],
     }
@@ -247,6 +252,7 @@ def export_markdown(
     items = repo.list_items(repo_slug=repo_slug, status=status, category=category, limit=limit)
     keys = [i.key for i in items]
     evals = repo.evaluations_for(keys)
+    batches = repo.latest_batch_conclusions(keys)      # 同 JSON：批量取，不逐条查
     stats = summarize(repo, repo_slug=repo_slug, status=status, category=category)
 
     lines: list[str] = []
@@ -297,7 +303,7 @@ def export_markdown(
                              f"{('（' + '；'.join(ev.spam.reasons) + '）') if ev.spam.reasons else ''}")
             if ev.summary:
                 lines.append(f"- 结论：{ev.summary}")
-        concl = repo.latest_batch_conclusion(item.key)
+        concl = batches.get(item.key)
         if concl is not None:
             lines.append(f"- 批量结论：`{concl.verdict}`（{concl.reason}）")
         if include_body and item.body:
@@ -328,27 +334,19 @@ def summarize(
     产出的那份 JSON 里，``count``（已过滤）与 ``summary.total`` / ``by_status``（全仓库）
     互相矛盾，Markdown 的「概览」与「明细」条数也对不上——外部读者据此会得出错误结论。
     """
-    items = repo.list_items(repo_slug=repo_slug, status=status, category=category, limit=100000)
-    by_type = Counter(i.item_type.value for i in items)
-    by_category = Counter(i.category.value for i in items)
-    by_priority = Counter(i.priority.value for i in items)
-    by_status = Counter(i.status.value for i in items)
+    # 计数走聚合查询，平均分只需要 key：原先 list_items(limit=100000) 会把十万条领域对象
+    # （含标签、正文元数据）全加载进内存，只为数几个数。
+    stats = repo.item_stats(repo_slug=repo_slug, status=status, category=category)
+    keys = repo.item_keys(repo_slug=repo_slug, status=status, category=category)
 
-    evals = repo.evaluations_for([i.key for i in items])
+    evals = repo.evaluations_for(keys)
     dims: dict[str, list[int]] = {}
     for ev in evals.values():
         for name, val in ev.scores.as_dict().items():
             dims.setdefault(name, []).append(val)
     avg_scores = {k: round(sum(v) / len(v), 1) for k, v in dims.items() if v}
 
-    return {
-        "total": len(items),
-        "by_type": dict(by_type),
-        "by_category": dict(by_category),
-        "by_priority": dict(by_priority),
-        "by_status": dict(by_status),
-        "avg_scores": avg_scores,
-    }
+    return {**stats, "avg_scores": avg_scores}
 
 
 def write_export(content: str, path: str | Path) -> Path:

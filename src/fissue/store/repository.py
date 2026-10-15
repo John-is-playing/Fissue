@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session, selectinload
 
 from ..logging_setup import get_logger
 from ..models import (
+    MATERIAL_FIELDS,
+    STALE_KEY,
     AuthorKind,
     BatchConclusion,
     Category,
@@ -53,6 +55,31 @@ log = get_logger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+#: 已有结论**已进入执行**的条目状态。内容实质变化时这些状态**不回落**——回落到 new 会让
+#: 条目重新走一遍评测，而队列里那条修复派发还在，等于给「重复修复/重复建 PR」再开一道口子。
+#: 代价是它们的结论会一直过期，所以必须把过期如实留痕（见 :meth:`Repository._mark_conclusion_stale`）。
+IN_FLIGHT_STATUSES: frozenset[str] = frozenset(
+    {ItemStatus.FIX_QUEUED.value, ItemStatus.FIXING.value, ItemStatus.PR_CREATED.value}
+)
+
+
+def _material_value(value: Any) -> str:
+    """把实质字段归一成可比较的字符串（labels 顺序不该影响判定）。"""
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(sorted(str(v) for v in value))
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    return str(value or "")
+
+
+def _material_differs(row: ItemRow, item: RawItem) -> bool:
+    """实质字段（``MATERIAL_FIELDS``）是否变了。**不含评论条数**——见该常量的注释。"""
+    return any(
+        _material_value(getattr(row, field, None)) != _material_value(getattr(item, field, None))
+        for field in MATERIAL_FIELDS
+    )
 
 
 # 尚未进入后续流程的状态：批量定论可以把它们推进到 labeled。
@@ -239,7 +266,12 @@ class Repository:
     def upsert_item(self, repo_id: int, item: RawItem) -> tuple[int, bool, bool]:
         """插入或更新条目。
 
-        :return: ``(item_id, created, changed)`` —— changed 表示内容指纹变化（需要重新评测）。
+        :return: ``(item_id, created, changed)`` —— changed 表示内容指纹变化（**含评论条数**）。
+
+        ``changed`` 只说明「平台侧的这条和库里不一样」，不直接等于「要重新评测」：指纹里带着
+        ``len(comments)``，每来一条评论都会为真。真正让已有结论作废的是**实质字段**
+        （``MATERIAL_FIELDS``）变化——那时本条目的结论会被标记过期，且只要结论还没进入执行
+        （见 ``IN_FLIGHT_STATUSES``）就回落为 ``new`` 等待重评。
         """
         content_hash = item.content_hash()
         with self.db.session() as s:
@@ -270,6 +302,11 @@ class Repository:
             elif row.content_hash != content_hash:
                 changed = True
 
+            # 「内容实质变化」（标题/正文/标签/状态/merged）与「讨论增长」（评论条数）要分开：
+            # 前者让已有结论作废，后者只重写评论表。必须在下面给 row 赋值**之前**算——
+            # 这里读到的还是旧值。
+            material_changed = not created and changed and _material_differs(row, item)
+
             # 更新字段
             row.repo_id = repo_id
             row.title = item.title or ""
@@ -293,27 +330,85 @@ class Repository:
             row.updated_at = item.updated_at
             row.closed_at = item.closed_at
             row.content_hash = content_hash
-            row.raw = item.raw or {}
+            incoming_raw = dict(item.raw or {})
+            if isinstance(row.raw, dict) and STALE_KEY in row.raw:
+                # 过期标记必须**黏住**：下一次抓取时内容已经和库里的 hash 一致（changed=False），
+                # 不会再重新检测出「变过」。若在这里被 item.raw 冲掉，过期就重新变成不可见了。
+                # 清零点只有一个：save_evaluation（重新出了结论）。
+                incoming_raw.setdefault(STALE_KEY, row.raw[STALE_KEY])
+            row.raw = incoming_raw
             row.fetched_at = _now()
             if created:
                 row.category = Category.UNKNOWN.value
             s.flush()
             item_id = int(row.id)
 
+            if material_changed:
+                self._mark_conclusion_stale(row)
+
             # 评论：整体替换（简单可靠，评论量不大）
             if changed:
-                s.execute(delete(CommentRow).where(CommentRow.item_id == item_id))
-                for c in item.comments:
-                    s.add(
-                        CommentRow(
-                            item_id=item_id,
-                            author=c.author,
-                            author_kind=c.author_kind.value,
-                            body=c.body,
-                            created_at=c.created_at,
-                        )
+                stored = int(
+                    s.scalar(
+                        select(func.count())
+                        .select_from(CommentRow)
+                        .where(CommentRow.item_id == item_id)
                     )
+                    or 0
+                )
+                if item.comments_incomplete and len(item.comments) < stored:
+                    # 本轮评论没拉全（接口失败/被截断）且比库里还少 → **绝不能**用它覆盖。
+                    # 原先这里照删照写：一次评论接口抖动就把整条讨论清空（评测随后可能就基于
+                    # 「零评论」下结论，而结论会被回写到平台、增量抓取又不会再碰这条——错误固化）。
+                    log.warning(
+                        "保留已入库讨论 %s：本轮评论残缺且更少（收到 %d 条 < 库里 %d 条，原因 %s）",
+                        item.key, len(item.comments), stored, item.degraded,
+                    )
+                else:
+                    s.execute(delete(CommentRow).where(CommentRow.item_id == item_id))
+                    for c in item.comments:
+                        s.add(
+                            CommentRow(
+                                item_id=item_id,
+                                author=c.author,
+                                author_kind=c.author_kind.value,
+                                body=c.body,
+                                created_at=c.created_at,
+                            )
+                        )
             return item_id, created, changed
+
+    def _mark_conclusion_stale(self, row: ItemRow) -> None:
+        """把「已有结论已过期」如实留痕，并按状态决定要不要回落重评。
+
+        两种处理：
+
+        * 结论**还没进入执行** → 回落成 ``new``，交给既有的评测路径重新评测。旧结论留在
+          ``evaluations`` 表里，历史不丢。
+        * 结论**已经进入执行**（``IN_FLIGHT_STATUSES``）→ 只标记 + 响亮告警，**不回落**。
+          回落会让条目重走评测，而队列里那条派发还在，等于给「重复修复 / 重复建 PR」再开
+          一道口子。代价是它的结论会一直过期，所以标记必须能被报告/看板看到
+          （``RawItem.stale_reasons``，导出与 API 都会带上）。
+        """
+        raw = dict(row.raw or {})
+        marks = raw.get(STALE_KEY)
+        marks = list(marks) if isinstance(marks, list) else []
+        mark = f"content_changed_at={_now().isoformat(timespec='seconds')}"
+        if mark not in marks:
+            marks.append(mark)
+        raw[STALE_KEY] = marks
+        row.raw = raw        # 必须整体赋值：原地改 JSON 列不会被 SQLAlchemy 跟踪
+
+        if row.status in IN_FLIGHT_STATUSES:
+            log.warning(
+                "内容实质变化但结论已进入执行（status=%s，key=%s）：不自动重评，只标记结论过期；"
+                "要重评请人工把它置回 new 后重跑评测",
+                row.status, row.key,
+            )
+            return
+        if row.status != ItemStatus.NEW.value:
+            log.info("内容实质变化（key=%s）：已有结论作废，置回 new 等待重新评测", row.key)
+            row.status = ItemStatus.NEW.value
 
     def get_item(self, key: str) -> RawItem | None:
         with self.db.session() as s:
@@ -403,6 +498,67 @@ class Repository:
                 )
             return keys
 
+    #: 队列行停在 ``pending`` 超过多久算「阶段中断残留」。见 :meth:`reclaim_stuck_queue_entries`。
+    STUCK_QUEUE_ENTRY_SECONDS = 3600
+
+    def reclaim_stuck_queue_entries(self, *, stale_seconds: int | None = None) -> list[str]:
+        """回收「阶段中断」留下的队列残留，返回被放回重做的条目 key。
+
+        为什么需要：``stages`` 的写法是三连——``set_item_status(QUEUED)`` → ``enqueue()``
+        → ``finish_queue_entry(done)``。进程在这三步之间被 Ctrl-C / 崩溃打断，队列行会
+        **永久**停在 ``pending``：
+
+        * ``queue_unflushed`` 只认 ``done``，这行永远不会被 flush；
+        * ``queue_pending_count`` 于是恒大于 0，``should_flush`` 的**「队列已无待处理条目」
+          这条兜底被永久废掉**（只剩数量阈值与空闲超时）；
+        * 条目自己卡在 ``queued``：``verify`` 只取 ``evaluated``，它既不会被重验，也永远
+          不会被打标签或派发。
+
+        修法与 :meth:`reclaim_fixing_items` 同一套路：把残留行删掉（它从没产出过任何结果，
+        删掉不丢信息；比改 ``failed`` 更稳——``(queue,item_key,status)`` 是唯一键，改状态
+        会撞上存量脏数据里已存在的 ``failed`` 行），条目放回 ``evaluated``，``verify`` 正是
+        从这里重新处理的。可见性靠这条 warning 日志 + 条目状态变化。
+
+        安全性：调用点在**开始一轮 flush 之前**，此时本进程还没入队任何东西，回收到的必然
+        是上一次（已死）运行的残留。跨进程例外与 ``reclaim_fixing_items`` 相同——系统本来
+        就没有跨进程的队列互斥。
+        """
+        window = self.STUCK_QUEUE_ENTRY_SECONDS if stale_seconds is None else stale_seconds
+        cutoff = _now() - timedelta(seconds=window)
+        with self.db.session() as s:
+            rows = list(
+                s.scalars(
+                    select(QueueEntryRow).where(
+                        and_(
+                            QueueEntryRow.status == "pending",
+                            QueueEntryRow.enqueued_at.is_not(None),
+                            QueueEntryRow.enqueued_at < cutoff,
+                        )
+                    )
+                )
+            )
+            if not rows:
+                return []
+            keys = sorted({str(r.item_key) for r in rows})
+            for row in rows:
+                s.delete(row)
+            s.execute(
+                update(ItemRow)
+                .where(
+                    and_(
+                        ItemRow.key.in_(keys),
+                        # 只动「卡在 queued」的：条目若已被人工/后续流程推到别的状态，不覆盖
+                        ItemRow.status == ItemStatus.QUEUED.value,
+                    )
+                )
+                .values(status=ItemStatus.EVALUATED.value)
+            )
+            log.warning(
+                "回收 %d 条「入队后未收尾」的队列残留（条目置回 evaluated 重做）：%s",
+                len(rows), "、".join(keys[:5]),
+            )
+            return keys
+
     def set_item_category(self, key: str, category: Category) -> None:
         with self.db.session() as s:
             s.execute(update(ItemRow).where(ItemRow.key == key).values(category=category.value))
@@ -481,6 +637,14 @@ class Repository:
                 # 报告/看板显示可疑。收敛为需人工，避免留下不一致的流转痕迹。
                 # 只动 fix_queued：fixing / pr_created 表示修复已开工，不回退。
                 item.status = ItemStatus.NEEDS_MANUAL.value
+
+            # 重新出了结论，「已过期」这个标记就该消失——它表达的是「结论 vs 内容」是否一致。
+            # 不清的话，条目会永远显示成过期（而内容可能再没变过）。
+            if isinstance(item.raw, dict) and STALE_KEY in item.raw:
+                fresh = dict(item.raw)
+                fresh.pop(STALE_KEY, None)
+                item.raw = fresh
+
             s.flush()
             return int(row.id)
 
@@ -962,15 +1126,114 @@ class Repository:
             )
             if row is None:
                 return None
-            return BatchConclusion(
-                item_key=row.item_key,
-                verdict=row.verdict or "",
-                labels=list(row.labels or []),
-                priority=Priority(row.priority or "none"),
-                reason=row.reason or "",
-                confidence=row.confidence or 0.5,
-                created_at=row.created_at,
+            return self._conclusion_of(row)
+
+    @staticmethod
+    def _conclusion_of(row: BatchConclusionRow) -> BatchConclusion:
+        return BatchConclusion(
+            item_key=row.item_key,
+            verdict=row.verdict or "",
+            labels=list(row.labels or []),
+            priority=Priority(row.priority or "none"),
+            reason=row.reason or "",
+            confidence=row.confidence or 0.5,
+            created_at=row.created_at,
+        )
+
+    def latest_batch_conclusions(self, keys: Sequence[str]) -> dict[str, BatchConclusion]:
+        """批量取「每条的最新一条」批量结论：**一条 SQL**，替代逐条调用。
+
+        原先导出对每条条目各查一次（每次还新开一个 session）：一万条就是一万次查询，而
+        ``GET /api/export?limit=10000`` 正好允许这个规模。按 ``id`` 升序扫一遍、同 key
+        后者覆盖前者，留下的就是最新那条——与 :meth:`latest_batch_conclusion` 同一口径。
+        """
+        if not keys:
+            return {}
+        out: dict[str, BatchConclusion] = {}
+        with self.db.session() as s:
+            rows = s.scalars(
+                select(BatchConclusionRow)
+                .where(BatchConclusionRow.item_key.in_([str(k) for k in keys]))
+                .order_by(BatchConclusionRow.item_key, BatchConclusionRow.id)
             )
+            for row in rows:
+                out[str(row.item_key)] = self._conclusion_of(row)
+        return out
+
+    def item_keys(
+        self,
+        *,
+        repo_slug: str | None = None,
+        status: ItemStatus | None = None,
+        category: Category | None = None,
+    ) -> list[str]:
+        """只取 key（不构造领域对象）。
+
+        概览算平均分只需要 key 去批量取评测——原先为此把十万条领域对象（含标签、正文元数据）
+        全加载进内存。
+        """
+        stmt = self._item_filtered(
+            select(ItemRow.key), repo_slug=repo_slug, status=status, category=category
+        )
+        with self.db.session() as s:
+            return [str(k) for k in s.scalars(stmt)]
+
+    def item_stats(
+        self,
+        *,
+        repo_slug: str | None = None,
+        status: ItemStatus | None = None,
+        category: Category | None = None,
+    ) -> dict[str, Any]:
+        """概览计数走**聚合查询**（一行 GROUP BY），不把条目对象加载进内存。
+
+        与逐条 ``Counter`` 完全等价：每条只属于一个分组，而分组把自己的 count 分别加到四个
+        计数器上——「每种类型/分类/优先级/状态各多少」四组数字都由此得出。
+        """
+        stmt = self._item_filtered(
+            select(ItemRow.item_type, ItemRow.category, ItemRow.priority, ItemRow.status, func.count()),
+            repo_slug=repo_slug,
+            status=status,
+            category=category,
+        )
+        stmt = stmt.group_by(ItemRow.item_type, ItemRow.category, ItemRow.priority, ItemRow.status)
+        by_type: dict[str, int] = {}
+        by_category: dict[str, int] = {}
+        by_priority: dict[str, int] = {}
+        by_status: dict[str, int] = {}
+        total = 0
+        with self.db.session() as s:
+            for item_type, cat, prio, stat, count in s.execute(stmt):
+                n = int(count or 0)
+                total += n
+                by_type[str(item_type)] = by_type.get(str(item_type), 0) + n
+                by_category[str(cat)] = by_category.get(str(cat), 0) + n
+                by_priority[str(prio)] = by_priority.get(str(prio), 0) + n
+                by_status[str(stat)] = by_status.get(str(stat), 0) + n
+        return {
+            "total": total,
+            "by_type": by_type,
+            "by_category": by_category,
+            "by_priority": by_priority,
+            "by_status": by_status,
+        }
+
+    @staticmethod
+    def _item_filtered(
+        stmt: Select,
+        *,
+        repo_slug: str | None = None,
+        status: ItemStatus | None = None,
+        category: Category | None = None,
+    ) -> Select:
+        """条目查询的公共过滤（与 :meth:`list_items` 同口径）。"""
+        if repo_slug:
+            stmt = stmt.where(ItemRow.repo_slug == repo_slug)
+        if status:
+            stmt = stmt.where(ItemRow.status == status.value)
+        if category:
+            stmt = stmt.where(ItemRow.category == category.value)
+        return stmt
 
     # -- 修复尝试 ---------------------------------------------------------
 

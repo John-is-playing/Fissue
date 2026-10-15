@@ -155,6 +155,15 @@ class EvalStage:
 
         async def one(item: RawItem) -> StageResult:
             async with sem:
+                if item.comments_incomplete:
+                    # 评论没拉全就下结论 = 在没有讨论上下文的数据上评测，而这个结论会被
+                    # **回写到平台**，增量抓取下一轮又会重抓同一条（本轮游标被冻结）——错误就此
+                    # 固化在库里和平台上。跳过它：条目留在 new，等抓到完整评论再评。
+                    log.warning("跳过评测 %s：评论数据残缺（%s）", item.key, item.degraded)
+                    return StageResult(
+                        key=item.key,
+                        skipped_reason=f"评论数据残缺：{'；'.join(item.degraded)}",
+                    )
                 try:
                     similar = _similar_to(item, pool) if pool else None
                     evaluation = await self.run(item, deep=deep, similar=similar)

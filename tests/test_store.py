@@ -620,3 +620,297 @@ def test_notification_claim_does_not_swallow_db_errors(repo: Repository, monkeyp
 
     with pytest.raises(OperationalError):
         repo.try_claim_notification("k2", "ev", "item", "console", {})
+
+
+# ---------------------------------------------------------------------------
+# 内容变更 → 结论作废
+# ---------------------------------------------------------------------------
+
+
+def _upsert_variant(repo: Repository, item: RawItem, **changes) -> None:
+    """按原条目改几个字段后再抓取一次（模拟平台侧内容变了）。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    payload = item.model_dump()
+    payload.update(changes)
+    repo.upsert_item(rid, RawItem(**payload))
+
+
+def test_material_change_puts_item_back_for_reeval(repo: Repository) -> None:
+    """正文这类**实质**变化 → 已有结论作废、条目回到 new 等待重评。
+
+    回归：`upsert_item` 原先只返回 `changed=True`，而 `changed_keys` 全仓**没有任何消费者**，
+    `items_needing_eval` 又只取 `new/classified` → 内容变了也永不重评；更糟的是
+    `content_hash` 在同一处被无条件覆写，事后连「这条结论过期了」都判不出来，
+    报告/看板/派发全都基于过期结论。
+    """
+    item = _seed(repo, number=41)
+    key = item.key
+    repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
+    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value
+
+    _upsert_variant(repo, item, body="改过的正文")
+
+    assert repo.get_item_row(key).status == ItemStatus.NEW.value, "实质变化要让结论作废并重评"
+    assert repo.get_item(key).stale_reasons, "作废这件事也必须留痕"
+    assert any(i.key == key for i in repo.items_needing_eval()), "应当重新出现在待评测里"
+
+
+def test_comment_only_change_does_not_invalidate_conclusion(repo: Repository) -> None:
+    """只是评论增长：评论表要刷新，但结论不动。
+
+    否则活跃 issue 上每来一条评论就重评测一次，持续烧 token（指纹里的 `len(comments)`
+    正是为「要不要重写评论表」服务的，不该拿来判结论过期）。
+    """
+    item = _seed(repo, number=42)
+    key = item.key
+    repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
+
+    _upsert_variant(repo, item, comments=[*item.comments, Comment(author="c2", body="又来一条")])
+
+    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value, "评论增长不该触发重评"
+    assert repo.get_item(key).stale_reasons == []
+    assert len(repo.get_item(key).comments) == 2, "但评论表必须刷新"
+
+
+def test_material_change_on_in_flight_fix_marks_stale_without_rewinding(repo: Repository) -> None:
+    """修复已开工时**不回落**（免得重复修复/重复建 PR），但过期必须留痕。"""
+    item = _seed(repo, number=43)
+    key = item.key
+    for status in (ItemStatus.FIX_QUEUED, ItemStatus.FIXING, ItemStatus.PR_CREATED):
+        repo.set_item_status(key, status, priority=Priority.TIER1)
+        _upsert_variant(repo, item, title=f"标题改成 {status.value}")
+        assert repo.get_item_row(key).status == status.value, "已开工的修复不该被回退"
+        assert repo.get_item(key).stale_reasons, "但过期必须看得见"
+
+
+def test_stale_mark_sticks_until_reeval(repo: Repository) -> None:
+    """过期标记要黏到「重新出结论」为止。
+
+    否则下一轮抓取时内容已和库里的 hash 一致（`changed=False`），`row.raw` 会被
+    `item.raw` 冲掉，过期重新变成不可见——那正是这次要修的「静默」本身。
+    """
+    item = _seed(repo, number=44)
+    key = item.key
+    repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
+
+    _upsert_variant(repo, item, body="改过的正文")
+    assert repo.get_item(key).stale_reasons
+
+    _upsert_variant(repo, item, body="改过的正文")          # 内容没再变
+    assert repo.get_item(key).stale_reasons, "标记必须黏住，不能被下一次抓取冲掉"
+
+    repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
+    assert repo.get_item(key).stale_reasons == [], "重新出了结论就不再过期"
+
+
+# ---------------------------------------------------------------------------
+# 评论残缺：不得覆盖已入库的讨论
+# ---------------------------------------------------------------------------
+
+
+def _upsert_degraded_comments(repo: Repository, item: RawItem, comments: list, reason: str) -> None:
+    """抓一次「评论残缺」的数据（评论为空或更少，raw 里带残缺标记）。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    payload = item.model_dump()
+    payload["comments"] = comments
+    variant = RawItem(**payload)
+    variant.mark_degraded(reason)
+    repo.upsert_item(rid, variant)
+
+
+def test_degraded_comments_never_shrink_stored_discussion(repo: Repository) -> None:
+    """本轮评论残缺且比库里少 → 绝不能用它覆盖已入库的讨论。
+
+    回归：`upsert_item` 原先照删照写，一次评论接口抖动就把整条讨论清空；评测随后可能就基于
+    「零评论」下结论，而结论会被**回写到平台**、增量抓取又不会再碰这条——错误就此固化在
+    库里和平台上。
+    """
+    item = _seed(repo, number=51)
+    assert len(repo.get_item(item.key).comments) == 1
+
+    _upsert_degraded_comments(repo, item, [], "comments_unavailable#51")
+
+    assert len(repo.get_item(item.key).comments) == 1, "残缺结果不得覆盖已有讨论"
+    assert repo.get_item(item.key).comments_incomplete, "但「残缺」必须留在条目上"
+
+
+def test_incomplete_but_not_smaller_comments_still_refresh(repo: Repository) -> None:
+    """「残缺但没变少」仍要刷新。
+
+    否则评论数超过上限的条目（`comments_may_be_truncated` 恒为真）会被永久冻住——那是把
+    「别丢数据」修成「永远不更新」，同样错。
+    """
+    item = _seed(repo, number=52)
+    _upsert_degraded_comments(
+        repo,
+        item,
+        [Comment(author="c1", body="评论"), Comment(author="c2", body="新的")],
+        "comments_may_be_truncated#52",
+    )
+
+    assert len(repo.get_item(item.key).comments) == 2
+
+
+# ---------------------------------------------------------------------------
+# 队列中断残留
+# ---------------------------------------------------------------------------
+
+
+def test_reclaim_stuck_queue_entries_returns_items_to_verify(repo: Repository, monkeypatch) -> None:
+    """入队后没收尾的残留必须回收，条目放回 evaluated 重做。
+
+    回归：该行永久停在 `pending` —— `queue_unflushed` 只认 `done`，它永远不会被 flush；
+    `queue_pending_count` 恒 > 0，于是 `should_flush` 的「队列已无待处理条目」这条兜底被
+    **永久废掉**；条目卡在 `queued`，而 `verify` 只取 `evaluated`，它再也不会被碰。
+    """
+    _seed(repo, number=61)
+    key = "github:psf/requests#61"
+    repo.set_item_status(key, ItemStatus.QUEUED)
+    repo.enqueue(QueueName.VERIFY, key)          # 没有 finish_queue_entry → 就是中断点
+
+    monkeypatch.setattr(repo, "STUCK_QUEUE_ENTRY_SECONDS", -1)      # 模拟超龄
+
+    assert repo.reclaim_stuck_queue_entries() == [key]
+    assert repo.queue_pending_count(QueueName.VERIFY) == 0, "残留不清，兜底就永久失效"
+    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value, "条目要能重验"
+
+
+def test_reclaim_leaves_fresh_and_finished_rows_alone(repo: Repository) -> None:
+    """刚入队的（可能真在跑）与已收尾的都不能动。"""
+    _seed(repo, number=62)
+    _seed(repo, number=63)
+    fresh = "github:psf/requests#62"
+    done = "github:psf/requests#63"
+    repo.enqueue(QueueName.VERIFY, fresh)
+    eid = repo.enqueue(QueueName.VERIFY, done)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    assert repo.reclaim_stuck_queue_entries() == []
+    assert repo.queue_pending_count(QueueName.VERIFY) == 1
+    assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
+
+
+# ---------------------------------------------------------------------------
+# 导出：聚合计数 + 批量取结论
+# ---------------------------------------------------------------------------
+
+
+def test_summarize_aggregates_totals_in_sql(repo: Repository, monkeypatch) -> None:
+    """概览的计数走聚合查询：不再把条目对象全加载进内存。
+
+    回归：`summarize` 原先 `list_items(limit=100000)` —— 十万条领域对象（含标签、正文
+    元数据）只为数几个数。
+    """
+    first = _seed(repo, number=81)
+    _seed(repo, number=82)
+    repo.set_item_status("github:psf/requests#82", ItemStatus.NEEDS_MANUAL)
+    repo.save_evaluation(first.key, Evaluation(scores=Scores(importance=DimensionScore(score=70))))
+
+    def boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("概览不该再把条目对象全加载进内存")
+
+    monkeypatch.setattr(repo, "list_items", boom)
+
+    stats = exp.summarize(repo)
+
+    assert stats["total"] == 2
+    # 第一条被 save_evaluation 推到 evaluated（既有语义），第二条被显式置为 needs_manual
+    assert stats["by_status"] == {"evaluated": 1, "needs_manual": 1}
+    assert stats["avg_scores"]["importance"] == 70.0
+
+
+def test_export_fetches_conclusions_in_one_query(repo: Repository, monkeypatch) -> None:
+    """导出批量取结论，不再逐条查。
+
+    回归：原先每条一次 `latest_batch_conclusion`、每次还新开一个 session；
+    `GET /api/export?limit=10000` 正好允许一万条这个规模。
+    """
+    item = _seed(repo, number=83)
+    repo.save_batch_conclusion(
+        item.key, "b1", verdict="fix", labels=["reproduced"],
+        priority=Priority.TIER1, reason="低难度高重要性", confidence=0.9, model="stub",
+    )
+
+    def boom(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        raise AssertionError("不该逐条查结论")
+
+    monkeypatch.setattr(repo, "latest_batch_conclusion", boom)
+
+    payload = json.loads(exp.export_json(repo))
+    assert payload["items"][0]["batch_conclusion"]["verdict"] == "fix"
+    assert "fix" in exp.export_markdown(repo)
+
+
+def test_latest_batch_conclusions_matches_the_single_key_version(repo: Repository) -> None:
+    """批量版取的是**每条最新一条**，与逐条版本同口径。"""
+    _seed(repo, number=84)
+    _seed(repo, number=85)
+    key, other = "github:psf/requests#84", "github:psf/requests#85"
+    for verdict in ("skip", "fix"):
+        repo.save_batch_conclusion(
+            key, f"b-{verdict}", verdict=verdict, labels=[],
+            priority=Priority.NONE, reason="r", confidence=0.5, model="stub",
+        )
+
+    out = repo.latest_batch_conclusions([key, other])
+
+    assert out[key].verdict == "fix", "同 key 要取最新那条"
+    assert other not in out, "没有结论的条目不该出现在结果里"
+    assert out[key].verdict == repo.latest_batch_conclusion(key).verdict, "与逐条版本同口径"
+
+
+# ---------------------------------------------------------------------------
+# SQLite 并发：WAL 与 busy 超时
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_uses_wal_and_a_longer_busy_timeout(tmp_path) -> None:
+    """SQLite 要开 WAL 并把 busy 超时明确调大。
+
+    实测（sqlite 3.54 / Python 3.11）：驱动**本来就**有 5s busy 超时——写锁被占 0.8s 时
+    第二个写者能等过去，但把超时压到 0.5s 就立刻 ``database is locked``。也就是说真正的上限
+    是那 5s；而没有 WAL 意味着回滚日志模式下长**读**事务（导出、看板）会挡住写者的提交。
+    """
+    from fissue.store.db import Database
+
+    db = Database(f"sqlite:///{tmp_path}/w.db")
+    db.create_all()
+
+    with db.engine.connect() as conn:
+        assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+        (busy,) = conn.exec_driver_sql("PRAGMA busy_timeout").one()
+        assert int(busy) >= 30_000, f"busy 超时要 >= 30s，实际 {busy}ms"
+
+
+def test_sqlite_concurrent_writers_do_not_lock_each_other_out(tmp_path) -> None:
+    """并发写不该因写锁互撞而失败（WAL + 30s busy 超时兜住）。"""
+    import threading
+
+    from fissue.store.db import Database
+
+    db = Database(f"sqlite:///{tmp_path}/c.db")
+    db.create_all()
+    repo = Repository(db)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    errors: list[Exception] = []
+
+    def writer(n: int) -> None:
+        try:
+            repo.upsert_item(
+                rid,
+                RawItem(
+                    platform=Platform.GITHUB, repo="psf/requests", number=n,
+                    item_type=ItemType.ISSUE, title=f"t{n}", body="b",
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(1, 9)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"并发写不该失败：{errors}"
+    assert {str(i.number) for i in repo.list_items(limit=20)} == {str(n) for n in range(1, 9)}

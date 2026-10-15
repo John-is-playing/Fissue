@@ -17,6 +17,14 @@ from .tables import Base
 
 log = get_logger(__name__)
 
+#: SQLite 的 busy 超时（秒）。
+#:
+#: 实测（sqlite 3.54 / Python 3.11）：驱动**本来就**有 5s 的 busy 超时，写锁被占 0.8s 时
+#: 第二个写者能等过去；但把超时压到 0.5s 就立刻抛 ``OperationalError: database is locked``
+#: ——也就是说真正的上限是那 5s，且**没有开 WAL**：回滚日志模式下长**读**事务（导出、看板）
+#: 会挡住写者的提交，一超过 5s 写者就失败。这里把超时明确调到 30s 并开 WAL。
+SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
+
 
 class Database:
     """封装 Engine 与 Session 生命周期。
@@ -33,14 +41,43 @@ class Database:
         if not self.is_sqlite:
             kwargs.update(pool_size=pool_size, max_overflow=max_overflow, pool_recycle=1800)
         else:
-            kwargs["connect_args"] = {"check_same_thread": False}
+            kwargs["connect_args"] = {
+                "check_same_thread": False,
+                # 见 SQLITE_BUSY_TIMEOUT_SECONDS：默认 5s 太短，读事务一长就把写者顶掉。
+                "timeout": SQLITE_BUSY_TIMEOUT_SECONDS,
+            }
         try:
             self.engine: Engine = create_engine(url, **kwargs)
         except Exception as exc:  # pragma: no cover
             raise FissueError(f"无法创建数据库引擎（{url}）：{exc}") from exc
+        if self.is_sqlite:
+            self._enable_sqlite_concurrency()
         self.session_factory = sessionmaker(
             bind=self.engine, expire_on_commit=False, class_=Session
         )
+
+    def _enable_sqlite_concurrency(self) -> None:
+        """给每条新连接开 WAL 并把 busy 超时落到 PRAGMA 上。
+
+        两条都冲着实测出来的那个 5s 上限：
+
+        * **WAL**：默认的回滚日志模式下读写互相挡——一个长读事务（导出、看板）会让写者的
+          提交等不到锁，超过 busy 超时就失败。WAL 下读者不再挡写者。
+        * **busy_timeout**：显式调大（驱动默认 5s），与 ``connect_args["timeout"]`` 同值，
+          两条路都设上，免得将来只改一处。
+
+        ``:memory:`` 上这两条是无害的：``journal_mode`` 改不动、会返回 ``memory``。
+        """
+        from sqlalchemy import event
+
+        @event.listens_for(self.engine, "connect")
+        def _apply_pragmas(dbapi_conn: Any, _record: Any) -> None:
+            cursor = dbapi_conn.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
+            finally:
+                cursor.close()
 
     # -- schema -----------------------------------------------------------
 
