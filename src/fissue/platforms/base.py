@@ -111,11 +111,11 @@ class PlatformAdapter(ABC):
         yield  # pragma: no cover - 使函数成为 async generator
 
     @abstractmethod
-    def item_url(self, repo: RepoRef, number: int, item_type: ItemType) -> str:
+    def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         """条目的网页地址。"""
 
     @abstractmethod
-    async def fetch_diff(self, repo: RepoRef, number: int) -> str:
+    async def fetch_diff(self, repo: RepoRef, number: int | str) -> str:
         """拉取 PR 的完整 diff/patch。"""
 
     # -- 通用能力（子类可覆写） -------------------------------------------
@@ -268,15 +268,15 @@ class PlatformAdapter(ABC):
         """
         return True
 
-    async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
+    async def add_labels(self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         """给条目加标签。"""
         raise PlatformError(f"{self.platform.display} 适配器未实现打标签")
 
-    async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def comment(self, repo: RepoRef, number: int | str, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         """在条目下发表评论。"""
         raise PlatformError(f"{self.platform.display} 适配器未实现评论")
 
-    async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def close_item(self, repo: RepoRef, number: int | str, item_type: ItemType = ItemType.ISSUE) -> None:
         raise PlatformError(f"{self.platform.display} 适配器未实现关闭条目")
 
     # -- 仓库操作（自动修复用） --------------------------------------------

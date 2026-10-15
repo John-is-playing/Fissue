@@ -57,7 +57,7 @@ class AtomGitAdapter(V5Adapter):
             return False
 
     async def add_labels(
-        self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE
+        self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE
     ) -> None:
         """给条目打标签：PATCH 条目自身，`labels` 传逗号分隔字符串。
 

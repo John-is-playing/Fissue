@@ -304,7 +304,7 @@ class V5Adapter(PlatformAdapter):
         return raw
 
     async def _fetch_comments(
-        self, repo: RepoRef, number: int, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
+        self, repo: RepoRef, number: int | str, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
     ) -> tuple[list[Comment], str]:
         """拉评论，返回 ``(评论, 残缺原因)``；原因非空表示数据不完整。
 
@@ -343,7 +343,7 @@ class V5Adapter(PlatformAdapter):
         return comments, (f"comments_may_be_truncated#{number}" if truncated else "")
 
     async def fetch_files(
-        self, repo: RepoRef, number: int, *, with_patch: bool = False, max_files: int = 100
+        self, repo: RepoRef, number: int | str, *, with_patch: bool = False, max_files: int = 100
     ) -> list[FileChange]:
         files: list[FileChange] = []
         try:
@@ -371,7 +371,7 @@ class V5Adapter(PlatformAdapter):
                 break
         return files
 
-    async def fetch_diff(self, repo: RepoRef, number: int) -> str:
+    async def fetch_diff(self, repo: RepoRef, number: int | str) -> str:
         """v5 支持在 PR URL 后加 ``.diff`` 直接取 diff 文本。"""
         url = f"{self._repo_api(repo)}/pulls/{number}.diff"
         return await self._request(
@@ -385,13 +385,13 @@ class V5Adapter(PlatformAdapter):
 
     # -- 写操作 -----------------------------------------------------------
 
-    async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
+    async def add_labels(self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         if not labels:
             return
         # v5：Issue 与 PR 的标签都通过 issues 端点操作
         await self._post(f"{self._repo_api(repo)}/issues/{number}/labels", {"labels": labels})
 
-    async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def comment(self, repo: RepoRef, number: int | str, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         url = f"{self._repo_api(repo)}/issues/{number}/comments"
 
         async def _probe() -> Any:
@@ -404,7 +404,7 @@ class V5Adapter(PlatformAdapter):
 
         await self._post(url, {"body": body}, probe=_probe)
 
-    async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def close_item(self, repo: RepoRef, number: int | str, item_type: ItemType = ItemType.ISSUE) -> None:
         await self._patch(f"{self._repo_api(repo)}/issues/{number}", {"state": "closed"})
 
     async def fork_repo(self, repo: RepoRef) -> RepoRef:
@@ -444,8 +444,10 @@ class V5Adapter(PlatformAdapter):
         （关 PR 不删分支，重跑必踩）。另**必须按分支核对**：平台若不支持 `head` 过滤参数，
         会把整张列表返回，拿第一条充数就会误报「已提 PR」。
         """
-        owner_part, sep, branch_part = head.partition(":")
-        branch = branch_part if (sep and branch_part and owner_part.lower() == upstream.owner.lower()) else head
+        # `head` 可能是调用方按 GitHub 习惯拼的 `owner:branch`，也可能是 fork 的
+        # `ns/repo:branch`；而平台 PR 里的 `head.ref` 是**裸分支名**。所以比对一律取
+        # **分支那一段**——否则 fork 场景下永远匹配不上，而 fork 恰恰是这里要修的场景。
+        branch = head.partition(":")[2] or head
         data = await self._get(
             f"{self._repo_api(upstream)}/pulls",
             head=branch,
@@ -492,7 +494,7 @@ class V5Adapter(PlatformAdapter):
             found = await self._get(
                 f"{self._repo_api(upstream)}/pulls",
                 head=head_ref,
-                state="all",
+                state="open",       # 与 find_open_pr 一致：已关闭的同头 PR 不算「已有」
                 per_page=20,
             )
             for pr in found or []:
@@ -515,7 +517,7 @@ class V5Adapter(PlatformAdapter):
             "url": data.get("html_url") or data.get("url"),
         }
 
-    def item_url(self, repo: RepoRef, number: int, item_type: ItemType) -> str:
+    def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         seg = self.issue_segment if item_type is ItemType.ISSUE else self.pr_segment
         return f"https://{self.web_host}/{repo.owner}/{repo.name}/{seg}/{number}"
 

@@ -208,14 +208,17 @@ class GitLabAdapter(PlatformAdapter):
                     # 一律为 None），所以这两个数只能从 diff 文本里数。
                     # 实测：不数的话它们恒为 0，而 render_item 会把 MR 渲染成
                     # 「+0/-0，10 个文件」——评测据此判 pr_quality 就被喂了错信息。
-                    # `+++`/`---` 是文件头不是内容行，要排除；`too_large` 的 diff 平台
-                    # 不给文本，那种情况下这两个数是**下限**。
+                    # `+++`/`---` 是文件头不是内容行，要排除——但**必须带上那个空格**：
+                    # 只判 `startswith("+++")` 会把内容行 `++i`、`--count` 一起误剔除，
+                    # 让 additions/deletions 系统性低估，而它们正是 pr_quality 的输入。
+                    # （真实文件头永远是 `+++ <路径>` / `--- <路径>`，哪怕是 /dev/null。）
+                    # `too_large` 的 diff 平台不给文本，那种情况下这两个数是**下限**。
                     plus = minus = 0
                     for entry in entries:
                         for line in str(entry.get("diff") or "").splitlines():
-                            if line.startswith("+") and not line.startswith("+++"):
+                            if line.startswith("+") and not line.startswith("+++ "):
                                 plus += 1
-                            elif line.startswith("-") and not line.startswith("---"):
+                            elif line.startswith("-") and not line.startswith("--- "):
                                 minus += 1
                     raw.additions = int(changes.get("additions") or plus)
                     raw.deletions = int(changes.get("deletions") or minus)
@@ -258,7 +261,7 @@ class GitLabAdapter(PlatformAdapter):
         return raw
 
     async def _fetch_notes(
-        self, repo: RepoRef, number: int, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
+        self, repo: RepoRef, number: int | str, *, item_type: ItemType = ItemType.ISSUE, limit: int = 100
     ) -> tuple[list[Comment], str]:
         """拉 MR/Issue 评论，返回 ``(评论, 残缺原因)``；原因非空表示数据不完整。
 
@@ -300,7 +303,7 @@ class GitLabAdapter(PlatformAdapter):
         return comments, (f"comments_may_be_truncated#{number}" if truncated else "")
 
     async def fetch_files(
-        self, repo: RepoRef, number: int, *, with_patch: bool = False, max_files: int = 100
+        self, repo: RepoRef, number: int | str, *, with_patch: bool = False, max_files: int = 100
     ) -> list[FileChange]:
         try:
             data = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
@@ -322,7 +325,7 @@ class GitLabAdapter(PlatformAdapter):
             )
         return files
 
-    async def fetch_diff(self, repo: RepoRef, number: int) -> str:
+    async def fetch_diff(self, repo: RepoRef, number: int | str) -> str:
         """拼接 MR 各文件的 diff 文本。"""
         try:
             data = await self._get(f"{self._project(repo)}/merge_requests/{number}/changes")
@@ -339,7 +342,7 @@ class GitLabAdapter(PlatformAdapter):
 
     # -- 写操作 -----------------------------------------------------------
 
-    async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
+    async def add_labels(self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         if not labels:
             return
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
@@ -349,7 +352,7 @@ class GitLabAdapter(PlatformAdapter):
             json={"add_labels": ",".join(labels)},
         )
 
-    async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def comment(self, repo: RepoRef, number: int | str, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
         notes_url = f"{self._project(repo)}/{segment}/{number}/notes"
 
@@ -363,7 +366,7 @@ class GitLabAdapter(PlatformAdapter):
 
         await self._request("POST", notes_url, json={"body": body}, probe=_probe)
 
-    async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def close_item(self, repo: RepoRef, number: int | str, item_type: ItemType = ItemType.ISSUE) -> None:
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
         event = "close" if item_type is ItemType.ISSUE else "close"
         await self._request(
@@ -449,7 +452,7 @@ class GitLabAdapter(PlatformAdapter):
             raise PlatformError(f"创建 MR 返回异常：{data}")
         return {"number": data.get("iid") or data.get("id"), "url": data.get("web_url")}
 
-    def item_url(self, repo: RepoRef, number: int, item_type: ItemType) -> str:
+    def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         seg = "issues" if item_type is ItemType.ISSUE else "merge_requests"
         return f"{self.scheme}{self.web_host}/{repo.owner}/{repo.name}/-/{seg}/{number}"
 

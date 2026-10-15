@@ -769,7 +769,8 @@ async def test_gitlab_pr_line_counts_are_counted_from_diff(gl) -> None:
                 {"old_path": "a.py", "new_path": "a.py",
                  "diff": "@@ -1,2 +1,3 @@\n context\n+added\n+added2\n-removed\n"},
                 {"old_path": "b.py", "new_path": "b.py",
-                 "diff": "--- a/b.py\n+++ b/b.py\n+x\n"},
+                 # 内容行以 `++i` 开头：只判 `startswith("+++")` 会把它当文件头误剔除
+                 "diff": "--- a/b.py\n+++ b/b.py\n+x\n++i\n"},
             ],
         })
     )
@@ -778,8 +779,9 @@ async def test_gitlab_pr_line_counts_are_counted_from_diff(gl) -> None:
     items = [i async for i in gl.fetch_items(REPO, item_types=[ItemType.PR])]
 
     pr = items[0]
-    # a.py：+2/-1；b.py：+1（`---`/`+++` 是文件头，不算内容行）
-    assert (pr.additions, pr.deletions, pr.changed_files) == (3, 1, 2)
+    # a.py：+2/-1； b.py：+2（`+x` 与**以 `++i` 开头的内容行**都要算）
+    # `--- `/`+++ ` 才是文件头——必须带那个空格，否则 `++i`/`--count` 这类内容行被误剔除。
+    assert (pr.additions, pr.deletions, pr.changed_files) == (4, 1, 2)
 
 
 @respx.mock

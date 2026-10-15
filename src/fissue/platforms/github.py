@@ -165,7 +165,7 @@ class GitHubAdapter(PlatformAdapter):
         )
         return raw
 
-    async def _enrich_pr(self, repo: RepoRef, number: int, raw: RawItem) -> None:
+    async def _enrich_pr(self, repo: RepoRef, number: int | str, raw: RawItem) -> None:
         """补 PR 专有字段：分支、可合并性、变更统计、diff 摘要。"""
         pr = await self._get(f"{self.api_base}/repos/{repo.owner}/{repo.name}/pulls/{number}")
         if not pr:
@@ -193,7 +193,7 @@ class GitHubAdapter(PlatformAdapter):
         # 关联 Issue：优先用 API 的 timeline 提取（此处用正文正则兜底，省一次请求）
         raw.linked_issues = extract_linked_issues(pr.get("title") or "", pr.get("body") or "")
 
-    async def fetch_files(self, repo: RepoRef, number: int, *, with_patch: bool = False, max_files: int = 100) -> list[FileChange]:
+    async def fetch_files(self, repo: RepoRef, number: int | str, *, with_patch: bool = False, max_files: int = 100) -> list[FileChange]:
         """PR 变更文件列表；``with_patch`` 为真时带 patch 内容（评代码质量用）。"""
         files: list[FileChange] = []
         async for batch in self._paginate(
@@ -214,7 +214,7 @@ class GitHubAdapter(PlatformAdapter):
                     return files
         return files
 
-    async def fetch_diff(self, repo: RepoRef, number: int) -> str:
+    async def fetch_diff(self, repo: RepoRef, number: int | str) -> str:
         headers = {**self._headers(), "Accept": "application/vnd.github.v3.diff"}
         return await self._request(
             "GET",
@@ -227,7 +227,7 @@ class GitHubAdapter(PlatformAdapter):
         )
 
     async def _fetch_comments(
-        self, repo: RepoRef, number: int, *, limit: int = 100
+        self, repo: RepoRef, number: int | str, *, limit: int = 100
     ) -> tuple[list[Comment], str]:
         """拉评论，返回 ``(评论, 残缺原因)``。
 
@@ -272,7 +272,7 @@ class GitHubAdapter(PlatformAdapter):
 
     # -- 写操作 -----------------------------------------------------------
 
-    async def add_labels(self, repo: RepoRef, number: int, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
+    async def add_labels(self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         if not labels:
             return
         await self._request(
@@ -281,7 +281,7 @@ class GitHubAdapter(PlatformAdapter):
             json={"labels": labels},
         )
 
-    async def comment(self, repo: RepoRef, number: int, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def comment(self, repo: RepoRef, number: int | str, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         async def _probe() -> Any:
             """已存在一条逐字相同的评论 → 说明这次写其实已经生效了。"""
             data = await self._get(
@@ -300,7 +300,7 @@ class GitHubAdapter(PlatformAdapter):
             probe=_probe,
         )
 
-    async def close_item(self, repo: RepoRef, number: int, item_type: ItemType = ItemType.ISSUE) -> None:
+    async def close_item(self, repo: RepoRef, number: int | str, item_type: ItemType = ItemType.ISSUE) -> None:
         await self._request(
             "PATCH",
             f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues/{number}",
@@ -361,6 +361,6 @@ class GitHubAdapter(PlatformAdapter):
         )
         return {"number": (data or {}).get("number"), "url": (data or {}).get("html_url")}
 
-    def item_url(self, repo: RepoRef, number: int, item_type: ItemType) -> str:
+    def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         seg = "issues" if item_type is ItemType.ISSUE else "pull"
         return f"https://github.com/{repo.owner}/{repo.name}/{seg}/{number}"

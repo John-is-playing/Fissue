@@ -900,10 +900,11 @@ def _similar_to(item: RawItem, pool: Sequence[RawItem], *, limit: int = 5) -> li
     my_body = _body_evidence(raw_body.get(item.key, set()), df, cutoff)
 
     scored: list[tuple[float, RawItem]] = []
+    item_num_key = _num_key(item.number)          # 循环不变量：别在循环里重复算
     for other in pool:
         if other.key == item.key:
             continue
-        if other.item_type is not item.item_type or _num_key(other.number) >= _num_key(item.number):
+        if other.item_type is not item.item_type or _num_key(other.number) >= item_num_key:
             continue
         toks = _title_tokens(other.title)
         if not toks:
