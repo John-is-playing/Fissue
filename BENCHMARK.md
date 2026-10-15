@@ -1040,10 +1040,11 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
   作为**唯一挂载点**，8 个变更入口全接上（CLI 的 fetch / eval / verify / flush / fix、
   daemon 的 `run_once` 与两个循环）。**读命令不接**——看板 / `status` 不该被常驻服务挡住。
 
-  > **未覆盖的一段（如实留档）**：独立 `serve` / `web` 进程**没有持锁**，它们的
-  > `/api/flush`、`/api/eval` 因此不在互斥保护内。不接的理由：这两条与 daemon 同跑本来
-  > 就会撞端口（实践上少见），而给长期进程持锁会把 CLI 的手动操作一起挡掉，代价大于收益。
-  > **别以为「全都互斥了」。**
+  > **【2026-10-15 更正】上面「独立 `serve` / `web` 进程没有持锁」已不成立**：7 个 Web 写
+  > 端点现在都过 `_exclusive_write`（进程内 `WRITE_GATE` + 跨进程 `flock`，拿不到回 409），
+  > 而同进程里 `flock` 走重入旁路的那一半，正由 `WRITE_GATE` 补上；flush 的批次另用条件
+  > UPDATE **原子抢占**，同一批不会被两个写者各跑一次（重复计费 + 重复打标签）。读命令仍
+  > **不接锁**——看板 / `status` 不该被常驻服务挡住。历史留档保留在上面，别当它还有效。
 
   （为什么这条不是 P0：唯一键、确定性分支名与「只认 open 的复用」已经挡住了重复条目/
   重复 PR，剩下的代价是重复评测烧 token 与 SQLite 写冲突。）
@@ -1062,3 +1063,104 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
   4. `stages._similar_to` 的 `_num_key(item.number)` 是循环不变量，却放在循环内重复计算 →
      提到循环外。
   5. `number` 的类型注解从 `int` 对齐为 `int | str`（适配器里 28 处）。运行期无影响，纯契约。
+
+---
+
+## 第三轮 P0/P1 审计与修复（2026-10-15）
+
+由独立审查 + 子代理分工查出。**上一轮只报了 5 条 P1**，这里把剩下的补齐，并更正上一轮两处
+不准确的留档。
+
+**先更正两处：**
+
+* 「独立 `serve` / `web` 进程没有持锁」——见上面那段更正，**已不成立**。
+* 「SQLite 无 `busy_timeout`」——**不准确**。实测（sqlite 3.54 / Python 3.11）：驱动**本来就有
+  5s** busy 超时（写锁被占 0.8s 时第二个写者能等过去；把超时压到 0.5s 才立刻
+  `OperationalError: database is locked`）。真正的上限是那 5s，且**没开 WAL**。
+
+### P0（4 条，全部静态可读出、不需要并发窗口）
+
+1. **容器可写的 `.git` 是宿主的执行入口**（逃逸 + 拿到密钥 + 写宿主）。攻击链：工作区以 rw
+   挂进容器（验证器要往里写测试文件），容器里跑的是不可信 PR 代码与模型生成的验证器、uid 与
+   宿主同用户 → 容器写 `.git/hooks/pre-push`；宿主的 `git push` 会在子进程环境里**带着平台
+   令牌**执行它。三道屏障：宿主 git 一律 `-c core.hooksPath=<devnull>`；克隆后与**每次沙盒
+   跑完**都重建 `.git/config`（`filter.*.clean` / `diff.*.textconv` / `credential.helper` /
+   `include.path` 一并失效）并删掉 `.git/hooks`；`push --no-verify`。防符号链接：`.git` 是链接
+   就什么都不动，config 先 unlink 再写。
+   `.git` 仍对容器可写（改成只读会让「自己调 git 的测试套件」直接失败），剩下的只是
+   index/refs 完整性风险，**不构成代码执行**。
+2. **flush 把「没拿到结论」的条目也算已消费**：模型少返回一个 key、或整批返回结构异常
+   （`conclude_batch` 只记一条 warning 就 `return []`；本地推理模型被 `finish_reason=length`
+   截断时正是这个形状）时，那些条目照样被打上 `flushed_at`——而 `queue_unflushed` 只取
+   `flushed_at IS NULL`，它们**再也不会被 flush 看到**：拿不到结论、打不上标签、进不了修复
+   队列，整条链路却报成功。现在只消费真拿到结论的，缺的留待下轮并把缺口写进
+   `FlushOutcome.error`；带 `MAX_FLUSH_MISSES=3` 上限，到顶落成显式 `failed`。
+3. **`sandbox.runtime` 只要不等于精确的 `"docker"` 就静默本地执行**：`Docker`（大小写）、
+   `podman`、尾空格都等于放弃全部容器隔离，绕开 `allow_local_fallback` 这道显式开关。现在
+   配置层 `Literal` 白名单 + 运行期 fail-closed 两道。
+4. **早停判定用过滤后的计数 → 游标照推**：适配器按 yield 条数早停，而判定用的是 `stats.fetched`
+   （只在 `_accept` 通过后自增）。配了 `labels_exclude`（示例配置默认就带）时被滤掉的条目不计入，
+   于是早停不被识别 → 不记「数据不完整」→ 游标推进 → `limit` 之后那些从未抓到的旧条目永久落在
+   增量窗口外。改用适配器交出来的条数判定。
+
+### P1（5 条）
+
+1. **写端点完全在互斥保护之外**——已并入上面的更正（`WRITE_GATE` + 7 个端点 + 批次原子抢占）。
+2. **通知去重吞掉真实错误**：`try_claim_notification` 原先裸 `except Exception: return False`，
+   而调用方把 False 读成「已发过」并记成成功——一次 `database is locked` 就能让这条告警
+   **永久消失还报成功**。改为只把唯一键冲突当「已发过」，其余抛出、调用方记为失败。
+3. **导出「概览」无视本文档的过滤条件**：一份 JSON 里 `count`（已过滤）与 `summary.total`
+   （全仓库）互相矛盾，Markdown 的「概览」与「明细」条数也对不上。
+4. **建 PR/MR 的幂等探测**：v5 的 `_probe` 拿列表第一条充数（平台不支持 `head=` 过滤时会返回
+   整张列表 → 把**别人的 PR** 记成自己建的）；GitLab 原先**根本没有覆写** `find_open_pr`
+   （基类恒返回 None，「已经 MR 过了就别再建」永远为假），其 `_probe` 又写死 `state="all"`
+   （已关闭的同源分支 MR 会被当成刚建好）。两处都改为复用「只认 open/opened + 按分支核对」
+   的那条路径。
+5. **反向代理残余（补刀而非边界）**：启动检查只能看绑定地址、看不见代理——「绑 127.0.0.1 +
+   同机 nginx 转出去」同样是无鉴权的写控制面，必须设 `FISSUE_API_TOKEN`。未开鉴权时带转发头
+   的写请求直接 403，但那只是让常见配置从「静默开放」变成「响亮拒绝」。
+
+### 上一轮**漏报**的 9 条（本轮已全部处理）
+
+1. **内容变更后永不重评**：`changed_keys` 全仓**没有消费者**，`items_needing_eval` 只取
+   `new/classified`，而 `content_hash` 在同一处被无条件覆写——事后连「结论过期」都判不出来。
+   现在把「实质字段变化」（`MATERIAL_FIELDS`，**不含评论条数**）与「讨论增长」分开：前者把条目
+   置回 `new` 重评；修复已开工（`fix_queued`/`fixing`/`pr_created`）的**不回落**（免得重复修复 /
+   重复建 PR），只把过期如实留痕（`RawItem.stale_reasons`，导出与 API 都带）。
+   ⚠️ 刻意**不用** `content_hash` 判过期——那指纹里带着 `len(comments)`，拿它当依据等于每来一条
+   评论就重评测一次，活跃 issue 上持续烧 token。
+2. **degraded 数据覆盖好数据**：评论拉取失败时 `comments=[]` 照常 upsert，把已入库讨论清空，
+   而评测侧无视 `degraded` 照样下结论（结论还会被回写平台）。现在「残缺且比库里少」时
+   **不覆盖**；评测阶段对评论残缺的条目**跳过**（条目留在 `new`，下轮抓到完整评论再评）。
+3. **队列 `pending` 残留永久卡死**：`stages` 的 `set_status(QUEUED)` → `enqueue` → `finish`
+   三步之间被中断，行会永久停在 `pending`：`queue_unflushed` 只认 `done`（永不 flush）、
+   `queue_pending_count` 恒 > 0（**「队列已无待处理条目」这条兜底被永久废掉**）、条目卡在
+   `queued`（`verify` 只取 `evaluated`，它再也不会被碰）。现在 flush 前先回收（删残留行 +
+   条目置回 `evaluated`）。
+4. **沙盒超时只 kill docker CLI、容器继续跑**：`--rm` 不触发，容器按限额吃资源且永不释放，
+   重跑还会累积。现在容器带 `--name`，超时后显式 `docker rm -f`。
+5. **沙盒输出无上限**：一个打印循环就能吃光宿主内存；走转发组件时超过 64MB 的帧会让它直接抛
+   异常、整条 stage 崩掉。现在每流保留上限 2MB，超出丢弃并在 stderr 标注「已截断」
+   （只丢弃、**不停止读**——关掉管道会让写端 EPIPE 提前退出，等于改掉被执行的命令的语义）。
+6. **转发组件两处**：客户端超时被**第一个**请求固化（短验证器之后，900s 的回归门会在半途假
+   超时）；服务端 accept 串行 + `recv` 无超时（一条只连不说的连接就能锁死整个服务，只能重启）。
+   现在客户端按**本次请求**算超时；服务端每连接一线程 + 读请求 60s 上限。
+7. **导出全表扫描 + N+1**：`summarize` 拉十万条领域对象只为数几个数、每条结论一次查询（每次
+   还新开 session）。现在计数走一行 GROUP BY、平均分只取 key、结论一次批量取。
+8. **SQLite 并发**（见上面更正）：busy 超时 5s → 30s，并开 **WAL**（回滚日志模式下长**读**事务
+   会把写者的提交挡住）。
+9. **AtomGit `PATCH labels` 的语义未知**：`PATCH 条目` 是实测选定的形状
+   （`POST /issues/{n}/labels` JSON 与表单都试过、一律 `Request body parsing error`，见 7f05780），
+   但那个 `labels` 字段**是替换还是追加没验证过**；若按 GitHub 同类接口是替换，每次 flush 都会
+   **抹掉维护者原有的标签**。官方文档页取不到（404），于是不依赖文档：**读改写取并集**
+   （替换语义下正确，追加语义下也正确），读不到现值就**拒绝写**（宁可这次打标签失败、记进
+   `label_errors` 看得见）。其余三平台用的都是追加型端点，无误删风险。
+
+**验证**：全量 **676 passed**。新增/改造的用例在**未修复的 HEAD 上全部失败**，即它们真的守得住
+这些缺陷；ruff 同口径对比无新增。
+
+> 跑测试的两个环境前提（否则会看到假失败）：
+> ① 本机需要 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 -p asyncio -p respx`，否则环境里 ROS 的
+> `launch_testing` 插件会拖死 pytest 启动；
+> ② PATH 上要有装了 pytest 的解释器，否则 `local` 沙盒里的 `python -m pytest` 会报
+> `No module named pytest`，`test_e2e.py` 的两条会假红。
