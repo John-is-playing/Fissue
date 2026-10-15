@@ -147,6 +147,10 @@ F2P 只表达**一个**方向：目标用例修复前失败、修复后通过。
   `--security-opt no-new-privileges`、非 root（1000:1000）运行。
 * 限 CPU / 内存 / PID 数 / 执行时长。
 * 只挂载**隔离工作区**（临时目录，可选 loopback 虚拟盘），绝不挂宿主普通目录。
+  工作区以 rw 挂进容器，但其中的 **`.git` 是只读的**（`index` 除外，见 `workspace_mounts`）：
+  它是宿主的执行入口（hooks、`filter.*`、`diff.*.textconv`、`credential.helper`）与伪造入口
+  （`objects`/`refs`）。真容器验证过：`.git/config`、`.git/hooks`、`.git/refs`、`.git/objects`
+  写操作一律 `Read-only file system`，而工作区、`.git/index` 与 `git status` 照常可用。
 * Docker 不可用时**默认拒绝执行**（不再静默降级）；确需降级要显式打开
   `sandbox.allow_local_fallback`，降级后没有任何隔离，且环境变量按白名单透传。
 * `sandbox.runtime` **只接受** `docker` / `local`：拼错（`Docker`、`podman`、带尾空格）在

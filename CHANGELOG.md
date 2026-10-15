@@ -31,6 +31,8 @@
 - **测试夹具体系**：textkit、ratekit、pipekit、envkit、lockkit 五套对抗夹具（60 Issue + 12 PR），覆盖单函数语义、数值边界、跨模块调用链、状态副作用、资源不变量
 - **增量抓取**：靠 `items.content_hash`（标题/正文/标签数/评论数/状态任一变化才算变更）
 - **`fissue requeue`**：把「只能人工放行」的条目放回流水线——`--stale`（内容实质变化后结论已过期、但当时修复已开工的条目）与 `--failed`（失败条目按已有结论回退到该走的下一步），默认先列计划再确认
+- **常驻服务的验证开关**：`schedule.verify_enabled`（关掉即把验证交给人工 `fissue verify`）与 `schedule.verify_batch_limit`（每轮最多验多少条，默认 30；积压由后续轮次继续消化）
+- **`sandbox.git_readonly`**：把工作区里的 `.git` 以只读挂进容器（`index` 除外），默认开启；测试套件需要容器写 git 时可关掉
 
 ### 变更
 
@@ -93,6 +95,7 @@
 - **显式 CA 不可用**：`FISSUE_CA_BUNDLE` 指向不存在的路径或内容非法时改为**报错**，不再静默回退系统信任库（那等于「以为只信某张根证书，实际用的是 OS 信任库」），并展开 `~`
 - **提交内容完整性**：`.git` 对容器可写，而 `git commit` 提交的是**索引**——现在提交前会把索引拉回 HEAD、确认仍在自己的分支上、并核对「将要提交的文件正好是 Agent 改过的那些」，多出来的一律拒绝提交（否则容器塞进索引的内容会跟着补丁被推出去）
 - **未鉴权写请求再加一道**：除转发头之外，来源不是回环地址的写请求也直接 403——启动检查读的是 `web.host`，把 `create_app()` 嵌进别人的服务器时它看不见。仍然**只是补刀**，边界始终是 `FISSUE_API_TOKEN`
+- **`.git` 只读挂进容器**（`sandbox.git_readonly`，默认开）：`.git` 既是宿主的**执行入口**（hooks、`filter.*.clean` 在 `git add` 时执行、`diff.*.textconv` 在 `git diff` 时执行、`credential.helper`），也是**伪造入口**（`objects`/`refs` 能伪造提交与引用，把内容混进面向上游的补丁）。现在整块只读、仅 `index` 可写（留它是为了别让顺手跑 `git status` 的测试套件整片失败，而宿主提交前会把索引拉回 HEAD）。真容器验证：`.git/config`、`.git/hooks`、`.git/refs`、`.git/objects` 写操作一律 `Read-only file system`，工作区、`.git/index`、`git status` 照常可用
 
 ---
 

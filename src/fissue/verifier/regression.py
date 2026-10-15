@@ -23,10 +23,10 @@ from ..config import RepoConfig, Settings
 from ..logging_setup import get_logger
 from ..models import VerifierOutcome, VerifierRun, VerifierSpec
 from ..sandbox.forwarder import SandboxManager
-from ..sandbox.protocol import ExecRequest, MountSpec
+from ..sandbox.protocol import ExecRequest
 from ..store.repository import Repository
 from ..workspace import RepoWorkspace
-from .runner import CONTAINER_WORKDIR, classify_outcome
+from .runner import CONTAINER_WORKDIR, classify_outcome, workspace_mounts
 
 log = get_logger(__name__)
 
@@ -116,7 +116,7 @@ class RegressionGate:
         spec: VerifierSpec,
         repo_cfg: RepoConfig,
         stage: str,
-        verifier_id: int,
+        verifier_id: int | None,
     ) -> VerifierRun:
         """执行一次回归门。``stage`` 为 ``"base"`` 或 ``"fix"``。"""
         started = time.monotonic()
@@ -140,9 +140,9 @@ class RegressionGate:
             image=self.settings.sandbox.image,
             command=command,
             workdir=CONTAINER_WORKDIR,
-            mounts=[
-                MountSpec(source=str(workspace.root), target=CONTAINER_WORKDIR, read_only=False)
-            ],
+            mounts=workspace_mounts(
+                workspace, git_readonly=self.settings.sandbox.git_readonly
+            ),
             cpus=self.settings.sandbox.limits.cpus,
             memory_mb=self.settings.sandbox.limits.memory_mb,
             pids=self.settings.sandbox.limits.pids,

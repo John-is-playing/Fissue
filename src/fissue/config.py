@@ -262,6 +262,20 @@ class SandboxConfig(BaseModel):
     network: str = "none"
     read_only_root: bool = True
     user: str = "1000:1000"
+    #: 把工作区里的 `.git` 以**只读**挂进容器（`index` 除外，见下）。默认开启。
+    #:
+    #: 容器对工作区可写，而 `.git` 是**宿主的执行入口**：hooks、`config` 里的
+    #: `filter.*.clean`（`git add` 时执行）、`diff.*.textconv`（`git diff` 时执行）、
+    #: `credential.helper`，以及 `objects`/`refs`（能伪造提交与引用，把内容混进面向上游的
+    #: 补丁里）。宿主侧另有几道软闸门（`RepoWorkspace.harden_git`），这一条是从**挂载层**
+    #: 直接掐掉——写不进去，就没有东西可执行、也没有东西可伪造。
+    #:
+    #: `.git/index` 单独留成可写：不少仓库的测试套件会顺手跑 `git status`/`git diff`，
+    #: 它们要刷新索引；整块只读会让这类套件直接报 `Read-only file system`。索引被改也无害：
+    #: 宿主提交前会 `reset_index()` 拉回 HEAD，再按白名单重新 stage。
+    #:
+    #: 确需容器写 git（例如测试套件要 `git commit`）时关掉它，退回「只有宿主侧软闸门」。
+    git_readonly: bool = True
     mounts: SandboxMountConfig = Field(default_factory=SandboxMountConfig)
     limits: SandboxLimits = Field(default_factory=SandboxLimits)
     forwarder: SandboxForwarderConfig = Field(default_factory=SandboxForwarderConfig)
@@ -392,6 +406,19 @@ class ScheduleConfig(BaseModel):
     scan_interval_seconds: int = 3600
     queue_flush_interval_seconds: int = 60
     full_rescan_days: int = 30
+
+    #: 常驻服务每一轮是否做「验证」（生成验证器 + 跑 F2P）这一步。
+    #:
+    #: 关掉它 = 常驻服务只做 抓取 → 评测 → flush → 修复，验证留给人工 `fissue verify`
+    #: （或调 API）。适合「验证要花很多钱/很慢，我想手动挑着跑」的用法。
+    verify_enabled: bool = True
+
+    #: 常驻服务**每轮**最多验证多少条。
+    #:
+    #: 验证是一轮里最慢的一步（每条要 LLM 生成验证器 + 数次沙盒执行），不设上限会把单轮
+    #: 拉得极长、日志也刷得看不清。积压不会因此丢：后面的轮次会继续消化。
+    #: 想「关掉这一步」请用上面的 `verify_enabled`，而不是把这里设成 0。
+    verify_batch_limit: int = Field(default=30, ge=1)
 
 
 class NotifyChannel(BaseModel):

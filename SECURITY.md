@@ -71,6 +71,7 @@ Fissue 的信任边界画在**沙盒**上。以下内容一律视为**不可信*
 | `cpus` / `memory_mb` / `pids` | `2.0` / `2048` / `256` | 限 CPU、内存、进程数 |
 | `timeout_seconds` | `600` | 限执行时长 |
 | 挂载 | 仅隔离工作区（临时目录，可选 loopback 虚拟盘） | **绝不挂载宿主普通目录** |
+| `.git` 挂载 | 工作区以 rw 挂进容器，但 **`.git` 只读**（`index` 除外，默认 `sandbox.git_readonly: true`） | 掐掉**宿主的执行入口**（hooks、`filter.*.clean`、`diff.*.textconv`、`credential.helper`）与**伪造入口**（`objects`/`refs` 能伪造提交与引用、把内容混进面向上游的补丁）。留 `index` 可写只是为了让「顺手跑 `git status`」的测试套件别整片失败，而宿主提交前会把索引拉回 HEAD 再按白名单重新 stage |
 
 「调用方不持有 Docker 句柄、只走受控的本地 socket 通道」**只在起了转发组件时成立**：
 转发组件关闭、非 POSIX 平台、或没起 `fissue sandbox serve`（socket 文件不存在）时，

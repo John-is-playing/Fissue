@@ -42,12 +42,6 @@ from .notify import Notifier
 
 log = get_logger(__name__)
 
-#: daemon 一轮里最多验证多少条。
-#:
-#: 验证是最慢的一步（每条要 LLM 生成验证器 + 数次沙盒执行），不设上限会把单轮拉得极长；
-#: 30 与 CLI `fissue verify` 的 `--limit` 默认值保持一致。
-VERIFY_BATCH_LIMIT = 30
-
 
 class FissueService:
     """常驻服务本体。"""
@@ -268,7 +262,7 @@ class FissueService:
         from ..fixer.autofix import AutoFixer
 
         fixer = AutoFixer(ctx)
-        report = {"attempted": 0, "succeeded": 0, "failed": 0, "prs": []}
+        report: dict[str, Any] = {"attempted": 0, "succeeded": 0, "failed": 0, "prs": []}
 
         for cfg in ctx.all_repos():
             if not self._budget_ok(ctx, cfg, notifier):
@@ -358,6 +352,11 @@ class FissueService:
         from ..pipeline.stages import PRVerifyStage, VerifyStage
 
         out: dict[str, Any] = {"verified": 0, "skipped": 0, "failed": 0}
+        if not self.settings.schedule.verify_enabled:
+            # 关掉这一步 = 验证交给人工（`fissue verify` / API），常驻服务只做抓取→评测→
+            # flush→修复。见 config.ScheduleConfig.verify_enabled。
+            out["skipped_reason"] = "schedule.verify_enabled=false"
+            return out
         ready, img_reason = ctx.sandbox.image_ready(self.settings.sandbox.image)
         if not ready:
             log.warning("跳过验证：%s（先构建镜像，或以 sandbox.runtime: local 运行）", img_reason)
@@ -368,7 +367,9 @@ class FissueService:
         max_retries = max(0, self.settings.verifier.item_retries)
         for cfg in ctx.all_repos():
             items = ctx.repo.list_items(
-                repo_slug=cfg.slug, status=ItemStatus.EVALUATED, limit=VERIFY_BATCH_LIMIT
+                repo_slug=cfg.slug,
+                status=ItemStatus.EVALUATED,
+                limit=self.settings.schedule.verify_batch_limit,
             )
             if not items:
                 continue

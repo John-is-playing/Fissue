@@ -49,6 +49,38 @@ log = get_logger(__name__)
 CONTAINER_WORKDIR = "/workspace"
 
 
+def workspace_mounts(workspace: RepoWorkspace, *, git_readonly: bool = True) -> list[MountSpec]:
+    """把工作区挂进容器：整体可写，但 `.git` **只读**（`index` 除外）。
+
+    为什么要动 `.git`：容器对工作区可写，而 `.git` 是**宿主的执行入口**——hooks、`config`
+    里的 `filter.*.clean` / `diff.*.textconv` / `credential.helper`，以及 `objects` / `refs`
+    （能伪造提交与引用，把内容混进面向上游的补丁）。宿主侧已有几道软闸门（见
+    ``RepoWorkspace.harden_git``），这一条是从**挂载层**掐掉：写不进去就没有东西可执行、
+    也没有东西可伪造。
+
+    为什么把 `.git/index` 单独留成可写：不少仓库的测试套件会顺手跑 `git status`/`git diff`，
+    它们要刷新索引——整块只读会让这类套件直接报 `Read-only file system`（响亮但无谓的失败）。
+    索引被改也无害：宿主提交前会 ``reset_index()`` 拉回 HEAD，再按白名单重新 stage。
+
+    真容器验证过（docker 29.8 + `fissue/sandbox-base`）：工作区写 OK、`.git/index` 写 OK、
+    `git status` OK；而 `.git/config`、`.git/hooks`、`.git/refs`、`.git/objects` 一律
+    `Read-only file system`。确需容器写 git 时把 ``sandbox.git_readonly`` 关掉。
+    """
+    mounts = [MountSpec(source=str(workspace.root), target=CONTAINER_WORKDIR, read_only=False)]
+    git_dir = workspace.root / ".git"
+    if not git_readonly or not git_dir.is_dir():
+        return mounts
+    mounts.append(
+        MountSpec(source=str(git_dir), target=f"{CONTAINER_WORKDIR}/.git", read_only=True)
+    )
+    index = git_dir / "index"
+    if index.exists():
+        mounts.append(
+            MountSpec(source=str(index), target=f"{CONTAINER_WORKDIR}/.git/index", read_only=False)
+        )
+    return mounts
+
+
 # ---------------------------------------------------------------------------
 # 结果判定
 # ---------------------------------------------------------------------------
@@ -369,10 +401,10 @@ class VerifierRunner:
     ) -> VerifierRun:
         """在沙盒里执行一次验证器。"""
         started = time.monotonic()
-        mounts = list(extra_mounts or [])
-        mounts.append(
-            MountSpec(source=str(workspace.root), target=CONTAINER_WORKDIR, read_only=False)
-        )
+        mounts = [
+            *list(extra_mounts or []),
+            *workspace_mounts(workspace, git_readonly=self.settings.sandbox.git_readonly),
+        ]
 
         if spec.kind is VerifierKind.CHECKLIST:
             # 清单型：跑「尽可能接近」的命令，或直接空跑，然后交 LLM 判定

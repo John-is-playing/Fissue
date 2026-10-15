@@ -984,6 +984,47 @@ def test_huge_output_is_truncated_instead_of_unbounded(monkeypatch) -> None:
     assert res.artifacts.get("output_truncated") == "1"
 
 
+def test_workspace_mounts_make_git_readonly_except_index(tmp_path) -> None:
+    """工作区整体可写，但 `.git` 只读（`index` 例外）。
+
+    这一步从**挂载层**掐掉宿主的执行入口与伪造入口：hooks、config 里的 filter/diff 驱动、
+    credential.helper，以及 objects/refs。`.git/index` 留可写是为了别让「顺手跑 git status」
+    的测试套件整片报 `Read-only file system`——索引被改也无害（宿主提交前会 reset_index）。
+
+    真容器验证见 `workspace_mounts` 的 docstring（docker 29.8 + fissue/sandbox-base）。
+    """
+    from fissue.config import SandboxConfig
+    from fissue.verifier.runner import CONTAINER_WORKDIR, workspace_mounts
+    from fissue.workspace import RepoWorkspace
+
+    assert SandboxConfig().git_readonly is True, "默认必须开着（否则容器能改宿主 git）"
+
+    root = tmp_path / "repo"
+    (root / ".git").mkdir(parents=True)
+    (root / ".git" / "index").write_bytes(b"")
+    ws = RepoWorkspace(root=root, slug="a/b")
+
+    mounts = workspace_mounts(ws)
+
+    assert [(m.source, m.target, m.read_only) for m in mounts] == [
+        (str(root), CONTAINER_WORKDIR, False),
+        (str(root / ".git"), f"{CONTAINER_WORKDIR}/.git", True),
+        (str(root / ".git" / "index"), f"{CONTAINER_WORKDIR}/.git/index", False),
+    ]
+
+    # 关掉开关 → 只剩工作区那一个挂载（退回「只有宿主侧软闸门」）
+    assert len(workspace_mounts(ws, git_readonly=False)) == 1
+
+    # 没有 index（刚克隆完的某些状态）→ 只多挂 .git 这一条只读
+    (root / ".git" / "index").unlink()
+    assert len(workspace_mounts(ws)) == 2
+
+    # 没有 .git（或 .git 是文件，如 git worktree）→ 也只挂工作区
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert len(workspace_mounts(RepoWorkspace(root=bare, slug="a/b"))) == 1
+
+
 def test_forwarder_is_used_once_its_socket_exists(tmp_path) -> None:
     """转发组件「起了就该被用上」——SECURITY.md 那条承诺（调用方不持 Docker 句柄）的前提。
 

@@ -170,6 +170,43 @@ async def test_daemon_skips_issue_feature(settings, repo, monkeypatch) -> None:
     assert repo.get_item_row(item.key).status == ItemStatus.LABELED.value, "应当直接等打标签"
 
 
+async def test_daemon_skips_verify_when_disabled(settings, repo, monkeypatch) -> None:
+    """`schedule.verify_enabled=false` 时不碰验证这一步（验证交给人工 `fissue verify`）。"""
+    from fissue.service.notify import Notifier
+
+    _seed_evaluated(repo)
+    ran: list[str] = []
+    _stub_stages(monkeypatch, ran)
+    settings.schedule.verify_enabled = False
+
+    service = FissueService(settings)
+    out = await service._verify_pending(
+        _fake_ctx(settings, repo), Notifier(settings.notify, settings, repo)
+    )
+
+    assert ran == [], "关掉之后一条都不该验"
+    assert out["verified"] == 0 and out["skipped_reason"] == "schedule.verify_enabled=false"
+
+
+async def test_daemon_respects_the_verify_batch_limit(settings, repo, monkeypatch) -> None:
+    """`verify_batch_limit` 决定一轮最多验多少条（积压留给后续轮次）。"""
+    from fissue.service.notify import Notifier
+
+    for n in (1, 2, 3):
+        _seed_evaluated(repo, number=n)
+    ran: list[str] = []
+    _stub_stages(monkeypatch, ran)
+    settings.schedule.verify_batch_limit = 2
+
+    service = FissueService(settings)
+    out = await service._verify_pending(
+        _fake_ctx(settings, repo), Notifier(settings.notify, settings, repo)
+    )
+
+    assert len(ran) == 2, f"上限 2 就不该验 3 条：{ran}"
+    assert out["verified"] == 2
+
+
 async def test_run_once_wires_the_verify_step_between_eval_and_flush(settings, repo, monkeypatch) -> None:
     """`run_once` 的步骤顺序里必须有验证（回归：它原先压根没有这一步）。
 

@@ -133,6 +133,11 @@ sandbox:
     - PYTHONDONTWRITEBYTECODE
   network: none                       # none=禁网（默认，最安全）
   read_only_root: true                # 根文件系统只读
+  git_readonly: true                  # 工作区里的 .git 对容器**只读**（index 除外）：
+                                      # 掐掉 hooks / config 里的 filter·diff 驱动 /
+                                      # credential.helper / objects / refs —— 它们既是宿主的
+                                      # 执行入口、也是伪造提交与引用的入口。
+                                      # 测试套件需要容器写 git（如 git commit）时设 false
   user: "1000:1000"                   # 非 root
   mounts:
     # 只挂载隔离的虚拟磁盘（loop 设备 / 独立卷），绝不挂载宿主目录
@@ -243,6 +248,9 @@ schedule:
   scan_interval_seconds: 3600         # 每小时扫描一次
   queue_flush_interval_seconds: 60    # 队列检查间隔（配合 idle 超时）
   full_rescan_days: 30                # 每隔 N 天做一次全量兜底
+  # 常驻服务的「验证」这一步（生成验证器 + 跑 F2P，是一轮里最慢的一环）
+  verify_enabled: true                # false = 只做抓取/评测/flush/修复，验证交给 `fissue verify`
+  verify_batch_limit: 30              # 每轮最多验证多少条（积压会由后续轮次继续消化）
 
 notify:
   enabled: true
