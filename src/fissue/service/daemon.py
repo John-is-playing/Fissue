@@ -31,7 +31,7 @@ from typing import Any, Sequence
 from ..config import RepoConfig, Settings
 from ..errors import BudgetExceeded, FissueError
 from ..logging_setup import get_logger
-from ..models import ItemStatus, ItemType, Priority, QueueName
+from ..models import Category, ItemStatus, ItemType, Priority, QueueName, RawItem
 from ..pipeline.context import RuntimeContext
 from ..pipeline.fetcher import Fetcher, FetchStats
 from ..pipeline.flush import FlushProcessor
@@ -40,6 +40,12 @@ from ..pipeline.stages import EvalStage
 from .notify import Notification, Notifier
 
 log = get_logger(__name__)
+
+#: daemon 一轮里最多验证多少条。
+#:
+#: 验证是最慢的一步（每条要 LLM 生成验证器 + 数次沙盒执行），不设上限会把单轮拉得极长；
+#: 30 与 CLI `fissue verify` 的 `--limit` 默认值保持一致。
+VERIFY_BATCH_LIMIT = 30
 
 
 class FissueService:
@@ -101,11 +107,18 @@ class FissueService:
                     log.exception("评测 %s 出错（继续）", cfg.slug)
             result["evaluated"] = evaluated
 
-            # 3) flush 队列 + 派发修复
+            # 3) 验证：给刚评测完的条目生成验证器并跑 F2P
+            #
+            # 此前 daemon **没有**这一步（只做 fetch → eval → flush → fix），于是常驻模式下
+            # 条目停在 `evaluated`、再也不会往下走——「部署成服务它自己就能转」这条链是断的，
+            # 验证只能靠人工 `fissue verify` / 调 API。这里补上。
+            result["verify"] = await self._verify_pending(ctx, notifier)
+
+            # 4) flush 队列 + 派发修复
             flush_info = await self._flush_queues(ctx, notifier)
             result["flush"] = flush_info
 
-            # 4) 自动修复（仅 tier1/tier2，受策略与预算限制）
+            # 5) 自动修复（仅 tier1/tier2，受策略与预算限制）
             result["fix"] = await self._run_fixes(ctx, notifier)
 
             log.info("单轮完成：%s", result)
@@ -327,6 +340,91 @@ class FissueService:
             await notifier.notify_high_importance(item, r.evaluation, url=url)
 
     # -- 辅助 -------------------------------------------------------------
+
+    async def _verify_pending(self, ctx: RuntimeContext, notifier: Notifier) -> dict[str, Any]:
+        """给 ``status=evaluated`` 的条目生成验证器并跑 F2P，返回本步计数。
+
+        口径与 CLI 的 ``fissue verify`` 对齐（那是先跑通的一条路）：只取 ``evaluated``；
+        Issue-FEATURE 不验证（没有缺陷可复现，直接置 ``labeled`` 等打标签）；失败重试
+        ``verifier.item_retries`` 次，用尽后计一次失败而**不抛**——一条失败不该拖垮整轮。
+
+        另外两道 daemon 特有的门：
+
+        * **基础镜像不可用就跳过整步**。daemon 里没人盯着，缺镜像时每条都要「克隆 → LLM
+          生成验证器 → 沙盒报错」白跑一遍（pipekit 实测 15 条全栽在这同一条上），既烧
+          token 又白等；CLI 那边是直接报错、让人先去 build。
+        * **预算熔断**：验证器生成要调 LLM，与评测共用当日预算。
+
+        串行执行：daemon 与评测 / flush 共享同一套资源（沙盒、预算），先求稳；要并发请用
+        CLI 的 ``--concurrency``。
+        """
+        from ..pipeline.stages import PRVerifyStage, VerifyStage
+
+        out: dict[str, Any] = {"verified": 0, "skipped": 0, "failed": 0}
+        ready, img_reason = ctx.sandbox.image_ready(self.settings.sandbox.image)
+        if not ready:
+            log.warning("跳过验证：%s（先构建镜像，或以 sandbox.runtime: local 运行）", img_reason)
+            out["skipped_reason"] = img_reason
+            return out
+
+        stage_issue, stage_pr = VerifyStage(ctx), PRVerifyStage(ctx)
+        max_retries = max(0, self.settings.verifier.item_retries)
+        for cfg in ctx.all_repos():
+            items = ctx.repo.list_items(
+                repo_slug=cfg.slug, status=ItemStatus.EVALUATED, limit=VERIFY_BATCH_LIMIT
+            )
+            if not items:
+                continue
+            if not self._budget_ok(ctx, cfg, notifier):
+                out["skipped"] += len(items)
+                continue
+            for item in items:
+                ev = ctx.repo.latest_evaluation(item.key)
+                if ev is None:
+                    out["skipped"] += 1
+                    continue
+                if ev.category is not Category.BUG and item.item_type is ItemType.ISSUE:
+                    # Issue-FEATURE 没有缺陷可复现，直接等打标签（与 CLI 同口径）
+                    ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
+                    out["skipped"] += 1
+                    continue
+                stage = stage_issue if item.item_type is ItemType.ISSUE else stage_pr
+                r = await self._verify_one(stage, item, ev, max_retries=max_retries)
+                if r.error:
+                    out["failed"] += 1
+                    log.warning("验证失败 %s：%s", item.key, r.error)
+                else:
+                    out["verified"] += 1
+                    log.info(
+                        "已验证 %s：%s", item.key, r.notes[-1] if r.notes else r.status
+                    )
+        if out["verified"] or out["failed"] or out["skipped"]:
+            log.info("验证一步：%s", out)
+        return out
+
+    async def _verify_one(
+        self,
+        stage: Any,
+        item: RawItem,
+        evaluation: Any,
+        *,
+        max_retries: int,
+    ) -> Any:
+        """跑一条验证；失败退避重试，用尽后返回带 ``error`` 的结果而不是抛异常。"""
+        from ..pipeline.stages import StageResult
+
+        delay = 2.0
+        last = ""
+        for attempt in range(max_retries + 1):
+            try:
+                return await stage.run(item, evaluation)
+            except Exception as exc:
+                last = f"{type(exc).__name__}: {exc}"
+                log.warning("验证 %s 第 %d 次失败：%s", item.key, attempt + 1, last)
+                if attempt < max_retries:
+                    await self._sleep(delay)
+                    delay = min(delay * 2, 30.0)
+        return StageResult(key=item.key, error=last)
 
     def _budget_ok(self, ctx: RuntimeContext, cfg: RepoConfig, notifier: Notifier) -> bool:
         """检查该仓库当日预算是否已超。"""
