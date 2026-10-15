@@ -12,7 +12,10 @@ from __future__ import annotations
 from ..errors import PlatformError, RateLimitError
 from ..logging_setup import get_logger
 from ..models import ItemType, Platform, RepoRef
-from .v5 import V5Adapter
+
+# `_label_names` 是 v5 的私有辅助（labels 可能是字符串数组或对象数组）。这里直接用同一个
+# 解析器，**故意不复制一份**：读改写判定「现值」与抓取侧判定「标签」必须是同一口径。
+from .v5 import V5Adapter, _label_names
 
 log = get_logger(__name__)
 
@@ -62,10 +65,32 @@ class AtomGitAdapter(V5Adapter):
         """给条目打标签：PATCH 条目自身，`labels` 传逗号分隔字符串。
 
         `labels` 为空时直接返回——实测空串会被拒（400），而调用方本来就只加不删。
+
+        **为什么先读再写**：这条 PATCH 的形状是实测定的（`POST /issues/{n}/labels` JSON 与
+        表单都试过、一律 `Request body parsing error`），但那个 `labels` 字段的语义**没有
+        被验证过**。按 GitHub 的同类接口，`PATCH /issues/{n}` 的 `labels` 是**替换**语义：
+        只发新增标签就会把维护者原有的标签一并抹掉——而这件事只在真写的时候才暴露，
+        读接口看不出任何异常。官方文档页取不到（404），所以这里不依赖文档，改成**读改写**：
+        取回现值、把新增并进去再发。这样**替换语义下正确，追加语义下也正确**
+        （并集里本来就有现值，重复追加是 no-op）。
+
+        读失败时**不写**：宁可这次打标签失败（调用方会记进 label_errors，看得见），
+        也不能冒「抹掉维护者标签」的风险——那等于静默改坏别人的仓库。
         """
         if not labels:
             return
         segment = "issues" if item_type is ItemType.ISSUE else self.pr_segment
-        await self._patch(
-            f"{self._repo_api(repo)}/{segment}/{number}", {"labels": ",".join(labels)}
-        )
+        url = f"{self._repo_api(repo)}/{segment}/{number}"
+        current = await self._current_labels(url)
+        merged = list(dict.fromkeys([*current, *labels]))       # 去重且保持顺序
+        await self._patch(url, {"labels": ",".join(merged)})
+
+    async def _current_labels(self, url: str) -> list[str]:
+        """取回条目当前的标签（读改写用）。取不到就抛错，让调用方放弃这次写。"""
+        data = await self._get(url)
+        if not isinstance(data, dict):
+            raise PlatformError(
+                f"打标签前读不回条目当前标签（{url}）：拿到 {type(data).__name__}。"
+                "AtomGit 的 labels 可能是**替换**语义，读不到就不写——免得抹掉维护者原有的标签。"
+            )
+        return _label_names(data.get("labels"))

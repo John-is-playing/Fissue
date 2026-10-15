@@ -615,13 +615,17 @@ async def test_atomgit_label_writes_use_form_and_patch(atomgit) -> None:
       `Color must be a valid color code`；
     * **给条目打标签**：`POST /issues/{n}/labels`（JSON 与表单都试过）一律 400
       `Request body parsing error`，正确做法是 **PATCH 条目自身**、
-      `labels` 传**逗号分隔的字符串**。
+      `labels` 传**逗号分隔的字符串**；
+    * 且 PATCH 前要先读回现值做并集（那个字段可能是替换语义，见 add_labels 的 docstring）。
     """
     respx.get(f"{ATOMGIT}/repos/psf/requests/labels").mock(
         return_value=httpx.Response(200, json=[])
     )
     create = respx.post(f"{ATOMGIT}/repos/psf/requests/labels").mock(
         return_value=httpx.Response(201, json={"name": "fissue", "color": "#0e8a16"})
+    )
+    respx.get(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"number": "7", "labels": [{"name": "triage"}]})
     )
     patch = respx.patch(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
         return_value=httpx.Response(200, json={"number": "7", "labels": []})
@@ -636,6 +640,29 @@ async def test_atomgit_label_writes_use_form_and_patch(atomgit) -> None:
     assert "color=%230e8a16" in body, f"颜色必须带 #：{body}"
     sent = patch.calls[0].request.content.decode()
     assert "fissue" in sent and "ai-generated" in sent, f"labels 要逗号分隔地传：{sent}"
+    assert "triage" in sent, f"ATOMGIT 上必须带上原有标签（替换语义会把它们抹掉）：{sent}"
+
+
+@respx.mock
+async def test_atomgit_add_labels_refuses_to_write_when_current_unknown(atomgit) -> None:
+    """读不回当前标签时**放弃这次写**，而不是冒险只发新增标签。
+
+    万一这个字段是替换语义，只发新增就等于**抹掉维护者原有的标签**——那会静默改坏别人的
+    仓库。宁可这次打标签失败（调用方记进 label_errors，看得见）。
+    """
+    from fissue.errors import PlatformError
+
+    respx.get(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(500, text="boom")
+    )
+    patch = respx.patch(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    with pytest.raises(PlatformError):
+        await atomgit.add_labels(REPO, 7, ["fissue"])
+
+    assert not patch.called, "读不到现值就绝不能写"
 
 
 @respx.mock
