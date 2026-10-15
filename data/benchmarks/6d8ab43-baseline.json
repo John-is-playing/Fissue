@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-10-15T11:46:24+00:00",
+  "label": "6d8ab43-baseline",
+  "fissue_version": "0.1.0",
+  "scope": {
+    "repo": "(全部启用的仓库)"
+  },
+  "provenance": {
+    "git": {
+      "commit": "6d8ab43cb038400823e2349864ce7ed15e2e1928",
+      "branch": "main",
+      "dirty": false,
+      "dirty_files": 0
+    },
+    "config": {
+      "llm": {
+        "model": "deepseek-v4.1-flash",
+        "fallback_model": "deepseek-v4.1-flash",
+        "base_url_host": "api.qingyuntop.ai",
+        "temperature": 0.2,
+        "max_tokens": 16384,
+        "concurrency": 4
+      },
+      "verifier": {
+        "mode": "hybrid",
+        "require_f2p": true,
+        "max_rounds": 2,
+        "regression_gate": "strict",
+        "concurrency": 4,
+        "item_retries": 2
+      },
+      "auto_fix": {
+        "enabled": true,
+        "agent_max_rounds": 12,
+        "stall_rounds": 4,
+        "on_failure": "report_manual",
+        "pr_strategy_mode": "fork"
+      },
+      "fix_policy": {
+        "tier_strategy": "importance",
+        "tier1_min_importance": 80,
+        "tier1_max_difficulty": 40,
+        "tier2_min_importance": 0,
+        "only_issues": true
+      },
+      "sandbox": {
+        "enabled": true,
+        "runtime": "docker",
+        "image": "fissue/sandbox-base:latest",
+        "network": "none"
+      },
+      "repos": [
+        "John-is-playing/envkit",
+        "John-is-playing/lockkit"
+      ]
+    }
+  },
+  "result": {
+    "items": {
+      "total": 118,
+      "by_repo": {
+        "John-is-playing/envkit": 29,
+        "John-is-playing/fissue-write-probe": 2,
+        "John-is-playing/lockkit": 27,
+        "John-is-playing/pipekit": 22,
+        "atomgit_atomcode/atomcode": 10,
+        "ccqtp/fissue-write-probe": 1,
+        "dromara/hutool": 11,
+        "gitlab-cn/gitlab": 15,
+        "qiaoen_python/fissue-write-probe": 1
+      },
+      "by_item_type": {
+        "issue": 74,
+        "pr": 44
+      },
+      "by_category": {
+        "bug": 84,
+        "feature": 24,
+        "unknown": 10
+      },
+      "by_priority": {
+        "none": 77,
+        "tier1": 1,
+        "tier2": 40
+      },
+      "by_status": {
+        "evaluated": 26,
+        "fix_queued": 19,
+        "labeled": 25,
+        "needs_manual": 22,
+        "new": 10,
+        "pr_created": 5,
+        "queued": 1,
+        "skipped": 10
+      }
+    },
+    "evaluation": {
+      "evaluated_items": 108,
+      "by_category": {
+        "bug": 84,
+        "feature": 24
+      },
+      "by_priority": {
+        "none": 67,
+        "tier1": 1,
+        "tier2": 40
+      },
+      "spam_or_duplicate": 13,
+      "avg_scores": {
+        "authenticity": 74.0,
+        "difficulty": 30.3,
+        "feasibility": 75.4,
+        "importance": 54.7,
+        "pr_quality": 56.8
+      }
+    },
+    "verifier": {
+      "verifiers": 76,
+      "f2p_satisfied": 43,
+      "by_kind": {
+        "checklist": 2,
+        "executable": 74
+      },
+      "runs_total": 257,
+      "by_stage": {
+        "agent": 32,
+        "base": 68,
+        "fix": 52,
+        "regression:base": 53,
+        "regression:fix": 52
+      },
+      "by_stage_outcome": {
+        "agent/pass": 32,
+        "base/fail": 68,
+        "fix/fail": 4,
+        "fix/pass": 48,
+        "regression:base/fail": 1,
+        "regression:base/pass": 52,
+        "regression:fix/fail": 3,
+        "regression:fix/pass": 49
+      },
+      "base_error_runs": 0
+    },
+    "fix": {
+      "attempts": 38,
+      "by_outcome": {
+        "failed": 1,
+        "needs_manual": 32,
+        "success": 5
+      },
+      "patches": 23,
+      "prs": 5,
+      "by_rounds": {
+        "0": 1,
+        "12": 3,
+        "2": 28,
+        "3": 4,
+        "4": 2
+      }
+    },
+    "conclusions": {
+      "total": 50,
+      "by_verdict": {
+        "fix": 29,
+        "merge": 15,
+        "needs_review": 3,
+        "reject": 3
+      }
+    }
+  },
+  "reproducible": true
+}

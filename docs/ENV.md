@@ -224,6 +224,8 @@ FISSUE_GITLAB_TOKEN=
 |---|---|
 | `401 Bad credentials` | Token 错 / 已过期 / 撤销了 |
 | `404` 访问私有仓库 | Token 权限不含该仓库 |
+| `404` `project or enterprise`（**写** Issue / 改 Issue） | **Gitee 特有，原因未定位**：读接口、git 推送、仓库级标签写都正常，只有**条目级写**一律被拒。已排除「令牌作用域」与「仓库可见性」（换新令牌、公开库同样 404，均为实测）。详见 `BENCHMARK.md` §4.16 |
+| `400` `Problems parsing JSON`（**写** 标签） | 同上，Gitee 条目级写被拒的另一种表现；注意它**不是**请求体格式问题（JSON 数组 / JSON 字符串 / 表单 / 查询串七种形状都试过）|
 | `403` 打标签失败 | Token 缺写权限（只勾了只读） |
 | `触发限流` | 未配 Token 或调用过密 |
 
