@@ -89,6 +89,46 @@ def test_repo_name_with_slash_rejected(tmp_path: Path) -> None:
         load_settings(cfg)
 
 
+def test_exposed_api_without_auth_is_refused(tmp_path: Path) -> None:
+    """对外可达 + 启用 API + 无鉴权 → **拒绝启动**（fail-safe）。
+
+    回归：这三者原先能同时成立，而 `/api/*` 里带着**会写外部仓库**的路由（`/api/flush`
+    会真的去平台上打标签、把条目推进修复队列）。`api.auth_required` 默认 false，
+    唯一的保险是「设了 `FISSUE_API_TOKEN` 才自动翻成 true」——于是把 `WEB_HOST` 指向
+    外部（或放到反向代理后面）就等于**把写操作入口对所有人开放**。
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump({"web": {"host": "0.0.0.0"},
+                        "api": {"enabled": True, "auth_required": False}}),
+        encoding="utf-8",
+    )
+    # **必须传一个显式的空 env 文件**：`load_settings(cfg)` 默认会去读仓库的 `.env`，
+    # 而那里有一个空的 `FISSUE_WEB_HOST=`（键在值空），它会把 host 打回默认的
+    # `127.0.0.1`——用例就永远触发不了这条规则（我第一次就是这么写错的）。
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="FISSUE_API_TOKEN"):
+        load_settings(cfg, env)
+
+
+def test_loopback_api_without_auth_is_still_allowed(tmp_path: Path) -> None:
+    """只绑本机时不拦——本地开发不该被迫配令牌（别把安全规则做成拦路虎）。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump({"web": {"host": "127.0.0.1"},
+                        "api": {"enabled": True, "auth_required": False}}),
+        encoding="utf-8",
+    )
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+
+    s = load_settings(cfg, env)
+
+    assert s.api.enabled and not s.api.auth_required
+
+
 def test_repo_lookup_helpers(settings: Settings) -> None:
     r = settings.repo("psf/requests")
     assert r.platform is Platform.GITHUB

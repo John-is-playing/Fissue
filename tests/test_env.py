@@ -170,7 +170,13 @@ def test_sandbox_socket_does_not_clobber_other_forwarder_fields(tmp_path: Path) 
 
 
 def test_web_host_and_port(tmp_path: Path) -> None:
-    env = _write(tmp_path / ".env", "FISSUE_WEB_HOST=0.0.0.0\nFISSUE_WEB_PORT=9001\n")
+    # 非本机绑定必须同时开鉴权（fail-safe：`api.enabled` 默认就是 true，而 `/api/*`
+    # 里带着会写外部仓库的路由）。这里测的是「环境变量能不能覆盖 host/port」，
+    # 所以把令牌一并给上——只管绑定的那条断言不变。
+    env = _write(
+        tmp_path / ".env",
+        "FISSUE_WEB_HOST=0.0.0.0\nFISSUE_WEB_PORT=9001\nFISSUE_API_TOKEN=s3cret\n",
+    )
     s = load_settings(None, env, overrides=BASE_OVERRIDES)
     assert s.web.host == "0.0.0.0"
     assert s.web.port == 9001

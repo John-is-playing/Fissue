@@ -523,6 +523,34 @@ class Settings(BaseModel):
             logging.getLogger(__name__).warning(
                 "sandbox.runtime=local：隔离性弱，仅建议本机开发使用"
             )
+
+        # 安全默认：把「远程可达」与「无鉴权」这两件事**互斥**掉。
+        #
+        # `api.enabled=true` 时才会注册 `/api/*`，其中包含**会写外部仓库**的路由——
+        # `/api/flush` 会真的去平台上打标签、把条目推进修复队列。而 `api.auth_required`
+        # 默认 **false**，唯一的保险是「设了 `FISSUE_API_TOKEN` 就自动翻成 true」。
+        # 也就是说：只要把 `WEB_HOST` 指向 0.0.0.0（或按常见做法放到反向代理后面）
+        # 而没设令牌，**任何人**都能触发对真实仓库的写操作——默认是 fail-open。
+        #
+        # 这里改成 fail-safe：宁可拒绝启动，也不默默开着一个能被外部写入的控制面。
+        host = str(self.web.host or "").strip().lower()
+        loopback = host in {"127.0.0.1", "localhost", "::1"} or host.startswith("127.")
+        if not loopback and self.api.enabled and not self.api.auth_required:
+            raise ConfigError(
+                f"api.enabled=true 且 web.host={self.web.host} 对外可达，但没有鉴权："
+                "请在 .env 里设置 FISSUE_API_TOKEN（会自动开启鉴权），"
+                "或在 config.yaml 写 api.auth_required: true 并同时提供该令牌"
+            )
+        if not loopback and not self.api.auth_required:
+            # 页面本身只有 GET（只读），所以这里只提醒不拦——但提前告知，
+            # 免得之后一开 api.enabled 就被上面那条拒绝启动。
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "web.host=%s 对外可达且未开鉴权：页面只读无碍，但一旦启用 api.enabled 会被拒绝启动；"
+                "建议现在就设置 FISSUE_API_TOKEN",
+                self.web.host,
+            )
         return self
 
 

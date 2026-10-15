@@ -269,6 +269,9 @@ api:
   enabled: true
   prefix: /api/v1
   auth_required: false                # 设为 true 需在 .env 配置 FISSUE_API_TOKEN
+  # 注意：`api.enabled: true` 且 `web.host` 对外可达时，**没开鉴权会被拒绝启动**——
+  # `/api/flush` 这类路由会真的去平台上打标签、把条目推进修复队列，不能对外裸奔。
+  # 在 .env 里设 FISSUE_API_TOKEN 即自动开鉴权（也可以显式写 auth_required: true）。
 
 # ---------------------------------------------------------------------------
 # 导出（Q2: 支持导出 JSON / Markdown）
