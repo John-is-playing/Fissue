@@ -70,3 +70,46 @@ def test_lock_released_after_use(settings) -> None:
         pass
     with single_flight(settings, action="第二次"):
         pass
+
+
+# ---------------------------------------------------------------------------
+# 进程内写闸门（flock 管不到的那一半）
+# ---------------------------------------------------------------------------
+
+
+async def test_write_gate_is_reentrant_for_the_same_task() -> None:
+    """同一任务重入必须放行。
+
+    `fissue daemon --web` 是「外层循环持锁 → 内层 `open(exclusive=True)`」的嵌套结构，
+    闸门若不可重入就会把自己锁死；而它同时又要挡住同进程里另一处（uvicorn 的请求任务）。
+    """
+    from fissue.lockfile import WriteGate
+
+    gate = WriteGate()
+    async with gate.hold_or_fail(action="外层循环"):
+        async with gate.hold_or_fail(action="内层 open"):    # 不该抛
+            pass
+    # 重入计数必须归零：否则之后谁都拿不到
+    async with gate.hold_or_fail(action="之后"):
+        pass
+
+
+async def test_write_gate_blocks_a_different_task() -> None:
+    """不同任务必须**立即**被拒（不排队）——同进程重复评测/重复打标签就靠这一道。"""
+    import asyncio
+
+    from fissue.lockfile import WriteGate
+
+    gate = WriteGate()
+    seen: list[str] = []
+
+    async def web_request() -> None:
+        try:
+            async with gate.hold_or_fail(action="uvicorn 的 /queues/flush"):
+                seen.append("BAD：不该拿到闸门")     # pragma: no cover
+        except FissueError:
+            seen.append("blocked")
+
+    async with gate.hold_or_fail(action="daemon 的 flush 循环"):
+        await asyncio.create_task(web_request())
+        assert seen == ["blocked"], f"不同任务必须被挡住：{seen}"

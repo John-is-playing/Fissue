@@ -95,13 +95,20 @@ class RuntimeContext:
             finally:
                 await ctx.aclose()
             return
-        from ..lockfile import single_flight
+        from ..lockfile import WRITE_GATE, single_flight
 
-        with single_flight(ctx.settings, action="抓取/评测/修复"):
-            try:
-                yield ctx
-            finally:
-                await ctx.aclose()
+        # 两道闸门：
+        # * `single_flight` 是 flock，管**跨进程**（CLI 撞 daemon / 撞 serve）；
+        # * `WRITE_GATE` 管**同进程**——`fissue daemon --web` 把 uvicorn 起在同一个
+        #   进程里，`flock` 那边走的是重入旁路，挡不住同进程的另一处写操作。
+        #   同一任务可重入，所以 daemon 的外层循环 + 内层 `open(exclusive=True)`
+        #   不会把自己挡住。
+        async with WRITE_GATE.hold_or_fail(action="抓取/评测/验证/修复"):
+            with single_flight(ctx.settings, action="抓取/评测/修复"):
+                try:
+                    yield ctx
+                finally:
+                    await ctx.aclose()
 
     async def aclose(self) -> None:
         for adapter in self._adapters.values():

@@ -12,12 +12,13 @@ SQLite 上互相写冲突。注意唯一键、确定性分支名与「只认 ope
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import errno
 import hashlib
 import os
 from pathlib import Path
-from typing import Iterator
+from typing import AsyncIterator, Iterator
 
 from .config import Settings
 from .errors import FissueError
@@ -88,3 +89,59 @@ def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterat
             fcntl.flock(handle, fcntl.LOCK_UN)
     finally:
         os.close(handle)
+
+
+class WriteGate:
+    """进程内的「写操作」串行闸门：同一任务可重入，不同任务互斥，拿不到立即报错。
+
+    为什么 `flock` 之外还需要它：`flock` 解决的是**跨进程**互斥，而
+    ``fissue daemon --web`` 把 uvicorn 起在**同一个进程**里（见
+    ``service.daemon.FissueService._web_loop``）。此时 daemon 的
+    ``_flush_loop`` 正持着 `flock`（并把它记在 `_hold_depth` 上），
+    同进程的 ``/queues/flush``、``/actions/*`` 走的是重入旁路、直接放行——
+    两个任务于是并行跑同一批条目：重复调 LLM（重复计费）、重复打平台标签。
+
+    ``asyncio.Lock`` 在这里不能用，有两个具体原因：
+
+    1. 它**不可重入**。daemon 是「外层循环持锁 → 内层 ``open(exclusive=True)``」
+       的嵌套结构，用 asyncio.Lock 会把自己锁死（`_hold_depth` 那段注释记的正是
+       这个坑）。
+    2. 它会把事件循环记在自己身上。测试里每个用例一个新循环，被争用过的
+       ``asyncio.Lock`` 换循环就会抛「bound to a different event loop」。
+
+    需要的语义只有三条——同任务可重入、不同任务互斥、拿不到立即报错——用一个
+    「拥有者 + 深度」就够，且与事件循环无关。检查与赋值之间没有 await，
+    单线程事件循环下是原子的。
+    """
+
+    def __init__(self) -> None:
+        self._owner: asyncio.Task | None = None
+        self._depth = 0
+
+    @contextlib.asynccontextmanager
+    async def hold_or_fail(self, *, action: str = "本次写操作") -> AsyncIterator[None]:
+        task = asyncio.current_task()
+        if task is not None and task is self._owner:
+            # 同一任务重入：daemon 的外层循环 + 内层 open，直接放行
+            self._depth += 1
+            try:
+                yield
+            finally:
+                self._depth -= 1
+            return
+        if self._owner is not None:
+            raise FissueError(
+                f"{action}正在本进程内进行中，本次不再并发执行。"
+                "同一时刻只允许一处会写外部仓库的操作——并发跑会重复调用 LLM 并重复写平台。"
+            )
+        self._owner = task
+        self._depth = 1
+        try:
+            yield
+        finally:
+            self._owner = None
+            self._depth = 0
+
+
+#: 进程级单例（各进程一份；跨进程的互斥仍由 `single_flight` 的 flock 负责）。
+WRITE_GATE = WriteGate()

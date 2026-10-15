@@ -195,7 +195,7 @@ def export_json(
     payload = {
         "generated_at": _iso(datetime.now().astimezone()),
         "count": len(items),
-        "summary": summarize(repo, repo_slug=repo_slug),
+        "summary": summarize(repo, repo_slug=repo_slug, status=status, category=category),
         "items": [
             item_to_dict(i, evals.get(i.key), batch=repo.latest_batch_conclusion(i.key))
             for i in items
@@ -247,7 +247,7 @@ def export_markdown(
     items = repo.list_items(repo_slug=repo_slug, status=status, category=category, limit=limit)
     keys = [i.key for i in items]
     evals = repo.evaluations_for(keys)
-    stats = summarize(repo, repo_slug=repo_slug)
+    stats = summarize(repo, repo_slug=repo_slug, status=status, category=category)
 
     lines: list[str] = []
     head = title or ("Fissue 评测报告" + (f" · {repo_slug}" if repo_slug else ""))
@@ -315,9 +315,20 @@ def export_markdown(
 # ---------------------------------------------------------------------------
 
 
-def summarize(repo: Repository, *, repo_slug: str | None = None) -> dict[str, Any]:
-    """概览统计。"""
-    items = repo.list_items(repo_slug=repo_slug, limit=100000)
+def summarize(
+    repo: Repository,
+    *,
+    repo_slug: str | None = None,
+    status: Any | None = None,
+    category: Category | None = None,
+) -> dict[str, Any]:
+    """概览统计。
+
+    过滤条件必须与明细**一致**：原先只接 ``repo_slug``，于是 ``fissue export --status x``
+    产出的那份 JSON 里，``count``（已过滤）与 ``summary.total`` / ``by_status``（全仓库）
+    互相矛盾，Markdown 的「概览」与「明细」条数也对不上——外部读者据此会得出错误结论。
+    """
+    items = repo.list_items(repo_slug=repo_slug, status=status, category=category, limit=100000)
     by_type = Counter(i.item_type.value for i in items)
     by_category = Counter(i.category.value for i in items)
     by_priority = Counter(i.priority.value for i in items)

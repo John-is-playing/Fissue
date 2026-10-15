@@ -182,25 +182,48 @@ def test_ca_bundle_takes_precedence_over_trust_store(tmp_path, monkeypatch: pyte
     assert str(pem) in ca_bundle_hint()
 
 
-def test_missing_ca_bundle_falls_back_instead_of_crashing(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CA 文件不存在时不能崩，应回退到系统信任库。"""
+def test_missing_ca_bundle_fails_fast_instead_of_falling_back(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """显式指定的 CA 不存在时必须**报错**，不能静默回退到系统信任库。
+
+    回归：原先只 ``log.error`` 一句就继续走信任库链，于是运维以为「只信我钉的那张根证书」，
+    实际用的是 OS 信任库——安全配置被无声忽略（比「多跑一次」严重得多）。
+    """
+    from fissue.errors import ConfigError
+
     missing = tmp_path / "nope.pem"
     monkeypatch.setenv(ENV_CA_BUNDLE, str(missing))
     net.reset_cache()
 
-    value = build_ssl_context()
-    assert value is not False, "不该因为一个坏路径就关掉校验"
+    with pytest.raises(ConfigError):
+        build_ssl_context()
 
 
-def test_invalid_ca_bundle_content_falls_back(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """CA 文件内容非法（不是 PEM）时也要优雅回退。"""
+def test_invalid_ca_bundle_content_fails_fast(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """CA 文件内容非法（不是 PEM）时同样报错，不回退——理由同上。"""
+    from fissue.errors import ConfigError
+
     bad = tmp_path / "bad.pem"
     bad.write_text("this is not a certificate\n", encoding="utf-8")
     monkeypatch.setenv(ENV_CA_BUNDLE, str(bad))
     net.reset_cache()
 
+    with pytest.raises(ConfigError):
+        build_ssl_context()
+
+
+def test_ca_bundle_expands_user_home(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``~/ca.pem`` 这种写法必须能工作。
+
+    回归：``os.path.exists`` 不展开 ``~``，于是「在 .env 里写 ~/ca.pem」恒等于「文件不
+    存在」——配合上一条的静默回退，用户完全看不出自己钉的证书压根没生效。
+    """
+    pem = _write_self_signed_pem(tmp_path / "ca.pem")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv(ENV_CA_BUNDLE, "~/ca.pem")
+    net.reset_cache()
+
     value = build_ssl_context()
-    assert value is not False
+    assert isinstance(value, ssl.SSLContext)
 
 
 def test_insecure_beats_ca_bundle(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

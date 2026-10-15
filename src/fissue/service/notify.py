@@ -297,9 +297,17 @@ class Notifier:
         for ch in self.channels:
             # 去重：同一 dedup_key + 渠道只发一次
             if self.repo is not None:
-                claimed = self.repo.try_claim_notification(
-                    f"{note.dedup_key}:{ch.kind}", note.event, note.item_key, ch.kind, note.payload
-                )
+                try:
+                    claimed = self.repo.try_claim_notification(
+                        f"{note.dedup_key}:{ch.kind}", note.event, note.item_key, ch.kind, note.payload
+                    )
+                except Exception as exc:
+                    # 去重表写不进去（库锁 / 连接断 / payload 不可序列化）**不能**当成
+                    # 「已经发过」——那会让这条告警永久消失、还被报成发送成功。记为失败，
+                    # 继续下一个渠道；下一轮 flush/扫描还会再试一次。
+                    log.warning("通知去重占位失败 [%s] %s：%s", ch.kind, note.title[:40], exc)
+                    results[ch.kind] = False
+                    continue
                 if not claimed:
                     log.debug("通知已发过，跳过：%s/%s", note.event, ch.kind)
                     results[ch.kind] = True

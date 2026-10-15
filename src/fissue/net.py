@@ -30,6 +30,7 @@ import ssl
 from functools import lru_cache
 from typing import Any
 
+from .errors import ConfigError
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -150,15 +151,24 @@ def build_ssl_context() -> ssl.SSLContext | bool:
     # 2) 显式指定 CA 文件
     bundle = _lookup(ENV_CA_BUNDLE)
     if bundle:
-        if not os.path.exists(bundle):
-            log.error("%s 指向的文件不存在：%s（将回退到系统信任库）", ENV_CA_BUNDLE, bundle)
-        else:
-            try:
-                ctx = ssl.create_default_context(cafile=bundle)
-                log.debug("使用 %s 指定的 CA：%s", ENV_CA_BUNDLE, bundle)
-                return ctx
-            except Exception as exc:  # pragma: no cover
-                log.error("加载 %s 失败（%s），将回退到系统信任库", bundle, exc)
+        # `~` 必须展开：在 .env 里写 `~/ca.pem` 是常见写法，不展开就等于「文件不存在」。
+        path = os.path.expanduser(bundle)
+        if not os.path.isfile(path):
+            raise ConfigError(
+                f"{ENV_CA_BUNDLE} 指向的文件不存在：{bundle}（解析为 {path}）。"
+                "显式指定了 CA 却不可用**绝不静默回退**到系统信任库——那样运维以为只信"
+                "某一张根证书，实际用的是 OS 信任库，属于「安全配置被无声忽略」。"
+                "请修正路径，或删掉这个变量改用系统信任库（默认行为）。"
+            )
+        try:
+            ctx = ssl.create_default_context(cafile=path)
+            log.debug("使用 %s 指定的 CA：%s", ENV_CA_BUNDLE, path)
+            return ctx
+        except Exception as exc:
+            raise ConfigError(
+                f"加载 {ENV_CA_BUNDLE}={bundle} 失败：{exc}。"
+                "显式指定的 CA 加载不了就不静默回退——请修正该路径，或删掉这个变量。"
+            ) from exc
 
     # 3) 操作系统信任库（推荐）
     ctx = _system_trust_context()

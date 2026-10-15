@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -26,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from ..config import Settings, load_settings
 from ..errors import FissueError
+from ..lockfile import WRITE_GATE, single_flight
 from ..logging_setup import get_logger, setup_logging
 from ..models import Category, ItemStatus, ItemType, Priority, QueueName
 
@@ -75,6 +77,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """构造 FastAPI 应用。"""
     st = settings or load_settings()
     setup_logging(st.app.log_level)
+    if st.api.enabled and not st.api.auth_required:
+        # 为什么告警在这里发而不是在 `Settings._validate`：那里是**构造期**，`fissue status
+        # --json` 这种机器可读输出会与 stderr 混流（click 的 CliRunner 默认 mix_stderr），
+        # 一句告警就能把 JSON 打坏。这里才是「即将对外提供 API」的那一刻。
+        #
+        # 为什么必须提醒：启动检查只能看**绑定地址**，看不见反向代理——`web.host=127.0.0.1`
+        # + 同机 nginx 转到本端口时，无鉴权的写控制面（打平台标签、推进修复队列）照样对外。
+        # 拦不了（拦了「绑本机、不开 token」这个默认用法就没了），但必须说清。
+        log.warning(
+            "未启用 API 鉴权（未设 FISSUE_API_TOKEN）：写操作入口（%s/queues/flush、"
+            "%s/actions/*）对本机任何进程开放；若在本端口前挂了反向代理，等于把它一并"
+            "开放出去。要对外提供服务请务必设置 FISSUE_API_TOKEN。",
+            st.api.prefix,
+            st.api.prefix,
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -127,6 +144,74 @@ def _auth_dependency(settings: Settings):
 def _require_writable(settings: Settings) -> None:
     if settings.web.read_only:
         raise HTTPException(status_code=403, detail="当前为只读模式（web.read_only=true）")
+
+
+#: 反向代理常见的转发头。无鉴权时见到它们就拒绝写请求——见 :func:`_reject_proxied_write`。
+_FORWARD_HEADERS = (
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+)
+
+
+def _reject_proxied_write(request: Request, settings: Settings) -> None:
+    """未启用鉴权时，拒绝「看起来经过了反向代理」的写请求。
+
+    ``Settings._validate`` 只能看**绑定地址**，因此 ``web.host=127.0.0.1`` + 同机 nginx
+    反代到本端口时，无鉴权的写操作控制面（去平台打标签、把条目推进修复队列）其实已经
+    对外开放，而启动检查看不见这一半。这里见到转发头就拒。
+
+    必须说清楚边界：**这是补刀，不是安全边界**。边界是 ``FISSUE_API_TOKEN``——同机代理
+    若一个转发头都不设，请求与「本机用户直接访问」在 HTTP 层无法区分，只有令牌能真正
+    兜住。转发头命中只是让常见配置（nginx 的 ``proxy_set_header``）从「静默开放」变成
+    「响亮拒绝」。
+    """
+    if settings.api.auth_required:
+        return          # 有鉴权，经不经过代理都无所谓
+    hit = [h for h in _FORWARD_HEADERS if request.headers.get(h)]
+    if hit:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"拒绝写操作：请求带有反向代理转发头（{'、'.join(hit)}），"
+                "而当前未启用 API 鉴权。请设置 FISSUE_API_TOKEN 后再经代理访问。"
+            ),
+        )
+
+
+def _exclusive_write(fn):
+    """写端点的互斥包装：进程内闸门 + 跨进程 flock；拿不到一律 409。
+
+    为什么写端点必须加：``/queues/flush``、``/actions/*`` 会真去平台上打标签、把条目推进
+    修复队列，而它们原先**完全不在互斥保护内**——独立 ``fissue web`` / ``serve`` 进程不持锁，
+    同进程（``fissue daemon --web`` 把 uvicorn 起在同一事件循环里）又走 `_hold_depth` 的重入旁路。
+
+    两道闸门缺一不可：
+
+    * ``WRITE_GATE`` 管同进程：uvicorn 的请求任务与 daemon 的 flush/fix 循环；
+    * ``single_flight`` 管跨进程：独立 web 进程与 CLI / daemon 之间。
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        request = kwargs.get("request")
+        if request is None:
+            request = next((a for a in args if isinstance(a, Request)), None)
+        if request is None:  # pragma: no cover —— 只会在端点签名被改坏时走到
+            return await fn(*args, **kwargs)
+        settings = _settings(request)
+        _reject_proxied_write(request, settings)
+        try:
+            async with WRITE_GATE.hold_or_fail(action="Web/API 写操作"):
+                with single_flight(settings, action="Web/API 写操作"):
+                    return await fn(*args, **kwargs)
+        except FissueError as exc:
+            # 409 而不是 500：这是「此刻有别处在写，你稍后再来」，不是服务故障
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    return wrapper
 
 
 def _ensure_state(request: Request) -> None:
@@ -315,6 +400,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         }
 
     @app.post(f"{prefix}/queues/flush")
+    @_exclusive_write
     async def flush_queue(
         request: Request, body: FlushRequest, _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -348,6 +434,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
     # -- 动作 -------------------------------------------------------------
 
     @app.post(f"{prefix}/actions/evaluate")
+    @_exclusive_write
     async def action_evaluate(
         request: Request, body: EvalRequest, _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -377,6 +464,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         }
 
     @app.post(f"{prefix}/actions/verify")
+    @_exclusive_write
     async def action_verify(
         request: Request, body: EvalRequest, _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -403,6 +491,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         return {"processed": len(out), "results": out}
 
     @app.post(f"{prefix}/actions/fix")
+    @_exclusive_write
     async def action_fix(
         request: Request, body: FixRequest, _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -428,6 +517,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         return {"attempted": len(results), "dry_run": body.dry_run, "results": results}
 
     @app.post(f"{prefix}/actions/scan")
+    @_exclusive_write
     async def action_scan(
         request: Request, body: ScanRequest, _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -450,6 +540,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         }
 
     @app.post(f"{prefix}/actions/approve-fix")
+    @_exclusive_write
     async def action_approve_fix(
         request: Request, body: ApproveRequest, key: str = Query(...), _: None = Depends(auth)
     ) -> dict[str, Any]:
@@ -465,6 +556,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         return _attempt_payload(attempt)
 
     @app.post(f"{prefix}/actions/approve-merge")
+    @_exclusive_write
     async def action_approve_merge(
         request: Request, body: ApproveRequest, key: str = Query(...), _: None = Depends(auth)
     ) -> dict[str, Any]:

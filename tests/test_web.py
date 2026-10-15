@@ -239,3 +239,45 @@ def test_api_disabled_registers_no_rest_routes(settings) -> None:
         assert c.get(f"{s.api.prefix}/health").status_code == 404
         assert c.get(f"{s.api.prefix}/stats").status_code == 404
         assert c.get("/").status_code == 200, "页面不该被一起关掉"
+
+
+# ---------------------------------------------------------------------------
+# 写端点的互斥与「经代理进来」的拒绝
+# ---------------------------------------------------------------------------
+
+
+def test_write_endpoint_rejects_proxied_unauthenticated_request(client) -> None:
+    """未开鉴权时，带反向代理转发头的写请求必须被拒。
+
+    回归：`Settings._validate` 只能看**绑定地址**，所以 `web.host=127.0.0.1` + 同机 nginx
+    反代到本端口时，无鉴权的写控制面（打平台标签、推进修复队列）其实已经对外开放。
+    见到转发头就 403，把「静默开放」变成「响亮拒绝」。
+
+    注意这是补刀、不是边界：真正的边界是 `FISSUE_API_TOKEN`。
+    """
+    r = client.post(
+        "/api/v1/queues/flush",
+        json={"queue": "verify", "force": True},
+        headers={"X-Forwarded-For": "203.0.113.7"},
+    )
+    assert r.status_code == 403, r.text
+    assert "FISSUE_API_TOKEN" in r.text
+
+    # 读接口不受影响（只读，没有副作用）
+    assert client.get("/api/v1/stats", headers={"X-Forwarded-For": "203.0.113.7"}).status_code == 200
+    # 同样的写请求，不带转发头照常放行（本机直接访问）
+    assert client.post("/api/v1/queues/flush", json={"queue": "verify", "force": True}).status_code == 200
+
+
+def test_write_endpoint_409_when_another_writer_holds_the_gate(client, monkeypatch) -> None:
+    """同进程里已有写操作在跑时，写端点回 409（而不是并行再跑一遍）。
+
+    这一条守的是 `WRITE_GATE`：`fissue daemon --web` 把 uvicorn 与 daemon 的 flush/fix
+    循环放在同一个事件循环里，`flock` 那侧走的是重入旁路，挡不住同进程的另一处写操作。
+    """
+    from fissue import lockfile
+
+    monkeypatch.setattr(lockfile.WRITE_GATE, "_owner", object())    # 假装别的任务正持有
+
+    r = client.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
+    assert r.status_code == 409, r.text
