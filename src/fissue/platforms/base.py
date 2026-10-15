@@ -286,7 +286,7 @@ class PlatformAdapter(ABC):
         raise PlatformError(f"{self.platform.display} 适配器未实现 fork")
 
     async def find_open_pr(self, upstream: RepoRef, *, head: str) -> dict[str, Any] | None:
-        """按 head 查已有 PR（含已关闭），没有则返回 None。
+        """按 head 查**仍开放**的 PR，没有则返回 None。
 
         这是「同一 head 不重复建 PR」与「已有 PR 就别再推送」的共同依据。默认返回
         None（不确定即当作没有），由各平台覆写；未覆写的平台行为与从前一致。

@@ -314,16 +314,20 @@ class GitHubAdapter(PlatformAdapter):
         return RepoRef(platform=self.platform, owner=owner, name=name or repo.name)
 
     async def find_open_pr(self, upstream: RepoRef, *, head: str) -> dict[str, Any] | None:
-        """按 head 查已有 PR（含已关闭）。
+        """按 head 查**仍开放**的 PR。
 
-        两个用途：创建 PR 前先去重；**已有 PR 时不再推送分支**（见
+        两个用途：创建 PR 前先去重；**已有开放 PR 时不再推送分支**（见
         ``PRCreator.submit``）。
+
+        **只认 open**：这里曾用 ``state=all``，于是**已关闭**的同头 PR 也会被当成「已有 PR」
+        ——复用它、跳过推送、直接报成功，实际上什么都没干。而关 PR 并不删分支，所以同一条目
+        重跑就会踩上这个坑（实测：一次批量关闭 17 个 PR 之后，那些 key 全都变成"假装成功"）。
         """
         head_ref = head if ":" in head else f"{upstream.owner}:{head}"
         data = await self._get(
             f"{self.api_base}/repos/{upstream.owner}/{upstream.name}/pulls",
             head=head_ref,
-            state="all",
+            state="open",
             per_page=20,
         )
         for pr in data or []:

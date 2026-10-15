@@ -542,6 +542,25 @@ async def test_gitlab_fetch_pr_populates_files(gl) -> None:
 
 
 @respx.mock
+async def test_github_find_open_pr_only_considers_open(gh) -> None:
+    """GitHub 查已有 PR 也**只认 open**：已关闭的同头 PR 不算「已有」。
+
+    回归：这里曾用 `state=all`，于是同条目重跑时会捞到那条**已关闭**的 PR、跳过推送与创建、
+    直接报成功——实际什么都没干（关 PR 不删分支，所以必踩）。
+    """
+    route = respx.get(f"{GH}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    found = await gh.find_open_pr(
+        RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"), head="psf:fix/x"
+    )
+
+    assert found is None
+    assert route.calls[0].request.url.params["state"] == "open"
+
+
+@respx.mock
 async def test_atomgit_label_writes_use_form_and_patch(atomgit) -> None:
     """AtomGit 的标签写接口与 Gitee 形状不同（实测两种都得对）：
 
@@ -629,7 +648,7 @@ async def test_v5_find_open_pr_matches_bare_branch_only(atomgit) -> None:
     已存在的 PR → 不走「复用」而直接强推 → 被 `--force-with-lease` 正确拦下，表现为
     「推送失败」。
     """
-    respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
+    route = respx.get(f"{ATOMGIT}/repos/psf/requests/pulls").mock(
         return_value=httpx.Response(200, json=[
             {"number": 9, "html_url": "u9", "head": {"ref": "other/branch"}},   # 不相干
             {"number": 1, "html_url": "u1", "head": {"ref": "fix/x"}},          # 目标
@@ -641,6 +660,8 @@ async def test_v5_find_open_pr_matches_bare_branch_only(atomgit) -> None:
     )
 
     assert found == {"number": 1, "url": "u1"}, f"应命中目标分支那条：{found}"
+    # 只认 open：已关闭的同头 PR 不算「已有 PR」，否则重跑会假装成功
+    assert route.calls[0].request.url.params["state"] == "open"
 
 
 @respx.mock
