@@ -1038,3 +1038,14 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
   上下文管理器，锁文件放数据目录；拿不到锁**立即退出并说明原因**，不要静默等待。
   （为什么这条不是 P0：唯一键、确定性分支名与「只认 open 的复用」已经挡住了重复条目/重复 PR，
   剩下的代价是重复评测烧 token 与 SQLite 写冲突。）
+
+  **接线图（已探明，动手前不必再摸）**：变更操作**没有单一收口**，只有两侧可选——
+  * **入口侧**：`cli/ops.py` 的 `fetch` / `eval` / `verify` / `flush` / `fix` 五个命令；
+    `service/daemon.py` 的 `run_once`（`_scan_loop` / `_flush_loop` / `_fix_loop` 都走它）；
+    以及 `fissue serve` 下 `/api/*` 的写路由（`FlushRequest` / `EvalRequest` 那几条）。
+  * **操作侧**：`pipeline/fetcher.py` 的 `fetch_many`、`pipeline/stages.py` 的 `run_batch`
+    与 `evaluate_items`、`pipeline/flush.py` 的 `FlushProcessor.flush_once`、
+    `fixer/autofix.py` 的 fix 入口。
+
+  **建议接入口侧**（改动少、语义清楚），并把取锁写进**一个装饰器/上下文管理器**，
+  免得日后新增命令漏接。**不要只接一半**：部分入口持锁反而会让人以为「已经互斥了」。
