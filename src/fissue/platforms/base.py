@@ -790,7 +790,7 @@ def guess_author_kind(
     return AuthorKind.COMMUNITY
 
 
-def extract_linked_issues(*texts: str) -> list[int]:
+def extract_linked_issues(*texts: str) -> list[int | str]:
     """从标题/正文中解析 ``#123`` / ``fixes #123`` 形式的关联 Issue 号。
 
     **只认 `#N`，不认 URL**：这里曾同时匹配 ``/issues/N`` ``/pull/N`` ``/merge_requests/N``
@@ -806,7 +806,7 @@ def extract_linked_issues(*texts: str) -> list[int]:
     """
     import re
 
-    found: list[int] = []
+    found: list[int | str] = []
     pattern = re.compile(r"#(\d{1,8})")
     for text in texts:
         if not text:

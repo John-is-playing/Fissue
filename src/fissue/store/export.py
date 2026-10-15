@@ -131,9 +131,9 @@ def item_to_dict(
         data["evaluation"] = {
             "scores": evaluation.scores.as_dict(),
             "dimensions": {
-                name: evaluation.scores.get(name).model_dump(mode="json")
+                name: score.model_dump(mode="json")
                 for name in ("authenticity", "importance", "feasibility", "pr_quality", "difficulty")
-                if evaluation.scores.get(name) is not None
+                if (score := evaluation.scores.get(name)) is not None
             },
             "category": evaluation.category.value,
             "action": evaluation.action.value,

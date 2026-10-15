@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import Any
+from typing import Any, NoReturn
 
 import typer
 
@@ -92,7 +92,7 @@ def load_cfg(config: str | None, env: str | None, *, verbose: bool = False, requ
     return settings
 
 
-def fail(message: str, *, code: int = 1) -> None:
+def fail(message: str, *, code: int = 1) -> NoReturn:
     emit(f"❌ {message}", style="bold red")
     raise typer.Exit(code)
 
@@ -463,7 +463,7 @@ def verify(
                         err = _SR(key=item.key, error=f"{type(exc).__name__}: {exc}")
                         async with lock:
                             done += 1
-                            emit(f"[{done}/{total}] ❌ {item.key} 异常：{err.error[:60]}")
+                            emit(f"[{done}/{total}] ❌ {item.key} 异常：{(err.error or '')[:60]}")
                         return {
                             "key": item.key,
                             "type": item.item_type.value,
@@ -471,7 +471,7 @@ def verify(
                             "reproduced": False,
                             "f2p": False,
                             "queued": "-",
-                            "note": err.error[:48],
+                            "note": (err.error or "")[:48],
                         }
 
             results = await asyncio.gather(*(run_one(i) for i in targets))

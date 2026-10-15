@@ -270,20 +270,21 @@ def export(
 
     out_dir = out or settings.export.output_dir
     # `--out` 指向文件还是目录：有后缀且只导出一个仓库 → 当作文件路径
-    out_is_file = bool(out) and Path(out).suffix.lower() in (".json", ".md", ".markdown")
+    out_is_file = out is not None and Path(out).suffix.lower() in (".json", ".md", ".markdown")
     if out_is_file and len(slugs) > 1:
         emit("⚠️  --out 指定了单个文件，但有多个仓库；将改为按目录输出", style="yellow")
         out_is_file = False
 
     written: list[str] = []
-    for slug in slugs or [None]:
+    targets: list[str | None] = list(slugs) or [None]
+    for slug in targets:
         if fmt.lower() == "json":
             content = exp.export_json(repository, repo_slug=slug, status=st, category=cat, limit=limit)
             ext = "json"
         else:
             content = exp.export_markdown(repository, repo_slug=slug, status=st, category=cat, limit=limit)
             ext = "md"
-        if out_is_file:
+        if out_is_file and out:
             path = exp.write_export(content, out)
         else:
             name = (slug.replace("/", "_") if slug else "all") + f".{ext}"

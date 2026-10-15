@@ -762,6 +762,8 @@ def _module_constant(node: Any) -> tuple[str, str | None]:
     """顶层常量赋值 → ``(名字, 字面值文本)``；非常量或私有名返回 ``(name, None)``。"""
     import ast
 
+    target: ast.expr | None
+    value: ast.expr | None
     if isinstance(node, ast.AnnAssign):
         target, value = node.target, node.value
     else:

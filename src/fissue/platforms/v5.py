@@ -282,9 +282,10 @@ class V5Adapter(PlatformAdapter):
                     # 同样不做 int()：Gitee 的关联 Issue 给的是编码。
                     # 排序键用 str：集合里可能既有数字（GitHub/AtomGit）又有编码（Gitee），
                     # 直接 sorted 会在混类型上抛 TypeError。
-                    nums = {
-                        x.get("number") for x in linked
-                        if isinstance(x, dict) and x.get("number")
+                    nums: set[int | str] = {
+                        v
+                        for x in linked
+                        if isinstance(x, dict) and (v := x.get("number")) is not None
                     }
                     raw.linked_issues = sorted(nums | set(raw.linked_issues), key=str)
             except RateLimitError:
@@ -459,7 +460,8 @@ class V5Adapter(PlatformAdapter):
         for pr in data or []:
             if not isinstance(pr, dict):
                 continue
-            pr_head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+            head_raw = pr.get("head")
+            pr_head: dict[str, Any] = head_raw if isinstance(head_raw, dict) else {}
             ref = str(pr_head.get("ref") or pr.get("source_branch") or "")
             if ref != branch:
                 # 平台没给分支字段（`ref` 为空）时**不能拿列表第一条充数**——那会谎报

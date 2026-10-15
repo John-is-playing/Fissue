@@ -128,8 +128,9 @@ class EvalStage:
                 fetcher = getattr(adapter, "fetch_diff", None)
                 if fetcher is not None:
                     diff = await adapter.fetch_diff(ref, item.number)
-                if not diff and getattr(adapter, "fetch_files", None) is not None:
-                    files = await adapter.fetch_files(ref, item.number, with_patch=True)
+                fetch_files = getattr(adapter, "fetch_files", None)
+                if not diff and fetch_files is not None:
+                    files = await fetch_files(ref, item.number, with_patch=True)
                     diff = "\n".join(f"--- {f.path} ---\n{f.patch or ''}" for f in files)
                 if diff:
                     deep_eval = await self.ctx.evaluator.deep_pr_review(item, diff=diff)
@@ -618,11 +619,14 @@ class PRVerifyStage:
 
         # 退路：直接抓源分支
         if item.head_repo and item.head_branch:
-            fetched = ws.fetch("origin", f"refs/heads/{item.head_branch}") or await asyncio.to_thread(
-                ws._git, ["git", "fetch", "--depth", "50", adapter.clone_url(ref), item.head_branch]
-            )
-            if not isinstance(fetched, bool):
-                fetched = bool(getattr(fetched, "ok", False))
+            fetched = ws.fetch("origin", f"refs/heads/{item.head_branch}")
+            if not fetched:
+                fetched = (
+                    await asyncio.to_thread(
+                        ws._git,
+                        ["git", "fetch", "--depth", "50", adapter.clone_url(ref), item.head_branch],
+                    )
+                ).ok
             if fetched:
                 ws.reset_hard("FETCH_HEAD")
                 return True, "已 fetch 并切换到 PR 源分支"

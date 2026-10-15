@@ -126,7 +126,8 @@ def parse_dimension(raw: Any) -> DimensionScore | None:
 
 def parse_scores(raw: dict[str, Any]) -> Scores:
     """解析四维 + 难度评分（兼容模型把分数放在顶层的情况）。"""
-    container = raw.get("scores") if isinstance(raw.get("scores"), dict) else raw
+    scores = raw.get("scores")
+    container: dict[str, Any] = scores if isinstance(scores, dict) else raw
     kwargs: dict[str, DimensionScore | None] = {}
     for name in DIMENSIONS:
         kwargs[name] = parse_dimension(container.get(name))

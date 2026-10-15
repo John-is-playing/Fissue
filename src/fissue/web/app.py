@@ -444,7 +444,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         handler = processor.make_handler()
 
         targets = [QueueName(body.queue)] if body.queue else list(QueueName)
-        results = []
+        results: list[dict[str, Any]] = []
         for q in targets:
             decision = qm.should_flush(q, force=body.force)
             if not decision.should_flush:

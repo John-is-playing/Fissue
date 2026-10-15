@@ -245,7 +245,7 @@ class GitLabAdapter(PlatformAdapter):
             raw.linked_issues = extract_linked_issues(title, body)
             if closable:
                 try:
-                    nums = {int(closable)}
+                    nums: set[int | str] = {int(closable)}
                     raw.linked_issues = sorted(nums | set(raw.linked_issues))
                 except (TypeError, ValueError):
                     pass

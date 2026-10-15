@@ -196,12 +196,14 @@ class QueueManager:
             key = str(c.get("key") or "")
             if key not in by_key:
                 continue
+            raw_prio = c.get("priority")
+            prio: Priority = raw_prio if isinstance(raw_prio, Priority) else Priority.NONE
             self.repo.save_batch_conclusion(
                 key,
                 batch_id,
                 verdict=str(c.get("verdict") or ""),
                 labels=[str(x) for x in (c.get("labels") or [])],
-                priority=c.get("priority") if isinstance(c.get("priority"), Priority) else Priority.NONE,
+                priority=prio,
                 reason=str(c.get("reason") or ""),
                 confidence=float(c.get("confidence") or 0.5),
                 model=str(c.get("model") or ""),

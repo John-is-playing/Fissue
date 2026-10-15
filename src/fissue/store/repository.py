@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import Select, and_, delete, func, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -20,6 +20,7 @@ from ..models import (
     AuthorKind,
     BatchConclusion,
     Category,
+    Comment,
     Evaluation,
     FileChange,
     FixAttempt,
@@ -122,12 +123,12 @@ def _item_to_domain(row: ItemRow, *, with_comments: bool = True) -> RawItem:
         author=row.author or "",
         author_kind=AuthorKind(row.author_kind or "unknown"),
         comments=[
-            {
-                "author": c.author,
-                "author_kind": AuthorKind(c.author_kind or "unknown"),
-                "body": c.body or "",
-                "created_at": c.created_at,
-            }
+            Comment(
+                author=c.author,
+                author_kind=AuthorKind(c.author_kind or "unknown"),
+                body=c.body or "",
+                created_at=c.created_at,
+            )
             for c in (row.comments if with_comments else [])
         ],
         created_at=row.created_at,
@@ -975,17 +976,22 @@ class Repository:
             )
             claimed: list[QueueEntryRow] = []
             for row in rows:
-                res = s.execute(
-                    update(QueueEntryRow)
-                    .where(
-                        and_(
-                            QueueEntryRow.id == row.id,
-                            QueueEntryRow.status == "done",
-                            QueueEntryRow.flushed_at.is_(None),
+                from sqlalchemy.engine import CursorResult
+
+                res = cast(
+                    CursorResult[Any],
+                    s.execute(
+                        update(QueueEntryRow)
+                        .where(
+                            and_(
+                                QueueEntryRow.id == row.id,
+                                QueueEntryRow.status == "done",
+                                QueueEntryRow.flushed_at.is_(None),
+                            )
                         )
-                    )
-                    .values(status="running", started_at=_now())
-                    .execution_options(synchronize_session=False)
+                        .values(status="running", started_at=_now())
+                        .execution_options(synchronize_session=False)
+                    ),
                 )
                 if res.rowcount == 1:
                     claimed.append(row)

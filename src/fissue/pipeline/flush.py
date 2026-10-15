@@ -115,7 +115,10 @@ class FlushProcessor:
                 continue
             verdict = str(c.get("verdict") or "").lower()
             report.verdicts[key] = verdict
-            priority = c.get("priority") if isinstance(c.get("priority"), Priority) else Priority.NONE
+            raw_priority = c.get("priority")
+            priority: Priority = (
+                raw_priority if isinstance(raw_priority, Priority) else Priority.NONE
+            )
 
             # 优先级**一律以规则结论为准**，LLM 的 priority 仅作参考。否则模型随手给个
             # tier2 就能绕过 fix_policy 的阈值与 only_issues，把高难度条目派去自动修复；
@@ -380,7 +383,8 @@ class FlushProcessor:
         planned = await self.ctx.evaluator.plan_fix_priority(rows)
         out: dict[str, Priority] = {}
         for key, info in planned.items():
-            prio = info.get("priority") if isinstance(info.get("priority"), Priority) else Priority.NONE
+            raw_prio = info.get("priority")
+            prio: Priority = raw_prio if isinstance(raw_prio, Priority) else Priority.NONE
             out[key] = prio
             self.ctx.repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=prio)
         return out

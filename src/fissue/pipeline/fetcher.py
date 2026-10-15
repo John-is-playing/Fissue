@@ -212,7 +212,7 @@ class Fetcher:
 
         results = await asyncio.gather(*(one(r) for r in repos), return_exceptions=True)
         for r, res in zip(repos, results, strict=True):
-            if isinstance(res, Exception):
+            if isinstance(res, BaseException):
                 total.error = f"{r.slug}: {res}"
                 log.error("抓取 %s 异常：%s", r.slug, res)
                 continue

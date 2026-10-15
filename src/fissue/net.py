@@ -171,9 +171,9 @@ def build_ssl_context() -> ssl.SSLContext | bool:
             ) from exc
 
     # 3) 操作系统信任库（推荐）
-    ctx = _system_trust_context()
-    if ctx is not None:
-        return ctx
+    system_ctx = _system_trust_context()
+    if system_ctx is not None:
+        return system_ctx
 
     # 4) 交回 httpx 默认（certifi）
     return True
