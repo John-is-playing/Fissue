@@ -240,6 +240,30 @@ async def test_github_fork_and_create_pr(gh) -> None:
     assert out["number"] == 9 and out["url"].endswith("/9")
 
 
+@respx.mock
+async def test_github_create_pr_keeps_url_when_settled_by_probe(gh) -> None:
+    """写请求结果不明、靠**探测**确认「其实已经建好了」时，返回的 url 不能丢。
+
+    `_request` 在那种情况下把探测结果原样返回，而探测（`find_open_pr`）给的是
+    `{"number", "url"}` 形状；`create_pr` 原先只认 `html_url` → url 变 None → daemon 既不算
+    成功、也不发 PR 通知，这次修复在报告里静默消失。
+    """
+    respx.post(f"{GH}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(502, text="bad gateway")
+    )
+    probe = respx.get(f"{GH}/repos/psf/requests/pulls").mock(
+        return_value=httpx.Response(
+            200, json=[{"number": 7, "html_url": "https://github.com/psf/requests/pull/7"}]
+        )
+    )
+
+    out = await gh.create_pr(REPO, head="me:fix", base="main", title="t", body="b")
+
+    assert probe.called, "应当先探测一次"
+    assert out["number"] == 7
+    assert out["url"] == "https://github.com/psf/requests/pull/7", "探测兜底时 url 不该是 None"
+
+
 # ---------------------------------------------------------------------------
 # Gitee / AtomGit（v5 同构）
 # ---------------------------------------------------------------------------
@@ -665,6 +689,37 @@ async def test_atomgit_add_labels_refuses_to_write_when_current_unknown(atomgit)
         await atomgit.add_labels(REPO, 7, ["fissue"])
 
     assert not patch.called, "读不到现值就绝不能写"
+
+
+@respx.mock
+async def test_gitlab_create_pr_keeps_number_and_url_when_settled_by_probe(gl) -> None:
+    """GitLab 的探测兜底路径原先 `number` 与 `url` **双双为 None**（只认 `iid`/`id`/`web_url`，
+    而探测给的是 `{"number", "url"}`）。后果比 GitHub 更重：MR 拿到 `number=None` 就不会被打上
+    AI 标签（`_label_pr` 直接 return）。
+    """
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}").mock(return_value=httpx.Response(200, json={"id": 111}))
+    respx.post(f"{GL}/projects/me%2Frequests/merge_requests").mock(
+        return_value=httpx.Response(502, text="bad gateway")
+    )
+    probe = respx.get(f"{GL}/projects/{pid}/merge_requests").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "iid": 10,
+                    "web_url": "https://gitlab.com/psf/requests/-/merge_requests/10",
+                    "source_branch": "fix",
+                }
+            ],
+        )
+    )
+
+    out = await gl.create_pr(REPO, head="me/requests:fix", base="main", title="t", body="b")
+
+    assert probe.called, "应当先探测一次"
+    assert out["number"] == 10, "探测兜底时 number 不该是 None（否则 MR 打不上标签）"
+    assert out["url"].endswith("/10")
 
 
 @respx.mock
@@ -1399,6 +1454,59 @@ async def test_paginate_follows_link_header(gh) -> None:
     assert first.call_count == 1 and second.call_count == 1, "同一页不该被重复请求"
     # link 风格下页码由响应头决定，第一页**不该**带 page 参数
     assert "page" not in dict(first.calls[0].request.url.params)
+
+
+@respx.mock
+async def test_paginate_page_style_flags_truncation_at_max_pages(gh) -> None:
+    """page 风格到 `max_pages` 就停时**必须留痕**。
+
+    静默截断的后果不是「少抓一点」：`fetcher` 会把它当成「到底了」照常推进游标，而被截掉的
+    那批（`update` 倒序里更旧的）从此落在增量窗口外，永久不会入库——日志里也看不出来。
+    """
+    full_page = [{"number": i} for i in range(gh.per_page)]
+    respx.get(f"{GH}/repos/psf/requests/issues").mock(
+        side_effect=lambda request: httpx.Response(200, json=full_page)      # 永远满页 → 永远没到底
+    )
+
+    batches = [
+        b async for b in gh._paginate(f"{GH}/repos/psf/requests/issues", max_pages=2)
+    ]
+
+    assert len(batches) == 2
+    assert gh.pagination_truncated == 1, "到上限就停必须留痕（调用方据此不推进游标）"
+
+    # 对照：真的到底了（不满一页）不算截断，别把标志打得太宽
+    gh.pagination_truncated = 0
+    respx.get(f"{GH}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(200, json=[{"number": 1}])
+    )
+    _ = [b async for b in gh._paginate(f"{GH}/repos/psf/requests/issues", max_pages=2)]
+    assert gh.pagination_truncated == 0, "到底了不该算截断"
+
+
+@respx.mock
+async def test_paginate_link_style_honours_max_pages(gh) -> None:
+    """link 风格同样要受 `max_pages` 约束——原先 `page` 只在 page 风格里自增，上限形同虚设。
+
+    触发场景：中间层/代理把 `Link` 重写成同一页（或服务端一直给 next），就会无限重复请求 +
+    重复 yield。这道刹车正是为同一处历史事故（首页被重复拉 200 次）加的。
+    """
+    def _respond(request):
+        page = int(request.url.params.get("page") or 1)
+        nxt = page + 1
+        headers = (
+            {"Link": f'<{GH}/repos/psf/requests/issues?page={nxt}>; rel="next"'} if nxt <= 6 else {}
+        )
+        return httpx.Response(200, json=[{"number": page}], headers=headers)
+
+    respx.get(f"{GH}/repos/psf/requests/issues").mock(side_effect=_respond)
+
+    batches = [
+        b async for b in gh._paginate(f"{GH}/repos/psf/requests/issues", style="link", max_pages=2)
+    ]
+
+    assert len(batches) == 2, f"max_pages 在 link 风格下也必须生效，实际拉了 {len(batches)} 页"
+    assert gh.pagination_truncated == 1, "到上限就停必须留痕"
 
 
 @respx.mock

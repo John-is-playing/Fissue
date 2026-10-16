@@ -1141,7 +1141,7 @@ def test_fix_usage_is_recorded_only_per_call(fixer_ctx, repo, sample_issue) -> N
     """不该额外写汇总行——逐轮记账已经把它写全了。
 
     实测：Agent 每一轮的调用都由 `LLMClient` 的 usage_sink 逐次写进 `llm_usage`
-    （purpose=`agent@<仓库>`），而 `_record_usage` 又把整次尝试的**累加量**写成一行
+    （purpose=`agent:<仓库>`），而 `_record_usage` 又把整次尝试的**累加量**写成一行
     `agent`——同一批 token 记两遍。量化过：那批汇总行让全表用量虚高 **14.6%**，
     而 `llm.budget` 的每日闸门正是按这张表算的，虚高会让它在没超预算时提前硬停。
     """

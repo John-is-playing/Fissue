@@ -166,6 +166,12 @@ class QueueManager:
         reclaimed = self.repo.reclaim_stuck_queue_entries()
         if reclaimed:
             log.info("flush 前回收了 %d 条中断残留：%s", len(reclaimed), "、".join(reclaimed[:5]))
+        # 超龄的 `running` 抢占同样要在**判定之前**回收：这些行既不是 done、也不算 pending，
+        # `should_flush` 看不见它们 → 会早退「没有已完成待定论的条目」→ 而回收代码
+        # （`claim_unflushed` 内的那次）只在判定为真时才跑，形成死结：队列从此再也 flush 不了。
+        stale = self.repo.release_stale_claims(queue)
+        if stale:
+            log.info("flush 前回收了 %d 条超龄抢占（running→done）：%s", stale, queue.value)
         decision = self.should_flush(queue, force=force)
         if not decision.should_flush:
             return FlushOutcome(queue=queue.value, batch_id=batch_id, error=None, flushed=0)
@@ -189,79 +195,93 @@ class QueueManager:
                 queue=queue.value, batch_id=batch_id, flushed=0, error=f"{type(exc).__name__}: {exc}"
             )
 
-        # 落库结论
-        by_key = {str(p.get("key")): p for p in payloads}
-        concluded: set[str] = set()
-        for c in conclusions:
-            key = str(c.get("key") or "")
-            if key not in by_key:
-                continue
-            raw_prio = c.get("priority")
-            prio: Priority = raw_prio if isinstance(raw_prio, Priority) else Priority.NONE
-            self.repo.save_batch_conclusion(
-                key,
-                batch_id,
-                verdict=str(c.get("verdict") or ""),
-                labels=[str(x) for x in (c.get("labels") or [])],
-                priority=prio,
-                reason=str(c.get("reason") or ""),
-                confidence=float(c.get("confidence") or 0.5),
-                model=str(c.get("model") or ""),
-            )
-            concluded.add(key)
-
-        # **只把真拿到结论的条目算作已消费。**
-        #
-        # 原先这里无条件 `mark_flushed(全部 entries)`：模型少返回一个 key、或整批返回结构
-        # 异常（`conclude_batch` 只记一条 warning 就 `return []`——本地推理模型被
-        # `finish_reason=length` 截断时正是这个形状）时，那些条目照样被打上 flushed_at。
-        # 而 `queue_unflushed` 只取 `flushed_at IS NULL`，它们**再也不会被 flush 看到**：
-        # 状态停在 queued、拿不到结论、打不上标签、也进不了修复队列，整条链路却报成功。
-        #
-        # 现在缺结论的留在队里等下一轮（可自愈）；但带 attempts 上限，到顶落成显式
-        # ``failed``，免得「恒不可定论」的条目每轮 flush 都白烧一次 token。
-        concluded_entries = [e for e in entries if str(e.item_key) in concluded]
-        missing_entries = [e for e in entries if str(e.item_key) not in concluded]
-        # 收尾抢占：拿到结论的落 flushed_at 并回 done；缺结论的只回 done（不落 flushed_at，
-        # 所以下一轮 flush 还会看到它）。两处都必须回 done —— 见 finish_flush_claim。
-        self.repo.finish_flush_claim(
-            concluded_ids=[int(e.id) for e in concluded_entries],
-            missing_ids=[int(e.id) for e in missing_entries],
-        )
-
-        error: str | None = None
-        if missing_entries:
-            exhausted = set(
-                self.repo.bump_queue_attempts(
-                    [int(e.id) for e in missing_entries], max_attempts=MAX_FLUSH_MISSES
+        # 落库与收尾**整段**都放进 try：这部分原先裸奔，任何异常（DB 抖动、结论形状意外）都会让
+        # 这批行停在 `running`——而 `should_flush` 看不见 `running`（它只认 done/pending），
+        # 于是该队列再也 flush 不了。异常路径现在立即把抢占还回去（超龄回收仍作二道兜底）。
+        try:
+            # 落库结论
+            by_key = {str(p.get("key")): p for p in payloads}
+            concluded: set[str] = set()
+            for c in conclusions:
+                key = str(c.get("key") or "")
+                if key not in by_key:
+                    continue
+                raw_prio = c.get("priority")
+                prio: Priority = raw_prio if isinstance(raw_prio, Priority) else Priority.NONE
+                self.repo.save_batch_conclusion(
+                    key,
+                    batch_id,
+                    verdict=str(c.get("verdict") or ""),
+                    labels=[str(x) for x in (c.get("labels") or [])],
+                    priority=prio,
+                    reason=str(c.get("reason") or ""),
+                    confidence=float(c.get("confidence") or 0.5),
+                    model=str(c.get("model") or ""),
                 )
-            )
-            for e in missing_entries:
-                if int(e.id) in exhausted:
-                    self.repo.finish_queue_entry(
-                        int(e.id),
-                        status="failed",
-                        result=e.result or {},
-                        error=f"连续 {MAX_FLUSH_MISSES} 轮批量结论里都没有这一条",
-                    )
-            error = (
-                f"{len(missing_entries)} 条没有拿到结论："
-                f"{len(missing_entries) - len(exhausted)} 条留待下轮重试，"
-                f"{len(exhausted)} 条已连续 {MAX_FLUSH_MISSES} 轮缺失 → 标记 failed（需人工 --key 重跑）"
-            )
-            log.warning("flush %s：%s", queue.value, error)
+                concluded.add(key)
 
-        log.info(
-            "flush %s 完成（batch=%s，%d 条，结论 %d 条）：%s",
-            queue.value, batch_id, len(entries), len(conclusions), decision.reason,
-        )
-        return FlushOutcome(
-            queue=queue.value,
-            batch_id=batch_id,
-            flushed=len(concluded_entries),
-            conclusions=conclusions,
-            error=error,
-        )
+            # **只把真拿到结论的条目算作已消费。**
+            #
+            # 原先这里无条件 `mark_flushed(全部 entries)`：模型少返回一个 key、或整批返回结构
+            # 异常（`conclude_batch` 只记一条 warning 就 `return []`——本地推理模型被
+            # `finish_reason=length` 截断时正是这个形状）时，那些条目照样被打上 flushed_at。
+            # 而 `queue_unflushed` 只取 `flushed_at IS NULL`，它们**再也不会被 flush 看到**：
+            # 状态停在 queued、拿不到结论、打不上标签、也进不了修复队列，整条链路却报成功。
+            #
+            # 现在缺结论的留在队里等下一轮（可自愈）；但带 attempts 上限，到顶落成显式
+            # ``failed``，免得「恒不可定论」的条目每轮 flush 都白烧一次 token。
+            concluded_entries = [e for e in entries if str(e.item_key) in concluded]
+            missing_entries = [e for e in entries if str(e.item_key) not in concluded]
+            # 收尾抢占：拿到结论的落 flushed_at 并回 done；缺结论的只回 done（不落 flushed_at，
+            # 所以下一轮 flush 还会看到它）。两处都必须回 done —— 见 finish_flush_claim。
+            self.repo.finish_flush_claim(
+                concluded_ids=[int(e.id) for e in concluded_entries],
+                missing_ids=[int(e.id) for e in missing_entries],
+            )
+
+            error: str | None = None
+            if missing_entries:
+                exhausted = set(
+                    self.repo.bump_queue_attempts(
+                        [int(e.id) for e in missing_entries], max_attempts=MAX_FLUSH_MISSES
+                    )
+                )
+                for e in missing_entries:
+                    if int(e.id) in exhausted:
+                        self.repo.finish_queue_entry(
+                            int(e.id),
+                            status="failed",
+                            result=e.result or {},
+                            error=f"连续 {MAX_FLUSH_MISSES} 轮批量结论里都没有这一条",
+                        )
+                error = (
+                    f"{len(missing_entries)} 条没有拿到结论："
+                    f"{len(missing_entries) - len(exhausted)} 条留待下轮重试，"
+                    f"{len(exhausted)} 条已连续 {MAX_FLUSH_MISSES} 轮缺失 → 标记 failed（需人工 --key 重跑）"
+                )
+                log.warning("flush %s：%s", queue.value, error)
+
+            log.info(
+                "flush %s 完成（batch=%s，%d 条，结论 %d 条）：%s",
+                queue.value, batch_id, len(entries), len(conclusions), decision.reason,
+            )
+            return FlushOutcome(
+                queue=queue.value,
+                batch_id=batch_id,
+                flushed=len(concluded_entries),
+                conclusions=conclusions,
+                error=error,
+            )
+        except Exception as exc:
+            log.exception("flush %s 落库/收尾失败，正在归还抢占", queue.value)
+            try:
+                self.repo.finish_flush_claim(missing_ids=[int(e.id) for e in entries])
+            except Exception:
+                # 归还也失败（DB 出问题）：记下来，靠 `release_stale_claims` 的超龄回收兜底。
+                log.exception("归还 flush 抢占失败（%s）：留给超龄回收兜底", queue.value)
+            return FlushOutcome(
+                queue=queue.value, batch_id=batch_id, flushed=0, error=f"{type(exc).__name__}: {exc}"
+            )
 
     async def flush_all(self, *, handler: FlushHandler, force: bool = False) -> list[FlushOutcome]:
         """按需 flush 所有队列。"""

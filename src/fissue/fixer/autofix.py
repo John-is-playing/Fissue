@@ -333,7 +333,7 @@ class PRCreator:
                     verifier_command=spec.command,
                     f2p_ok=f2p_ok,
                 ),
-                purpose="fix_pr_body",
+                purpose=f"fix_pr_body:{item.repo}",
                 default={},
             )
             title = str(data.get("title") or default_title)[:120]

@@ -183,6 +183,24 @@ class RepoWorkspace:
             return items
         return ["git", "-c", f"core.hooksPath={cls.NO_HOOKS_PATH}", *items[1:]]
 
+    @staticmethod
+    def _safe_config_value(value: str, *, limit: int = 200) -> str | None:
+        """把要写回 `.git/config` 的值收敛成安全的单行值；不安全就返回 `None`。
+
+        为什么需要：这些值来自**容器写得进**的 `.git/config`，而 git 配置是**按行**解析的。
+        git 允许值里带字面换行（`git config --get` 会原样输出），`.strip()` 只去首尾——
+        于是 `user.name = "x\\n[core]\\n\\tfsmonitor = sh -c '…'"` 会被原样写回，在「重建后」
+        的配置里凭空多出一个执行入口（`fsmonitor`、`filter.*.clean`、`credential.helper`
+        都会被宿主随后的 `git add` / `git commit` / `git push` 执行）。
+        """
+        if not value or len(value) > limit:
+            return None
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            return None
+        if value.lstrip().startswith(("[", ";", "#")):
+            return None
+        return value
+
     def harden_git(self) -> None:
         """把 `.git` 里「容器写得进、宿主会执行」的部分收回自己控制。
 
@@ -198,8 +216,9 @@ class RepoWorkspace:
         做法是**重建** `.git/config`：只写由我们决定内容的几项（URL 取克隆时记下的那份，
         不回头读可能已被篡改的配置），再删掉整个 `.git/hooks`。被塞进来的键一个都活不下来。
 
-        `user.name` / `user.email` 会从原配置带过来——它们是提交元数据、不是执行入口，
-        但提交缺了它们会直接失败。
+        `user.name` / `user.email` 会从原配置带过来——它们是提交元数据、不是执行入口。
+        但**同样是不可信输入**（配置对容器可写）：只接受安全的单行值，含换行/控制字符就
+        丢弃。丢弃不影响提交——:meth:`commit` 自己用 `-c user.name` / `-c user.email` 带身份。
 
         调用点两处：克隆之后一次；每次沙盒跑过、要再动宿主 git 之前一次
         （见 `fixer.autofix.PRCreator._commit_and_push`）。
@@ -210,13 +229,22 @@ class RepoWorkspace:
         # 兜底（见 :meth:`_harden_argv`），不依赖这里。
         if not gitdir.is_dir() or gitdir.is_symlink():
             return
-        url = self.origin_url or self._git(
-            ["git", "config", "--local", "--get", "remote.origin.url"]
-        ).stdout.strip()
+        # 两个值都来自**容器写得进**的配置，一律当不可信输入：只接受安全的单行值。
+        url = self._safe_config_value(
+            self.origin_url
+            or self._git(["git", "config", "--local", "--get", "remote.origin.url"]).stdout.strip()
+        )
+        if url is None:
+            log.warning("丢弃不可信的 origin url（含换行/控制字符）：%s", self.slug or self.root)
         ident = [
             (k, v)
             for k in ("user.name", "user.email")
-            if (v := self._git(["git", "config", "--local", "--get", k]).stdout.strip())
+            if (
+                v := self._safe_config_value(
+                    self._git(["git", "config", "--local", "--get", k]).stdout.strip()
+                )
+            )
+            is not None
         ]
 
         hooks = gitdir / "hooks"

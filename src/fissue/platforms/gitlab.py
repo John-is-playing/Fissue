@@ -107,6 +107,7 @@ class GitLabAdapter(PlatformAdapter):
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
         self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
+        self.pagination_truncated = 0       # 同上：分页到顶也算「数据不完整」
         count = 0
         state_param = {"all": "all", "open": "opened", "closed": "closed"}.get(state, state)
 
@@ -472,7 +473,12 @@ class GitLabAdapter(PlatformAdapter):
         )
         if not isinstance(data, dict):
             raise PlatformError(f"创建 MR 返回异常：{data}")
-        return {"number": data.get("iid") or data.get("id"), "url": data.get("web_url")}
+        # 同上（见 github.create_pr）：探测结果（find_open_pr）是 {"number", "url"} 形状，
+        # 两个键都要认——原先只认 iid/id/web_url，探测兜底时 number 和 url 会**双双为 None**。
+        return {
+            "number": data.get("iid") or data.get("id") or data.get("number"),
+            "url": data.get("web_url") or data.get("url"),
+        }
 
     def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         seg = "issues" if item_type is ItemType.ISSUE else "merge_requests"

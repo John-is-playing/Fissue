@@ -129,6 +129,7 @@ class V5Adapter(PlatformAdapter):
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
         self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
+        self.pagination_truncated = 0       # 同上：分页到顶也算「数据不完整」
         count = 0
 
         # Issue

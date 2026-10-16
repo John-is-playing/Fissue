@@ -72,6 +72,8 @@ def fix(
                 rows.append(_attempt_row(attempt, dry_run=dry_run))
             else:
                 for cfg in repos:
+                    # 用量按仓库归属，守卫也得跟着换（单槽）
+                    ctx.llm.budget_guard = ctx.budget_guard(cfg.slug)
                     if plan:
                         # 先批量规划优先级（Q1 规则）
                         pending = ctx.repo.list_items(
@@ -175,19 +177,23 @@ def _attempt_row(attempt, *, dry_run: bool = False) -> dict[str, Any]:
 
 
 def _resolve_repos_safe(settings, repo: list[str], platform: str | None):
-    """解析仓库；失败时回退到配置里的启用仓库。"""
+    """解析要处理的仓库。
+
+    **给了 `--repo` 却解析不出来时必须报错**，不能回退成「配置里所有启用仓库」：`fix` 是
+    写命令（会推分支、提 PR），回退等于在用户**没有点名**的仓库上动手。只有完全没给
+    `--repo` 时，才按「不指定就是全部」的语义取配置里的启用仓库。
+    """
     from ..platforms.registry import resolve_repos
 
     specs = list(repo or [])
     if platform and specs:
         specs = [s if ":" in s else f"{platform}:{s}" for s in specs]
-    try:
-        repos = resolve_repos(settings, specs or None)
-    except FissueError:
-        repos = []
-    if not repos:
-        repos = settings.enabled_repos()
-    return repos
+    if specs:
+        try:
+            return resolve_repos(settings, specs)
+        except FissueError as exc:
+            fail(f"--repo / --platform 解析失败：{exc}")
+    return settings.enabled_repos()
 
 
 # ---------------------------------------------------------------------------

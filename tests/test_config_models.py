@@ -245,6 +245,24 @@ def test_pr_strategy_no_longer_has_auto_submit() -> None:
     assert PRStrategy(auto_submit=False).mode == "fork"  # type: ignore[call-arg]
 
 
+def test_pr_strategy_mode_rejects_typos() -> None:
+    """拼错 `mode` 必须报错，不能静默落到「直推上游仓库」。
+
+    `fixer.autofix` 只有**精确等于** `fork` 才走 fork（`patch_only` 只落补丁），其余取值一律
+    `head_repo = 上游仓库` → 把分支直推到别人的仓库。于是 `Fork` / `frok` / 带尾空格这类拼写
+    错误会静默关掉 fork 安全阀。
+    """
+    from fissue.config import PRStrategy
+    from fissue.errors import ConfigError
+
+    for good in ("fork", "direct", "patch_only"):
+        assert PRStrategy(mode=good).mode == good
+
+    for bad in ("Fork", "frok", "direct ", "dirct", ""):
+        with pytest.raises(ConfigError):
+            PRStrategy(mode=bad)
+
+
 def test_platform_max_retry_after_default() -> None:
     """限流单次等待上限有默认值，且能按平台覆盖。"""
     from fissue.config import PlatformConfig

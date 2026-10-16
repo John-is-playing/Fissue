@@ -4,7 +4,8 @@
 --------------
 * ``network=none``：默认断网，杜绝不可信代码外联/回连。
 * ``read_only=True`` + ``tmpfs``：根文件系统只读，只给 /tmp 一个受限可写层。
-* 非 root 用户（默认 1000:1000），配合 ``no-new-privileges``。
+* 非 root 用户（默认**跟随宿主 uid:gid**，见 :func:`default_container_user`），配合
+  ``no-new-privileges``。
 * ``cap_drop=ALL``：丢弃全部 Linux capabilities。
 * 资源限额：CPU、内存、PID 数、执行时长。
 * 只挂载调用方传入的**隔离工作区**，绝不挂载宿主普通目录。
@@ -38,6 +39,20 @@ log = get_logger(__name__)
 #: 走转发组件时更糟——超过 64MB 的帧会让它直接抛异常，整条验证 stage 崩掉，
 #: 而不是给出一个「输出过大」的结论。
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+
+
+def default_container_user() -> str:
+    """容器里跑命令用的 ``uid:gid``——**默认跟随宿主**。
+
+    为什么不写死 ``1000:1000``：工作区是宿主 uid 的 ``mkdtemp``（``0700``，见
+    ``workspace.RepoWorkspace.clone``），而 bind mount 会把属主/权限原样带进容器。宿主 uid
+    不是 1000 时（不少发行版的第一个普通用户就是 1001），容器既遍历不了也写不进
+    ``/workspace``，于是**整条验证链路以 Permission denied 收场**——日志看上去却像代码或
+    验证器的问题。本机恰好 uid=1000，所以这个坑一直没暴露。
+    """
+    if hasattr(os, "getuid"):          # POSIX
+        return f"{os.getuid()}:{os.getgid()}"
+    return "1000:1000"                 # Windows 上没有 --user 这回事，留个占位
 
 
 class DockerRuntime:
@@ -144,7 +159,7 @@ class DockerRuntime:
         pids: int = 256,
         timeout_seconds: int = 600,
         read_only_root: bool = True,
-        user: str = "1000:1000",
+        user: str = "",
         label: str = "",
     ) -> ExecResult:
         """执行一次命令。
@@ -156,6 +171,9 @@ class DockerRuntime:
         """
         start = time.monotonic()
         mount_list = list(mounts or [])
+        # 留空 = 跟随宿主 uid:gid（见 default_container_user）。写死值会让 uid≠1000 的宿主上
+        # 容器写不进工作区。
+        user = user or default_container_user()
 
         # 未知取值必须 fail-closed。这里原先只有 `if self.cfg.runtime == "docker"` 一条判定，
         # 于是任何别的值都会落到函数末尾的 `_run_local`：拼错一个字母（`Docker`、`podman`）

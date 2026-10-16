@@ -265,6 +265,8 @@ class FissueService:
         report: dict[str, Any] = {"attempted": 0, "succeeded": 0, "failed": 0, "prs": []}
 
         for cfg in ctx.all_repos():
+            # 同上：自动修复是最烧 token 的一步，守卫必须跟着仓库走。
+            ctx.llm.budget_guard = ctx.budget_guard(cfg.slug)
             if not self._budget_ok(ctx, cfg, notifier):
                 continue
             try:
@@ -366,6 +368,9 @@ class FissueService:
         stage_issue, stage_pr = VerifyStage(ctx), PRVerifyStage(ctx)
         max_retries = max(0, self.settings.verifier.item_retries)
         for cfg in ctx.all_repos():
+            # `llm.budget_guard` 是**全局单槽**，而预算是 per-repo 的：每换一个仓库就换一把守卫。
+            # 不接的话 `_budget_ok` 读到的用量永远是别人（或空）的口径，硬停形同虚设。
+            ctx.llm.budget_guard = ctx.budget_guard(cfg.slug)
             items = ctx.repo.list_items(
                 repo_slug=cfg.slug,
                 status=ItemStatus.EVALUATED,
@@ -390,7 +395,10 @@ class FissueService:
                 r = await self._verify_one(stage, item, ev, max_retries=max_retries)
                 if r.error:
                     out["failed"] += 1
-                    log.warning("验证失败 %s：%s", item.key, r.error)
+                    # 退避重试（_verify_one）**用尽**才落 FAILED：瞬时故障不该在第一次就钉死条目，
+                    # 而落成 FAILED 仍可恢复（`fissue requeue --failed`）。
+                    ctx.repo.set_item_status(item.key, ItemStatus.FAILED)
+                    log.warning("验证失败（已重试 %d 次）%s：%s", max_retries + 1, item.key, r.error)
                 else:
                     out["verified"] += 1
                     log.info(

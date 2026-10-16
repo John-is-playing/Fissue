@@ -327,11 +327,14 @@ class VerifyStage:
             result.status = ItemStatus.QUEUED
             result.notes.append(base_result.conclusion)
             return result
-        except Exception as exc:
+        except Exception:
+            # **上抛**，不要在这里把条目钉成 FAILED：验证失败的绝大多数是瞬时故障（克隆失败、
+            # 网络抖动、沙盒报错），而常驻服务那侧本来就有带退避的重试（`daemon._verify_one`）
+            # ——它只认「run 抛异常」。这里一吞，那次重试永远不会发生，条目在第一次抖动就被钉死
+            # （只能人工 `fissue requeue --failed` 救）。落档交给调用方：daemon 重试用尽后落
+            # FAILED；CLI / Web 逐条兜住并如实报错。
             log.exception("验证流程失败 %s", item.key)
-            result.error = f"{type(exc).__name__}: {exc}"
-            self.ctx.repo.set_item_status(item.key, ItemStatus.FAILED)
-            return result
+            raise
         finally:
             if owns_workspace and ws is not None:
                 _safe_cleanup(ws)
@@ -390,11 +393,17 @@ class PRVerifyStage:
         if item.item_type is not ItemType.PR:
             result.skipped_reason = "非 PR"
             return result
-        if item.merged:
-            result.skipped_reason = "PR 已合并，无需验证"
-            return result
-        if item.state == "closed":
-            result.skipped_reason = "PR 已关闭"
+        if item.merged or item.state == "closed":
+            why = "PR 已合并，无需验证" if item.merged else "PR 已关闭"
+            result.status = ItemStatus.SKIPPED
+            result.skipped_reason = why
+            # **必须落状态**：这两个分支原先只写 skipped_reason 就返回，条目于是永久停在
+            # EVALUATED，每轮都被重新取到（daemon 按 `status=EVALUATED` + `verify_batch_limit`
+            # 取件），数量一多就把真正待验证的条目挤在批次之外。
+            # 但只在**还没往后走过**时才落 SKIPPED——别把已经 verified/labeled 的条目打回去。
+            row = self.ctx.repo.get_item_row(item.key)
+            if row is not None and row.status == ItemStatus.EVALUATED.value:
+                self.ctx.repo.set_item_status(item.key, ItemStatus.SKIPPED)
             return result
 
         # 与 VerifyStage 同口径：疑似刷量/重复的 PR 也不进沙盒验证与合并流程。
@@ -560,11 +569,10 @@ class PRVerifyStage:
             result.status = ItemStatus.QUEUED
             result.notes.append(finished.conclusion)
             return result
-        except Exception as exc:
+        except Exception:
+            # 同上：瞬时故障交给调用方重试，别在第一次抖动就把条目钉成 FAILED。
             log.exception("PR 验证流程失败 %s", item.key)
-            result.error = f"{type(exc).__name__}: {exc}"
-            self.ctx.repo.set_item_status(item.key, ItemStatus.FAILED)
-            return result
+            raise
         finally:
             if ws is not None:
                 _safe_cleanup(ws)
@@ -754,10 +762,14 @@ class Pipeline:
                 )
                 continue
 
-            if item.item_type is ItemType.ISSUE:
-                combined.add(await self.verify_stage.run(item, r.evaluation))
-            else:
-                combined.add(await self.pr_stage.run(item, r.evaluation))
+            stage = self.verify_stage if item.item_type is ItemType.ISSUE else self.pr_stage
+            try:
+                combined.add(await stage.run(item, r.evaluation))
+            except Exception as exc:
+                # 验证阶段把瞬时故障**上抛**（见 VerifyStage），这里逐条兜住：一条失败不该让
+                # 整批「评测 + 验证」中断，其余条目的结论也不该跟着丢。
+                log.exception("验证流程失败 %s（继续处理其余条目）", item.key)
+                combined.add(StageResult(key=item.key, error=f"{type(exc).__name__}: {exc}"))
 
         log.info(combined.summary)
         return combined

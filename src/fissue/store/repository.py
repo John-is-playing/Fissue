@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 from sqlalchemy import Select, and_, delete, func, select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, selectinload
 
 from ..logging_setup import get_logger
@@ -989,8 +990,6 @@ class Repository:
             )
             claimed: list[QueueEntryRow] = []
             for row in rows:
-                from sqlalchemy.engine import CursorResult
-
                 res = cast(
                     CursorResult[Any],
                     s.execute(
@@ -1038,26 +1037,40 @@ class Repository:
                     .values(status="done")
                 )
 
-    def _release_stale_claims(self, s: Session, queue: QueueName) -> None:
-        """把崩溃残留的 ``running`` 行放回 ``done``。
+    def release_stale_claims(self, queue: QueueName) -> int:
+        """把超龄的 ``running`` 抢占放回 ``done``，返回回收条数。
+
+        调用点必须在 flush 的**判定之前**（见 ``QueueManager.flush``）：这些行既不是 ``done``
+        也不算 ``pending``，``should_flush`` 看不见它们——于是「没有已完成待定论的条目」会让
+        flush 直接早退，而 ``claim_unflushed`` 里的那次回收又只在判定为真时才跑，形成死结。
+        """
+        with self.db.session() as s:
+            return self._release_stale_claims(s, queue)
+
+    def _release_stale_claims(self, s: Session, queue: QueueName) -> int:
+        """把崩溃残留的 ``running`` 行放回 ``done``（返回放回的行数）。
 
         抢占之后进程被 kill（或断电）会让行停在 ``running`` 且未落 ``flushed_at``，而 flush
         只认 ``done``——这些条目就再无人认领。超龄即放回：代价是「这一轮它被又跑了一次」，
         好过「永久卡住」。
         """
         cutoff = _now() - timedelta(seconds=self.CLAIM_STALE_SECONDS)
-        s.execute(
-            update(QueueEntryRow)
-            .where(
-                and_(
-                    QueueEntryRow.queue == queue.value,
-                    QueueEntryRow.status == "running",
-                    QueueEntryRow.started_at.is_not(None),
-                    QueueEntryRow.started_at < cutoff,
+        res = cast(
+            CursorResult[Any],
+            s.execute(
+                update(QueueEntryRow)
+                .where(
+                    and_(
+                        QueueEntryRow.queue == queue.value,
+                        QueueEntryRow.status == "running",
+                        QueueEntryRow.started_at.is_not(None),
+                        QueueEntryRow.started_at < cutoff,
+                    )
                 )
-            )
-            .values(status="done", started_at=None)
+                .values(status="done", started_at=None)
+            ),
         )
+        return int(res.rowcount or 0)
 
     def mark_flushed(self, entry_ids: Sequence[int]) -> None:
         if not entry_ids:

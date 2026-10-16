@@ -509,7 +509,21 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         out = []
         for item in items:
             ev = ctx.repo.latest_evaluation(item.key)
-            r = await (stage_issue.run(item, ev) if item.item_type is ItemType.ISSUE else stage_pr.run(item, ev))
+            stage = stage_issue if item.item_type is ItemType.ISSUE else stage_pr
+            try:
+                r = await stage.run(item, ev)
+            except Exception as exc:
+                # 验证阶段现在把瞬时故障**上抛**（好让常驻服务那侧带退避重试，见 VerifyStage），
+                # 所以这里必须逐条兜住——否则一条失败会让整批结果全丢、端点直接 500。
+                out.append(
+                    {
+                        "key": item.key,
+                        "reproduced": False,
+                        "queued": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
             out.append(
                 {
                     "key": r.key,

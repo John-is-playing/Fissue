@@ -138,7 +138,7 @@ sandbox:
                                       # credential.helper / objects / refs —— 它们既是宿主的
                                       # 执行入口、也是伪造提交与引用的入口。
                                       # 测试套件需要容器写 git（如 git commit）时设 false
-  user: "1000:1000"                   # 非 root
+  user: ""                            # 留空 = 跟随宿主 uid:gid（容器要能写进工作区）
   mounts:
     # 只挂载隔离的虚拟磁盘（loop 设备 / 独立卷），绝不挂载宿主目录
     type: volume                      # volume | loopback

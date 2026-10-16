@@ -158,6 +158,12 @@ class Fetcher:
         if skipped_build:
             self._mark_incomplete(stats, f"item_build_failures={skipped_build}")
 
+        # 分页到上限就停（不是「到底了」）同样意味着有条目没抓到——理由见
+        # `BaseAdapter._paginate`。少了这一条，page 风格被截断时会静默推进游标。
+        truncated = getattr(adapter, "pagination_truncated", 0)
+        if truncated:
+            self._mark_incomplete(stats, f"pagination_truncated={truncated}")
+
         # 早停在 --limit 上意味着后面还有没抓到的旧条目，不能把游标推过去。
         #
         # 判定必须用**适配器交出来的条数**（`seen`），不能再用 `stats.fetched`：适配器的

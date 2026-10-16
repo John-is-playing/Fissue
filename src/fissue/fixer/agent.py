@@ -166,7 +166,7 @@ class FixAgent:
                     # 实测模型宁可反复读仓库文件、也不主动去读它，那就别让它「想起来」。
                     verifier_files=spec.files,
                 ),
-                purpose=f"agent@{item.repo}",
+                purpose=f"agent:{item.repo}",
                 default={},
             )
             self._accumulate(trace, usage)

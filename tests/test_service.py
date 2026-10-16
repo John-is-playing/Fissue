@@ -63,10 +63,16 @@ def _fake_ctx(settings, repo, *, image_ready: tuple[bool, str] = (True, "ok")):
         def image_ready(image):  # noqa: ANN001, ANN202
             return image_ready
 
+    class _LLM:
+        # daemon 会按仓库换预算守卫（这是个全局单槽），替身里给个占位即可
+        budget_guard = None
+
     return SimpleNamespace(
         settings=settings,
         repo=repo,
         sandbox=_Sandbox(),
+        llm=_LLM(),
+        budget_guard=lambda slug: None,
         all_repos=lambda: settings.enabled_repos(),
         usage_report=lambda *a, **k: {"total_tokens": 0, "cost_usd": 0.0},
     )
@@ -205,6 +211,48 @@ async def test_daemon_respects_the_verify_batch_limit(settings, repo, monkeypatc
 
     assert len(ran) == 2, f"上限 2 就不该验 3 条：{ran}"
     assert out["verified"] == 2
+
+
+async def test_periodic_notifications_are_deduped_per_day_not_forever(settings, repo, monkeypatch) -> None:
+    """周期通知（扫描完成 / 日报 / 预算告警）按**日**去重，而不是一辈子只发一次。
+
+    回归：这三类通知的标题是**常量**（`扫描完成：owner/repo`、`Fissue 巡检日报`），而去重键原先
+    只由「事件 + 条目 + 标题」组成 → 键永远相同 → `try_claim_notification` 第一次就把它占住，
+    此后每轮都被判「已发过」静默丢弃。真跑里正是这个表现：三个仓库各收到过一条「扫描完成」，
+    之后再没收到任何周期性告警。
+    """
+    from types import SimpleNamespace
+
+    from fissue.config import NotifyChannel
+    from fissue.service import notify as notify_mod
+    from fissue.service.notify import Channel, Notifier
+
+    sent: list[str] = []
+
+    class _Fake(Channel):
+        kind = "console"
+
+        def __init__(self) -> None:
+            super().__init__(NotifyChannel(type="console"))
+
+        async def send(self, note):  # noqa: ANN001, ANN202
+            sent.append(note.title)
+            return True, ""
+
+    settings.notify.enabled = True
+    settings.notify.events = []
+    notifier = Notifier(settings.notify, settings, repo)
+    notifier.channels = [_Fake()]
+    stats = SimpleNamespace(fetched=1, created=0, updated=1, unchanged=0)
+
+    monkeypatch.setattr(notify_mod, "_periodic_scope", lambda: "2026-10-16")
+    await notifier.notify_scan(repo_slug="psf/requests", stats=stats)
+    await notifier.notify_scan(repo_slug="psf/requests", stats=stats)
+    assert len(sent) == 1, "同一时间窗内重复的扫描通知应当去重"
+
+    monkeypatch.setattr(notify_mod, "_periodic_scope", lambda: "2026-10-17")
+    await notifier.notify_scan(repo_slug="psf/requests", stats=stats)
+    assert len(sent) == 2, "换了一天必须重新发——原先常量标题让它一辈子只发一次"
 
 
 async def test_run_once_wires_the_verify_step_between_eval_and_flush(settings, repo, monkeypatch) -> None:

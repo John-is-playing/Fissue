@@ -75,6 +75,17 @@
 - **CLI**：日志一律写 stderr——`RichHandler` 默认落在 stdout，一句 WARNING 就能把 `fissue status --json` 的输出打坏（实测 `JSONDecodeError`）
 - **常驻服务**：补齐**验证**这一步。`run_once` 原先只做抓取 → 评测 → flush → 修复，条目停在 `evaluated`，「部署成服务它自己转」这条链是断的；现按 CLI 口径接上（带镜像前置检查与预算门），Issue-FEATURE 不验证
 - **推送**：强推改用**精确租约**。裸 `--force-with-lease` 在「推送目标是 URL、修复分支从未 fetch」时拿不到期望值，于是**远端已有同名分支就一律 `stale info`**，把正常重推也拒掉——真跑里 6 次推送全被拒、PR 一个也没建出来（修复分支是「条目+内容哈希」的确定性名字，远端早已存在，重推是常态）。现在先 `ls-remote` 问远端：有则用 `--force-with-lease=refs/heads/<branch>:<sha>`，确认没有则普通推送。**问不到远端状态时拒绝强推**并给出底层原因（此前会静默降级成普通推送，报出误导性的 `fetch first`）
+- **`.git` 加固的两处漏网**（全仓库 review 后补）：`harden_git` 会把容器可写的 `user.name` / `user.email`（以及 url 回退分支）**原样写回**重建后的配置，而 git 配置是**按行**解析的——一个带字面换行的值就能在「加固后」的配置里凭空造出执行入口；现在这些值当不可信输入处理，含换行/控制字符一律丢弃（丢弃不影响提交：`commit()` 自带 `-c user.name`）
+- **`pr_strategy.mode` 加白名单**：它原先没有校验，而代码只对**精确等于** `fork` 走 fork、其余一律 `head_repo = 上游仓库`——把 `fork` 拼成 `Fork`/`frok` 就等于**静默关掉 fork 安全阀**，把分支直推到别人的仓库
+- **CLI `fix` 的 `--repo` 解析失败不再回退**：原先解析异常被吞掉后回退成「配置里所有启用仓库」，于是 `--repo bad-spec` 会在你**没有点名**的仓库上自动修复（写命令，会推分支、提 PR）
+- **建 PR 的探测兜底丢字段**：写请求结果不明、靠探测确认「其实已建好」时，`create_pr` 会拿到探测给出的 `{"number","url"}`——而 GitHub 只认 `html_url`（url 变 None → 既不计入成功也不发通知）、GitLab 连 `number` 都丢（那个 MR 还会被打不上 AI 标签）
+- **容器 `--user` 默认跟随宿主 uid:gid**（不再写死 `1000:1000`）：工作区是宿主 uid 的 `mkdtemp`（0700），bind mount 把这套权限带进容器——宿主 uid 不是 1000 的机器上容器写不进 `/workspace`，整条验证链路以 Permission denied 收场
+- **验证阶段的瞬时故障改为上抛**：原先 `run()` 自己 catch-all 并置 `FAILED`，而常驻服务那侧本来就有带退避的重试（`_verify_one`）——它只认「run 抛异常」。一吞，重试永不发生，一次克隆/网络抖动就把条目永久钉死（现在：daemon 重试用尽才落 `FAILED`；CLI / Web / Pipeline 逐条兜住并如实报错）
+- **已合并 / 已关闭的 PR 落 `SKIPPED`**：原先只写 `skipped_reason` 就返回，条目永久停在 `EVALUATED`，每轮被重新取到、占满 `verify_batch_limit`（默认 30），真正待验证的条目进不了批次（已经 verified/labeled 的不会被打回）
+- **分页 `max_pages` 真正生效 + 截断可传播**：`page` 原先只在 page 风格里自增，link 风格下这道上限形同虚设（服务端一直给同一页就无限重复请求）；page 风格到顶是静默截断，`fetcher` 照推游标 → 被截掉的那批永久落在增量窗口外。现在统一计数、到顶记 `pagination_truncated`，`fetcher` 据此判「数据不完整 → 不推进游标」
+- **flush 的抢占保护**：claim 之后的「落库/收尾」段原先没有异常保护（`try` 只包住 handler），异常一抛行就停在 `running`——而 `should_flush` 看不见 `running`（只认 done/pending），该队列再也 flush 不了；现在异常路径立即归还抢占，且**超龄抢占在判定之前就回收**（不再依赖 `should_flush` 为真）
+- **周期通知按日去重**：`扫描完成` / `巡检日报` / `预算告警` 的标题是常量，而去重键只由「事件+条目+标题」组成 → 键永远相同 → 第一次之后每轮都被判「已发过」静默丢弃
+- **用量记到仓库名下 + 预算守卫接线**：记账原先取 `purpose.split(":")[0]` 当仓库（那取到的是用途本身），于是每行 `repo_key` 都是空串、per-repo 每日预算恒读 ~0、`except BudgetExceeded` 成了死代码；现在 purpose 形如 `evaluate:<仓库>` 并据此归属，daemon / CLI 的评测·验证·修复按仓库切换守卫。顺带删掉清单型验证器的重复记账（同一批 token 记两遍）
 
 ### 文档
 

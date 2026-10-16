@@ -308,6 +308,19 @@ def test_db_check_on_missing_database_fails_cleanly(cli_env: dict[str, str]) -> 
     assert "连接失败" in result.output
 
 
+def test_fix_with_an_invalid_repo_ref_refuses_instead_of_fixing_everything(cli_env: dict[str, str]) -> None:
+    """`fix --repo` 写错时必须报错，**绝不能**静默改成「配置里所有仓库」。
+
+    `fix` 是写命令（会推分支、提 PR）。原先 `_resolve_repos_safe` 把解析异常吞掉后回退到
+    `enabled_repos()`，于是 `--repo bad-spec` 变成了「在你没点名的仓库上全都修一遍」。
+    """
+    result = _run(["fix", "--repo", "bad-spec"], cli_env)
+
+    assert result.exit_code != 0
+    assert "解析失败" in result.output, result.output
+    assert "bad-spec" in result.output, "报错要点名是哪个 spec 不合法"
+
+
 def test_missing_explicit_config_fails(cli_env: dict[str, str]) -> None:
     """显式指定不存在的配置文件 → 明确报错（不静默用默认值）。"""
     result = runner.invoke(

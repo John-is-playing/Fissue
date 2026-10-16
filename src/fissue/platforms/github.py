@@ -89,6 +89,7 @@ class GitHubAdapter(PlatformAdapter):
     ) -> AsyncIterator[RawItem]:
         wanted = set(item_types)
         self.skipped_build_failures = 0     # 本轮重新计数（调用方读它判「数据不完整」）
+        self.pagination_truncated = 0       # 同上：分页到顶也算「数据不完整」
         # /issues 会同时返回 issue 与 PR（PR 带 pull_request 字段），一次拉全量最省配额
         url = f"{self.api_base}/repos/{repo.owner}/{repo.name}/issues"
         params: dict[str, Any] = {
@@ -359,7 +360,11 @@ class GitHubAdapter(PlatformAdapter):
             json={"title": title, "head": head, "base": base, "body": body, "draft": draft},
             probe=_probe,
         )
-        return {"number": (data or {}).get("number"), "url": (data or {}).get("html_url")}
+        data = data or {}
+        # 写请求结果不明时，`_request` 会把**探测结果**原样返回，而探测（`find_open_pr`）
+        # 给的是 {"number", "url"} 形状——所以两个键都要认。只认 html_url 的话，探测兜底
+        # 那条路上 `url` 会变成 None，于是 daemon 既不计成功、也不发 PR 通知，静默消失。
+        return {"number": data.get("number"), "url": data.get("html_url") or data.get("url")}
 
     def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
         seg = "issues" if item_type is ItemType.ISSUE else "pull"

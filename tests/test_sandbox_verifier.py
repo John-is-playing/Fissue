@@ -927,6 +927,45 @@ def test_docker_run_names_the_container(monkeypatch) -> None:
     assert captured["kwargs"]["container"] == name, "名字要交给 _spawn，超时才回收得掉"
 
 
+def test_container_user_follows_the_host_uid(monkeypatch) -> None:
+    """`--user` 默认要跟随**宿主** uid:gid，不能写死 `1000:1000`。
+
+    工作区是宿主 uid 的 `mkdtemp`（0700），bind mount 会把属主/权限一起带进容器：写死
+    1000:1000 时，宿主 uid≠1000 的机器上容器写不进 `/workspace`，整条验证链路以
+    Permission denied 收场。**本机恰好 uid=1000**，所以这个坑连真跑都暴露不了——只有把
+    uid 打桩才测得出来。
+    """
+    import os as _os
+
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.protocol import ExecResult
+    from fissue.sandbox.runtime import DockerRuntime, default_container_user
+
+    assert SandboxConfig().user == "", "配置默认应当是「留空 = 跟随宿主」"
+
+    monkeypatch.setattr(_os, "getuid", lambda: 4242, raising=False)
+    monkeypatch.setattr(_os, "getgid", lambda: 4343, raising=False)
+    assert default_container_user() == "4242:4343"
+
+    rt = DockerRuntime(SandboxConfig(runtime="docker"))
+    monkeypatch.setattr(rt, "_docker_bin", "/usr/bin/docker")
+    monkeypatch.setattr(rt, "available", lambda: (True, "ok"))
+    monkeypatch.setattr(rt, "ensure_image", lambda image: True)
+    captured: dict[str, Any] = {}
+
+    def fake_spawn(args, **kwargs):  # noqa: ANN001, ANN202
+        captured["args"] = list(args)
+        return ExecResult(ok=True)
+
+    monkeypatch.setattr(rt, "_spawn", fake_spawn)
+
+    rt.run(image="img", command="echo hi", timeout_seconds=30)
+
+    args = captured.get("args") or []
+    assert "--user" in args, "docker 参数里必须带 --user"
+    assert args[args.index("--user") + 1] == "4242:4343", "应当按宿主 uid:gid 跑"
+
+
 def test_timeout_reclaims_the_container(monkeypatch) -> None:
     """超时后必须显式回收容器。
 

@@ -369,6 +369,8 @@ def verify(
                 repos = _resolve_repos(settings, repo, platform)
                 targets = []
                 for cfg in repos:
+                    # 用量按仓库归属，守卫也得跟着换（单槽，与 eval 同一处理）
+                    ctx.llm.budget_guard = ctx.budget_guard(cfg.slug)
                     targets.extend(
                         ctx.repo.list_items(
                             repo_slug=cfg.slug,

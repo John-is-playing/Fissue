@@ -149,8 +149,8 @@ class ScriptedLLM:
     async def chat_json(self, messages, *, purpose: str = "", **kwargs):
         from fissue.ai.client import Usage
 
-        # purpose 形如 "agent@psf/requests" → 归一到 "agent"
-        key = purpose.split("@")[0]
+        # purpose 形如 "evaluate:psf/requests"（旧形状 "agent@psf/requests" 也认）→ 归一到用途
+        key = purpose.split(":")[0].split("@")[0]
         self.seen.append(key)
         queue = self.script.get(key) or self.script.get("*") or []
         data = queue.pop(0) if queue else {}

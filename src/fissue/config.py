@@ -261,7 +261,13 @@ class SandboxConfig(BaseModel):
     )
     network: str = "none"
     read_only_root: bool = True
-    user: str = "1000:1000"
+    #: 容器里跑命令用的 ``uid:gid``。**留空 = 跟随宿主**（见
+    #: ``sandbox.runtime.default_container_user``）。
+    #:
+    #: 不能写死 ``1000:1000``：工作区是宿主 uid 的 ``mkdtemp``（0700），bind mount 会把属主
+    #: 与权限一起带进容器；宿主 uid 不是 1000 时容器写不进 ``/workspace``，整条验证链路会以
+    #: ``Permission denied`` 收场，而日志看上去像代码或验证器的问题。
+    user: str = ""
     #: 把工作区里的 `.git` 以**只读**挂进容器（`index` 除外，见下）。默认开启。
     #:
     #: 容器对工作区可写，而 `.git` 是**宿主的执行入口**：hooks、`config` 里的
@@ -304,6 +310,23 @@ class PRStrategy(BaseModel):
     # 这里曾有一个 `auto_submit` 开关：文档建议「首次使用设成 false」，但代码
     # 从来没读过它——设了照样自动提 PR，是个会给人虚假安全感的空开关，已删除。
     # 要「只出补丁、不提 PR」请用 `mode: patch_only` 或 `fissue fix --dry-run`。
+
+    @field_validator("mode")
+    @classmethod
+    def _check_mode(cls, v: str) -> str:
+        """只接受**代码真的实现了**的三种取值。
+
+        这条校验是安全相关的：`fixer.autofix` 里只有**精确等于** `fork` 才走 fork、
+        `patch_only` 走只落补丁，其余一律落到 `head_repo = 上游仓库`——也就是「把分支直推到
+        别人的仓库」。于是 `Fork` / `frok` / `direct ` 这类拼写错误会**静默**关掉 fork 这道
+        安全阀（对比：fork 真失败时代码是明确停手、不降级的）。
+        """
+        allowed = {"fork", "direct", "patch_only"}
+        if v not in allowed:
+            raise ConfigError(
+                f"auto_fix.pr_strategy.mode 只接受 fork|direct|patch_only，当前为 {v!r}"
+            )
+        return v
 
 
 class AutoFixConfig(BaseModel):

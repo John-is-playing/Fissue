@@ -281,6 +281,57 @@ def test_host_git_ignores_container_written_hooks(tmp_path: Path) -> None:
     assert not marker.exists(), "容器写下的 pre-push 钩子在宿主被执行了"
 
 
+def test_harden_git_drops_a_poisoned_identity_instead_of_writing_it_back(tmp_path: Path) -> None:
+    """`.git/config` 对容器可写：身份值里带换行时**绝不能原样写回**重建后的配置。
+
+    git 配置是**按行**解析的，而 `git config --get` 会把值里的字面换行原样输出（`.strip()`
+    只去首尾）。于是往 `user.name` 里塞一段 `[core] fsmonitor = …`，就能在**加固后**的配置里
+    凭空造出一个执行入口——而宿主随后正要 `git add` / `git commit`（push 的子进程还带着令牌）。
+    """
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b", origin_url="https://example.invalid/o/r.git")
+
+    _run_git(["config", "user.name", "x\n[core]\n\tfsmonitor = sh -c 'touch /tmp/pwned'"], cwd=root)
+    _run_git(["config", "user.email", "bot@example.com"], cwd=root)      # 正常值应当保留
+
+    ws.harden_git()
+
+    text = (root / ".git" / "config").read_text(encoding="utf-8")
+    assert "fsmonitor" not in text, "被污染的身份值不该出现在重建后的配置里"
+    assert "pwned" not in text
+    assert "bot@example.com" in text, "正常身份仍要带过来（别一刀切）"
+
+    # 丢掉身份不影响提交：commit() 自己带 -c user.name / -c user.email
+    (root / "f.txt").write_text("x", encoding="utf-8")
+    _run_git(["add", "f.txt"], cwd=root)
+    assert ws.commit("t").ok, "丢掉身份后仍要能提交"
+
+
+def test_harden_git_drops_a_poisoned_origin_url(tmp_path: Path) -> None:
+    """origin url 同样来自可写配置：带换行时整条不写，且不影响正常 url。"""
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")            # 不传 origin_url → 回退读配置
+
+    _run_git(
+        [
+            "config",
+            "remote.origin.url",
+            "https://example.invalid/o/r.git\n[core]\n\tfsmonitor = sh -c 'touch /tmp/pwned'",
+        ],
+        cwd=root,
+    )
+    ws.harden_git()
+    text = (root / ".git" / "config").read_text(encoding="utf-8")
+    assert "fsmonitor" not in text and "pwned" not in text
+    assert '[remote "origin"]' not in text, "不可信的 url 应当整条不写，而不是写一半"
+
+    # 换成正常 url 后应当照常写回（证明没有一刀切）
+    _run_git(["config", "remote.origin.url", "https://example.invalid/good/repo.git"], cwd=root)
+    ws.harden_git()
+    text2 = (root / ".git" / "config").read_text(encoding="utf-8")
+    assert "https://example.invalid/good/repo.git" in text2
+
+
 def test_harden_git_drops_execution_entries_keeps_remote_and_identity(tmp_path: Path) -> None:
     """`harden_git` 清掉 `.git/config` 里的执行入口，但保留 remote 与提交身份。
 

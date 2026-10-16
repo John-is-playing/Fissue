@@ -316,6 +316,10 @@ class PlatformAdapter(ABC):
     #: （除非 `--full`）——那等于把「响亮的失败」换成「静默丢条目」。
     skipped_build_failures: int = 0
 
+    #: 本轮抓取里「分页到上限还没到底」的次数。适配器在 `fetch_items` 开头清零；调用方读到
+    #: 非零就同样把本轮记为**数据不完整 → 不推进游标**（没抓到的那一段再也不会被增量碰到）。
+    pagination_truncated: int = 0
+
     def _note_build_failure(self, kind: str, ident: Any, exc: BaseException) -> None:
         """记一处「单条构造失败」：本轮跳过该条目，并让整批记为数据不完整。
 
@@ -625,8 +629,9 @@ class PlatformAdapter(ABC):
         """
         base_params = dict(params or {})
         page = 1
+        fetched = 0
         next_url: str | None = None
-        while page <= max_pages:
+        while fetched < max_pages:
             if style == "link":
                 # GitHub 风格：页码不在请求参数里，而在响应的 `Link` 头里
                 # （`<https://…&page=2>; rel="next"`）。所以第一页不带 page，
@@ -645,14 +650,27 @@ class PlatformAdapter(ABC):
             if not isinstance(batch, list) or not batch:
                 return
             yield batch
+            fetched += 1
 
             if style == "link":
                 next_url = _next_link(resp_headers)
                 if not next_url:
                     return          # 没有 rel="next" → 这就是最后一页
-            elif len(batch) < self.per_page:
-                return              # 不满一页 → 到底了
-            page += 1
+            else:
+                if len(batch) < self.per_page:
+                    return          # 不满一页 → 到底了
+                page += 1
+
+        # 到上限退出（而不是「到底了」）：**必须让调用方知道**。原先 `page` 只在 page 风格里
+        # 自增，于是 link 风格下这个上限等于不存在——服务端一直给同一页（被中间层/代理重写）
+        # 就会无限重复请求；而 page 风格下到顶是静默返回，`fetcher` 照常推进游标，被截掉的
+        # 那批（`update` 倒序里更旧的）就永久落在增量窗口外。
+        self.pagination_truncated += 1
+        log.warning(
+            "[%s] 分页到上限 %d 页就停了（style=%s）：后面的条目本轮没抓到，"
+            "记为数据不完整、不推进游标",
+            self.platform.value, max_pages, style,
+        )
 
     @staticmethod
     def _backoff(attempt: int) -> float:

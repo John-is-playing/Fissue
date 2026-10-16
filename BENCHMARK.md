@@ -1220,3 +1220,31 @@ flush 出结论 7 条（verify 3 + fix_bug 4，并在 GitHub 上建了标签）�
 
 **测试**：全量 **701 passed**；ruff 与 mypy 双绿（mypy 起覆盖 `src/fissue` **与 `tests`** 共 70 个
 源文件，本批先清掉 tests 里 68 处类型问题）。
+
+### 4.18 全仓库 review 后的 11 项修复（2026-10-17）
+
+四路并行审查（沙盒/工作区、流水线与验证、平台与网络、存储/CLI/服务）产出约 50 条主张；**逐条回到
+代码里核实**后，挑出 11 条确定的缺陷修掉，每条都配守卫用例。
+
+| # | 位置 | 问题 | 后果 |
+|---|---|---|---|
+| 1 | `workspace.harden_git` | `user.name` / `user.email`（以及 url 回退分支）从**容器可写**的配置读出后**原样写回**重建后的 config，而 git 配置按行解析——值里的字面换行能凭空造出执行入口 | `git_readonly:false` 或 `runtime:local` 下容器可注回 `[core] fsmonitor` / `filter.*.clean` 等 → 宿主执行，而 push 子进程带着令牌 |
+| 2 | `config.PRStrategy.mode` | 无校验；代码只对**精确等于** `fork` 走 fork，其余一律 `head_repo = 上游仓库` | `Fork` / `frok` 这类拼写错误**静默关掉 fork 安全阀**，分支直推别人的仓库 |
+| 3 | `cli._resolve_repos_safe` | 解析异常被吞掉后回退成「配置里所有启用仓库」 | `fissue fix --repo bad-spec` 在**没点名**的仓库上自动修复（写命令，会推分支、提 PR） |
+| 4 | `github/gitlab.create_pr` | 写请求结果不明时拿到的是探测结果 `{"number","url"}`，而这里解析 `html_url` / `iid` / `web_url` | GitHub 丢 url、GitLab 连 number 都丢 → 成功的修复既不计入 succeeded 也不发通知（GitLab 那个 MR 还打不上 AI 标签） |
+| 5 | `sandbox.runtime` / `config` / `protocol` | 容器 `--user` 写死 `1000:1000`，而工作区是宿主 uid 的 `mkdtemp`（0700） | 宿主 uid≠1000 的机器上容器写不进 `/workspace`，**整条验证链路 Permission denied**（本机恰好 uid=1000 才没暴露） |
+| 6 | `stages.VerifyStage` / `PRVerifyStage` | 异常被 catch-all 成 `FAILED`，而 daemon 的带退避重试只认「run 抛异常」 | 克隆/网络的一次抖动就把条目**永久**钉死（只能人工 `requeue`），`item_retries` 形同虚设 |
+| 7 | `stages.PRVerifyStage` | 已合并/已关闭的 PR 只写 `skipped_reason`，**不改状态** | 永久停在 `EVALUATED`、每轮被重取，累计到 `verify_batch_limit`（30）就把真正待验证的挤出去 |
+| 8 | `platforms._paginate` | `page` 只在 page 风格自增；上限到顶时静默返回 | link 风格下 `max_pages` **形同虚设**（服务端一直给同一页就无限重复请求）；page 风格静默截断而 `fetcher` 照推游标 → 被截的那批永久漏抓 |
+| 9 | `queue.flush` | claim 之后的「落库/收尾」段没有异常保护；超龄 `running` 回收只在 `claim_unflushed` 内（即只在 `should_flush` 为真时才跑） | 异常一抛行停在 `running`，而 `should_flush` 看不见 `running` → **该队列再也 flush 不了** |
+| 10 | `service.notify` | `扫描完成` / `巡检日报` / `预算告警` 的标题是常量，去重键只由「事件+条目+标题」组成 | 去重键永远相同 → **只在第一次发得出去**，此后每轮静默丢弃（真跑实测：三个仓库各收到过一条扫描完成，之后再无周期性告警） |
+| 11 | `pipeline.context` / 各调用点 | 记账取 `purpose.split(":")[0]` 当仓库——那取到的是**用途**本身；`LLMClient` 构造也没接 `budget_guard` | 每行 `llm_usage.repo_key` 都是空串 → per-repo 每日预算恒读 ~0、`except BudgetExceeded` 成了死代码；顺带删掉清单型验证器的重复记账（同一批 token 记两遍） |
+
+**验证**：全量 **717 passed**，ruff 与 mypy 双绿（70 个源文件）。本批 **15 条新用例在未修改的
+HEAD 上全部失败**（选中集 16 条里 16 条失败），即它们真的守得住这些缺陷。
+
+**本轮另有一批主张尚未逐条核实**（留待下一轮，不做就是没做）：`net.register_env_file_values`
+不清 `build_ssl_context` 缓存、SQLite 未开 `PRAGMA foreign_keys=ON`、导出/列表的 `comments` 恒为 0、
+`usage_today` 实为滚动 24h、`single_flight` 在「拿到锁、yield 之前」抛错会留下进程内深度、
+Gitee 条目级标签仍打项目自己实测「恒 400」的端点、未知配置键静默忽略、Web 端点非法枚举参数返回 500、
+转发组件 `Executor` 对请求里的 `mounts/user/network` 零校验、local 沙盒超时只杀直接子进程。

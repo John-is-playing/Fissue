@@ -124,6 +124,19 @@ def parse_dimension(raw: Any) -> DimensionScore | None:
     return DimensionScore(score=score, reason=reason, evidence=evidence, confidence=confidence)
 
 
+def _repo_from_entries(entries: Sequence[dict[str, Any]]) -> str:
+    """从批量条目的 key（形如 ``github:owner/name#12``）里取出仓库 slug。
+
+    用量要按**仓库**汇总（见 `_make_usage_sink` 与 per-repo 每日预算），批量调用也得带上它。
+    取不到就给空串——宁可记成「无归属」，也不要记错归属。
+    """
+    for entry in entries:
+        key = str(entry.get("key") or "")
+        if ":" in key:
+            return key.split(":", 1)[1].split("#", 1)[0]
+    return ""
+
+
 def parse_scores(raw: dict[str, Any]) -> Scores:
     """解析四维 + 难度评分（兼容模型把分数放在顶层的情况）。"""
     scores = raw.get("scores")
@@ -446,7 +459,7 @@ class Evaluator:
                 return Category.UNKNOWN, 0.2, "关键词无法判定且未启用 LLM 兜底"
 
         data, _ = await self.client.chat_json(
-            prompts.classification_prompt(item), purpose="classify", default={}
+            prompts.classification_prompt(item), purpose=f"classify:{item.repo}", default={}
         )
         return (
             parse_category(data.get("category")),
@@ -469,7 +482,7 @@ class Evaluator:
         )
         data, usage = await self.client.chat_json(
             prompts.evaluation_prompt(item, threshold_hint=threshold_hint, similar_issues=similar),
-            purpose="evaluate",
+            purpose=f"evaluate:{item.repo}",
             default={},
         )
 
@@ -502,7 +515,7 @@ class Evaluator:
         if item.item_type is not ItemType.PR:
             return None
         data, usage = await self.client.chat_json(
-            prompts.pr_quality_prompt(item, diff=diff), purpose="pr_review", default={}
+            prompts.pr_quality_prompt(item, diff=diff), purpose=f"pr_review:{item.repo}", default={}
         )
         if not data:
             return None
@@ -535,7 +548,7 @@ class Evaluator:
         if not entries:
             return {}
         data, _ = await self.client.chat_json(
-            prompts.fix_plan_prompt(items=entries), purpose="fix_plan", default={}
+            prompts.fix_plan_prompt(items=entries), purpose=f"fix_plan:{_repo_from_entries(entries)}", default={}
         )
         out: dict[str, dict[str, Any]] = {}
         for r in data.get("results") or []:
@@ -562,7 +575,7 @@ class Evaluator:
             return []
         data, usage = await self.client.chat_json(
             prompts.batch_conclusion_prompt(queue_kind=queue_kind, entries=entries),
-            purpose="batch_conclusion",
+            purpose=f"batch_conclusion:{_repo_from_entries(entries)}",
             default={},
         )
         results = data.get("results")

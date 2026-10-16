@@ -152,6 +152,8 @@ class _StubFetchAdapter:
     def __init__(self, items: list[RawItem], *, error: Exception | None = None) -> None:
         self.items = items
         self.error = error
+        # 与真实适配器同名：fetcher 用 getattr 读它判「本轮数据是否完整」
+        self.pagination_truncated = 0
 
     async def fetch_items(self, ref, *, item_types=None, since=None, limit=None):  # noqa: ANN001, ANN201
         if self.error is not None:
@@ -248,6 +250,26 @@ async def test_cursor_frozen_on_early_stop(settings, ctx, monkeypatch) -> None:
     assert stats.fetched == 1
     assert stats.incomplete is True
     assert "early_stop" in "；".join(stats.incomplete_reasons)
+    assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
+
+
+async def test_cursor_frozen_when_pagination_was_truncated(settings, ctx, monkeypatch) -> None:
+    """分页到上限被截断时**不能推进游标**——没抓到的那段再也不会被增量碰到。
+
+    触发场景：`_paginate` 到 `max_pages` 就停（page 风格原先静默返回；link 风格原先连这个
+    上限都不生效）。截断本身不可怕，可怕的是它被当成「到底了」——那批（`update` 倒序里更旧的）
+    就永久落在增量窗口外，日志里也看不出来。
+    """
+    cfg = _repo_cfg()
+    _seed_cursor(ctx, cfg, "2026-01-01T00:00:00+00:00")
+    adapter = _StubFetchAdapter([_fetched_item(1, "2026-01-09T00:00:00+00:00")])
+    adapter.pagination_truncated = 1                     # 模拟适配器报上来的截断
+    fetcher = _wire_adapter(ctx, monkeypatch, adapter)
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.incomplete is True
+    assert "pagination_truncated" in "；".join(stats.incomplete_reasons)
     assert ctx.repo.get_repo_cursor(cfg.slug)["last_updated_at"].startswith("2026-01-01")
 
 
@@ -822,6 +844,41 @@ def test_context_budget_guard_reads_usage(ctx, settings) -> None:
     guard.check()                                     # 无用量 → 不抛
 
 
+def test_usage_sink_attributes_spend_to_the_repo(ctx, repo, settings) -> None:
+    """记账必须落到**仓库**键上，否则 per-repo 每日预算恒读 ~0、永远不会熔断。
+
+    回归：`_make_usage_sink` 原先取 `usage.purpose.split(":")[0]` 当 repo_key——那取到的是
+    **用途**本身，于是每一行 `llm_usage` 的 repo_key 都是空串；而 `usage_today(repo_key=slug)`
+    正是按这个键汇总的，daemon 的 `_budget_ok` 于是永远读到 ~0（`except BudgetExceeded` 那两处
+    成了死代码）。
+    """
+    from fissue.ai.client import Usage
+    from fissue.errors import BudgetExceeded
+    from fissue.pipeline.context import _make_usage_sink
+
+    sink = _make_usage_sink(repo)
+    sink(
+        Usage(
+            purpose="evaluate:psf/requests",
+            model="stub",
+            prompt_tokens=10,
+            completion_tokens=5,
+            cost_usd=0.01,
+        )
+    )
+
+    used = repo.usage_today(repo_key="psf/requests")
+    assert used["total_tokens"] == 15, f"用量应当记在该仓库名下，实际：{used}"
+    # 别的仓库不该看到这笔（注意：`repo_key=""` 在 usage_today 里表示**不加过滤**，
+    # 所以这里不能用它来验「空桶」）
+    assert repo.usage_today(repo_key="other/repo")["total_tokens"] == 0
+
+    # 归属修好之后，per-repo 守卫才真的看得见这笔用量
+    settings.llm.budget.daily_tokens_per_repo = 10
+    with pytest.raises(BudgetExceeded):
+        ctx.budget_guard("psf/requests").check()
+
+
 async def test_require_repos_helper(ctx, settings) -> None:
     from fissue.pipeline.context import require_repos
 
@@ -1267,6 +1324,72 @@ async def test_flush_reclaims_interrupted_residue_first(ctx, repo, settings, mon
     assert repo.get_item_row(stuck.key).status == ItemStatus.EVALUATED.value, "卡住的条目被放回重验"
 
 
+async def test_flush_releases_stale_claims_before_the_decision(ctx, repo, settings, monkeypatch) -> None:
+    """超龄的 `running` 抢占要在**判定之前**回收，否则队列永久卡死。
+
+    这些行既不是 `done`、也不算 `pending`：`should_flush` 看不见它们 → 早退「没有已完成待定论
+    的条目」→ 而回收代码（`claim_unflushed` 内那次）只在判定为真时才跑——死结。真跑里落库中途
+    报错就能造出这个形状（见下一条用例），此后**每一轮 flush 都会直接早退**。
+    """
+    settings.queues.verify_queue.flush_size = 100            # 数量阈值远不可达
+    settings.queues.verify_queue.idle_flush_seconds = 99999  # 空闲兜底也关掉
+    qm = QueueManager(ctx)
+
+    item = _seed_issue(repo, 81)
+    eid = qm.enqueue(QueueName.VERIFY, item.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+    assert repo.claim_unflushed(QueueName.VERIFY, limit=10), "先正常抢一次，制造 running 行"
+
+    monkeypatch.setattr(repo, "CLAIM_STALE_SECONDS", -1)     # 模拟超龄
+
+    async def handler(queue_kind, entries):
+        return [
+            {"key": e["key"], "verdict": "skip", "labels": [], "priority": Priority.NONE,
+             "reason": "r", "confidence": 0.5, "model": "stub"}
+            for e in entries
+        ]
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=handler)
+
+    assert outcome.flushed == 1, "超龄抢占回收后，这条应当被正常消费"
+
+
+async def test_flush_releases_the_claim_when_the_db_tail_fails(ctx, repo, settings, monkeypatch) -> None:
+    """落库/收尾段抛异常时**必须把抢占还回去**，否则条目停在 running、该队列再也 flush 不了。
+
+    回归：claim 之后的整段（`save_batch_conclusion` → `finish_flush_claim` → 收尾）原先没有任何
+    异常保护（`try` 只包住 handler）。异常一抛，行停在 `running`，而 `queue_unflushed` 只认 done、
+    `queue_pending_count` 只认 pending——谁也看不见它：队列表面上「没有待定论条目」。
+    """
+    settings.queues.verify_queue.flush_size = 100
+    settings.queues.verify_queue.idle_flush_seconds = 99999
+    qm = QueueManager(ctx)
+
+    item = _seed_issue(repo, 82)
+    eid = qm.enqueue(QueueName.VERIFY, item.key)
+    repo.finish_queue_entry(eid, status="done", result={})
+
+    def boom(*a, **kw):
+        raise RuntimeError("DB 抖了")
+
+    monkeypatch.setattr(repo, "save_batch_conclusion", boom)
+
+    async def handler(queue_kind, entries):
+        return [
+            {"key": e["key"], "verdict": "fix", "labels": [], "priority": Priority.NONE,
+             "reason": "r", "confidence": 0.5, "model": "stub"}
+            for e in entries
+        ]
+
+    outcome = await qm.flush(QueueName.VERIFY, handler=handler)
+
+    assert outcome.error and "DB 抖了" in outcome.error, "失败要如实报出来，不能假装成功"
+    assert outcome.flushed == 0
+    assert repo.claim_unflushed(QueueName.VERIFY, limit=10), (
+        "抢占必须归还——否则条目永久停在 running，而 should_flush 看不见 running"
+    )
+
+
 async def test_eval_skips_items_with_incomplete_comments(ctx, repo) -> None:
     """评论残缺时不评测。
 
@@ -1666,6 +1789,80 @@ async def test_pr_verify_docs_only_pr_explicitly_rejects_merge(ctx, repo, monkey
     assert "README.md" in (result.skipped_reason or "")
 
 
+async def test_pr_verify_marks_merged_and_closed_prs_skipped(ctx, repo) -> None:
+    """已合并 / 已关闭的 PR 必须落 SKIPPED，不能再永久停在 EVALUATED。
+
+    回归：这两个分支原先只写 `skipped_reason` 就返回。daemon 每轮按 `status=EVALUATED` +
+    `verify_batch_limit`（默认 30）取件，于是这类条目一旦累积到 30，**真正待验证的条目就永远
+    进不了这一批**。但只在「还没往后走过」时才落 SKIPPED——已经 verified/labeled 的不该被打回。
+    """
+    from fissue.pipeline.stages import PRVerifyStage
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+
+    def _pr(number: int, **kw: Any):
+        it = RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=number,
+            item_type=ItemType.PR, title=f"pr {number}", body="b", **kw,
+        )
+        repo.upsert_item(rid, it)
+        repo.set_item_status(it.key, ItemStatus.EVALUATED)
+        return it
+
+    merged = _pr(101, merged=True)
+    closed = _pr(102, state="closed")
+    already = _pr(103, merged=True)
+    repo.set_item_status(already.key, ItemStatus.LABELED)      # 已推进过的不能被打回
+
+    ev = Evaluation(category=Category.BUG, model="stub")
+    r1 = await PRVerifyStage(ctx).run(merged, ev)
+    r2 = await PRVerifyStage(ctx).run(closed, ev)
+
+    assert r1.status is ItemStatus.SKIPPED and "已合并" in (r1.skipped_reason or "")
+    assert r2.status is ItemStatus.SKIPPED and "已关闭" in (r2.skipped_reason or "")
+    assert repo.get_item_row(merged.key).status == ItemStatus.SKIPPED.value, "必须落状态"
+    assert repo.get_item_row(closed.key).status == ItemStatus.SKIPPED.value
+
+    await PRVerifyStage(ctx).run(already, ev)
+    assert repo.get_item_row(already.key).status == ItemStatus.LABELED.value, (
+        "别把已经打标/验证过的条目打回 SKIPPED"
+    )
+
+
+async def test_verify_stage_reraises_transient_failure_and_keeps_the_item_retryable(
+    ctx, repo, monkeypatch
+) -> None:
+    """验证阶段的瞬时故障必须**上抛**，条目留在可重试状态，而不是当场 FAILED。
+
+    回归：`run()` 原先自己 catch-all 并置 `FAILED`，而常驻服务那侧本来就写了带退避的重试
+    （`daemon._verify_one`）——它**只认「run 抛异常」**。这里一吞，那次重试永远不会发生：
+    克隆/网络的一次抖动就把条目永久钉死（daemon 只取 EVALUATED），只能人工
+    `fissue requeue --failed` 救回来。
+    """
+    from fissue.pipeline.stages import VerifyStage
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    item = RawItem(
+        platform=Platform.GITHUB, repo="psf/requests", number=901,
+        item_type=ItemType.ISSUE, title="t", body="b",
+    )
+    repo.upsert_item(rid, item)
+    repo.set_item_status(item.key, ItemStatus.EVALUATED)
+    ev = Evaluation(category=Category.BUG, priority=Priority.TIER1, model="stub")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("克隆炸了")
+
+    monkeypatch.setattr(ctx, "clone_workspace", boom)
+
+    with pytest.raises(RuntimeError, match="克隆炸了"):
+        await VerifyStage(ctx).run(item, ev)
+
+    assert repo.get_item_row(item.key).status == ItemStatus.EVALUATED.value, (
+        "瞬时故障不该把条目钉成 FAILED——它还得能被重试"
+    )
+
+
 async def test_pr_verify_code_pr_is_not_short_circuited(ctx, repo, monkeypatch) -> None:
     """含代码改动的 PR 不能被文档闸门误拦——必须照常走验证。"""
     from fissue.models import FileChange
@@ -1685,7 +1882,9 @@ async def test_pr_verify_code_pr_is_not_short_circuited(ctx, repo, monkeypatch) 
     monkeypatch.setattr(ctx, "clone_workspace", spy_clone)
 
     ev = Evaluation(category=Category.BUG, model="stub")
-    await PRVerifyStage(ctx).run(item, ev)
+    # 验证阶段把瞬时故障**上抛**（见 VerifyStage）：这里正好用它证明闸门确实放行了
+    with pytest.raises(RuntimeError, match="闸门放行"):
+        await PRVerifyStage(ctx).run(item, ev)
 
     assert reached["n"] == 1, "含代码改动的 PR 应继续走验证"
 

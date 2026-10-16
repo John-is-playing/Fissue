@@ -34,6 +34,16 @@ log = get_logger(__name__)
 TIMEOUT = httpx.Timeout(15.0, connect=8.0)
 
 
+def _periodic_scope() -> str:
+    """周期通知的**时间窗**：同一个 UTC 日内只发一次。
+
+    只影响「是否重复」的判定——跨日必须允许重发。否则「扫描完成 / 巡检日报 / 预算告警」这种
+    **标题是常量**的通知，去重键永远相同：只在第一次发得出去，此后每轮都被判「已发过」静默丢弃
+    （真跑里就是这个表现：三个仓库各发过一条扫描完成，之后再没收到过任何一条周期性告警）。
+    """
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
 @dataclass
 class Notification:
     """一条待发送的通知。"""
@@ -45,11 +55,14 @@ class Notification:
     url: str | None = None
     level: str = "info"                     # info | warn | critical
     payload: dict[str, Any] = field(default_factory=dict)
+    #: 去重的**时间窗**（周期事件用）。像「扫描完成」「巡检日报」这种**标题是常量**的通知，
+    #: 若不带时间窗，去重键就永远相同——只在第一次发得出去，此后每轮都被判「已发过」静默丢弃。
+    dedup_scope: str = ""
 
     @property
     def dedup_key(self) -> str:
-        """去重键：事件 + 条目 + 标题摘要。"""
-        raw = f"{self.event}|{self.item_key}|{self.title[:80]}"
+        """去重键：事件 + 条目 + 标题摘要 +（可选）时间窗。"""
+        raw = f"{self.event}|{self.item_key}|{self.title[:80]}|{self.dedup_scope}"
         return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -339,6 +352,7 @@ class Notifier:
                 title=f"扫描完成：{repo_slug}",
                 body=f"拉取 {stats.fetched}，新增 {stats.created}，更新 {stats.updated}，未变 {stats.unchanged}",
                 level="info",
+                dedup_scope=_periodic_scope(),
             )
         )
 
@@ -403,6 +417,7 @@ class Notifier:
                 ),
                 level="critical",
                 payload=used,
+                dedup_scope=_periodic_scope(),
             )
         )
 
@@ -411,5 +426,11 @@ class Notifier:
         if actions:
             body += "\n\n建议动作：\n" + "\n".join(f"- {a}" for a in actions)
         await self.notify(
-            Notification(event="digest", title="Fissue 巡检日报", body=body, level="info")
+            Notification(
+                event="digest",
+                title="Fissue 巡检日报",
+                body=body,
+                level="info",
+                dedup_scope=_periodic_scope(),
+            )
         )

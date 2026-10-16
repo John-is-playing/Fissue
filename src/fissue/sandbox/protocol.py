@@ -57,7 +57,8 @@ class ExecRequest:
     # 隔离
     network: str = "none"                        # none | bridge
     read_only_root: bool = True
-    user: str = "1000:1000"
+    # 留空 = 跟随宿主 uid:gid（见 sandbox.runtime.default_container_user）
+    user: str = ""
     # 额外挂载（如克隆好的仓库）
     mounts: list[MountSpec] = field(default_factory=list)
     # 元信息（透传，便于日志与产物归档）

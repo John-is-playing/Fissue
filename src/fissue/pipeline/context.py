@@ -218,9 +218,14 @@ def _make_usage_sink(repo: Repository):
     """构造写入 llm_usage 表的回调。"""
 
     def sink(usage: Usage) -> None:
+        # purpose 约定形如 `<用途>:<仓库slug>`（如 `evaluate:psf/requests`）。原先这里取
+        # `usage.purpose.split(":")[0]` 当仓库——那取到的是**用途本身**，于是每一行 `llm_usage`
+        # 的 repo_key 都是空串；而 per-repo 每日预算正是按这个键汇总
+        # （`usage_today(repo_key=slug)`），结果预算永远读到 ~0、永不触发。
+        kind, _, repo_slug = (usage.purpose or "").partition(":")
         repo.record_usage(
-            repo_key=usage.purpose.split(":")[0] if ":" in usage.purpose else "",
-            purpose=usage.purpose or "unknown",
+            repo_key=repo_slug,
+            purpose=kind or "unknown",
             model=usage.model,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,

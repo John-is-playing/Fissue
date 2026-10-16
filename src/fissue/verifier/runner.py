@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..ai import prompts
-from ..ai.client import LLMClient, Usage
+from ..ai.client import LLMClient
 from ..config import Settings
 from ..errors import VerifierError
 from ..logging_setup import get_logger
@@ -520,9 +520,9 @@ class VerifierRunner:
         if self.client is None:
             raise VerifierError("清单型验证器需要 LLM 客户端做判定")
 
-        data, usage = await self.client.chat_json(
+        data, _ = await self.client.chat_json(
             prompts.checklist_judge_prompt(item, checklist=spec.checklist, output=output),
-            purpose="checklist_judge",
+            purpose=f"checklist_judge:{item.repo}",
             default={},
         )
         passed = bool(data.get("passed"))
@@ -542,7 +542,6 @@ class VerifierRunner:
         )
         run.stdout = f"{conclusion}\n{detail}"
         self.repo.save_verifier_run(run)
-        self._record_usage(usage, item_key)
         return run
 
     # -- 修正循环 ---------------------------------------------------------
@@ -739,17 +738,6 @@ class VerifierRunner:
             encoding="utf-8",
         )
         return out_dir
-
-    def _record_usage(self, usage: Usage, item_key: str) -> None:
-        repo_key = item_key.split(":")[1] if ":" in item_key else item_key
-        self.repo.record_usage(
-            repo_key=repo_key,
-            purpose=usage.purpose or "checklist_judge",
-            model=usage.model,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-            cost_usd=usage.cost_usd,
-        )
 
 
 def _json_dump(data: dict[str, Any]) -> str:

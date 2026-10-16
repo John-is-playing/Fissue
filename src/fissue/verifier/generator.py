@@ -136,7 +136,7 @@ class VerifierGenerator:
                 test_hint=test_hint,
                 linked_context=linked_context,
             ),
-            purpose="verifier",
+            purpose=f"verifier:{item.repo}",
             default={},
         )
         spec = self.parse(data, item=item, mode=effective_mode)
@@ -177,7 +177,7 @@ class VerifierGenerator:
                 ),
             }
         )
-        data, usage = await self.client.chat_json(messages, purpose="verifier_refine", default={})
+        data, usage = await self.client.chat_json(messages, purpose=f"verifier_refine:{item.repo}", default={})
         new_spec = self.parse(data, item=item, mode=self.cfg.mode) if data else spec
         warnings = validate_spec(new_spec)
         return GeneratedVerifier(spec=new_spec, usage=usage, warnings=warnings)
