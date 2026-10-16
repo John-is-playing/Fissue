@@ -711,7 +711,11 @@ Python 项目 `wtk`（均值 / 中位数 / 百分位），**刻意留了一处�
 3. **v5 建 PR 要裸分支名**：调用方按 GitHub 习惯拼的 `owner:branch` 会被 400 拒，
    而且**错误体为空**——全靠拿真实分支逐个形状去试才定位到。
 4. **v5 从未覆写 `find_open_pr`**（基类默认返回 None）→ 永远查不到已有 PR → 不走
-   「复用」而直接强推 → 被 `--force-with-lease` **正确**拦下，表现为「推送失败」。
+   「复用」而直接强推 → 被 `--force-with-lease` 拦下，表现为「推送失败」。
+   **（2026-10-16 更正：这句当时写的「正确拦下」是错的。）** 那次拒绝**不是保护，是缺陷**：
+   裸 `--force-with-lease` 拿不到期望值（推送目标是 URL、修复分支从未 fetch，本地没有
+   remote-tracking ref），于是**只要远端已有同名分支就一律 `stale info`**，把正常的重推
+   也拒掉了——详见 §4.17 与 `697cb1f`。
 
 **Gitee**（Private 靶子 `ccqtp/fissue-write-probe`）——**写操作受阻，但受阻范围已钉准**：
 
@@ -1164,3 +1168,55 @@ MR 侧抓取仍未测」——**注意不含写操作**，别把这次当成「A
 > `launch_testing` 插件会拖死 pytest 启动；
 > ② PATH 上要有装了 pytest 的解释器，否则 `local` 沙盒里的 `python -m pytest` 会报
 > `No module named pytest`，`test_e2e.py` 的两条会假红。
+
+### 4.17 第二轮真跑：验证闭环跑通，并挖出两处「强推」缺陷（2026-10-16）
+
+三个 GitHub 靶子（pipekit / envkit / lockkit）各跑一轮 `fissue serve --once`（真 LLM、真 Docker），
+重点是把前几轮的改动放进真实链路里验。
+
+**单轮数字**：抓取 44（新增 3 / 更新 31 / 未变 10）→ 评测 28 → **验证 28（0 跳过、0 失败）** →
+flush 出结论 7 条（verify 3 + fix_bug 4，并在 GitHub 上建了标签）→ 修复 6 次尝试。
+
+**验证这一步本就还没在真跑里走过**（常驻服务此前压根没有它）：28 条共触发 30+ 次真容器执行
+（`base` / `fix` / `agent` / `regression:base` / `regression:fix`），且跑在**只读 `.git`** 的新挂载下
+（`.git` 整块只读、仅 `index` 可写），回归门同步生效。
+
+**前几轮改动在真实链路里的行为（均符合设计）**：
+
+* 内容实质变化 → 旧结论作废、置回 `new` 重评；**已开工**（`fix_queued` / `pr_created`）的只留痕、不回落；
+* `regression_assertion_conflict` 真的拦下了「回归断言在未修复代码上就失败」的验证器
+  （envkit#17、#12，lockkit#20）；
+* 验证器自错 → 带反馈重生成（lockkit#17、#16、#20：第 1 轮 `AttributeError` / `TypeError`，第 2 轮可用）；
+* 清单型验证器 → 转人工（envkit#11）。
+
+**缺陷一：裸 `--force-with-lease` 把正常的重推一律拒掉**（`697cb1f`）
+
+推送目标是**不带令牌的 URL**、修复分支从未 fetch，本地没有 remote-tracking ref → 裸 lease
+拿不到期望值 → **只要远端已有同名分支就 `stale info` 拒绝**。而修复分支是「条目 + 内容哈希」的
+**确定性**名字，远端早已存在（`fissue/fix-9-envkit-b02076` 等的最后提交是 10-09），
+`_commit_and_push` 又**恒传 `force=True`**，于是那一轮 **6 次推送全被拒、PR 一个也没建出来**，
+6 个条目被误标 `needs_manual`。
+
+修法：先 `ls-remote` 问远端当前 sha → 拿到就用 `--force-with-lease=refs/heads/<branch>:<sha>`
+精确租约（只允许覆盖刚看到的状态），确认没有就普通推送。**真实验证**：对同一条目重跑 →
+`envkit#9` 建出 **PR #32**，分支正是此前被拒的那一个。
+
+**缺陷二：探不到远端状态时静默降级，报出误导性的 `fetch first`**（`4b15d93`）
+
+同一批重跑里 `envkit#6` 报的是 `! [rejected] ... (fetch first)`——读起来像「远端有别人的提交」，
+实际是 `ls-remote` 探测撞上一次瞬时网络故障，而第一版把它与「远端没有该分支」混为一谈
+（都返回空串）→ 去掉租约 → 普通推送 → 非快进。排查为此绕了一圈（验过分支保护、lease refname）。
+
+修法：把三种结果分开——`<sha>` / `""`（**确认**不存在）/ `None`（**问不到**）；问不到时
+**拒绝强推**并给出底层原因，连 `push` 都不发起。
+
+**结果**：5 条重跑里 4 条当场建出 PR（envkit#7、lockkit#5 / #6 / #9），第 5 条（envkit#6）先撞上
+机器到 `github.com:443` 的**瞬时网络故障**（克隆报 `Empty reply from server` /
+`TLS connection was non-properly terminated`；同一时刻 `api.github.com` 正常），网络恢复后重跑 →
+**PR #34**。
+
+**本轮真跑共产出 6 个 PR**：envkit#32 / #33 / #34、lockkit#29 / #30 / #31——它们的分支
+**全都是远端早已存在的**，也就是说：正是这两处修复让它们推得动。
+
+**测试**：全量 **701 passed**；ruff 与 mypy 双绿（mypy 起覆盖 `src/fissue` **与 `tests`** 共 70 个
+源文件，本批先清掉 tests 里 68 处类型问题）。

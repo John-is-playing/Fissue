@@ -74,6 +74,7 @@
 - **数据库**：SQLite 开 WAL 并把 busy 超时提到 30s（驱动默认 5s，回滚日志模式下长读事务会挡住写者提交）
 - **CLI**：日志一律写 stderr——`RichHandler` 默认落在 stdout，一句 WARNING 就能把 `fissue status --json` 的输出打坏（实测 `JSONDecodeError`）
 - **常驻服务**：补齐**验证**这一步。`run_once` 原先只做抓取 → 评测 → flush → 修复，条目停在 `evaluated`，「部署成服务它自己转」这条链是断的；现按 CLI 口径接上（带镜像前置检查与预算门），Issue-FEATURE 不验证
+- **推送**：强推改用**精确租约**。裸 `--force-with-lease` 在「推送目标是 URL、修复分支从未 fetch」时拿不到期望值，于是**远端已有同名分支就一律 `stale info`**，把正常重推也拒掉——真跑里 6 次推送全被拒、PR 一个也没建出来（修复分支是「条目+内容哈希」的确定性名字，远端早已存在，重推是常态）。现在先 `ls-remote` 问远端：有则用 `--force-with-lease=refs/heads/<branch>:<sha>`，确认没有则普通推送。**问不到远端状态时拒绝强推**并给出底层原因（此前会静默降级成普通推送，报出误导性的 `fetch first`）
 
 ### 文档
 
