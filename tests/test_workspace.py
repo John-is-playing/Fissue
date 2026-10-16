@@ -69,7 +69,8 @@ def test_remote_branch_sha_reports_existence(tmp_path: Path) -> None:
 
     assert ws.remote_branch_sha(str(remote), "fissue/nope") == "", "不存在的分支应当是空串"
     assert ws.push(str(remote), "fissue/here").ok
-    assert len(ws.remote_branch_sha(str(remote), "fissue/here")) == 40
+    sha = ws.remote_branch_sha(str(remote), "fissue/here")
+    assert sha is not None and len(sha) == 40
 
 
 def test_push_uses_an_explicit_lease_when_the_branch_already_exists(tmp_path: Path, monkeypatch) -> None:
@@ -136,6 +137,49 @@ def test_push_skips_the_lease_for_a_brand_new_branch(tmp_path: Path, monkeypatch
     push_argv = [a for a in captured if " push " in f" {a} "]
     assert push_argv and "--force-with-lease" not in push_argv[-1], (
         f"新分支不该带租约，实际：{push_argv[-1] if push_argv else '(没有 push)'}"
+    )
+
+
+def test_push_refuses_to_force_when_the_remote_cannot_be_probed(tmp_path: Path, monkeypatch) -> None:
+    """问不到远端状态时**不许强推**——宁可响亮失败，也别给出误导性的 ``fetch first``。
+
+    回归背景（真跑实测）：那条修复分支的 ``ls-remote`` 撞上一次瞬时网络故障，而旧实现把
+    「问不到」当成「远端没有这个分支」→ 普通推送 → 报 ``! [rejected] (fetch first)``，
+    读起来像「远端有别人的提交」，实际只是探测失败，排查被绕了一圈。
+    """
+    import fissue.workspace as ws_mod
+
+    remote = tmp_path / "remote.git"
+    _run_git(["init", "--bare", "-q", str(remote)])
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+
+    seen: list[str] = []
+    real_run = ws_mod.subprocess.run
+
+    class _ProbeFail:
+        returncode, stdout, stderr = 128, "", "fatal: 无法访问（模拟网络故障）"
+
+    def _spy(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        argv = " ".join(str(c) for c in cmd)
+        seen.append(argv)
+        if "ls-remote" in argv:
+            return _ProbeFail()
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _spy)
+
+    result = ws.push(str(remote), "fissue/cannot-probe", force=True)
+
+    assert not result.ok, "问不到远端状态时不该硬推"
+    assert "拒绝强推" in result.stderr, f"要给可操作的原因，实际：{result.stderr}"
+    assert not any(" push " in f" {a} " for a in seen), "探测失败时连 push 都不该发起"
+
+    assert ws.remote_branch_sha(str(remote), "fissue/cannot-probe") is None, "探测失败应当返回 None"
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", real_run)
+    assert ws.remote_branch_sha(str(remote), "fissue/cannot-probe") == "", (
+        "恢复真实执行后确认：远端确实没有这个分支（空串＝确认不存在，与 None 是两回事）"
     )
 
 

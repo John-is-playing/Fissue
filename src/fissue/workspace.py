@@ -466,19 +466,29 @@ class RepoWorkspace:
         )
         return ["-c", f"credential.helper={helper}"], {self.PUSH_TOKEN_ENV: token}
 
-    def remote_branch_sha(self, url: str, branch: str, token: str = "") -> str:
-        """问远端该分支当前的 sha（不存在、或问不到时返回空串）。
-
-        只读。用途是给 ``--force-with-lease`` 一个**精确的**期望值——原因见 :meth:`push`。
-        """
+    def _probe_remote_branch(self, url: str, branch: str, token: str = "") -> GitResult:
+        """`git ls-remote` 探一次远端分支（只读）。"""
         cred, extra_env = self._git_credential_args(token)
-        res = self._git(
+        return self._git(
             ["git", *cred, "ls-remote", "--heads", url, f"refs/heads/{branch}"],
             timeout=120,
             extra_env=extra_env,
         )
+
+    def remote_branch_sha(self, url: str, branch: str, token: str = "") -> str | None:
+        """问远端该分支当前的 sha。
+
+        **三种结果要分开**（真跑踩过这个坑）：
+
+        * ``"<sha>"``——远端当前的 sha；
+        * ``""``——确认远端**没有**这个分支（可以当新分支推）；
+        * ``None``——**问不到**（网络/认证/超时）。这与「不存在」含义完全不同：把它当成
+          「不存在」去普通推送，会得到一个难懂的 ``fetch first``（我在真跑里就是这么
+          被绕了一轮）。
+        """
+        res = self._probe_remote_branch(url, branch, token)
         if not res.ok:
-            return ""
+            return None
         out = (res.stdout or "").strip()
         return out.split()[0] if out else ""
 
@@ -494,7 +504,11 @@ class RepoWorkspace:
         本地根本没有那个 ref——只要远端**已有**同名分支，git 就判 ``stale info`` 拒绝。
         真跑实测（三个探针仓库）：那些修复分支是 10-09 留下的，于是 6 次推送全被拒、
         PR 一个也没建出来。现在改为**先问远端要当前 sha**：拿得到就用它做租约（只允许
-        覆盖「我们刚看到的那个状态」），拿不到就是新分支（本来无可覆盖），普通推送即可。
+        覆盖「我们刚看到的那个状态」），确认没有就是新分支（本来无可覆盖），普通推送即可。
+
+        **问不到时不允许强推**，直接响亮失败：否则要么把「问不到」当成「不存在」去普通
+        推送（表现为难懂的 ``fetch first``），要么真去覆盖别人的提交。让调用方重试，
+        比假装成功或给出误导性错误好。
         """
         # `-c` 是 **git 本体**的选项，必须排在子命令**之前**。
         # 这里曾写成 `git push --quiet --force-with-lease -c credential.helper=…`，
@@ -503,9 +517,18 @@ class RepoWorkspace:
         cred, extra_env = self._git_credential_args(token)
         args = ["git", *cred, "push", "--quiet", "--no-verify"]
         if force:
-            expected = self.remote_branch_sha(url, branch, token)
-            if expected:
-                args.append(f"--force-with-lease=refs/heads/{branch}:{expected}")
+            probe = self._probe_remote_branch(url, branch, token)
+            if not probe.ok:
+                why = self.sanitize(probe.stderr)[:200] or f"rc={probe.returncode}"
+                return GitResult(
+                    False,
+                    probe.returncode,
+                    "",
+                    f"无法确认远端分支当前状态（{why}），拒绝强推以免覆盖别人的提交；请重试。",
+                )
+            current = (probe.stdout or "").strip()
+            if current:
+                args.append(f"--force-with-lease=refs/heads/{branch}:{current.split()[0]}")
         args += [url, f"HEAD:refs/heads/{branch}"]
         result = self._git(args, timeout=900, extra_env=extra_env)
         # 兜底：万一 git 把凭据回显进了输出
