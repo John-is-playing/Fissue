@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import ssl
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -33,7 +34,7 @@ from fissue.net import (
 
 
 @pytest.fixture(autouse=True)
-def _clean_net_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def _clean_net_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """每个用例都从干净的网络环境变量开始，并清掉 TLS 上下文缓存。"""
     monkeypatch.delenv(ENV_CA_BUNDLE, raising=False)
     monkeypatch.delenv(ENV_INSECURE, raising=False)
@@ -548,7 +549,9 @@ def _collect_httpx_calls() -> list[tuple[Path, int, str, bool]]:
             if _builds_httpx_client(node):
                 found.append((path, node.lineno, "httpx 客户端构造", _has_verify_kwarg(node)))
             elif _builds_httpx_shortcut(node):
-                found.append((path, node.lineno, f"httpx.{node.func.attr} 快捷调用", _has_verify_kwarg(node)))
+                # 快捷调用形如 `Client(...)`（`from httpx import Client`）：函数名在 `.id` 上
+                fname = node.func.id if isinstance(node.func, ast.Name) else "?"
+                found.append((path, node.lineno, f"httpx.{fname} 快捷调用", _has_verify_kwarg(node)))
     return found
 
 
@@ -620,6 +623,7 @@ def test_setup_script_tls_verify_is_usable() -> None:
 
     script = REPO_ROOT / "demo" / "scripts" / "setup_github.py"
     spec = importlib.util.spec_from_file_location("_demo_setup_github", script)
+    assert spec is not None
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     # 必须先注册进 sys.modules：脚本里用了 @dataclass，

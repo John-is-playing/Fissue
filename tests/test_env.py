@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -19,7 +20,7 @@ from fissue.models import Platform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-BASE_OVERRIDES = {"repos": []}
+BASE_OVERRIDES: dict[str, Any] = {"repos": []}
 
 
 def _write(path: Path, text: str) -> Path:
@@ -292,7 +293,9 @@ def test_env_example_is_parseable_and_has_required_keys() -> None:
     assert "FISSUE_LLM_API_KEY" in values
     assert "FISSUE_DATABASE_URL" in values
     # 不能有生效的真实密钥被误提交
-    assert values["FISSUE_LLM_API_KEY"].startswith("sk-your-key")
+    example_key = values["FISSUE_LLM_API_KEY"]
+    assert example_key is not None, "示例里应当有这个键"
+    assert example_key.startswith("sk-your-key")
     for key in ("FISSUE_GITHUB_TOKEN", "FISSUE_GITEE_TOKEN", "FISSUE_ATOMGIT_TOKEN", "FISSUE_GITLAB_TOKEN"):
         assert values.get(key) in (None, ""), f"{key} 在示例里应为空"
 

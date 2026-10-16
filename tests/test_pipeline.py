@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 import httpx
 import pytest
@@ -951,7 +952,7 @@ async def test_pr_verify_passes_linked_issue_body_to_verifier(ctx, repo, monkeyp
                  title="fix: slugify 连续空白", body="Hello   World 已修好", linked_issues=[2])
     repo.upsert_item(rid, pr)
 
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     async def fake_validate(*, item, workspace, repo_context, generator, test_hint=None,
                             linked_context=None):
@@ -1200,7 +1201,7 @@ def test_similar_to_body_signal_needs_more_than_one_shared_word() -> None:
 async def test_eval_batch_passes_similar_candidates(ctx, repo) -> None:
     from fissue.pipeline.stages import EvalStage
 
-    seen: dict[str, object] = {}
+    seen: dict[str, Any] = {}
 
     class _FakeEval:
         async def evaluate(self, item, *, similar=None):
@@ -1743,7 +1744,7 @@ async def test_e2e_self_error_detected_then_regenerates_in_real_sandbox(ctx, rep
         command=cmd,
     )
 
-    calls = {"generate": 0, "refine": 0, "feedback": ""}
+    calls: dict[str, Any] = {"generate": 0, "refine": 0, "feedback": ""}
 
     class _Gen:
         async def generate(self, item, **kw):

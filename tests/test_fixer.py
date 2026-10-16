@@ -320,15 +320,14 @@ async def test_fix_item_retries_after_needs_manual(fixer_ctx, repo, sample_issue
 def test_has_open_attempt_only_blocks_success(repo, sample_issue) -> None:
     """只有 SUCCESS 才算「已提过 PR」；其余终态一律放行重试。"""
     from fissue.models import FixAttempt
+    from fissue.pipeline.context import RuntimeContext
 
     _register(repo, sample_issue)
     fixer = AutoFixer.__new__(AutoFixer)
 
-    class _Ctx:
-        pass
-
-    ctx = _Ctx()
-    ctx.repo = repo
+    # 与 test_e2e 同一手法：绕过构造造一个只带 repo 的 ctx（自造类与 RuntimeContext 不兼容）
+    ctx = RuntimeContext.__new__(RuntimeContext)
+    object.__setattr__(ctx, "repo", repo)
     fixer.ctx = ctx
 
     for outcome, blocked in [

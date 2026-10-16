@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from fissue.models import (
@@ -202,10 +204,11 @@ def test_docker_runtime_image_ready_true_when_present(monkeypatch) -> None:
     class _Proc:
         returncode, stdout, stderr = 0, "[]", ""
 
-    monkeypatch.setattr(
-        "fissue.sandbox.runtime.subprocess.run",
-        lambda cmd, **kw: (calls.append(list(cmd)), _Proc())[1],
-    )
+    def _fake_run(cmd, **kw):  # noqa: ANN001, ANN202
+        calls.append(list(cmd))
+        return _Proc()
+
+    monkeypatch.setattr("fissue.sandbox.runtime.subprocess.run", _fake_run)
     rt = DockerRuntime(SandboxConfig(runtime="docker", image="fissue/x:latest"))
     rt._docker_bin = "docker"
 
@@ -900,7 +903,7 @@ def test_docker_run_names_the_container(monkeypatch) -> None:
     rt = DockerRuntime(SandboxConfig(runtime="docker"))
     monkeypatch.setattr(rt, "_docker_bin", "/usr/bin/docker")
     monkeypatch.setattr(rt, "ensure_image", lambda image: True)
-    captured: dict[str, object] = {}
+    captured: dict[str, Any] = {}
 
     def fake_spawn(args, **kwargs):  # noqa: ANN001, ANN202
         captured["args"] = list(args)
