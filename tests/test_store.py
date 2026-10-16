@@ -804,6 +804,26 @@ def test_reclaim_leaves_fresh_and_finished_rows_alone(repo: Repository) -> None:
     assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
 
 
+def test_save_verifier_run_requires_a_verifier_id(repo: Repository) -> None:
+    """`verifier_runs.verifier_id` 是 NOT NULL：缺 id 要给可操作的报错，而不是裸 IntegrityError。
+
+    域模型 `VerifierRun.verifier_id` 与 `VerifierRunner.run_once` 的参数都允许 None
+    （活链路里 generate_and_validate 每轮都会先 save_verifier 拿到真 id，所以走不到）。
+
+    回归背景：一次真容器冒烟里，我直接调 `run_once(verifier_id=None)` 撞到了
+    `NOT NULL constraint failed: verifier_runs.verifier_id`——排查成本全花在「为什么是约束错误」
+    上。这里把它变成一句话说清该怎么办。
+    """
+    from fissue.models import VerifierOutcome, VerifierRun
+
+    item = _seed(repo, number=91)
+
+    with pytest.raises(ValueError, match="verifier_id"):
+        repo.save_verifier_run(
+            VerifierRun(item_key=item.key, stage="base", outcome=VerifierOutcome.PASS)
+        )
+
+
 # ---------------------------------------------------------------------------
 # 导出：聚合计数 + 批量取结论
 # ---------------------------------------------------------------------------

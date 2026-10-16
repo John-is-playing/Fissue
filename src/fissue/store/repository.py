@@ -742,6 +742,19 @@ class Repository:
             s.execute(update(VerifierRow).where(VerifierRow.id == verifier_id).values(f2p_satisfied=ok))
 
     def save_verifier_run(self, run: VerifierRun) -> int:
+        """落库一次验证器执行。
+
+        ``verifier_id`` 在这里是**必填**（表上就是 NOT NULL）。域模型与
+        ``VerifierRunner.run_once`` 的参数都允许 ``None``——活链路里
+        `generate_and_validate` 每轮都会先 ``save_verifier`` 拿到真 id，所以那条路走不到；
+        但边界这里挡一道，免得将来某个调用方撞上一条难以定位的
+        ``IntegrityError: NOT NULL constraint failed: verifier_runs.verifier_id``。
+        """
+        if run.verifier_id is None:
+            raise ValueError(
+                f"验证器执行记录缺少 verifier_id（item={run.item_key} stage={run.stage}）："
+                "verifier_runs.verifier_id 是 NOT NULL，请先 repo.save_verifier(...) 拿到 id"
+            )
         with self.db.session() as s:
             row = VerifierRunRow(
                 verifier_id=run.verifier_id,
