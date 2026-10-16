@@ -1,7 +1,7 @@
 name: CI
 
 # 单测是本项目最重要的安全网：代码绝大多数由 AI Agent 驱动编写，
-# 唯一能拦住「看起来对、实际坏了」的就是这 491 项离线测试。
+# 唯一能拦住「看起来对、实际坏了」的就是这 697 项离线测试。
 #
 # 设计要点
 # --------
@@ -12,6 +12,9 @@ name: CI
 #    mypy 覆盖 `src/fissue` 全部 51 个源文件。
 # 3) 版本矩阵取最低支持版本（requires-python >= 3.10）与一个现代版本，
 #    保证「声明支持的最老版本」真的有机器在验证。
+# 4) **runner 与 action 都钉住**：`runs-on` 写死 `ubuntu-24.04` 而不是 `ubuntu-latest`
+#    （该标签 2026-10-19 起迁到 Ubuntu 26，钉住可免于镜像漂移带来的意外）；action 用当前
+#    主版本（v4/v5 指向的 Node 20 已被 GitHub 弃用，会被强制跑在 Node 24 上）。
 
 on:
   push:
@@ -26,15 +29,15 @@ concurrency:
 jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -49,14 +52,14 @@ jobs:
 
   lint:
     name: ruff + mypy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 两者的存量都已在 2026-10-16 清零（ruff：219 处自动 + 30 处手工；mypy：34 处），
     # 所以这里不再有 continue-on-error——新引入的问题会直接把 CI 打红。
     # 旧注释里的「`flush.py::_refresh_labels` 定义冲突」已不成立——现在只有一处定义。
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
