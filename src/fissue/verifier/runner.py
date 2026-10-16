@@ -471,28 +471,6 @@ class VerifierRunner:
 
     # -- 完整 F2P 流程 ----------------------------------------------------
 
-    async def verify(
-        self,
-        ctx: VerifyContext,
-        *,
-        verifier_id: int | None = None,
-    ) -> VerifierResult:
-        """对「未修复的 base」执行验证器，判定问题是否可复现。"""
-        base = await self.run_once(
-            item_key=ctx.item.key,
-            workspace=ctx.workspace,
-            spec=ctx.spec,
-            stage="base",
-            extra_mounts=ctx.extra_mounts,
-            label=f"{ctx.item.key}:base",
-            verifier_id=verifier_id,
-        )
-        result = judge_f2p(
-            ctx.spec, base, None, require_f2p=self.settings.verifier.require_f2p
-        )
-        self._persist(ctx, result, verifier_id)
-        return result
-
     async def verify_fix(
         self,
         ctx: VerifyContext,
