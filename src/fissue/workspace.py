@@ -451,33 +451,61 @@ class RepoWorkspace:
     #: 命令行对同机所有用户可见（`ps`、`/proc/<pid>/cmdline`），环境变量只有本用户可读。
     PUSH_TOKEN_ENV = "FISSUE_GIT_PUSH_TOKEN"
 
+    def _git_credential_args(self, token: str) -> tuple[list[str], dict[str, str]]:
+        """令牌 → git 的 ``-c credential.helper`` 与子进程环境（两者都不上命令行）。
+
+        助手脚本里只出现**环境变量名**，令牌本身不在命令行上。
+        这里用普通字符串拼接而不是 f-string：脚本末尾有字面量 `}`，在 f-string
+        里得写成 `}}`，容易看错。
+        """
+        if not token:
+            return [], {}
+        helper = (
+            "!f(){ printf 'username=%s\\npassword=%s\\n' oauth2 "
+            '"$' + self.PUSH_TOKEN_ENV + '"; };f'
+        )
+        return ["-c", f"credential.helper={helper}"], {self.PUSH_TOKEN_ENV: token}
+
+    def remote_branch_sha(self, url: str, branch: str, token: str = "") -> str:
+        """问远端该分支当前的 sha（不存在、或问不到时返回空串）。
+
+        只读。用途是给 ``--force-with-lease`` 一个**精确的**期望值——原因见 :meth:`push`。
+        """
+        cred, extra_env = self._git_credential_args(token)
+        res = self._git(
+            ["git", *cred, "ls-remote", "--heads", url, f"refs/heads/{branch}"],
+            timeout=120,
+            extra_env=extra_env,
+        )
+        if not res.ok:
+            return ""
+        out = (res.stdout or "").strip()
+        return out.split()[0] if out else ""
+
     def push(self, url: str, branch: str, *, force: bool = False, token: str = "") -> GitResult:
         """推送分支。
 
         ``url`` **不带令牌**；令牌由 ``token`` 参数提供，经**子进程环境变量 +
         凭据助手**交给 git。这样它不会出现在命令行参数里（那是同机任何用户都能
         看到的），也不会被写进 git 配置或 remote。
+
+        ``force=True`` 用的是**精确租约**，不是裸 ``--force-with-lease``：后者拿本地的
+        remote-tracking ref 当期望值，而这里的推送目标是 URL、修复分支又从未 fetch 过，
+        本地根本没有那个 ref——只要远端**已有**同名分支，git 就判 ``stale info`` 拒绝。
+        真跑实测（三个探针仓库）：那些修复分支是 10-09 留下的，于是 6 次推送全被拒、
+        PR 一个也没建出来。现在改为**先问远端要当前 sha**：拿得到就用它做租约（只允许
+        覆盖「我们刚看到的那个状态」），拿不到就是新分支（本来无可覆盖），普通推送即可。
         """
         # `-c` 是 **git 本体**的选项，必须排在子命令**之前**。
         # 这里曾写成 `git push --quiet --force-with-lease -c credential.helper=…`，
         # 于是 git 直接报「未知开关 `c'」——推送全线失败、PR 一个也建不出来。
         # 真提 PR 时实测撞到：Agent 明明修好了（验证器与回归门都通过），死在推送。
-        args = ["git"]
-        extra_env: dict[str, str] = {}
-        if token:
-            # 助手脚本里只出现**环境变量名**，令牌本身不在命令行上。
-            # 这里用普通字符串拼接而不是 f-string：脚本末尾有字面量 `}`，在 f-string
-            # 里得写成 `}}`，容易看错。
-            helper = (
-                "!f(){ printf 'username=%s\\npassword=%s\\n' oauth2 "
-                '"$' + self.PUSH_TOKEN_ENV + '"; };f'
-            )
-            args += ["-c", f"credential.helper={helper}"]
-            extra_env[self.PUSH_TOKEN_ENV] = token
-
-        args += ["push", "--quiet", "--no-verify"]
+        cred, extra_env = self._git_credential_args(token)
+        args = ["git", *cred, "push", "--quiet", "--no-verify"]
         if force:
-            args.append("--force-with-lease")
+            expected = self.remote_branch_sha(url, branch, token)
+            if expected:
+                args.append(f"--force-with-lease=refs/heads/{branch}:{expected}")
         args += [url, f"HEAD:refs/heads/{branch}"]
         result = self._git(args, timeout=900, extra_env=extra_env)
         # 兜底：万一 git 把凭据回显进了输出

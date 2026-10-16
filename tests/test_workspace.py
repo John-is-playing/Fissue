@@ -60,6 +60,85 @@ def test_push_reaches_a_real_remote(tmp_path: Path) -> None:
     assert "fissue/test-branch" in branches, "远端应当真的有这个分支"
 
 
+def test_remote_branch_sha_reports_existence(tmp_path: Path) -> None:
+    """``remote_branch_sha`` 只读地问远端：不存在给空串，存在给 sha。"""
+    remote = tmp_path / "remote.git"
+    _run_git(["init", "--bare", "-q", str(remote)])
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+
+    assert ws.remote_branch_sha(str(remote), "fissue/nope") == "", "不存在的分支应当是空串"
+    assert ws.push(str(remote), "fissue/here").ok
+    assert len(ws.remote_branch_sha(str(remote), "fissue/here")) == 40
+
+
+def test_push_uses_an_explicit_lease_when_the_branch_already_exists(tmp_path: Path, monkeypatch) -> None:
+    """远端已有同名分支时，必须用**精确租约**，而不是裸 ``--force-with-lease``。
+
+    回归背景（真跑实测）：这里推的是 URL、修复分支又从未 fetch 过，本地没有对应的
+    remote-tracking ref——裸 lease 拿不到期望值，于是只要远端已有该分支就一律
+    ``stale info`` 拒绝：三个探针仓库那一轮 6 次推送全被拒、PR 一个也没建出来。
+    而分支名是「条目 + 内容哈希」的确定性名字，**远端已有才是常态**。
+    """
+    import re
+
+    import fissue.workspace as ws_mod
+
+    remote = tmp_path / "remote.git"
+    _run_git(["init", "--bare", "-q", str(remote)])
+    root = _repo_with_commit(tmp_path)
+    ws = RepoWorkspace(root=root, slug="a/b")
+    branch = "fissue/dup"
+    assert ws.push(str(remote), branch).ok, "第一次推送：远端还没有，普通推送即可"
+
+    captured: list[str] = []
+    real_run = ws_mod.subprocess.run
+
+    def _spy(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append(" ".join(str(c) for c in cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _spy)
+    _run_git(["commit", "--allow-empty", "-qm", "second"], cwd=root)
+
+    result = ws.push(str(remote), branch, force=True)
+
+    assert result.ok, f"已有分支时也该推得动，实际 stderr：{result.stderr}"
+    push_argv = [a for a in captured if " push " in f" {a} "]
+    assert push_argv, "应当真的调用了一次 push"
+    argv = push_argv[-1]
+    assert re.search(rf"--force-with-lease=refs/heads/{branch}:[0-9a-f]{{40}}", argv), (
+        f"应当带远端 sha 的精确租约，实际：{argv}"
+    )
+    assert " --force-with-lease " not in f" {argv} ", "不该再出现不带期望值的裸 lease"
+
+
+def test_push_skips_the_lease_for_a_brand_new_branch(tmp_path: Path, monkeypatch) -> None:
+    """远端没有这个分支时**不加租约**：本来无可覆盖，普通推送即可。"""
+    import fissue.workspace as ws_mod
+
+    remote = tmp_path / "remote.git"
+    _run_git(["init", "--bare", "-q", str(remote)])
+    root = _repo_with_commit(tmp_path)
+
+    captured: list[str] = []
+    real_run = ws_mod.subprocess.run
+
+    def _spy(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        captured.append(" ".join(str(c) for c in cmd))
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _spy)
+
+    result = RepoWorkspace(root=root, slug="a/b").push(str(remote), "fissue/brand-new", force=True)
+
+    assert result.ok, result.stderr
+    push_argv = [a for a in captured if " push " in f" {a} "]
+    assert push_argv and "--force-with-lease" not in push_argv[-1], (
+        f"新分支不该带租约，实际：{push_argv[-1] if push_argv else '(没有 push)'}"
+    )
+
+
 def test_push_keeps_token_out_of_argv(tmp_path: Path, monkeypatch) -> None:
     """令牌只经子进程环境传递，绝不出现在命令行参数里。
 
