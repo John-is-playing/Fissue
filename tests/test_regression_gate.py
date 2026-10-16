@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -245,6 +246,8 @@ async def test_regression_gate_uses_its_own_timeout_budget(settings, repo, tmp_p
     cfg = RepoConfig(platform=Platform.GITHUB, owner="a", name="b")
     vid = _verifier_id(repo)
 
+    from fissue.sandbox.forwarder import SandboxManager
+
     captured: dict[str, int] = {}
 
     class _SpySandbox:
@@ -252,7 +255,7 @@ async def test_regression_gate_uses_its_own_timeout_budget(settings, repo, tmp_p
             captured["timeout"] = req.timeout_seconds
             return ExecResult(ok=True, exit_code=None, timed_out=True, error="执行超时（7s）")
 
-    gate = RegressionGate(_SpySandbox(), repo, settings)
+    gate = RegressionGate(cast(SandboxManager, _SpySandbox()), repo, settings)
     # spec 的预算是 600，回归门必须用自己的 7
     spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q", timeout_seconds=600)
     run = await gate.run(
@@ -661,7 +664,7 @@ async def test_autofix_strict_regression_rejection_reports(verify_ctx, repo, mon
     spec = _spec()
 
     ok, why = await fixer._run_regression_gate(
-        item=item, workspace=_PrWs(), spec=spec, repo_cfg=RepoConfig(
+        item=item, workspace=cast(RepoWorkspace, _PrWs()), spec=spec, repo_cfg=RepoConfig(
             platform=Platform.GITHUB, owner="psf", name="requests"
         )
     )

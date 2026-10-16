@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import socket
+from typing import Any, cast
 
 import pytest
 
@@ -864,7 +865,8 @@ def test_unknown_runtime_is_rejected_at_config_load() -> None:
 
     for bad in ("Docker", "podman", "docker ", "docke"):
         with pytest.raises(ValidationError):
-            SandboxConfig(runtime=bad)
+            # 刻意传非法取值：这里考的正是校验会拒绝它
+            SandboxConfig(runtime=bad)  # type: ignore[arg-type]
 
 
 def test_unknown_runtime_never_executes_locally(monkeypatch) -> None:
@@ -1034,19 +1036,19 @@ def test_forwarder_is_used_once_its_socket_exists(tmp_path) -> None:
     语义是「socket 在 → 走转发组件；不在 → 只能 inline」。默认 `forwarder.enabled` 必须是
     true，否则按文档起 `fissue sandbox serve` 之后客户端仍然自己握 Docker 句柄，承诺悄悄落空。
     """
-    from fissue.config import SandboxConfig
+    from fissue.config import SandboxConfig, SandboxForwarderConfig
     from fissue.sandbox.forwarder import SandboxManager
 
     assert SandboxConfig().forwarder.enabled is True, "默认必须开着，否则文档让起的服务白起"
 
     sock = tmp_path / "f.sock"
-    cfg = SandboxConfig(forwarder={"enabled": True, "socket": str(sock)})
+    cfg = SandboxConfig(forwarder=SandboxForwarderConfig(enabled=True, socket=str(sock)))
 
     assert SandboxManager(cfg).inline is True, "服务还没起（socket 不存在）→ 只能 inline"
     sock.write_text("", encoding="utf-8")                  # 模拟服务已启动
     assert SandboxManager(cfg).inline is False, "socket 在 → 必须走转发组件"
 
-    off = SandboxConfig(forwarder={"enabled": False, "socket": str(sock)})
+    off = SandboxConfig(forwarder=SandboxForwarderConfig(enabled=False, socket=str(sock)))
     assert SandboxManager(off).inline is True, "显式关掉时才允许不用"
 
 
@@ -1105,9 +1107,9 @@ def test_forwarder_server_bounds_the_request_read() -> None:
             closed.append(True)
 
     conn = _Conn()
-    server._handle = lambda c: handled.append(c)      # type: ignore[method-assign]
+    server._handle = lambda conn: handled.append(conn)      # type: ignore[method-assign]
 
-    server._handle_conn(conn)
+    server._handle_conn(cast(socket.socket, conn))
 
     assert timeouts and timeouts[0] == fw.ForwarderServer.REQUEST_TIMEOUT_SECONDS, "读请求要有超时"
     assert handled == [conn], "正常路径照旧处理"

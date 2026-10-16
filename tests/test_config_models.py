@@ -241,8 +241,8 @@ def test_pr_strategy_no_longer_has_auto_submit() -> None:
     from fissue.config import PRStrategy
 
     assert not hasattr(PRStrategy(), "auto_submit")
-    # 老配置文件里残留的那一行不该让加载直接报错（多余键被忽略）
-    assert PRStrategy(auto_submit=False).mode == "fork"
+    # 老配置文件里残留的那一行不该让加载直接报错（多余键被忽略）——故意传这个键
+    assert PRStrategy(auto_submit=False).mode == "fork"  # type: ignore[call-arg]
 
 
 def test_platform_max_retry_after_default() -> None:
@@ -283,8 +283,9 @@ def test_deleted_keys_in_old_config_files_do_not_break_loading() -> None:
     """老配置文件里残留这些键不该让加载报错（多余键被忽略）。"""
     from fissue.config import SandboxForwarderConfig, WebConfig
 
-    assert SandboxForwarderConfig(protocol="unix").enabled is True
-    assert WebConfig(allow_repo_management=True).read_only is False
+    # 故意传已删除的键：考的就是 pydantic 会忽略它们
+    assert SandboxForwarderConfig(protocol="unix").enabled is True  # type: ignore[call-arg]
+    assert WebConfig(allow_repo_management=True).read_only is False  # type: ignore[call-arg]
 
 
 def test_switches_that_are_read_have_their_defaults() -> None:

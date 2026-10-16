@@ -9,7 +9,8 @@ name: CI
 #    平台适配器用 respx 拦截、沙盒走 local+force_inline。
 #    因此 CI **不需要任何 Secret**（无 LLM Key、无平台 token、无 Docker）。
 # 2) **测试 / ruff / mypy 全部阻断**：三者都已清零（2026-10-16），再引入新问题会被拦下。
-#    mypy 覆盖 `src/fissue` 全部 51 个源文件。
+#    mypy 覆盖 `src/fissue` **与 `tests`**（共 70 个源文件）——测试里的类型问题同样是真问题
+#    （这一批就修出两处：自造 `_Ctx` 冒充 `RuntimeContext`、用 `(list.append(x), obj)[1]` 取巧）。
 # 3) 版本矩阵取最低支持版本（requires-python >= 3.10）与一个现代版本，
 #    保证「声明支持的最老版本」真的有机器在验证。
 # 4) **runner 与 action 都钉住**：`runs-on` 写死 `ubuntu-24.04` 而不是 `ubuntu-latest`
@@ -73,4 +74,4 @@ jobs:
         run: python -m ruff check src tests
 
       - name: mypy
-        run: python -m mypy src/fissue
+        run: python -m mypy src/fissue tests

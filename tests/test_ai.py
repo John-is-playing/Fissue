@@ -18,7 +18,7 @@ from fissue.ai.evaluator import (
     parse_spam,
 )
 from fissue.config import ClassificationConfig, FixPolicyConfig
-from fissue.models import Action, Category, ItemType, Priority, RawItem
+from fissue.models import Action, Category, DimensionScore, ItemType, Priority, RawItem
 
 # ---------------------------------------------------------------------------
 # JSON 提取
@@ -57,6 +57,12 @@ def test_clamp_helpers() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dim(score: DimensionScore | None) -> DimensionScore:
+    """取某一维的分数对象——断言它确实被解析出来了，省得每条断言前都写一遍 None 检查。"""
+    assert score is not None, "该维度应当被解析出来"
+    return score
+
+
 def test_parse_scores_full() -> None:
     scores = parse_scores(
         {
@@ -67,18 +73,18 @@ def test_parse_scores_full() -> None:
             }
         }
     )
-    assert scores.authenticity.score == 90
-    assert scores.importance.score == 70
-    assert scores.difficulty.score == 20
+    assert _dim(scores.authenticity).score == 90
+    assert _dim(scores.importance).score == 70
+    assert _dim(scores.difficulty).score == 20
     assert scores.pr_quality is None
-    assert scores.authenticity.evidence == ["e"]
+    assert _dim(scores.authenticity).evidence == ["e"]
 
 
 def test_parse_scores_compat_top_level() -> None:
     """模型偶尔不套 scores 层，分数直接放顶层。"""
     scores = parse_scores({"authenticity": 55, "importance": 65})
-    assert scores.authenticity.score == 55
-    assert scores.importance.score == 65
+    assert _dim(scores.authenticity).score == 55
+    assert _dim(scores.importance).score == 65
 
 
 @pytest.mark.parametrize(

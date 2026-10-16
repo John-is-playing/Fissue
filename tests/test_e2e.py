@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -285,6 +285,7 @@ async def test_e2e_full_loop(e2e_ctx, repo, template_repo, monkeypatch) -> None:
     assert v_result.verifier_kind is VerifierKind.EXECUTABLE
     assert v_result.verifier_result is not None
     assert v_result.verifier_result.reproducible is True, v_result.verifier_result.conclusion
+    assert v_result.verifier_result.base_run is not None
     assert v_result.verifier_result.base_run.outcome is VerifierOutcome.FAIL
     assert v_result.queued is QueueName.VERIFY
 
@@ -305,10 +306,11 @@ async def test_e2e_full_loop(e2e_ctx, repo, template_repo, monkeypatch) -> None:
     assert row.priority == Priority.TIER1.value
 
     # ---- 4) 自动修复（Agent 循环 → F2P 复核 → dry-run 出补丁）----------
+    from fissue.ai.client import LLMClient
     from fissue.fixer.autofix import AutoFixer
 
     fixer = AutoFixer(ctx)
-    fixer.agent = FixAgent(script, repo, ctx.verifier, ctx.settings)   # 用脚本 LLM
+    fixer.agent = FixAgent(cast(LLMClient, script), repo, ctx.verifier, ctx.settings)  # 用脚本 LLM
 
     attempt = await fixer.fix_item(repo.get_item(key), dry_run=True)
 

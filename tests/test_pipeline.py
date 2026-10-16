@@ -413,7 +413,7 @@ async def test_flush_handler_error_does_not_lose_entries(ctx, repo) -> None:
 
     outcome = await qm.flush(QueueName.VERIFY, handler=boom, force=True)
     assert outcome.ok is False
-    assert "LLM 挂了" in outcome.error
+    assert "LLM 挂了" in (outcome.error or "")
     # 条目仍留在未 flush 状态，等下一轮重试
     assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
 
@@ -446,7 +446,7 @@ async def test_flush_missing_conclusion_is_not_marked_flushed(ctx, repo) -> None
     outcome = await qm.flush(QueueName.VERIFY, handler=handler, force=True)
 
     assert outcome.flushed == 1, "只有真拿到结论的那条算已消费"
-    assert outcome.error and "1 条没有拿到结论" in outcome.error, "缺结论必须响亮报出来"
+    assert outcome.error and "1 条没有拿到结论" in (outcome.error or ""), "缺结论必须响亮报出来"
     left = {e.item_key for e in repo.queue_unflushed(QueueName.VERIFY)}
     assert left == {i.key for i in items} - set(answered), "缺结论的那条要留在队里等下一轮"
     assert repo.latest_batch_conclusion(answered[0]) is not None, "拿到结论的要正常落库"
@@ -1048,7 +1048,7 @@ async def test_pr_verify_blocks_suspicious_before_verifying(
 
     assert order == []
     assert result.status is ItemStatus.SKIPPED
-    assert keyword in result.skipped_reason
+    assert keyword in (result.skipped_reason or "")
     assert repo.get_item_row(item.key).status == ItemStatus.SKIPPED.value
 
 
@@ -1528,7 +1528,7 @@ async def test_verify_stage_blocks_suspicious_before_generating(
     result = await VerifyStage(ctx).run(item, ev)
 
     assert result.status is ItemStatus.SKIPPED
-    assert keyword in result.skipped_reason
+    assert keyword in (result.skipped_reason or "")
     assert repo.get_item(item.key).status is ItemStatus.SKIPPED
 
 
@@ -1871,7 +1871,8 @@ def _install_fake_adapter(ctx, *, label_ttl: float):
         calls["n"] += 1
         return ["bug"]
 
-    adapter.fetch_repo_labels = fake_list
+    # 给实例方法打桩：mypy 不喜欢「给方法赋值」，而这里正是它的用武之地
+    adapter.fetch_repo_labels = fake_list  # type: ignore[method-assign]
     return adapter, calls
 
 

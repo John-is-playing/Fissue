@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -222,7 +223,7 @@ async def test_fix_item_skips_without_evaluation(fixer_ctx, repo, sample_issue) 
     _register(repo, sample_issue)
     attempt = await AutoFixer(fixer_ctx).fix_item(sample_issue)
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "评测结果" in attempt.error
+    assert "评测结果" in (attempt.error or "")
 
 
 async def test_fix_item_skips_non_tier_priority(fixer_ctx, repo, sample_issue) -> None:
@@ -232,7 +233,7 @@ async def test_fix_item_skips_non_tier_priority(fixer_ctx, repo, sample_issue) -
 
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "优先级" in attempt.error
+    assert "优先级" in (attempt.error or "")
 
 
 async def test_fix_item_skips_suspicious_spam(fixer_ctx, repo, sample_issue) -> None:
@@ -245,7 +246,7 @@ async def test_fix_item_skips_suspicious_spam(fixer_ctx, repo, sample_issue) -> 
 
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "刷量" in attempt.error
+    assert "刷量" in (attempt.error or "")
 
 
 async def test_fix_item_skips_without_verifier(fixer_ctx, repo, sample_issue) -> None:
@@ -255,7 +256,7 @@ async def test_fix_item_skips_without_verifier(fixer_ctx, repo, sample_issue) ->
 
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "验证器" in attempt.error
+    assert "验证器" in (attempt.error or "")
 
 
 async def test_fix_item_skips_checklist_verifier(fixer_ctx, repo, sample_issue) -> None:
@@ -266,7 +267,7 @@ async def test_fix_item_skips_checklist_verifier(fixer_ctx, repo, sample_issue) 
 
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "清单型" in attempt.error
+    assert "清单型" in (attempt.error or "")
 
 
 async def test_fix_item_skips_when_attempt_exists(fixer_ctx, repo, sample_issue) -> None:
@@ -280,7 +281,7 @@ async def test_fix_item_skips_when_attempt_exists(fixer_ctx, repo, sample_issue)
 
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
     assert attempt.outcome is FixOutcome.SKIPPED
-    assert "重复" in attempt.error
+    assert "重复" in (attempt.error or "")
 
 
 async def test_fix_item_retries_after_needs_manual(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
@@ -1066,7 +1067,7 @@ async def test_fork_failure_stops_without_pushing_upstream(
         attempt=FixAttempt(item_key=sample_issue.key),
         trace=AgentTrace(rounds=1),
         item=sample_issue,
-        workspace=_FakeWS(),
+        workspace=cast(RepoWorkspace, _FakeWS()),
         repo_cfg=repo_cfg,
         spec=VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"),
         f2p_ok=True,
@@ -1118,7 +1119,7 @@ async def test_existing_pr_is_reused_without_pushing(fixer_ctx, repo, sample_iss
         attempt=FixAttempt(item_key=sample_issue.key),
         trace=AgentTrace(rounds=2),
         item=sample_issue,
-        workspace=_FakeWS(),
+        workspace=cast(RepoWorkspace, _FakeWS()),
         repo_cfg=repo_cfg,
         spec=VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"),
         f2p_ok=True,

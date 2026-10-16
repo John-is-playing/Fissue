@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fissue import benchmark as bm
+import fissue.benchmark as bm
 from fissue.models import (
     Category,
     DimensionScore,

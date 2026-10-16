@@ -29,6 +29,37 @@ from fissue.models import (
 )
 from fissue.store import export as exp
 from fissue.store.repository import Repository
+from fissue.store.tables import ItemRow, QueueEntryRow, RepoRow
+
+# -- 取值助手 ---------------------------------------------------------------
+#
+# 存储层的读接口一律返回 `X | None`——取不到是**正确的语义**（src 里也必须处理它），
+# 但用例的场景几乎都是「刚写进去，就该读得回来」：读不到反而该当场炸。
+# 这几个助手把那句前提写成断言，调用点于是少一层 None 检查，失败时还直接说清缺了什么。
+
+
+def _item_row(repo: Repository, key: str) -> ItemRow:
+    row = repo.get_item_row(key)
+    assert row is not None, f"条目行不存在：{key}"
+    return row
+
+
+def _item(repo: Repository, key: str) -> RawItem:
+    item = repo.get_item(key)
+    assert item is not None, f"条目不存在：{key}"
+    return item
+
+
+def _repo_row(repo: Repository, slug: str) -> RepoRow:
+    row = repo.get_repo(slug)
+    assert row is not None, f"仓库未登记：{slug}"
+    return row
+
+
+def _claimed(repo: Repository, queue: QueueName) -> QueueEntryRow:
+    row = repo.claim_next(queue)
+    assert row is not None, f"队列里应有可取条目：{queue}"
+    return row
 
 
 def _seed(repo: Repository, *, number: int = 1, item_type: ItemType = ItemType.ISSUE, labels=None) -> RawItem:
@@ -55,11 +86,11 @@ def _seed(repo: Repository, *, number: int = 1, item_type: ItemType = ItemType.I
 
 def test_upsert_is_idempotent_and_reports_changes(repo: Repository) -> None:
     item = _seed(repo)
-    _id, created, changed = repo.upsert_item(repo.get_repo("psf/requests").id, item)
+    _id, created, changed = repo.upsert_item(_repo_row(repo, "psf/requests").id, item)
     assert (created, changed) == (False, False)
 
     item.title = "改了标题"
-    _id2, created2, changed2 = repo.upsert_item(repo.get_repo("psf/requests").id, item)
+    _id2, created2, changed2 = repo.upsert_item(_repo_row(repo, "psf/requests").id, item)
     assert created2 is False and changed2 is True
 
 
@@ -85,7 +116,7 @@ def test_list_items_filters(repo: Repository) -> None:
 def test_set_item_status_and_priority(repo: Repository) -> None:
     _seed(repo, number=3)
     repo.set_item_status("github:psf/requests#3", ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
-    row = repo.get_item_row("github:psf/requests#3")
+    row = _item_row(repo, "github:psf/requests#3")
     assert row.status == ItemStatus.FIX_QUEUED.value
     assert row.priority == Priority.TIER1.value
 
@@ -113,7 +144,9 @@ def test_evaluation_roundtrip(repo: Repository, good_evaluation: Evaluation) -> 
     assert got.difficulty == 25
     assert got.category is Category.BUG
     assert got.priority is Priority.TIER1
-    assert got.scores.authenticity.reason == "有完整复现步骤"
+    authenticity = got.scores.authenticity
+    assert authenticity is not None
+    assert authenticity.reason == "有完整复现步骤"
 
 
 def test_latest_evaluation_returns_newest(repo: Repository) -> None:
@@ -121,7 +154,8 @@ def test_latest_evaluation_returns_newest(repo: Repository) -> None:
     key = "github:psf/requests#6"
     repo.save_evaluation(key, Evaluation(scores=Scores(importance=DimensionScore(score=10)), model="a"))
     repo.save_evaluation(key, Evaluation(scores=Scores(importance=DimensionScore(score=99)), model="b"))
-    assert repo.latest_evaluation(key).importance == 99
+    newest = repo.latest_evaluation(key)
+    assert newest is not None and newest.importance == 99
 
 
 def test_evaluations_for_bulk(repo: Repository) -> None:
@@ -151,7 +185,7 @@ def test_reeval_downgrade_clears_fix_queued(repo: Repository) -> None:
     repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
 
     repo.save_evaluation(key, Evaluation(priority=Priority.NONE, model="stub"))
-    row = repo.get_item_row(key)
+    row = _item_row(repo, key)
     assert row.status == ItemStatus.NEEDS_MANUAL.value
     assert row.priority == Priority.NONE.value
 
@@ -162,7 +196,7 @@ def test_reeval_keeps_qualified_fix_queued(repo: Repository) -> None:
     key = "github/psf/requests#32".replace("github/", "github:")   # github:psf/requests#32
     repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=Priority.TIER2)
     repo.save_evaluation(key, Evaluation(priority=Priority.TIER2, model="stub"))
-    assert repo.get_item_row(key).status == ItemStatus.FIX_QUEUED.value
+    assert _item_row(repo, key).status == ItemStatus.FIX_QUEUED.value
 
 
 def test_reeval_does_not_rewind_in_progress_fix(repo: Repository) -> None:
@@ -172,7 +206,7 @@ def test_reeval_does_not_rewind_in_progress_fix(repo: Repository) -> None:
     for status in (ItemStatus.FIXING, ItemStatus.PR_CREATED):
         repo.set_item_status(key, status, priority=Priority.TIER1)
         repo.save_evaluation(key, Evaluation(priority=Priority.NONE, model="stub"))
-        assert repo.get_item_row(key).status == status.value
+        assert _item_row(repo, key).status == status.value
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +229,7 @@ def test_verifier_and_runs_roundtrip(repo: Repository) -> None:
     assert got is not None
     verifier_id, saved = got
     assert verifier_id == vid
+    assert saved.command is not None
     assert saved.command.startswith("python -m pytest")
     assert list(saved.files) == ["tests/test_repro.py"]
 
@@ -234,7 +269,7 @@ def test_enqueue_dedup_and_claim(repo: Repository) -> None:
     assert a == b                                     # 同队列同条目 pending 去重
     assert repo.queue_pending_count(QueueName.VERIFY) == 1
 
-    row = repo.claim_next(QueueName.VERIFY)
+    row = _claimed(repo, QueueName.VERIFY)
     assert row is not None and row.status == "running" and row.attempts == 1
     assert repo.claim_next(QueueName.VERIFY) is None    # 已被取走
 
@@ -255,7 +290,7 @@ def test_enqueue_reuse_after_done_does_not_crash(repo: Repository) -> None:
     key = "github:psf/requests#21"
 
     first = repo.enqueue(QueueName.FIX_BUG, key, payload={"run": 1})
-    row = repo.claim_next(QueueName.FIX_BUG)
+    row = _claimed(repo, QueueName.FIX_BUG)
     repo.finish_queue_entry(row.id, status="done", result={"merge_recommended": False})
 
     # 重跑：同一条目再次入队
@@ -334,7 +369,7 @@ def test_unflushed_age_and_mark_flushed(repo: Repository) -> None:
     _seed(repo, number=13)
     key = "github:psf/requests#13"
     repo.enqueue(QueueName.VERIFY, key)
-    row = repo.claim_next(QueueName.VERIFY)
+    row = _claimed(repo, QueueName.VERIFY)
     repo.finish_queue_entry(row.id, status="done", result={})
     age = repo.oldest_unflushed_age(QueueName.VERIFY)
     assert age is not None and age < 60
@@ -361,7 +396,7 @@ def test_batch_conclusion_roundtrip(repo: Repository) -> None:
     assert c is not None
     assert c.verdict == "fix"
     assert c.priority is Priority.TIER1
-    assert repo.get_item_row(key).status == ItemStatus.LABELED.value
+    assert _item_row(repo, key).status == ItemStatus.LABELED.value
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +422,7 @@ def test_fix_attempt_roundtrip_sets_status(repo: Repository) -> None:
     assert len(attempts) == 1
     assert attempts[0].outcome is FixOutcome.SUCCESS
     assert attempts[0].pr_number == 100
-    assert repo.get_item_row(key).status == ItemStatus.PR_CREATED.value
+    assert _item_row(repo, key).status == ItemStatus.PR_CREATED.value
 
 
 def test_reclaim_fixing_items_returns_stuck_entries_to_queue(repo: Repository) -> None:
@@ -405,10 +440,10 @@ def test_reclaim_fixing_items_returns_stuck_entries_to_queue(repo: Repository) -
     reclaimed = repo.reclaim_fixing_items(repo_slug="psf/requests")
 
     assert sorted(reclaimed) == ["github:psf/requests#20", "github:psf/requests#21"]
-    assert repo.get_item_row("github:psf/requests#20").status == ItemStatus.FIX_QUEUED.value
-    assert repo.get_item_row("github:psf/requests#21").status == ItemStatus.FIX_QUEUED.value
+    assert _item_row(repo, "github:psf/requests#20").status == ItemStatus.FIX_QUEUED.value
+    assert _item_row(repo, "github:psf/requests#21").status == ItemStatus.FIX_QUEUED.value
     # 正常情况下（没卡住的条目）不该被动
-    assert repo.get_item_row("github:psf/requests#22").status == ItemStatus.NEW.value
+    assert _item_row(repo, "github:psf/requests#22").status == ItemStatus.NEW.value
     # 幂等：再调一次没有可认领的
     assert repo.reclaim_fixing_items(repo_slug="psf/requests") == []
 
@@ -428,7 +463,7 @@ def test_reclaim_fixing_items_respects_repo_scope(repo: Repository) -> None:
     reclaimed = repo.reclaim_fixing_items(repo_slug="psf/requests")
 
     assert reclaimed == ["github:psf/requests#30"]
-    assert repo.get_item_row("github:psf/urllib3#1").status == ItemStatus.FIXING.value
+    assert _item_row(repo, "github:psf/urllib3#1").status == ItemStatus.FIXING.value
 
 
 def test_usage_records_and_today(repo: Repository) -> None:
@@ -642,12 +677,12 @@ def test_material_change_puts_item_back_for_reeval(repo: Repository) -> None:
     item = _seed(repo, number=41)
     key = item.key
     repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
-    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value
+    assert _item_row(repo, key).status == ItemStatus.EVALUATED.value
 
     _upsert_variant(repo, item, body="改过的正文")
 
-    assert repo.get_item_row(key).status == ItemStatus.NEW.value, "实质变化要让结论作废并重评"
-    assert repo.get_item(key).stale_reasons, "作废这件事也必须留痕"
+    assert _item_row(repo, key).status == ItemStatus.NEW.value, "实质变化要让结论作废并重评"
+    assert _item(repo, key).stale_reasons, "作废这件事也必须留痕"
     assert any(i.key == key for i in repo.items_needing_eval()), "应当重新出现在待评测里"
 
 
@@ -663,9 +698,9 @@ def test_comment_only_change_does_not_invalidate_conclusion(repo: Repository) ->
 
     _upsert_variant(repo, item, comments=[*item.comments, Comment(author="c2", body="又来一条")])
 
-    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value, "评论增长不该触发重评"
-    assert repo.get_item(key).stale_reasons == []
-    assert len(repo.get_item(key).comments) == 2, "但评论表必须刷新"
+    assert _item_row(repo, key).status == ItemStatus.EVALUATED.value, "评论增长不该触发重评"
+    assert _item(repo, key).stale_reasons == []
+    assert len(_item(repo, key).comments) == 2, "但评论表必须刷新"
 
 
 def test_material_change_on_in_flight_fix_marks_stale_without_rewinding(repo: Repository) -> None:
@@ -675,8 +710,8 @@ def test_material_change_on_in_flight_fix_marks_stale_without_rewinding(repo: Re
     for status in (ItemStatus.FIX_QUEUED, ItemStatus.FIXING, ItemStatus.PR_CREATED):
         repo.set_item_status(key, status, priority=Priority.TIER1)
         _upsert_variant(repo, item, title=f"标题改成 {status.value}")
-        assert repo.get_item_row(key).status == status.value, "已开工的修复不该被回退"
-        assert repo.get_item(key).stale_reasons, "但过期必须看得见"
+        assert _item_row(repo, key).status == status.value, "已开工的修复不该被回退"
+        assert _item(repo, key).stale_reasons, "但过期必须看得见"
 
 
 def test_stale_mark_sticks_until_reeval(repo: Repository) -> None:
@@ -690,13 +725,13 @@ def test_stale_mark_sticks_until_reeval(repo: Repository) -> None:
     repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
 
     _upsert_variant(repo, item, body="改过的正文")
-    assert repo.get_item(key).stale_reasons
+    assert _item(repo, key).stale_reasons
 
     _upsert_variant(repo, item, body="改过的正文")          # 内容没再变
-    assert repo.get_item(key).stale_reasons, "标记必须黏住，不能被下一次抓取冲掉"
+    assert _item(repo, key).stale_reasons, "标记必须黏住，不能被下一次抓取冲掉"
 
     repo.save_evaluation(key, Evaluation(priority=Priority.TIER1, model="stub"))
-    assert repo.get_item(key).stale_reasons == [], "重新出了结论就不再过期"
+    assert _item(repo, key).stale_reasons == [], "重新出了结论就不再过期"
 
 
 def test_items_with_stale_conclusions_only_lists_in_flight(repo: Repository) -> None:
@@ -740,12 +775,12 @@ def test_degraded_comments_never_shrink_stored_discussion(repo: Repository) -> N
     库里和平台上。
     """
     item = _seed(repo, number=51)
-    assert len(repo.get_item(item.key).comments) == 1
+    assert len(_item(repo, item.key).comments) == 1
 
     _upsert_degraded_comments(repo, item, [], "comments_unavailable#51")
 
-    assert len(repo.get_item(item.key).comments) == 1, "残缺结果不得覆盖已有讨论"
-    assert repo.get_item(item.key).comments_incomplete, "但「残缺」必须留在条目上"
+    assert len(_item(repo, item.key).comments) == 1, "残缺结果不得覆盖已有讨论"
+    assert _item(repo, item.key).comments_incomplete, "但「残缺」必须留在条目上"
 
 
 def test_incomplete_but_not_smaller_comments_still_refresh(repo: Repository) -> None:
@@ -762,7 +797,7 @@ def test_incomplete_but_not_smaller_comments_still_refresh(repo: Repository) -> 
         "comments_may_be_truncated#52",
     )
 
-    assert len(repo.get_item(item.key).comments) == 2
+    assert len(_item(repo, item.key).comments) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +821,7 @@ def test_reclaim_stuck_queue_entries_returns_items_to_verify(repo: Repository, m
 
     assert repo.reclaim_stuck_queue_entries() == [key]
     assert repo.queue_pending_count(QueueName.VERIFY) == 0, "残留不清，兜底就永久失效"
-    assert repo.get_item_row(key).status == ItemStatus.EVALUATED.value, "条目要能重验"
+    assert _item_row(repo, key).status == ItemStatus.EVALUATED.value, "条目要能重验"
 
 
 def test_reclaim_leaves_fresh_and_finished_rows_alone(repo: Repository) -> None:
@@ -890,7 +925,9 @@ def test_latest_batch_conclusions_matches_the_single_key_version(repo: Repositor
 
     assert out[key].verdict == "fix", "同 key 要取最新那条"
     assert other not in out, "没有结论的条目不该出现在结果里"
-    assert out[key].verdict == repo.latest_batch_conclusion(key).verdict, "与逐条版本同口径"
+    single = repo.latest_batch_conclusion(key)
+    assert single is not None
+    assert out[key].verdict == single.verdict, "与逐条版本同口径"
 
 
 # ---------------------------------------------------------------------------
