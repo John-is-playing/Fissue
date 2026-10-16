@@ -85,6 +85,7 @@
   以及 `.github` 下的 Issue 模板、PR 模板与漏洞上报表单
 - `BENCHMARK.md` 补第三轮 P0/P1 审计台账，并**更正两处过时留档**（「独立 Web 进程不持锁」已不成立；SQLite 的 busy 超时并非「没有」而是驱动默认 5s）
 - `SECURITY.md` 补 `.git` 加固与写操作互斥两条护栏、隔离一节补「取值白名单 / 超时回收容器 / 输出上限」，部署清单补「挂反向代理必须设 `FISSUE_API_TOKEN`」
+- `docs/USAGE.md` / `docs/ENV.md` / `README.md` 与现状对齐：`FISSUE_CA_BUNDLE` 不可用时**直接报错**（不再静默回退系统信任库）、命令表补 `fissue requeue`、配置示例补 `sandbox.git_readonly` 与 `schedule.verify_enabled`·`verify_batch_limit`、常驻服务的扫描循环补上「验证」这一步
 
 ### 安全
 

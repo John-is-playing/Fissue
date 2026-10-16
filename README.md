@@ -139,6 +139,7 @@ fissue web
 | `fissue eval` | AI 评测（四维评分 + 标签 + 反刷子） |
 | `fissue verify` | 生成验证器 + 沙盒 F2P 验证 |
 | `fissue flush` | 手动 flush 验证/修复队列 |
+| `fissue requeue` | 把卡住的条目放回流水线（`--stale` = 结论过期但修复已开工；`--failed` = 失败重试） |
 | `fissue fix` | 自动修复并提 PR（`--dry-run` 只产 patch） |
 | `fissue report` | 生成 Markdown/JSON 报告 |
 | `fissue export` | 导出全量数据 |

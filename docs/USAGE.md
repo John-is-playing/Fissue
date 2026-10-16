@@ -124,6 +124,11 @@ FISSUE_WEB_PORT=8000
 FISSUE_API_TOKEN=            # 留空=不鉴权（仅本地）；填了则自动开启鉴权
 ```
 
+> ⚠️ **挂了反向代理就必须填 `FISSUE_API_TOKEN`**。启动检查只能看**绑定地址**，看不见代理——
+> 「绑 `127.0.0.1` + 同机 nginx 转出去」同样等于把无鉴权的写控制面
+> （`/api/v1/queues/flush`、`/api/v1/actions/*`）对外开放。未开鉴权时，带转发头或来自
+> 非回环地址的写请求会被 403，但那只是补刀：**边界始终是令牌**。
+
 ---
 
 ## 4. 配置业务规则（config.yaml）
@@ -158,16 +163,22 @@ repos:
 ```yaml
 sandbox:
   enabled: true
-  runtime: docker             # docker | local（local 无隔离，仅本机开发）
+  runtime: docker             # docker | local（local 无隔离，仅本机开发）；拼错会被拒绝启动
   image: fissue/sandbox-base:latest
   network: none               # 禁网，最安全
   read_only_root: true
+  git_readonly: true          # 工作区里的 .git 对容器只读（index 除外）
   user: "1000:1000"           # 非 root
   limits:
     cpus: 2.0
     memory_mb: 2048
     timeout_seconds: 600
 ```
+
+> `git_readonly` 掐掉的是**宿主的执行入口**（`.git/hooks`、`config` 里的 `filter.*.clean`、
+> `diff.*.textconv`、`credential.helper`）与**伪造入口**（`.git/objects`、`refs`）。`.git/index`
+> 特意留成可写——不少仓库的测试套件会顺手跑 `git status`，整块只读会让它们整片失败。只有
+> 「测试套件要在容器里 `git commit`」的仓库才需要关掉它。
 
 ### 4.3 自动修复（默认已开，上线前务必确认）
 
@@ -607,11 +618,11 @@ fissue serve --once
 
 | 循环 | 默认间隔 | 做什么 |
 |---|---|---|
-| 扫描 | 每小时 | 增量抓取 → 评测新条目 → 高重要性告警 |
+| 扫描 | 每小时 | 增量抓取 → 评测新条目 → **验证**（生成验证器 + F2P）→ 高重要性告警 |
 | flush | 60 秒 | 按触发条件 flush 队列 → 打标签 → 派发修复 |
 | 修复 | 120 秒 | 修 tier1/tier2 的 Issue，受预算与策略限制 |
 
-定时用 `config.yaml` 调：
+定时与「一轮做多少活」都用 `config.yaml` 调：
 
 ```yaml
 schedule:
@@ -619,6 +630,8 @@ schedule:
   scan_interval_seconds: 3600
   queue_flush_interval_seconds: 60
   full_rescan_days: 30         # 每 30 天做一次全量兜底
+  verify_enabled: true         # false = 常驻服务不做验证，交给人工 `fissue verify`
+  verify_batch_limit: 30       # 每轮最多验多少条（积压由后续轮次继续消化）
 ```
 
 外部 cron 方案（不常驻）：
@@ -821,6 +834,28 @@ fissue fix    --key $KEY --dry-run
 
 > 说明：`eval` 没有 `--key` 参数（它是批量语义），单条用 `--limit 1`，
 > 或直接 `fissue verify --key` / `fissue fix --key`（这两个支持 `--key`）。
+
+---
+
+### 9.7 条目卡住了：`fissue requeue`
+
+两种条目**只能人工放行**（此前没有入口）：
+
+```bash
+# 内容改过、结论已过期，但当时它的修复已开工（fix_queued / fixing / pr_created）
+fissue requeue --stale --dry-run      # 先看计划，不改状态
+fissue requeue --stale --yes          # 放回重评
+
+# 状态为 failed 的条目（评测 / 验证 / 修复中途异常）
+fissue requeue --failed --yes
+```
+
+`--failed` 的回退目标按**已有结论**决定：有评测 → `evaluated`（重跑验证这一步），
+没有 → `new`（重跑评测）。默认先列计划再询问确认。
+
+> 为什么 `--stale` 不自动重评？条目内容实质变化时它的修复可能已经开工，自动回落会给
+> 「重复修复 / 重复建 PR」再开一道口子，所以那里只留痕（`RawItem.stale_reasons`，
+> 导出与 API 都看得到），由你确认后放回。
 
 ---
 

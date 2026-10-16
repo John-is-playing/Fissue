@@ -365,6 +365,10 @@ Fissue 依赖里已包含 [`truststore`](https://pypi.org/project/truststore/)�
 FISSUE_CA_BUNDLE=/path/to/root-ca.pem
 ```
 
+> ⚠️ 这个变量是**严格的**：路径不存在、或内容不是合法 PEM 时，Fissue 会**直接报错**，
+> **不会**静默回退到系统信任库。这是刻意的——静默回退会让你以为「只信我钉的这张根证书」，
+> 实际用的却是 OS 信任库，属于安全配置被无声忽略。路径支持 `~`（如 `~/corp-root.pem`）。
+
 若中间人不止一层，根证书就不止一张，要**合并**成一个 PEM：
 
 ```bash
@@ -421,7 +425,7 @@ fissue fetch --repo psf/requests --limit 1
 | `FISSUE_WEB_HOST` | | `127.0.0.1` | 监听地址 |
 | `FISSUE_WEB_PORT` | | `8000` | 监听端口 |
 | `FISSUE_SANDBOX_RUNNER_SOCKET` | | 空（inline） | 沙盒转发组件 socket |
-| `FISSUE_CA_BUNDLE` | | 空（用系统信任库） | 指定 CA 证书 PEM 路径 |
+| `FISSUE_CA_BUNDLE` | | 空（用系统信任库） | 指定 CA 证书 PEM 路径（支持 `~`；路径不可用会**直接报错**，不静默回退） |
 | `FISSUE_INSECURE_SKIP_VERIFY` | | 空（开启校验） | 关闭 TLS 校验（**仅排查**） |
 | `FISSUE_LOG_LEVEL` | | `info` | 日志级别 |
 | `FISSUE_CONFIG` | | `./config.yaml` | 配置文件位置 |
