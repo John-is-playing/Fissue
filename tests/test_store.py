@@ -839,6 +839,81 @@ def test_reclaim_leaves_fresh_and_finished_rows_alone(repo: Repository) -> None:
     assert len(repo.queue_unflushed(QueueName.VERIFY)) == 1
 
 
+def test_usage_today_is_the_calendar_day_not_a_rolling_window(repo: Repository) -> None:
+    """`usage_today` 必须按**自然日**（UTC）算，不是滚动 24 小时。
+
+    回归：窗口是 `now - timedelta(days=1)`，于是「今日用量」在午夜不归零、还一直带着昨天后半段
+    的量；而配置项叫 `daily_tokens_per_repo`、报告里写「今日用量」。
+
+    判别是确定性的：把「昨天最后一分钟」那笔放进去——滚动窗口**必然**算它（24 小时内），
+    自然日窗口则必然不算。
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import text
+
+    day = Repository._day_start()
+    # 今天这笔放在午夜**之后**一分钟：SQLite 里时间戳按字符串比较，而窗口起点是 tz-aware 的
+    # （渲染成 `…+00:00`），正好等于午夜那一瞬会被判成「小于」它。昨天那笔放在午夜前一分钟。
+    for ts, tokens in ((day + timedelta(minutes=1), 7), (day - timedelta(minutes=1), 100)):
+        with repo.db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO llm_usage (repo_key, purpose, model, prompt_tokens, "
+                    "completion_tokens, cost_usd, success, created_at) "
+                    "VALUES ('psf/requests', 'evaluate', 'm', :p, 0, 0.0, 1, :ts)"
+                ),
+                {"p": tokens, "ts": ts},
+            )
+
+    used = repo.usage_today(repo_key="psf/requests")
+    assert used["total_tokens"] == 7, f"只该算今天那笔，实际：{used}"
+    assert used["calls"] == 1
+
+
+def test_sqlite_enforces_foreign_keys(repo: Repository) -> None:
+    """SQLite 上必须真的开 `foreign_keys`，否则外键与 `ON DELETE CASCADE` 都是摆设。
+
+    证据：`tables.py` 里 6 条外键都写了 `ondelete="CASCADE"`，但 SQLite **默认不强制**外键，
+    而且这个 pragma 是**按连接**生效的（不是建库时定下来的）——本地 SQLite 上插一条指向不存在
+    父行的子行不会报错、删父行也不级联，等换成 PostgreSQL 才发现库里早就有脏数据。
+    """
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    def _insert_orphan_comment() -> None:
+        with repo.db.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO comments (item_id, author, author_kind, body) "
+                    "VALUES (999999, 'x', 'unknown', 'y')"
+                )
+            )
+
+    with pytest.raises(IntegrityError):
+        _insert_orphan_comment()
+
+
+def test_export_shows_real_comment_counts(repo: Repository) -> None:
+    """导出里的 `comments` 必须是**真数**，而不是恒为 0。
+
+    回归：`list_items` 不加载评论（``with_comments=False``），而 `item_to_dict` 直接取
+    ``len(item.comments)`` → 导出与 API 列表里的 ``comments`` 一直是 0：真有讨论也显示
+    「0 条评论」，而详情页（`get_item` 会 ``selectinload`` 评论）却显示真实条数——同一个
+    字段两个口径。
+    """
+    import json
+
+    _seed(repo, number=95)
+
+    data = json.loads(exp.export_json(repo))
+    rows = data["items"]
+    assert len(rows) == 1, f"应当导出 1 条，实际：{rows}"
+    assert str(rows[0]["number"]) == "95", f"应当是 #95，实际：{rows[0]}"
+
+    assert rows[0]["comments"] >= 1, f"导出里的评论数应当是真数，实际：{rows[0]['comments']}"
+
+
 def test_save_verifier_run_requires_a_verifier_id(repo: Repository) -> None:
     """`verifier_runs.verifier_id` 是 NOT NULL：缺 id 要给可操作的报错，而不是裸 IntegrityError。
 

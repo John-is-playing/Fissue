@@ -245,6 +245,32 @@ def test_pr_strategy_no_longer_has_auto_submit() -> None:
     assert PRStrategy(auto_submit=False).mode == "fork"  # type: ignore[call-arg]
 
 
+def test_unknown_config_keys_are_reported_with_a_hint(tmp_path: Path) -> None:
+    """拼错的配置键必须能被**指出来**：老键仍不报错，但不能一声不响地忽略。
+
+    回归：`load_settings` 把 YAML 直接交给 pydantic，而 pydantic 默认忽略多余键——把
+    `api.auth_required` 写成 `api.auth_requird`、`web.read_only` 写成 `web.readonly`，既不报错
+    也不提示，而这两个都是**安全开关**：用户以为开了，实际按默认跑。
+    """
+    from fissue.config import _unknown_config_keys, load_settings
+
+    found = dict(
+        _unknown_config_keys({"api": {"auth_requird": True}, "web": {"readonly": True}, "nope": 1})
+    )
+    assert set(found) == {"api.auth_requird", "web.readonly", "nope"}
+    assert "auth_required" in found["api.auth_requird"], "要给「你是不是想写…」的候选"
+    assert "read_only" in found["web.readonly"]
+
+    # 既有契约：老配置里的残留键（已删除的字段）仍**不报错**，只是会被忽略
+    assert _unknown_config_keys({"auto_fix": {"pr_strategy": {"mode": "fork"}}, "repos": []}) == []
+
+    # 端到端：带未知键的配置照旧能加载（不报错），未知键按默认值走
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text("web:\n  readonly: true\nrepos: []\n", encoding="utf-8")
+    settings = load_settings(cfg, tmp_path / "nope.env")
+    assert settings.web.read_only is False, "未知键被忽略（不会变成 read_only）"
+
+
 def test_pr_strategy_mode_rejects_typos() -> None:
     """拼错 `mode` 必须报错，不能静默落到「直推上游仓库」。
 

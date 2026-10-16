@@ -757,6 +757,8 @@ class Repository:
                 "verifier_runs.verifier_id 是 NOT NULL，请先 repo.save_verifier(...) 拿到 id"
             )
         with self.db.session() as s:
+            from sqlalchemy.exc import IntegrityError
+
             row = VerifierRunRow(
                 verifier_id=run.verifier_id,
                 item_key=run.item_key,
@@ -771,7 +773,16 @@ class Repository:
                 error=run.error,
             )
             s.add(row)
-            s.flush()
+            try:
+                s.flush()
+            except IntegrityError as exc:
+                # 走到这里几乎只有一个原因：这个 verifier_id 在 `verifiers` 里**不存在**
+                # （条目被级联删过、或调用方拿的是自造的 id）。把它说清楚，别让调用方
+                # 对着一句 `FOREIGN KEY constraint failed` 猜。
+                raise ValueError(
+                    f"验证器执行记录指向的验证器不存在：item={run.item_key} "
+                    f"verifier_id={run.verifier_id} stage={run.stage}（{exc}）"
+                ) from exc
             return int(row.id)
 
     def verifier_runs(self, item_key: str, *, stage: str | None = None, limit: int = 20) -> list[VerifierRun]:
@@ -1235,6 +1246,25 @@ class Repository:
         with self.db.session() as s:
             return [str(k) for k in s.scalars(stmt)]
 
+    def comment_counts(self, keys: Sequence[str]) -> dict[str, int]:
+        """每个条目的**评论条数**（一条 GROUP BY，不把评论行拉进内存）。
+
+        为什么需要：`list_items` 默认不加载评论（``with_comments=False``），所以
+        ``len(item.comments)`` 恒为 0——导出与 API 里的 ``comments`` 字段一直是**假数字**
+        （真的讨论被显示成「0 条评论」）。这里用一条聚合查询把它变成真值。
+        """
+        wanted = [str(k) for k in keys]
+        if not wanted:
+            return {}
+        with self.db.session() as s:
+            rows = s.execute(
+                select(ItemRow.key, func.count(CommentRow.id))
+                .join(CommentRow, CommentRow.item_id == ItemRow.id)
+                .where(ItemRow.key.in_(wanted))
+                .group_by(ItemRow.key)
+            ).all()
+        return {str(k): int(n or 0) for k, n in rows}
+
     def item_stats(
         self,
         *,
@@ -1377,8 +1407,21 @@ class Repository:
                 )
             )
 
+    @staticmethod
+    def _day_start(now: datetime | None = None) -> datetime:
+        """UTC 当日零点——`usage_today` 的窗口起点。"""
+        base = now or datetime.now(timezone.utc)
+        return base.replace(hour=0, minute=0, second=0, microsecond=0)
+
     def usage_today(self, *, repo_key: str | None = None) -> dict[str, float]:
-        start = datetime.now(timezone.utc) - timedelta(days=1)
+        """**自然日**（UTC）的用量。
+
+        窗口原先写成 ``now - timedelta(days=1)``，也就是**滚动 24 小时**——可名字叫 ``today``、
+        预算配置叫 ``daily_tokens_per_repo``、报告里写「今日用量」，三处口径却都不等于自然日：
+        报告里的「今日」在午夜不归零，而且一直带着昨天后半段的量。现在按 UTC 自然日算：per-repo
+        每日预算在 UTC 午夜归零，报告里的数字也真的只有今天。
+        """
+        start = self._day_start()
         stmt = select(
             func.coalesce(func.sum(LLMUsageRow.prompt_tokens), 0),
             func.coalesce(func.sum(LLMUsageRow.completion_tokens), 0),

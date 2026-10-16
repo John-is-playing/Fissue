@@ -134,6 +134,53 @@ def test_executor_blocks_escaping_files(settings) -> None:
     assert "非法路径" in (res.error or "")
 
 
+def test_executor_rejects_requests_that_try_to_widen_isolation(settings, tmp_path, monkeypatch) -> None:
+    """转发组件的执行点必须校验请求里的隔离参数。
+
+    回归：`Executor` 原先对请求里的 `mounts` / `user` / `network` / `read_only_root` **一个都不看**
+    ——任何连得上 socket 的进程（socket 是 0600，即同 uid）都能让容器拿到任意宿主目录的 rw 挂载，
+    而 `req.files` 还会被 `write_text` 直接写进那个宿主目录。同 uid 本无权限边界，这道校验是
+    防误用与防被生成代码利用的补刀。
+    """
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    (allowed / "sub").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv(Executor.MOUNT_ROOTS_ENV, str(allowed))
+    ex = Executor(settings.sandbox)
+
+    res = ex.execute(
+        ExecRequest(
+            command="echo hi", workdir="/workspace",
+            mounts=[MountSpec(source=str(outside), target="/workspace")],
+            label="t", timeout_seconds=30,
+        )
+    )
+    assert res.ok is False, "允许根之外的挂载源必须被拒"
+    assert "拒绝挂载" in (res.error or ""), res.error
+
+    res2 = ex.execute(
+        ExecRequest(
+            command="echo hi", workdir="/workspace",
+            mounts=[MountSpec(source=str(allowed), target="/etc")],
+            label="t", timeout_seconds=30,
+        )
+    )
+    assert res2.ok is False, "目标越出 workdir 必须被拒"
+    assert "workdir" in (res2.error or ""), res2.error
+
+    ok_req = ExecRequest(
+        command="echo hi", workdir="/workspace",
+        mounts=[
+            MountSpec(source=str(allowed), target="/workspace"),
+            MountSpec(source=str(allowed / "sub"), target="/workspace/sub"),
+        ],
+        label="t", timeout_seconds=30,
+    )
+    assert ex._reject_reason(ok_req, ok_req.mounts) is None, "合规请求（工作区 + 其子路径）应当放行"
+
+
 def test_executor_timeout(settings) -> None:
     ex = Executor(settings.sandbox)
     # 跨平台：用 python 自身睡眠，避免依赖 sleep/ping 的可用性
@@ -142,6 +189,62 @@ def test_executor_timeout(settings) -> None:
     assert res.timed_out is True
     assert res.ok is False
     assert "超时" in (res.error or "")
+
+
+def test_local_timeout_kills_the_whole_process_group(tmp_path) -> None:
+    """本地路径超时必须回收**整棵进程树**，否则子孙进程会一直持有管道写端。
+
+    回归：超时只 `proc.kill()`（直接子进程是 `sh -lc …`）时，命令自己起的子孙进程继续持有
+    stdout/stderr 的写端 → 读线程永久阻塞在 `read()` 上 → `_spawn` 永不返回（表现为
+    `fissue verify` 卡死，而不是给出「超时」结论），孤儿进程还继续吃 CPU/内存。
+    """
+    import subprocess
+    import time
+
+    from fissue.config import SandboxConfig
+    from fissue.sandbox.runtime import DockerRuntime
+
+    rt = DockerRuntime(SandboxConfig(runtime="local"))
+    pidfile = tmp_path / "child.pid"
+    proc = subprocess.Popen(
+        ["sh", "-c", f"sleep 30 & echo $! > {pidfile}; sleep 30"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    for _ in range(60):                      # 等后台子进程写下自己的 pid
+        if pidfile.exists() and pidfile.read_text(encoding="utf-8").strip():
+            break
+        time.sleep(0.05)
+    child = int(pidfile.read_text(encoding="utf-8").strip())
+
+    rt._kill_tree(proc)
+    proc.wait(timeout=5)
+    time.sleep(0.3)
+
+    import os as _os
+
+    with pytest.raises(ProcessLookupError):
+        _os.kill(child, 0)                    # 子孙进程也应当一起没了
+
+
+def test_collect_gives_up_instead_of_blocking_forever() -> None:
+    """读线程收不了工时必须**认输**——「卡死」比「少一段日志」严重得多。"""
+    import io
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from fissue.sandbox.runtime import DockerRuntime
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(time.sleep, 60)         # 模拟「永远不结束」的读线程
+    t0 = time.monotonic()
+    text, cut = DockerRuntime._collect(fut, io.StringIO(), seconds=0.2)
+    elapsed = time.monotonic() - t0
+
+    assert (text, cut) == ("", True), "收不了工就如实标记截断"
+    assert elapsed < 15, f"必须尽快认输，实际等了 {elapsed:.1f}s"
+    pool.shutdown(wait=False)
 
 
 def test_sandbox_manager_local_backend(settings) -> None:

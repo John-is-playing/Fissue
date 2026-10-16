@@ -66,6 +66,30 @@ KEY_ENC = quote(KEY, safe="")
 # ---------------------------------------------------------------------------
 
 
+def test_invalid_enum_query_param_returns_400_not_500(client) -> None:
+    """非法枚举查询参数是**客户端**错误 → 400 且说明可选值，而不是 500 + 堆栈。
+
+    回归：这些参数原先直接 `ItemStatus(status)`：FastAPI 的 Query 只做 str→str，非法值在处理
+    函数里抛 `ValueError`，被兜成 500——调用方看不出是自己参数写错了，只看到服务器故障。
+    """
+    r = client.get("/api/v1/items", params={"status": "nope"})
+    assert r.status_code == 400, r.text
+    assert "status" in r.json()["detail"] and "可选" in r.json()["detail"]
+
+    r2 = client.get("/api/v1/items", params={"category": "nope"})
+    assert r2.status_code == 400, r2.text
+
+    # 合法取值照旧
+    assert client.get("/api/v1/items", params={"status": "new"}).status_code == 200
+
+
+def test_items_list_reports_real_comment_counts(client) -> None:
+    """API 列表里的 `comments` 也要是真数（与导出同一口径）。"""
+    data = client.get("/api/v1/items", params={"limit": 10}).json()
+    assert data["items"], "夹具应当至少有一条条目"
+    assert any(i["comments"] >= 1 for i in data["items"]), f"评论数不该全是 0：{data['items']}"
+
+
 def test_health_and_stats(client) -> None:
     assert client.get("/api/v1/health").json()["status"] == "ok"
     stats = client.get("/api/v1/stats").json()

@@ -198,12 +198,20 @@ def export_json(
     # 结论**批量**取：原先 `latest_batch_conclusion(i.key)` 是逐条查、每条还新开一个
     # session——一万条就是一万次查询（GET /api/export?limit=10000 正好允许这个规模）。
     batches = repo.latest_batch_conclusions(keys)
+    # 评论条数走聚合查询：`list_items` 不加载评论，所以 `len(item.comments)` 恒为 0，
+    # 导出里的 `comments` 一直是假数字（真有讨论也显示 0）。
+    counts = repo.comment_counts(keys)
     payload = {
         "generated_at": _iso(datetime.now().astimezone()),
         "count": len(items),
         "summary": summarize(repo, repo_slug=repo_slug, status=status, category=category),
         "items": [
-            item_to_dict(i, evals.get(i.key), batch=batches.get(i.key))
+            item_to_dict(
+                i,
+                evals.get(i.key),
+                batch=batches.get(i.key),
+                extra={"comments": counts.get(i.key, len(i.comments))},
+            )
             for i in items
         ],
     }

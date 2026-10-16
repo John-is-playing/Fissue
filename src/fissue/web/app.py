@@ -74,6 +74,23 @@ class ApproveRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _enum_param(value: str | None, enum_cls: Any, *, name: str) -> Any:
+    """查询参数 → 枚举；非法取值返回 **400**（原先是 500 + 一堆堆栈）。
+
+    FastAPI 的 Query 只做 str→str，非法值会在处理函数里抛 `ValueError`，被兜成 500——可这是
+    **客户端**的参数错误，应当是 4xx，而且要明确告诉对方可选值有哪些。
+    """
+    if not value:
+        return None
+    try:
+        return enum_cls(value)
+    except ValueError as exc:
+        allowed = "、".join(str(m.value) for m in enum_cls)
+        raise HTTPException(
+            status_code=400, detail=f"{name} 取值非法：{value!r}；可选：{allowed}"
+        ) from exc
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """构造 FastAPI 应用。"""
     st = settings or load_settings()
@@ -342,17 +359,22 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         r = _repo(request)
         items = r.list_items(
             repo_slug=repo_slug,
-            item_type=ItemType(item_type) if item_type else None,
-            status=ItemStatus(status) if status else None,
-            category=Category(category) if category else None,
-            priority=Priority(priority) if priority else None,
+            item_type=_enum_param(item_type, ItemType, name="item_type"),
+            status=_enum_param(status, ItemStatus, name="status"),
+            category=_enum_param(category, Category, name="category"),
+            priority=_enum_param(priority, Priority, name="priority"),
             limit=limit,
             offset=offset,
         )
         evals = r.evaluations_for([i.key for i in items])
+        # 列表路径不加载评论（`list_items`）→ `len(i.comments)` 恒为 0，这里补一条聚合计数
+        counts = r.comment_counts([i.key for i in items])
         return {
             "count": len(items),
-            "items": [exp.item_to_dict(i, evals.get(i.key)) for i in items],
+            "items": [
+                exp.item_to_dict(i, evals.get(i.key), extra={"comments": counts.get(i.key, 0)})
+                for i in items
+            ],
         }
 
     @app.get(f"{prefix}/items/{{key:path}}")
@@ -689,14 +711,18 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
         r = _repo(request)
         items = r.list_items(
             repo_slug=repo_slug,
-            status=ItemStatus(status) if status else None,
-            category=Category(category) if category else None,
-            priority=Priority(priority) if priority else None,
-            item_type=ItemType(item_type) if item_type else None,
+            status=_enum_param(status, ItemStatus, name="status"),
+            category=_enum_param(category, Category, name="category"),
+            priority=_enum_param(priority, Priority, name="priority"),
+            item_type=_enum_param(item_type, ItemType, name="item_type"),
             limit=limit,
         )
         evals = r.evaluations_for([i.key for i in items])
-        rows = [exp.item_to_dict(i, evals.get(i.key)) for i in items]
+        counts = r.comment_counts([i.key for i in items])
+        rows = [
+            exp.item_to_dict(i, evals.get(i.key), extra={"comments": counts.get(i.key, 0)})
+            for i in items
+        ]
         summary = exp.summarize(r, repo_slug=repo_slug)
         return templates.TemplateResponse(
             request,

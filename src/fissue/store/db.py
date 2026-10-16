@@ -76,6 +76,11 @@ class Database:
             try:
                 cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
+                # SQLite **默认不强制**外键，而且这个开关是**按连接**生效的（不是建库时定下的），
+                # 所以必须每条新连接都开。不开的后果：表里 6 条 `ondelete="CASCADE"` 与所有
+                # 外键在本地的 SQLite 库上**形同虚设**——插得进指向不存在父行的子行、删父行也
+                # 不级联，等换成 PostgreSQL 才发现库里早就有脏数据。
+                cursor.execute("PRAGMA foreign_keys=ON")
             finally:
                 cursor.close()
 

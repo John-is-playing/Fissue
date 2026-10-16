@@ -969,7 +969,10 @@ def _make_pr_stage(ctx, monkeypatch, *, spec, base_result, fix_result=None, orde
                             linked_context=None):
         if order is not None:
             order.append("base")
-        return 1, spec, base_result
+        # verifier_id 必须是**库里真有的行**：SQLite 开了外键强制之后，自造的 id 会让
+        # `save_verifier_run` 撞 FK（以前不强制，所以自造 id 也能“过”）。
+        verifier_id = ctx.repo.save_verifier(item.key, spec)
+        return verifier_id, spec, base_result
 
     async def fake_merge(ws, it, repo_cfg):
         if order is not None:

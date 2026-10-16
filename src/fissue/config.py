@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import difflib
+import logging
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -716,6 +718,42 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return out
 
 
+def _sub_model(annotation: Any) -> type[BaseModel] | None:
+    """字段注解里的子模型（含 ``X | None`` 这类联合）。"""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    for arg in getattr(annotation, "__args__", ()):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _unknown_config_keys(
+    raw: dict[str, Any], model: Any = None, prefix: str = ""
+) -> list[tuple[str, list[str]]]:
+    """找出 YAML 里**模型不认识的键路径**，返回 ``[(路径, 该层已知键), …]``。
+
+    为什么不直接报错：项目明确允许「老配置文件里的残留键」（见
+    ``tests/test_config_models.py::test_deleted_keys_in_old_config_files_do_not_break_loading``），
+    报错会把这类用户的加载直接打死。
+
+    但**静默忽略**更糟：把 ``api.auth_required`` 写成 ``api.auth_requird``、``web.read_only``
+    写成 ``web.readonly``，pydantic 默认一声不响地丢掉——而这两个都是**安全开关**：用户以为
+    开了，实际按默认值跑。所以策略是：不报错，但一条条**响亮地喊出来**，并给出「你是不是想写 X」。
+    """
+    model = model or Settings
+    fields = dict(getattr(model, "model_fields", {}))
+    out: list[tuple[str, list[str]]] = []
+    for key, value in (raw or {}).items():
+        if key not in fields:
+            out.append((f"{prefix}{key}", sorted(fields)))
+            continue
+        sub = _sub_model(fields[key].annotation)
+        if isinstance(value, dict) and sub is not None:
+            out.extend(_unknown_config_keys(value, sub, prefix=f"{prefix}{key}."))
+    return out
+
+
 def load_settings(
     config_path: str | Path | None = None,
     env_path: str | Path | None = None,
@@ -759,6 +797,17 @@ def load_settings(
     raw = _apply_env_overrides(raw, env_values)
     if overrides:
         raw = _deep_merge(raw, overrides)
+
+    # 未知键**不报错**（项目允许老配置里的残留键），但必须**响亮**：安全开关被拼错时，
+    # 静默忽略等于让用户以为它生效了。见 _unknown_config_keys 的说明。
+    for path, candidates in _unknown_config_keys(raw):
+        leaf = path.rsplit(".", 1)[-1]
+        near = difflib.get_close_matches(leaf, candidates, n=2, cutoff=0.6)
+        logging.getLogger(__name__).warning(
+            "配置里有未知键 `%s`，会被忽略%s",
+            path,
+            f"；你是不是想写 {'、'.join(near)}？" if near else "",
+        )
 
     try:
         settings = Settings(**raw)

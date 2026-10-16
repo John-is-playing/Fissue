@@ -1243,8 +1243,35 @@ flush 出结论 7 条（verify 3 + fix_bug 4，并在 GitHub 上建了标签）�
 **验证**：全量 **717 passed**，ruff 与 mypy 双绿（70 个源文件）。本批 **15 条新用例在未修改的
 HEAD 上全部失败**（选中集 16 条里 16 条失败），即它们真的守得住这些缺陷。
 
-**本轮另有一批主张尚未逐条核实**（留待下一轮，不做就是没做）：`net.register_env_file_values`
-不清 `build_ssl_context` 缓存、SQLite 未开 `PRAGMA foreign_keys=ON`、导出/列表的 `comments` 恒为 0、
-`usage_today` 实为滚动 24h、`single_flight` 在「拿到锁、yield 之前」抛错会留下进程内深度、
-Gitee 条目级标签仍打项目自己实测「恒 400」的端点、未知配置键静默忽略、Web 端点非法枚举参数返回 500、
-转发组件 `Executor` 对请求里的 `mounts/user/network` 零校验、local 沙盒超时只杀直接子进程。
+**那批「尚未逐条核实」的主张已在 §4.19 全部核实并处理**：10 条里 9 条属实并修掉，1 条（Gitee
+条目级标签）的措辞按实测更正。
+
+### 4.19 review 第二批：上一节那批主张的核实与修复（2026-10-17）
+
+§4.18 末尾列出的 10 条「未核实主张」逐条回到代码里核实后：**9 条属实、1 条措辞需更正**（见 #6）。
+每条都配守卫用例。
+
+| # | 位置 | 问题 | 后果 |
+|---|---|---|---|
+| 1 | `sandbox.forwarder.Executor` | 对请求里的 `mounts` / `user` / `network` / `read_only_root` **零校验** | 任何连得上 socket 的进程（socket 是 0600，即同 uid）都能让容器拿到任意宿主目录的 rw 挂载，而 `req.files` 还会被直接写进那个宿主目录 |
+| 2 | `lockfile.single_flight` | `_hold_depth = 1` 写在写锁文件**之前**，归零只在 `yield` 之后 | 写锁文件任一步抛错 → 深度留在 1 → 本进程此后**再也不抢锁**，可与另一进程并发写同一个库 |
+| 3 | `net.register_env_file_values` | 只换登记表、不清 `build_ssl_context` 的 `lru_cache` | 后一次登记的显式 CA **既不生效也不报错**，与模块「绝不静默回退」的承诺矛盾 |
+| 4 | `sandbox.runtime._spawn`（local） | 超时只 `proc.kill()` 直接子进程 | 子孙进程继续持有管道写端 → 读线程永久阻塞在 `read()` → `_spawn` 永不返回（表现为 verify 卡死），孤儿进程继续吃资源 |
+| 5 | `export` / `web` 列表 | `list_items` 不加载评论，却输出 `len(item.comments)` | 导出与 API 列表里 `comments` 恒为 0，而详情页有真数——同一字段两个口径 |
+| 6 | `platforms.v5.add_labels` | 条目级标签打 `POST /issues/{n}/labels` | **措辞更正**：那条端点是**在 AtomGit 上**实测恒 400（AtomGit 早已覆写成 PATCH 形状）；Gitee 上**没测过**。现在加能力位：先试直连、失败自动落到并集 PATCH |
+| 7 | `store.db` | SQLite 未开 `PRAGMA foreign_keys=ON`（该 pragma **按连接**生效） | 表里 6 条 `ondelete="CASCADE"` 与所有外键在本地库上形同虚设：插得进悬空引用、删父行也不级联 |
+| 8 | `store.repository.usage_today` | 窗口是 `now - 24h`（滚动），不是自然日 | 「今日用量」午夜不归零、还一直带着昨天后半段；而配置叫 `daily_*`、报告里写「今日用量」 |
+| 9 | `config.load_settings` | pydantic 默认静默忽略多余键 | `api.auth_required` / `web.read_only` 这类**安全开关**拼错后一声不响地按默认值跑 |
+| 10 | `web.app` 查询参数 | `ItemStatus(status)` 直接在处理函数里抛 `ValueError` | 客户端参数写错变成 500 + 堆栈，看不出是自己写错了 |
+
+**这一批里我自己引入、又当场修掉的两处回归**（记下来：它们说明「守卫用例 + 全量回归」缺一不可）：
+
+* 第 1 条的校验最初要求挂载源必须是**目录**，而工作区挂载里合法地含 `.git/index`（**文件**，正是
+  「`.git` 只读、单独放行 index」那套的产物）——于是回归门的请求被拒、6 条既有用例当即转红。
+  已改为「源必须存在、非符号链接、在允许根之下」，目录与文件都收。
+* 第 7 条一开外键强制，立刻有一条既有用例转红：它的桩里**自造** `verifier_id=1`（以前不强制才
+  “过”）。已改成在桩里真建一行；顺带给 `save_verifier_run` 的外键失败换成一句可操作的报错
+  （说清是哪个 item / 哪个 verifier_id / 哪个 stage）。
+
+**验证**：全量 **729 passed**；ruff 与 mypy 双绿（70 个源文件）；本批 **12 条新用例在未修改的
+HEAD 上全部失败**（12 选中、12 全灭），即它们真的守得住这些缺陷。

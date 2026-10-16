@@ -1629,6 +1629,35 @@ async def test_v5_create_pr_probe_does_not_claim_someone_elses_pr(atomgit) -> No
     assert probe.calls[0].request.url.params["state"] == "open", "探测必须只认 open"
 
 
+@respx.mock
+async def test_gitee_item_labels_fall_back_to_a_union_patch_when_the_endpoint_is_broken(gitee) -> None:
+    """条目级标签端点不可用时必须**自动落到并集 PATCH**，而不是把这次打标签丢掉。
+
+    背景：``POST /issues/{n}/labels`` 在 AtomGit 上实测恒 400（JSON 与表单两种体都试过），
+    而 Gitee 与它同属 v5；同一条端点在 Gitee 上**没测过**，所以不预先假设——先试直连，
+    失败再落到 ``PATCH 条目``。而那条 PATCH 的 ``labels`` 语义也没验证过（按 GitHub 同类接口
+    可能是**替换**语义），所以必须先读回现值做并集，避免抹掉维护者原有的标签。
+    """
+    import json as _json
+
+    ref = RepoRef(platform=Platform.GITEE, owner="psf", name="requests")
+    respx.post(f"{GITEE}/repos/psf/requests/issues/7/labels").mock(
+        return_value=httpx.Response(400, json={"message": "Request body parsing error"})
+    )
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"number": 7, "labels": [{"name": "bug"}]})
+    )
+    patched = respx.patch(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"number": 7})
+    )
+
+    await gitee.add_labels(ref, 7, ["ai-generated"])
+
+    assert patched.called, "直连端点失败后应当改用 PATCH 条目"
+    body = _json.loads(patched.calls[0].request.content)
+    assert body["labels"] == "bug,ai-generated", f"应当发**并集**，实际：{body}"
+
+
 def test_is_already_exists_requires_an_explicit_marker() -> None:
     """「已存在」必须由平台**明确说出来**，不能凭 409/422 猜。
 

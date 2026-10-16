@@ -389,11 +389,57 @@ class V5Adapter(PlatformAdapter):
 
     # -- 写操作 -----------------------------------------------------------
 
+    #: 该平台的「条目级打标签」端点（``POST /issues/{n}/labels``）是否**确认可用**。
+    #:
+    #: v5 系上这条端点**实测不可靠**：AtomGit 上 JSON 与表单两种体一律
+    #: ``Request body parsing error``，官方文档页也取不到（404）。默认仍先试直连（对文档里
+    #: 正常支持的平台保持原行为），**失败时自动落到并集写法**（见 :meth:`_patch_labels_union`）；
+    #: 已经确认不可用的平台直接把这里置 ``False``，一次都不浪费。
+    item_label_endpoint_usable: bool = True
+
+    async def _patch_labels_union(
+        self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType
+    ) -> None:
+        """给条目打标签：``PATCH`` 条目自身，``labels`` 传**逗号分隔的并集**（读改写）。
+
+        为什么先读再写：``PATCH /issues/{n}`` 的 ``labels`` 语义**没有被验证过**。按 GitHub 的
+        同类接口它是**替换**语义——只发新增标签就会把维护者原有的标签一并抹掉，而这件事只在真写
+        的时候才暴露（读接口看不出任何异常）。取回现值、并进去再发：替换语义下正确，追加语义下
+        也正确（并集里本来就有现值，重复追加是 no-op）。
+
+        读不回就**不写**：宁可这次打标签失败（调用方会记进 ``label_errors``，看得见），也不冒
+        「抹掉维护者标签」的风险。
+        """
+        segment = "issues" if item_type is ItemType.ISSUE else self.pr_segment
+        url = f"{self._repo_api(repo)}/{segment}/{number}"
+        data = await self._get(url)
+        if not isinstance(data, dict):
+            raise PlatformError(
+                f"打标签前读不回条目当前标签（{url}）：拿到 {type(data).__name__}。"
+                "v5 的 labels 可能是**替换**语义，读不到就不写——免得抹掉维护者原有的标签。"
+            )
+        merged = list(dict.fromkeys([*_label_names(data.get("labels")), *labels]))
+        await self._patch(url, {"labels": ",".join(merged)})
+
     async def add_labels(self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType = ItemType.ISSUE) -> None:
         if not labels:
+            return                      # 实测空串会被拒（400），而调用方本来就只加不删
+        if not self.item_label_endpoint_usable:
+            await self._patch_labels_union(repo, number, labels, item_type)
             return
-        # v5：Issue 与 PR 的标签都通过 issues 端点操作
-        await self._post(f"{self._repo_api(repo)}/issues/{number}/labels", {"labels": labels})
+        try:
+            # v5：Issue 与 PR 的标签都通过 issues 端点操作
+            await self._post(f"{self._repo_api(repo)}/issues/{number}/labels", {"labels": labels})
+        except RateLimitError:
+            raise
+        except PlatformError as exc:
+            # 直连端点不可用 → 自动落到并集写法。**哪个形状可用由真写的结果说了算**：
+            # v5 的文档页取不到（404），不能靠猜，更不能把这次打标签直接丢掉。
+            log.warning(
+                "[%s] 条目级标签端点不可用（%s），改用 PATCH 条目做并集：%s",
+                self.platform.value, number, exc,
+            )
+            await self._patch_labels_union(repo, number, labels, item_type)
 
     async def comment(self, repo: RepoRef, number: int | str, body: str, item_type: ItemType = ItemType.ISSUE) -> None:
         url = f"{self._repo_api(repo)}/issues/{number}/comments"

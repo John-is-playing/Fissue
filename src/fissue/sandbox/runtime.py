@@ -18,8 +18,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -399,6 +401,42 @@ class DockerRuntime:
 
     # -- 进程封装 ---------------------------------------------------------
 
+    @staticmethod
+    def _kill_tree(proc: subprocess.Popen) -> None:
+        """结束**整棵进程树**，而不只是 `Popen` 直接创建的那个进程。
+
+        为什么必须这样：本地路径下直接子进程是 `sh -lc <命令>`，而命令自己起的子孙进程会
+        **继承 stdout/stderr 管道的写端**。只 `proc.kill()` 的话管道永不 EOF，两个读线程就永久
+        阻塞在 `read()` 上——`_spawn` 再也返回不了（表现为 `fissue verify` 卡死，而不是给出
+        「超时」结论），孤儿进程还继续占着 CPU 与内存。docker 路径本不受影响（被杀的 CLI 不派
+        生子进程持管道），一起处理也无害。
+        """
+        if os.name == "posix":
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                return
+            except OSError:      # pragma: no cover - 进程已退出 / 权限不足
+                pass
+        proc.kill()
+
+    @staticmethod
+    def _collect(fut: Any, pipe: Any, *, seconds: float = 30.0) -> tuple[str, bool]:
+        """取读线程的结果；**仍卡住就认输**，绝不让 `_spawn` 永不返回。
+
+        关掉我们这侧的读端会让阻塞中的 `read()` 立刻返回（EOF/异常），于是线程收工；实在收不了
+        就放弃这部分输出（返回空串 + 「已截断」），因为「卡死」比「少一段日志」严重得多。
+        """
+        try:
+            return fut.result(timeout=seconds)       # type: ignore[no-any-return]
+        except Exception:                            # TimeoutError，或读端被关导致的异常
+            with contextlib.suppress(Exception):
+                pipe.close()
+            try:
+                return fut.result(timeout=5)         # type: ignore[no-any-return]
+            except Exception:
+                log.warning("读线程仍未收工，放弃这部分输出（子进程侧写端未关闭）")
+                return "", True
+
     def _spawn(
         self,
         args: list[str],
@@ -419,6 +457,10 @@ class DockerRuntime:
         * ``subprocess.run`` 超时只 kill **宿主上的 docker CLI**，``--rm`` 不会触发，
           容器仍在后台按限额吃资源（``fissue.managed=true`` 那个标签全仓没人读）。
         """
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "posix":
+            # 自成会话/进程组：超时才能整组回收（见 _kill_tree）
+            popen_kwargs["start_new_session"] = True
         try:
             proc = subprocess.Popen(
                 args,
@@ -429,6 +471,7 @@ class DockerRuntime:
                 errors="replace",
                 cwd=cwd,
                 env=env,
+                **popen_kwargs,
             )
         except OSError as exc:
             return ExecResult(
@@ -445,13 +488,14 @@ class DockerRuntime:
                 proc.wait(timeout=timeout_seconds)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                proc.kill()          # 先结束 CLI：管道才会 EOF，两个读线程才会收工
+                # 结束**整棵进程树**：管道才会 EOF，两个读线程才会收工（见 _kill_tree）
+                self._kill_tree(proc)
                 try:
                     proc.wait(timeout=30)
                 except subprocess.TimeoutExpired:      # pragma: no cover - 杀不掉只能放弃
                     log.warning("子进程 kill 之后仍未退出：%s", args[:2])
-            stdout, out_cut = out_f.result()
-            stderr, err_cut = err_f.result()
+            stdout, out_cut = self._collect(out_f, proc.stdout)
+            stderr, err_cut = self._collect(err_f, proc.stderr)
 
         truncated = out_cut or err_cut
         if truncated:

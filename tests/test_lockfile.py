@@ -34,6 +34,36 @@ def test_lock_file_records_holder_pid(settings) -> None:
     assert f"pid={os.getpid()}" in content
 
 
+def test_failed_lock_file_write_does_not_leak_the_reentrancy_depth(settings, monkeypatch) -> None:
+    """写锁文件那一步失败时**不能**把进程内深度留在 1——否则本进程此后再也不抢锁。
+
+    回归：`_hold_depth = 1` 原先写在 `lseek/ftruncate/write` **之前**，而归零只在 `yield`
+    之后。任一步抛错（磁盘满、只读数据目录、EBADF）时，flock 会被外层 `finally: os.close`
+    释放，深度却留在 1 → 此后所有 `single_flight` 都命中「重入」旁路，两个进程可以同时写同一个库。
+    """
+    import fissue.lockfile as lock_mod
+
+    real_write = os.write
+    calls = {"n": 0}
+
+    def flaky_write(fd, data):  # noqa: ANN001, ANN202
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(28, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", flaky_write)
+    with pytest.raises(OSError), single_flight(settings, action="测试"):
+        pass
+
+    assert lock_mod._hold_depth == 0, "失败路径不能把进程内重入深度留在 1"
+
+    # 而且下一次要**真的重新拿锁**（重入旁路不会写锁文件）
+    _lock_path(settings).write_text("", encoding="utf-8")
+    with single_flight(settings, action="再来一次"):
+        assert f"pid={os.getpid()}" in _lock_path(settings).read_text(encoding="utf-8")
+
+
 def test_lock_is_refused_when_another_process_holds_it(settings) -> None:
     """真·跨进程：别的进程持锁时，本进程**立即报错**（不排队、不静默等待）。
 

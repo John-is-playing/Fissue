@@ -85,7 +85,16 @@
 - **分页 `max_pages` 真正生效 + 截断可传播**：`page` 原先只在 page 风格里自增，link 风格下这道上限形同虚设（服务端一直给同一页就无限重复请求）；page 风格到顶是静默截断，`fetcher` 照推游标 → 被截掉的那批永久落在增量窗口外。现在统一计数、到顶记 `pagination_truncated`，`fetcher` 据此判「数据不完整 → 不推进游标」
 - **flush 的抢占保护**：claim 之后的「落库/收尾」段原先没有异常保护（`try` 只包住 handler），异常一抛行就停在 `running`——而 `should_flush` 看不见 `running`（只认 done/pending），该队列再也 flush 不了；现在异常路径立即归还抢占，且**超龄抢占在判定之前就回收**（不再依赖 `should_flush` 为真）
 - **周期通知按日去重**：`扫描完成` / `巡检日报` / `预算告警` 的标题是常量，而去重键只由「事件+条目+标题」组成 → 键永远相同 → 第一次之后每轮都被判「已发过」静默丢弃
-- **用量记到仓库名下 + 预算守卫接线**：记账原先取 `purpose.split(":")[0]` 当仓库（那取到的是用途本身），于是每行 `repo_key` 都是空串、per-repo 每日预算恒读 ~0、`except BudgetExceeded` 成了死代码；现在 purpose 形如 `evaluate:<仓库>` 并据此归属，daemon / CLI 的评测·验证·修复按仓库切换守卫。顺带删掉清单型验证器的重复记账（同一批 token 记两遍）
+- **转发组件的执行点开始校验请求**：`Executor` 原先对请求里的 `mounts` / `user` / `network` / `read_only_root` **一个都不看**——任何连得上 socket 的进程（0600，即同 uid）都能让容器拿到任意宿主目录的 rw 挂载，而 `req.files` 还会被直接写进那个宿主目录。现在：挂载源必须在允许的根之下（默认临时目录，`FISSUE_SANDBOX_MOUNT_ROOTS` 可放宽）、目标必须落在 workdir 内，隔离参数与资源上限一律以服务端配置为准
+- **`single_flight` 的重入深度不再泄漏**：`_hold_depth = 1` 原先写在写锁文件（`lseek/ftruncate/write`）**之前**，任一步抛错（磁盘满、只读数据目录）就会把深度留在 1——此后本进程所有 `single_flight` 都走「重入」旁路、**再也不抢锁**，两个进程可以同时写同一个库
+- **`.env` 登记会让 TLS 上下文缓存失效**：`build_ssl_context` 用 `lru_cache`，输入却是「进程环境 + .env 登记表」；不失效的话先前建好的那份一直生效，后一次登记的显式 CA **既不生效也不报错**（与模块「绝不静默回退」的承诺矛盾）
+- **local 沙盒超时回收整棵进程树**：原先只 kill 直接子进程（`sh -lc …`），命令自己起的子孙进程继续持有管道写端 → 读线程永久阻塞在 `read()` 上，`_spawn` 永不返回（表现为 `fissue verify` 卡死），孤儿进程还占着资源；现在整组 kill + 读线程**有界等待**，收不了工就认输并标记截断
+- **导出与 API 的 `comments` 改成真数**：`list_items` 不加载评论（`with_comments=False`），而 `item_to_dict` 直接取 `len(item.comments)` → 列表与导出里恒为 0，详情页却有真数——同一字段两个口径。现在列表/导出走一条聚合计数
+- **Gitee 的条目级打标签不再撞那条实测恒 400 的端点**：`POST /issues/{n}/labels` 在 AtomGit 上 JSON 与表单两种体都返 `Request body parsing error`，而 Gitee 与其同属 v5 却没测过。现在加能力位：先试直连，失败自动落到「PATCH 条目 + 逗号分隔的 labels 并集」（读改写，避免抹掉维护者原有标签）
+- **SQLite 真的开外键强制**：该 pragma 是**按连接**生效的，此前没开 → 表里 6 条 `ondelete="CASCADE"` 与所有外键在本地库上形同虚设（插得进悬空引用、删父行不级联）。开上之后立刻抓出一处测试自造 `verifier_id` 的旧捷径
+- **`usage_today` 改成自然日**（UTC）：窗口原先是滚动 24 小时，于是「今日用量」在午夜不归零、还带着昨天后半段——而配置叫 `daily_*`、报告写「今日用量」。per-repo 每日预算现在在 UTC 午夜归零
+- **未知配置键会被响亮指出**：pydantic 默认静默忽略多余键，把 `api.auth_required` 写成 `api.auth_requird`、`web.read_only` 写成 `web.readonly` 都不报错也不提示，而它们是**安全开关**。现在逐个记 WARNING 并给「你是不是想写 X」（老配置里的残留键仍不报错——这是既有契约）
+- **Web 的非法枚举查询参数返回 400**：原先 `ItemStatus("nope")` 在处理函数里抛 `ValueError` 被兜成 500，调用方看不出是自己参数写错；现在 400 并列出可选值
 
 ### 文档
 

@@ -77,11 +77,15 @@ def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterat
                 f"锁文件：{path}。同一时刻只允许一个会写仓库的进程——"
                 "请等它结束，或先停掉常驻服务（fissue daemon）。"
             ) from exc
-        _hold_depth = 1
         # 把持有者写进锁文件：拿不到锁的人由此能看到「是谁在跑」，便于判断。
         os.lseek(handle, 0, os.SEEK_SET)
         os.ftruncate(handle, 0)
         os.write(handle, f"pid={os.getpid()}\n".encode())
+        # `_hold_depth` 必须在**可能抛异常的那几步之后**才置 1，归零仍放在 yield 之后。
+        # 否则 `lseek/ftruncate/write` 任一步抛错（磁盘满、只读数据目录、EBADF）时：flock 被
+        # 外层 `finally: os.close` 释放，而进程内深度留在 1 → 此后本进程**所有** `single_flight`
+        # 都命中「重入」旁路，再也不抢锁——于是两个进程可以同时写同一个库。
+        _hold_depth = 1
         try:
             yield
         finally:

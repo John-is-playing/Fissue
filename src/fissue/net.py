@@ -54,6 +54,10 @@ def register_env_file_values(values: dict[str, str]) -> None:
     """登记 .env 里的值（``load_settings`` 读取 .env 后调用）。"""
     _env_file_values.clear()
     _env_file_values.update(values)
+    # 同时必须让 TLS 上下文的缓存失效：`build_ssl_context` 的输入是「进程环境 + 这份登记表」，
+    # 而它用 `lru_cache` 只按「无参数」缓存。不失效的话，先建好的上下文会一直端回来——后一次
+    # 登记的显式 CA **既不生效也不报错**，与模块头部「显式指定的 CA 不可用绝不静默回退」相矛盾。
+    build_ssl_context.cache_clear()
 
 
 def _lookup(name: str) -> str | None:

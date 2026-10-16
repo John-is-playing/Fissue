@@ -199,6 +199,24 @@ def test_missing_ca_bundle_fails_fast_instead_of_falling_back(tmp_path, monkeypa
         build_ssl_context()
 
 
+def test_registering_a_new_env_file_invalidates_the_tls_cache(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """登记新的 .env 值必须让 TLS 上下文缓存失效——否则显式 CA 会被前一次缓存顶掉、还不报错。
+
+    回归：`build_ssl_context` 用 `lru_cache(maxsize=1)`，而它的输入是「进程环境 + 登记表」；
+    `register_env_file_values` 只换登记表、不清缓存，于是先建好的那份一直生效——后一次登记的
+    显式 CA **既不生效也不报错**，与模块开头「显式指定的 CA 不可用绝不静默回退」直接矛盾。
+    """
+    from fissue.errors import ConfigError
+
+    net.register_env_file_values({})                # 第一次：没有 CA → 系统信任库 / certifi
+    assert build_ssl_context() is not False         # 真建一次，把缓存填上
+
+    # 登记一个**不可用**的显式 CA：按模块承诺必须直接报错，而不是把缓存里那份端回来
+    net.register_env_file_values({ENV_CA_BUNDLE: str(tmp_path / "nope.pem")})
+    with pytest.raises(ConfigError):
+        build_ssl_context()
+
+
 def test_invalid_ca_bundle_content_fails_fast(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """CA 文件内容非法（不是 PEM）时同样报错，不回退——理由同上。"""
     from fissue.errors import ConfigError

@@ -167,6 +167,52 @@ class Executor:
         self.cfg = cfg
         self.runtime = DockerRuntime(cfg)
 
+    #: 允许被挂进容器的宿主目录根（逗号分隔可覆盖）。默认只放临时目录——工作副本正是
+    #: `tempfile.mkdtemp` 建的（见 `workspace.RepoWorkspace.clone`）。
+    MOUNT_ROOTS_ENV = "FISSUE_SANDBOX_MOUNT_ROOTS"
+
+    def _allowed_mount_roots(self) -> list[Path]:
+        raw = os.environ.get(self.MOUNT_ROOTS_ENV, "")
+        roots = [Path(p).expanduser().resolve() for p in raw.split(",") if p.strip()]
+        return roots or [Path(tempfile.gettempdir()).resolve()]
+
+    def _reject_reason(self, req: ExecRequest, mounts: list[MountSpec]) -> str | None:
+        """校验请求里的隔离参数；返回拒绝原因（``None`` = 放行）。
+
+        为什么需要：`Executor` 是文档承诺的「隔离执行点」，但它原先对请求里的 `mounts` /
+        `user` / `network` / `read_only_root` **一个都不看**——任何连得上 socket 的进程
+        （socket 是 0600，即同 uid）都能让容器拿到任意宿主目录的 rw 挂载，而且 `req.files`
+        还会被 `write_text` **直接写进那个宿主目录**。
+
+        同 uid 之间本来就没有权限边界，所以这不是权限隔离，而是**防误用、防被生成代码利用**
+        的补刀：
+
+        1. 挂载源必须是**已存在的目录**，且落在允许的根之下（默认临时目录，可用
+           ``FISSUE_SANDBOX_MOUNT_ROOTS`` 放宽），不接受符号链接与 ``/``；
+        2. 挂载目标必须落在 ``workdir`` 之内；
+        3. `user` / `network` / `read_only_root` / 资源上限一律以**服务端配置**为准，请求
+           无权把隔离关掉或把限额放大。
+        """
+        roots = self._allowed_mount_roots()
+        workdir = Path(req.workdir)
+        for m in mounts:
+            src = Path(m.source)
+            # 源可以是**目录**（工作区）也可以是**文件**（例如 `.git/index`：整块 `.git` 只读时
+            # 单独把它挂成可写，好让容器里的 `git status` 照常刷新索引）。
+            if not m.source or src.is_symlink() or not src.exists():
+                return f"拒绝挂载 {m.source!r}：挂载源必须存在（且不能是符号链接）"
+            real = src.resolve()
+            if not any(real.is_relative_to(root) for root in roots):
+                return (
+                    f"拒绝挂载 {m.source!r}：不在允许的根之下（"
+                    + "、".join(str(r) for r in roots)
+                    + f"）；确需放宽请设 {self.MOUNT_ROOTS_ENV}"
+                )
+            target = Path(m.target)
+            if target != workdir and not target.is_relative_to(workdir):
+                return f"拒绝挂载 {m.target!r}：目标必须落在 workdir（{req.workdir}）之内"
+        return None
+
     def execute(self, req: ExecRequest, *, workspace: str | None = None) -> ExecResult:
         """同步执行（转发服务在线程中调用）。
 
@@ -177,6 +223,10 @@ class Executor:
         """
         start = time.monotonic()
         mounts = list(req.mounts)
+        bad = self._reject_reason(req, mounts)
+        if bad is not None:
+            log.warning("拒绝执行请求（%s）：%s", req.label or "-", bad)
+            return ExecResult(ok=False, error=bad, duration_seconds=round(time.monotonic() - start, 3))
         bound = next((m for m in mounts if m.target.rstrip("/") == req.workdir.rstrip("/")), None)
 
         work: Workspace | None = None
@@ -215,13 +265,18 @@ class Executor:
                 workdir=req.workdir,
                 mounts=mounts,
                 env=req.env,
-                network=req.network or self.cfg.network,
-                cpus=req.cpus or self.cfg.limits.cpus,
-                memory_mb=req.memory_mb or self.cfg.limits.memory_mb,
-                pids=req.pids or self.cfg.limits.pids,
+                # 隔离参数（网络、只读根、用户）与资源上限一律取**服务端配置**：请求无权关掉
+                # 隔离或放大限额（见 _reject_reason）。超时仍由请求决定——那是功能性的
+                # （回归门要 900s，验证器只要 600s）。
+                network=self.cfg.network,
+                cpus=min(req.cpus or self.cfg.limits.cpus, self.cfg.limits.cpus),
+                memory_mb=min(
+                    req.memory_mb or self.cfg.limits.memory_mb, self.cfg.limits.memory_mb
+                ),
+                pids=min(req.pids or self.cfg.limits.pids, self.cfg.limits.pids),
                 timeout_seconds=req.timeout_seconds or self.cfg.limits.timeout_seconds,
-                read_only_root=req.read_only_root,
-                user=req.user or self.cfg.user,
+                read_only_root=self.cfg.read_only_root,
+                user=self.cfg.user,
                 label=req.label,
             )
             result.duration_seconds = round(time.monotonic() - start, 3)
