@@ -1942,6 +1942,109 @@ async def test_never_writing_exploration_is_bounded(settings, workspace, sample_
     assert attempt.outcome is FixOutcome.FAILED
 
 
+async def test_write_of_invalid_python_is_rejected(settings, workspace, sample_issue) -> None:
+    """把 `.py` 写成非法 Python → 拒绝该文件、不落盘，并把语法错误（行号 + 出错处）回给模型。
+
+    回归（Fissue #1 真跑）：模型把 `src/fissue/web/hooks.py` 整个换成了 `/*placeholder*/`，于是
+    `app.py` 导入即 SyntaxError、验证器 5 次全败、12 轮耗尽——现有护栏（锁定文件、保护路径、单文件
+    大小、改动文件数、diff 行数）都没拦住，因为「300 行删除」本身不超标。
+    """
+    workspace.write("app.py", "x = 1\n")
+    steps = [
+        {"action": "write", "files": {"app.py": "/*placeholder*/"}},
+        {"action": "give_up", "reason": "改不动"},
+    ]
+    agent, llm, runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=2
+    )
+
+    assert workspace.read("app.py") == "x = 1\n", "被拒的文件绝不能落盘"
+    assert "app.py" not in trace.written_files
+    assert any("不是合法 Python" in r for r in trace.rejected), trace.rejected
+    prompt = str(llm.history[1])
+    assert "不是合法 Python" in prompt, "拒绝理由要回给模型"
+    assert "placeholder" in prompt, "要带出错处，模型才定位得到"
+    assert runner.runs == 0, "什么都没写进去，不该跑验证器"
+
+
+async def test_partial_write_rejection_is_reported_to_the_model(
+    settings, workspace, sample_issue
+) -> None:
+    """同批里坏文件被拒、好文件照常落盘——但**必须告诉模型**（否则它会去查验证器）。
+
+    实测（Fissue #1）：它把 `hooks.py` 写成占位符、同时把 `app.py` 的导入改好，接着 5 轮都在查
+    「验证器为什么不过」，从没回头看那个被写坏的文件。
+    """
+    from fissue.models import VerifierOutcome
+
+    steps = [
+        {"action": "write", "files": {"good.py": "y = 2\n", "bad.py": "def broken(:\n"}},
+        {"action": "give_up", "reason": "停"},
+    ]
+    # 验证器打桩成失败 → 循环继续，才有第二轮提示词可断言
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(VerifierOutcome.FAIL))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=2
+    )
+
+    assert "good.py" in trace.written_files and "bad.py" not in trace.written_files
+    prompt = str(llm.history[1])
+    assert "bad.py" in prompt and "有文件没有被写入" in prompt, prompt[-500:]
+
+
+async def test_fragment_edit_that_breaks_syntax_is_rejected(
+    settings, workspace, sample_issue
+) -> None:
+    """片段替换如果把文件弄成非法 Python，同样拒绝（自检看的是**最终内容**）。
+
+    注意别把「语法错」写错：`return` 后面什么都不写是**合法**的（返回 None），所以要拿括号没闭合
+    这种来测。
+    """
+    workspace.write("app.py", "def f():\n    return 1\n")
+    steps = [
+        {"action": "write", "files": {"app.py": {"find": "    return 1", "replace": "    return (1"}}},
+        {"action": "give_up", "reason": "改不动"},
+    ]
+    agent, _llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=2
+    )
+
+    assert workspace.read("app.py") == "def f():\n    return 1\n", "非法结果不能落盘"
+    assert any("不是合法 Python" in r for r in trace.rejected), trace.rejected
+
+
+async def test_syntax_check_only_applies_to_python(settings, workspace, sample_issue) -> None:
+    """非 `.py` 文件不做语法自检（写成什么样都放行）。"""
+    steps = [{"action": "write", "files": {"notes.md": "/*placeholder*/\n不是 Python 也行\n"}}]
+    agent, _llm, runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=1
+    )
+
+    assert "notes.md" in trace.written_files, trace.rejected
+    assert trace.rejected == []
+
+
+async def test_syntax_check_can_be_disabled(settings, workspace, sample_issue) -> None:
+    """`auto_fix.syntax_check=false` → 回到旧行为（真有仓库需要故意写非法 Python 时用）。"""
+    settings.auto_fix.syntax_check = False
+    steps = [{"action": "write", "files": {"broken.py": "/*placeholder*/"}}]
+    agent, _llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=1
+    )
+
+    assert "broken.py" in trace.written_files, trace.rejected
+    assert trace.rejected == []
+
+
 async def test_barren_streak_resets_after_a_write(settings, workspace, sample_issue) -> None:
     """对照：中途真的写了文件就不算空转（别把正常的多轮阅读误判成空转）。"""
     from fissue.models import VerifierOutcome

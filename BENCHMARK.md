@@ -1525,3 +1525,37 @@ issue #1**（webhook 按动作过滤 + 投递去重）。原始凭据在设备�
 **验证**：`tests/test_fixer.py` 改 3 条（b5 的空转用例改为报「从未动笔」、b4 的读去重改为「拒绝」、
 pipekit 那条改为只测空转闸门）+ 新增 1 条（一直不动笔的探查要被兜住）；全量 759 passed；
 ruff 与 mypy 双绿。
+
+### 4.30 写入语法自检：Python 文件必须先是 Python（v1.0.0-b9）（2026-10-17）
+
+**由来**（真跑 Fissue #1 第五次尝试）。这一轮**失败类型升级了**：它不再只读不写——验证器被执行了
+5 次（只有 write / run 才会触发），12 轮耗尽，报的是「达到最大轮次仍未通过验证器」。翻设备上
+`verifier_runs` 存的 stdout，根因一眼就出来了：
+
+```text
+/workspace/src/fissue/web/hooks.py line 1
+  /*placeholder*/
+SyntaxError: invalid syntax
+```
+
+模型把 `hooks.py` **整个换成了 `/*placeholder*/`**，同时把 `app.py:35` 改成
+`from .hooks import DeliveryLog, action_triggers, delivery_id, parse_event, signature_ok`
+——那三个名字我们的仓库里根本不存在（全库 grep 零命中），`/*placeholder*/` 也不在仓库、更不在
+验证器生成的测试文件里：**是模型自己写进去的**。它显然在按一个不错的设计走（`delivery_id()` 取
+投递头、`action_triggers()` 动作表、`DeliveryLog` 去重账本），但**先把调用方改好、再把实现文件替换
+成占位符就再没回去写**。
+
+**为什么现有护栏没拦住**：拦的是锁定文件、保护路径、单文件大小、改动文件数、**diff 行数**——而
+「300 行 → 15 字符」只有 300 行删除，`max_diff_lines: 800` 一路放行。**没有一道检查「你写出来的
+Python 还能不能被解析」**。
+
+**改法**（`auto_fix.syntax_check`，默认开；真有仓库需要故意写非法 Python 时可关）：
+
+* 落盘前对 `.py` / `.pyi` 用内置 `compile()` 自检；不合法就**拒绝该文件**（不落盘），并把
+  **行号 + 出错处**回给模型（「第 1 行：invalid syntax，出错处 `/*placeholder*/`」）。
+* 关键补充：**被拒的文件必须让模型知道，哪怕同批里别的文件写成功了**——否则它会以为这一轮全写
+  进去了，然后把验证器的报错归咎于验证器（实测正是如此：它改好了 `app.py` 的导入，接着 5 轮都在查
+  「验证器为什么不过」）。
+
+**验证**：`tests/test_fixer.py` 新增 5 条（非法 Python 被拒且理由带出错处、部分被拒要回给模型、
+片段替换致非法同样被拒、非 `.py` 不管、开关可关）；全量 764 passed；ruff 与 mypy 双绿。

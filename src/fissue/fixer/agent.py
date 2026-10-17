@@ -276,15 +276,27 @@ class FixAgent:
                 if not isinstance(files, dict) or not files:
                     trace.note("write 动作未提供 files")
                     continue
+                rejected_before = len(trace.rejected)
                 written, err = self._apply_writes(workspace, files, locked=locked, trace=trace)
+                # 被拒的文件**必须让模型知道**，哪怕同一批里别的文件写成功了——否则它以为这一轮
+                # 全写进去了，然后把验证器的报错归咎于验证器。实测（Fissue #1）：它把 hooks.py 写成
+                # 占位符、同时改好了 app.py 的导入，接着 5 轮都在查「验证器为什么不过」。
+                new_rejections = trace.rejected[rejected_before:]
                 if err:
-                    last_output = f"写入被拒绝：{err}"
+                    last_output = "写入被拒绝：\n" + "\n".join(new_rejections[-5:] or [err])
                     continue
                 trace.written_files.extend(written)
                 # 写完立刻跑一次验证器；**通过即收工**，不必等模型再回 done
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
+                if new_rejections:
+                    last_output = (
+                        "注意：这一轮**有文件没有被写入**（见下）。先把它们改对，再谈验证器：\n"
+                        + "\n".join(f"- {r}" for r in new_rejections[-5:])
+                        + "\n\n"
+                        + (last_output or "")
+                    )
                 finished, last_output = self._after_verifier_run(
                     attempt, trace, workspace, round_index, last_output
                 )
@@ -420,6 +432,38 @@ class FixAgent:
         trace.note(f"    {path}: 片段替换 {len(edits)} 处")
         return text, None
 
+    #: 需要做语法自检的后缀。
+    _SYNTAX_SUFFIXES = (".py", ".pyi")
+
+    def _check_syntax(self, path: str, content: str) -> str | None:
+        """对 Python 文件做一次语法自检；不合法就返回给模型看的理由（``None`` = 通过）。
+
+        用内置 ``compile`` 而不是 ``ast.parse``：同样抛 ``SyntaxError``，但不用引新依赖，而且
+        报出来的 ``lineno`` / ``msg`` / ``text`` 正好是给模型最好的提示。
+
+        为什么要有这一道：实测（Fissue #1）模型把 `hooks.py` 整个换成了 `/*placeholder*/`，于是
+        `app.py` 导入即 SyntaxError、验证器 5 次全败、12 轮耗尽——而现有护栏（锁定文件、保护路径、
+        单文件大小、改动文件数、diff 行数）一路放行，因为「300 行删除」本身没超标 ✗。这不是靠
+        枚举占位符形态能解决的，守住「Python 文件必须先是 Python」这条底线才管用。
+        """
+        if not getattr(self.cfg, "syntax_check", True):
+            return None
+        if not path.lower().endswith(self._SYNTAX_SUFFIXES):
+            return None
+        try:
+            compile(content, path, "exec")
+        except SyntaxError as exc:
+            where = f"第 {exc.lineno} 行" if exc.lineno else "未知位置"
+            detail = (exc.text or "").strip()[:80]
+            return (
+                f"{path}: 写出来的内容不是合法 Python（{where}：{exc.msg}）"
+                + (f"，出错处：{detail!r}" if detail else "")
+                + "。请给出完整可解析的内容——别用占位符，也别把文件写空。"
+            )
+        except ValueError as exc:               # 例如内容里带 NUL 字节
+            return f"{path}: 写出来的内容无法解析（{exc}）"
+        return None
+
     def _apply_writes(
         self,
         workspace: RepoWorkspace,
@@ -458,6 +502,12 @@ class FixAgent:
             # 3) 单文件过大
             if len(content) > 1_000_000:
                 trace.rejected.append(f"{path}: 文件过大（{len(content)} 字符）")
+                continue
+
+            # 4) 语法自检：写出来的 `.py` 必须还是合法 Python（见 `_check_syntax`）
+            syntax_err = self._check_syntax(path, content)
+            if syntax_err is not None:
+                trace.rejected.append(syntax_err)
                 continue
 
             try:

@@ -197,6 +197,11 @@ auto_fix:
   review_model: ""                    # 留空 = 用全局 llm.model；建议换一个模型（第二意见）
   # 是否允许 Agent 改动仓库文件；设 false 则只出补丁、不动工作区
   allow_file_write: true
+  # 写入时对 Python 文件做语法自检：落盘前 compile() 一次，不合法就拒绝该文件并把「行号 + 出错处」
+  # 回给模型。实测里模型把 hooks.py 整个换成了 /*placeholder*/，于是 app.py 导入即 SyntaxError、
+  # 验证器 5 次全败、12 轮耗尽——而 300 行删除并不超 diff 上限，别的护栏都拦不住。真有仓库需要
+  # 故意写非法 Python（比如夹具）时可关掉。
+  syntax_check: true
   # 允许修改的文件范围（glob），敏感文件默认排除
   protected_paths: [".github/**", ".gitlab/**", "LICENSE", "**/*.lock"]
   max_changed_files: 20
