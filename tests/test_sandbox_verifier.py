@@ -749,6 +749,22 @@ def test_verifier_prompt_requires_regression_naming_convention(sample_issue) -> 
     assert "必须通过" in text                  # 说清「在未修复代码上必须通过」
 
 
+def test_verifier_prompt_states_the_sandbox_environment(sample_issue) -> None:
+    """提示词必须写清**沙盒环境事实**——这是「回归断言自相矛盾」的真实根因。
+
+    真跑（Fissue #1）实测：连续两轮的验证器都在沙盒里指望宿主配置（`load_settings()`），
+    而工作区只是**仓库快照**——没有 `config.yaml`、没有 `.env`、没有已登记仓库 → 白名单为空
+    → 路由回 `accepted=False` → 「opened 仍会触发一轮」这条**回归断言**必然失败，两轮同因。
+    """
+    from fissue.ai import prompts
+
+    text = prompts.verifier_prompt(sample_issue, repo_context="(repo)")[1]["content"]
+
+    assert "config.yaml" in text and "没有" in text     # 沙盒里没有宿主配置
+    assert "RepoConfig" in text and "overrides" in text  # 自造配置的两条路
+    assert "打桩" in text                                # 副作用要打桩，别真跑
+
+
 # ---------------------------------------------------------------------------
 # C：自称「回归断言」却在未修复代码上失败 → 自相矛盾，必须拦下
 #
@@ -785,6 +801,10 @@ def test_regression_conflict_flagged_on_real_pipekit_case() -> None:
     assert "test_regression_standard_drop_behavior" in got
     # 必须点明「不要为了让它通过去改被测代码」——否则模型可能反过来改库
     assert "不要为了让它通过去改被测代码" in got
+    # 反馈还必须**先指向夹具**：真跑（Fissue #1）两轮都是夹具不自洽（沙盒里没有宿主配置），
+    # 只说「改正期望值」的话，模型会照着改期望值、换文件名，然后撞同一个坑
+    assert "夹具" in got
+    assert "config.yaml" in got
 
 
 def test_regression_conflict_none_when_only_target_tests_fail() -> None:
