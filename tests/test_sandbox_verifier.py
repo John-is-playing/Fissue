@@ -224,8 +224,25 @@ def test_local_timeout_kills_the_whole_process_group(tmp_path) -> None:
 
     import os as _os
 
-    with pytest.raises(ProcessLookupError):
-        _os.kill(child, 0)                    # 子孙进程也应当一起没了
+    def _proc_state(pid: int) -> str:
+        """读 ``/proc/<pid>/stat`` 的状态字符；读不到（已回收，或无 /proc 的平台）返回 ""。"""
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError:
+            return ""
+        # comm 里可能有空格和括号 → 从**最后一个** ')' 之后取状态字符
+        return raw.rsplit(")", 1)[-1].split()[0] if ")" in raw else ""
+
+    # 判「不在运行」，而不是判「这个 pid 查不到」：被 SIGKILL 掉的孤儿如果在容器里
+    # 没人回收，会以**僵尸（Z）**长期留在进程表里，而 `os.kill(pid, 0)` 对僵尸仍然成功
+    # ——照旧写法这条用例在容器里必失败（本机有 init 及时收尸，所以本机看不出来）。
+    state = _proc_state(child)
+    if state:
+        assert state == "Z", f"子孙进程仍在运行（state={state}），进程组没被整棵回收"
+    else:
+        with pytest.raises(ProcessLookupError):
+            _os.kill(child, 0)                # 已彻底回收：这个 pid 也应当查不到了
 
 
 def test_collect_gives_up_instead_of_blocking_forever() -> None:

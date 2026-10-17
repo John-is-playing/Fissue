@@ -1313,3 +1313,20 @@ HEAD 上全部失败**（12 选中、12 全灭），即它们真的守得住这�
 **验证**：`tests/test_web.py` 新增 10 条 + `tests/test_config_models.py` 新增 1 条；全量 **740
 passed**；ruff 与 mypy 双绿（71 个源文件）；这 **11 条新用例在未修改的 HEAD 上全部失败**
 （3 failed + 8 errors，0 passed）。
+
+### 4.21 修掉守望在容器里的假失败（自维护的前置）（2026-10-17）
+
+**现象**：`test_local_timeout_kills_the_whole_process_group` 在本机全绿，在**容器里**必失败
+（`DID NOT RAISE ProcessLookupError`）。后果不只是「一条用例红」：任何「在沙盒里跑本仓库测试」
+的路径都会被它带红，**回归门于是把 base 判成失败**，自维护直接卡住。
+
+**根因（不是产品缺陷）**：`_kill_tree` 确实把整棵进程树杀了，但被 SIGKILL 掉的**孤儿**在容器里
+没人回收时会以**僵尸**长期留在进程表里，而 `os.kill(pid, 0)` 对僵尸**仍然成功**——旧断言
+「这个 pid 应当查不到」于是恒不成立。本机有 init 及时收尸，所以本机看不出来。
+
+**改法**：断言改成看**状态**（读 `/proc/<pid>/stat`，`Z` 即视为已回收；无 `/proc` 的平台退回旧
+判据），注释里写明为什么不能只看 pid 是否存在。
+
+**顺带**：把 `docker/self/Dockerfile` 收进仓库（此前只给过文本、设备上是手建的）。它给「依赖不轻
+的仓库」用的沙盒镜像装齐运行时 + dev 依赖（`respx` 等），并**刻意不装项目自身**——靠
+`PYTHONPATH=/workspace/src` 让 `import` 命中挂载进来的源码，免得验证器测到镜像里的旧副本。
