@@ -197,6 +197,138 @@ def test_webhook_fails_closed_when_the_secret_is_missing(hook_client, settings) 
     assert hook_client.rounds == []
 
 
+# ---------------------------------------------------------------------------
+# issue #1：动作过滤 + 投递去重
+# ---------------------------------------------------------------------------
+
+
+def _github_headers_with_delivery(secret: str, body: bytes, delivery: str) -> dict[str, str]:
+    headers = _github_headers(secret, body)
+    headers["X-GitHub-Delivery"] = delivery
+    return headers
+
+
+def _github_body(action: str, number: int = 42) -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "action": action,
+            "repository": {"full_name": "psf/requests"},
+            "issue": {"number": number},
+        }
+    ).encode()
+
+
+def test_webhook_ignores_actions_that_do_not_change_the_item(hook_client) -> None:
+    """`closed` / `labeled` 这类只动外围状态的动作**不触发整轮**（issue #1 的一半）。
+
+    为什么必须拦：一次批量打标签能在几秒内灌进几十个事件，而一个事件一轮的代价（LLM + 沙盒）
+    远高于开着轮询。注意本用例**不**改 `parse_event` 的契约——`usable` 仍是「解析得出来」。
+    """
+    for action in ("closed", "labeled", "assigned", "unassigned"):
+        body = _github_body(action)
+        r = hook_client.post(
+            "/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body)
+        )
+        assert r.status_code == 202, r.text
+        assert r.json()["accepted"] is False, r.json()
+    assert hook_client.rounds == [], "只动外围状态的动作不该触发任何一轮"
+
+
+def test_webhook_still_triggers_for_content_changing_actions(hook_client) -> None:
+    """对照：`reopened` / `synchronize` 这类会改内容的动作照常触发一轮。"""
+    body = _github_body("reopened")
+    r = hook_client.post(
+        "/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body)
+    )
+    assert r.status_code == 202 and r.json()["accepted"] is True, r.json()
+    assert hook_client.rounds == ["round"]
+
+
+def test_webhook_deduplicates_the_same_delivery_id(hook_client) -> None:
+    """同一个 delivery id 重推**只处理一次**（issue #1 的另一半）。
+
+    平台在超时/失败时会原样重推；不判重的话一次重推就是一轮真金白银。
+    """
+    body = _github_payload()
+    headers = _github_headers_with_delivery("hook-secret", body, "delivery-1")
+
+    first = hook_client.post("/api/v1/webhooks/github", content=body, headers=headers)
+    second = hook_client.post("/api/v1/webhooks/github", content=body, headers=headers)
+
+    assert first.status_code == 202 and first.json()["accepted"] is True, first.json()
+    assert second.status_code == 202 and second.json()["accepted"] is False, second.json()
+    assert "重复投递" in second.json()["reason"]
+    assert hook_client.rounds == ["round"], "重推不该再排一轮"
+
+
+def test_webhook_dedup_is_per_app_not_a_module_global(settings, repo, monkeypatch) -> None:
+    """幂等账本是**每 app 一份**：换一个新的 app，同一个 delivery id 应当被当作新投递。
+
+    回归（评审点名的那条）：上一版把账本放在模块级全局、用 `id(settings)` 当键——地址会被回收
+    复用，新 app 会继承旧 app 的状态。这里用「两个 app 各自处理同一条投递」把它钉住。
+    """
+    from fastapi.testclient import TestClient
+
+    from fissue.service.daemon import FissueService
+    from fissue.web.app import create_app
+
+    settings.webhooks.enabled = True
+    settings.webhooks.secrets.github = "hook-secret"
+
+    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+        return {}
+
+    monkeypatch.setattr(FissueService, "run_once", fake_round)
+    body = _github_payload()
+    headers = _github_headers_with_delivery("hook-secret", body, "delivery-same")
+
+    with TestClient(create_app(settings)) as c1:
+        first = c1.post("/api/v1/webhooks/github", content=body, headers=headers)
+        assert first.json()["accepted"] is True, first.json()
+
+    with TestClient(create_app(settings)) as c2:
+        second = c2.post("/api/v1/webhooks/github", content=body, headers=headers)
+        assert second.json()["accepted"] is True, "新 app 不该继承旧 app 的投递记忆"
+
+
+async def test_delivery_ledger_claim_confirm_rollback() -> None:
+    """账本语义：处理中拒、确认后 TTL 内拒、**回滚后放行**（否则事件永远丢了）。"""
+    from fissue.web.delivery import DeliveryLedger
+
+    led = DeliveryLedger(ttl_seconds=60.0, max_entries=4)
+
+    assert await led.claim("") is True, "平台没给标识 → 不做去重"
+    assert await led.claim("k") is True
+    assert await led.claim("k") is False, "处理中就该算重复"
+    await led.rollback("k")
+    assert await led.claim("k") is True, "失败回滚后，平台的重推要能进来"
+
+    await led.confirm("k")
+    assert await led.claim("k") is False, "确认过 → TTL 内继续拒"
+    assert await led.claim("other") is True
+
+
+async def test_delivery_ledger_expires_and_stays_bounded(monkeypatch) -> None:
+    """过了 TTL 可以再处理；`seen` 有上限，灌多了丢最旧的（不会无界增长）。"""
+    from fissue.web import delivery as delivery_mod
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(delivery_mod.time, "monotonic", lambda: clock["now"])
+    led = delivery_mod.DeliveryLedger(ttl_seconds=10.0, max_entries=4)
+
+    assert await led.claim("k") is True
+    await led.confirm("k")
+    assert await led.claim("k") is False
+    clock["now"] += 11.0
+    assert await led.claim("k") is True, "过了 TTL 就该放行（窗口不是永久的）"
+
+    for i in range(10):
+        await led.confirm(f"k{i}")
+    assert len(led._seen) <= 4, "seen 必须有上限"
+
+
 def test_webhook_accepts_a_github_push_and_schedules_a_round(hook_client) -> None:
     """签名对 + 仓库已登记 → 202 立刻返回，并且**后台确实触发了一轮**。"""
     body = _github_payload()
