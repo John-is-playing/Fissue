@@ -985,6 +985,144 @@ async def test_dry_run_keeps_item_in_fix_queue(fixer_ctx, repo, sample_issue, mo
     assert repo.get_item_row(sample_issue.key).status == ItemStatus.FIX_QUEUED.value
 
 
+def test_fix_agent_prompt_carries_the_regression_feedback(sample_issue) -> None:
+    """回归门失败后重跑时，失败反馈必须摆进提示词（否则模型不知道该修什么）。
+
+    回归（Fissue #1 真跑）：一次修复让自写验证器过了、却破坏了 `parse_event` 的既有契约，
+    回归门拦下后直接收工——而「哪几条既有用例被改坏」正是最好的下一步提示。
+    """
+    from fissue.ai import prompts
+
+    text = prompts.fix_agent_step_prompt(
+        sample_issue,
+        repo_context="ctx",
+        verifier_command="python -m pytest -q",
+        last_test_output=None,
+        round_index=1,
+        max_rounds=12,
+        prior_failure="回归门未通过：失败用例 tests/test_web.py::test_parse_event",
+    )[1]["content"]
+
+    assert "上一轮修复的失败反馈" in text
+    assert "test_parse_event" in text
+    assert "既有用例" in text and "不要改" in text
+
+
+async def test_agent_puts_the_prior_failure_in_the_prompt(settings, workspace, sample_issue) -> None:
+    """`prior_failure` 必须真的进到模型看得见的那条提示里。"""
+    steps = [{"action": "give_up", "reason": "做不了"}]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    await agent.run(
+        item=sample_issue,
+        workspace=workspace,
+        spec=_SPEC,
+        repo_context="ctx",
+        prior_failure="回归门未通过：失败用例 tests/test_web.py::test_parse_event_handles_the_v5_shapes",
+        max_rounds=1,
+    )
+
+    assert "test_parse_event_handles_the_v5_shapes" in str(llm.history[0])
+    assert "上一轮修复的失败反馈" in str(llm.history[0])
+
+
+async def test_regression_gate_failure_retries_the_agent_with_feedback(
+    fixer_ctx, repo, sample_issue, monkeypatch
+) -> None:
+    """回归门失败 → 带着失败反馈重跑 Agent（默认 1 次）；第二次过了就算修好。
+
+    回归（Fissue #1 真跑）：第一次修复让自写验证器过了、却破坏了既有契约；此前直接
+    `needs_manual` 收工，等于把「再试一次就能改对」的机会扔掉。
+    """
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt, VerifierKind, VerifierResult
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key,
+                         Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key,
+                       VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
+
+    fixer = AutoFixer(fixer_ctx)
+    seen_feedback: list[str | None] = []
+
+    async def fake_clone(repo_cfg, **kwargs):
+        return _FakeWS()
+
+    async def fake_agent_run(**kwargs):
+        seen_feedback.append(kwargs.get("prior_failure"))
+        return FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS), AgentTrace(rounds=1)
+
+    async def fake_verify_fix(ctx_verify, *, verifier_id=None, base_run=None):
+        return VerifierResult(kind=VerifierKind.EXECUTABLE, f2p_satisfied=True, conclusion="ok")
+
+    gate_calls = {"n": 0}
+
+    async def fake_gate(**kwargs):
+        gate_calls["n"] += 1
+        if gate_calls["n"] == 1:
+            return False, "失败用例：tests/test_web.py::test_parse_event_handles_the_v5_shapes"
+        return True, ""
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(fixer.agent, "run", fake_agent_run)
+    monkeypatch.setattr(fixer_ctx.verifier, "verify_fix", fake_verify_fix)
+    monkeypatch.setattr(fixer, "_run_regression_gate", fake_gate)
+    monkeypatch.setattr(fixer.pr_creator, "_save_patch", lambda item, diff: "/tmp/x.patch")
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert gate_calls["n"] == 2, "回归门失败要带着反馈重跑一次"
+    assert len(seen_feedback) == 2
+    assert seen_feedback[0] is None, "第一次不该带反馈"
+    assert seen_feedback[1] is not None and "test_parse_event" in seen_feedback[1]
+    assert attempt.dry_run is True
+
+
+async def test_regression_gate_failure_without_budget_stays_needs_manual(
+    fixer_ctx, repo, sample_issue, monkeypatch
+) -> None:
+    """`regression_retries=0` → 保持旧行为：回归门一失败就 needs_manual，不重跑。"""
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt, VerifierKind, VerifierResult
+
+    fixer_ctx.settings.auto_fix.regression_retries = 0
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key,
+                         Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key,
+                       VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
+
+    fixer = AutoFixer(fixer_ctx)
+    agent_runs = {"n": 0}
+
+    async def fake_clone(repo_cfg, **kwargs):
+        return _FakeWS()
+
+    async def fake_agent_run(**kwargs):
+        agent_runs["n"] += 1
+        return FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS), AgentTrace(rounds=1)
+
+    async def fake_verify_fix(ctx_verify, *, verifier_id=None, base_run=None):
+        return VerifierResult(kind=VerifierKind.EXECUTABLE, f2p_satisfied=True, conclusion="ok")
+
+    async def fake_gate(**kwargs):
+        return False, "失败用例：tests/test_web.py::test_parse_event_handles_the_v5_shapes"
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(fixer.agent, "run", fake_agent_run)
+    monkeypatch.setattr(fixer_ctx.verifier, "verify_fix", fake_verify_fix)
+    monkeypatch.setattr(fixer, "_run_regression_gate", fake_gate)
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert agent_runs["n"] == 1, "余额为 0 时不该重跑"
+    assert attempt.outcome is FixOutcome.NEEDS_MANUAL
+    assert "回归门未通过" in (attempt.error or "")
+
+
 async def test_real_run_after_dry_run_still_finds_candidate(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
     """干跑之后再跑真修，候选仍取得到（端到端口径一致）。"""
     from fissue.fixer.agent import AgentTrace

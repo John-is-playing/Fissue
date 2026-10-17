@@ -114,8 +114,15 @@ class FixAgent:
         repo_context: str,
         verifier_id: int | None = None,
         max_rounds: int | None = None,
+        prior_failure: str | None = None,
     ) -> tuple[FixAttempt, AgentTrace]:
-        """跑 Agent 循环，直到验证器通过或放弃。"""
+        """跑 Agent 循环，直到验证器通过或放弃。
+
+        ``prior_failure``：上一次修复尝试的失败反馈（目前来自**回归门**——「你的改动让这些
+        既有用例失败了」）。它每轮都摆在提示词里：模型得先把它修好，这次修复才算数。
+        为什么要有它：验证器只覆盖这条 issue 自己的行为，模型完全可能「修好了它、却改坏了
+        别处」；实测（Fissue #1）就是这样被回归门拦下的，而失败信息本身就是最好的下一步提示。
+        """
         rounds_limit = max_rounds or self.cfg.agent_max_rounds
         trace = AgentTrace()
         attempt = FixAttempt(item_key=item.key, outcome=FixOutcome.SKIPPED)
@@ -183,6 +190,7 @@ class FixAgent:
                     # 验收标准（验证器自带的测试文件）每轮直接摆在提示最前面：
                     # 实测模型宁可反复读仓库文件、也不主动去读它，那就别让它「想起来」。
                     verifier_files=spec.files,
+                    prior_failure=prior_failure,
                 ),
                 purpose=f"agent:{item.repo}",
                 default={},

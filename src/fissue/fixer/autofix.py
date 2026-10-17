@@ -59,6 +59,19 @@ def _write_patch(path: Path, diff: str) -> None:
     path.write_bytes(data)
 
 
+def _retry_feedback(reason: str) -> str:
+    """把「上一轮修复没过哪道关」写成给 Agent 的反馈。
+
+    必须同时说清两件事：① 上一轮的改动**仍在工作区里**（不是从干净基线重来），所以它要做的
+    是「把已经改过的地方修对」；② 目标是让既有用例重新通过，**不是**去改那些用例。
+    """
+    return (
+        f"上一轮修复没通过最后一道检查：{reason}\n\n"
+        "注意：**上一轮的改动仍在工作区里**（不是从干净基线重来）——请把它改对，"
+        "让上面列出的既有用例重新通过；不要改测试用例或它们的期望值。"
+    )
+
+
 @dataclass
 class FixReport:
     """一批修复的结果。
@@ -446,50 +459,76 @@ class AutoFixer:
             workspace = await self._clone_with_retry(repo_cfg, item)
             repo_context = self._repo_context(workspace, repo_cfg)
 
-            # 1) Agent 循环修复
-            attempt, trace = await self.agent.run(
-                item=item,
-                workspace=workspace,
-                spec=spec,
-                repo_context=repo_context,
-                verifier_id=verifier_id,
-                max_rounds=max_rounds,
-            )
-            # 这里**不再**把 trace.usage 记一次账：Agent 每一轮的调用都已经由
-            # `LLMClient` 的 usage_sink 逐次写进 llm_usage（purpose=`agent@<仓库>`），
-            # 再把整次尝试的累加量写一行 `agent` 等于把同一批 token 记两遍。
-            # 实测：那批汇总行让全表用量虚高 14.6%，而 `llm.budget` 的每日闸门正是
-            # 按这张表算的——虚高会让它在没超预算时提前硬停。
+            # 1) Agent 循环修复。最后两道关（完整 F2P、既有测试回归门）失败时**带着反馈重跑**，
+            #    次数由 `auto_fix.regression_retries` 限定（默认 1，0 = 旧行为）。
+            retries_limit = max(0, int(self.settings.auto_fix.regression_retries))
+            prior_failure: str | None = None
+            for attempt_index in range(retries_limit + 1):
+                attempt, trace = await self.agent.run(
+                    item=item,
+                    workspace=workspace,
+                    spec=spec,
+                    repo_context=repo_context,
+                    verifier_id=verifier_id,
+                    max_rounds=max_rounds,
+                    prior_failure=prior_failure,
+                )
+                # 这里**不再**把 trace.usage 记一次账：Agent 每一轮的调用都已经由
+                # `LLMClient` 的 usage_sink 逐次写进 llm_usage（purpose=`agent@<仓库>`），
+                # 再把整次尝试的累加量写一行 `agent` 等于把同一批 token 记两遍。
+                # 实测：那批汇总行让全表用量虚高 14.6%，而 `llm.budget` 的每日闸门正是
+                # 按这张表算的——虚高会让它在没超预算时提前硬停。
 
-            if attempt.outcome is not FixOutcome.SUCCESS:
-                return await self._handle_failure(item, attempt, trace, spec)
+                if attempt.outcome is not FixOutcome.SUCCESS:
+                    return await self._handle_failure(item, attempt, trace, spec)
 
-            # 2) 提 PR 前再跑一次完整 F2P（防止 Agent 自说自话）
-            ctx_verify = VerifyContext(
-                workspace=workspace,
-                item=item,
-                spec=spec,
-                repo_slug=repo_cfg.slug,
-                test_hint=repo_cfg.test_hint,
-            )
-            final = await self.ctx.verifier.verify_fix(
-                ctx_verify, verifier_id=verifier_id
-            )
-            if not final.f2p_satisfied and self.settings.verifier.require_f2p:
-                attempt.outcome = FixOutcome.NEEDS_MANUAL
-                attempt.error = f"最终 F2P 未通过：{final.conclusion}"
-                return await self._handle_failure(item, attempt, trace, spec)
+                # 2) 提 PR 前再跑一次完整 F2P（防止 Agent 自说自话）
+                ctx_verify = VerifyContext(
+                    workspace=workspace,
+                    item=item,
+                    spec=spec,
+                    repo_slug=repo_cfg.slug,
+                    test_hint=repo_cfg.test_hint,
+                )
+                final = await self.ctx.verifier.verify_fix(
+                    ctx_verify, verifier_id=verifier_id
+                )
+                if not final.f2p_satisfied and self.settings.verifier.require_f2p:
+                    reason = f"最终 F2P 未通过：{final.conclusion}"
+                    if attempt_index < retries_limit:
+                        prior_failure = _retry_feedback(reason)
+                        log.warning(
+                            "%s：最终 F2P 未过，带着反馈重跑修复（第 %d 次）",
+                            item.key, attempt_index + 2,
+                        )
+                        continue
+                    attempt.outcome = FixOutcome.NEEDS_MANUAL
+                    attempt.error = reason
+                    return await self._handle_failure(item, attempt, trace, spec)
 
-            # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
-            # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
-            reg_ok, reg_why = await self._run_regression_gate(
-                item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
-                verifier_id=verifier_id,
-            )
-            if not reg_ok:
-                attempt.outcome = FixOutcome.NEEDS_MANUAL
-                attempt.error = f"回归门未通过：{reg_why}"
-                return await self._handle_failure(item, attempt, trace, spec, regression_note=reg_why)
+                # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
+                # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
+                reg_ok, reg_why = await self._run_regression_gate(
+                    item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
+                    verifier_id=verifier_id,
+                )
+                if not reg_ok:
+                    # 失败信息（**哪几条既有用例被改坏**）本身就是最好的下一步提示。实测
+                    # （Fissue #1）：第一次修复让自写验证器过了、却破坏了 `parse_event` 的既有
+                    # 契约，当场收工等于把「模型再试一次就能改对」的机会直接扔掉。
+                    if attempt_index < retries_limit:
+                        prior_failure = _retry_feedback(f"回归门未通过：{reg_why}")
+                        log.warning(
+                            "%s：回归门未过，带着反馈重跑修复（第 %d 次）",
+                            item.key, attempt_index + 2,
+                        )
+                        continue
+                    attempt.outcome = FixOutcome.NEEDS_MANUAL
+                    attempt.error = f"回归门未通过：{reg_why}"
+                    return await self._handle_failure(
+                        item, attempt, trace, spec, regression_note=reg_why
+                    )
+                break          # 两道关都过了 → 继续 diff / 提 PR
 
             attempt.diff = attempt.diff or workspace.diff()
 

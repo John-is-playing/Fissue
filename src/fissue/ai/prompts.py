@@ -619,6 +619,7 @@ def fix_agent_step_prompt(
     max_rounds: int,
     read_files: dict[str, str] | None = None,
     verifier_files: dict[str, str] | None = None,
+    prior_failure: str | None = None,
 ) -> list[dict[str, str]]:
     """Agent 循环中的单步提示：让模型决定「读哪些文件 / 改哪些文件」。
 
@@ -645,6 +646,16 @@ def fix_agent_step_prompt(
             budget -= len(piece)
         head += "\n它的测试文件（**不得修改**）：\n\n" + "\n\n".join(parts)
     blocks.append(head)
+
+    # 回归门反馈：比「上一轮验证器输出」更硬——验证器只证明目标行为修好了，证明不了没弄坏
+    # 别处；这里给的正是「弄坏了哪几条既有用例」。
+    if prior_failure:
+        blocks.append(
+            "## 上一轮修复的失败反馈（这次必须一起修好）\n"
+            + _truncate(prior_failure, 2000)
+            + "\n\n**要求**：改完必须让上面这些既有用例重新通过。"
+            "**不要**去改那些用例、也不要改它们的期望值——要改的是你的实现。"
+        )
 
     # 2) 上一轮验证器输出——模型当下最可靠的信息
     if last_test_output:
