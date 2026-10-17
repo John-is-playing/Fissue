@@ -167,7 +167,8 @@ class FixAgent:
                     last_output = (
                         f"你已经连续 {trace.barren_streak} 轮只读不写。现在必须二选一："
                         '① 给出 `write`（改几行就用片段替换 `{"find": …, "replace": …}`）；'
-                        "② 或者 `give_up` 并说明为什么做不了。**不要再读文件。**"
+                        "② 或者 `give_up` 并说明为什么做不了。"
+                        "**不要再读文件——从现在起 `read` 会被直接拒绝。**"
                     )
                     trace.note("    空转提醒：要求给出改动或放弃")
                     # **不能 continue**：提醒要随这一轮的提示词一起送出去。跳过模型调用的话，
@@ -204,6 +205,20 @@ class FixAgent:
             trace.note(f"r{round_index}: {action}")
 
             if action == "read":
+                if nudged:
+                    # 提醒之后**禁用 read**。为什么必须堵死：实测（Fissue #1 真跑）提醒发出去之后
+                    # 它照样读，而且每读到一个「**新**文件」就把空转计数清零——于是读循环能把轮次
+                    # 一轮轮耗掉（真跑：提醒在 r8，之后还读到 r10，整轮烧掉约 19 万 prompt tokens）。
+                    # 提醒就是最后一次机会：从这里起只允许 `write` 或 `give_up`。理由照常写进
+                    # `last_output`（万一还有下一轮），但实际上拒绝之后这一轮依旧算「无进展」，
+                    # 闸门紧接着就会收工——这正是我们要的**有界**。
+                    trace.note("    空转提醒之后 read 已被禁用（只允许 write / give_up）")
+                    last_output = (
+                        "read 已被禁用：你上一轮已经收到过空转提醒。现在只能二选一——"
+                        '① `write`（改几行就用片段替换 `{"find": …, "replace": …}`）；'
+                        "② `give_up` 并说明为什么做不了。"
+                    )
+                    continue
                 paths = [str(p) for p in (data.get("paths") or []) if str(p).strip()]
                 for p in paths[:10]:
                     content = self._safe_read(workspace, p, trace, locked_files=spec.files)

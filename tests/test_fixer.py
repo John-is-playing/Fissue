@@ -1206,6 +1206,35 @@ async def test_review_overlaps_the_regression_gate(fixer_ctx, repo, sample_issue
     assert started.is_set()
 
 
+async def test_read_is_refused_after_the_stall_nudge(settings, workspace, sample_issue) -> None:
+    """提醒之后 `read` 必须被拒——否则它只要「再读一个**新**文件」就能把空转计数清零。
+
+    实测（Fissue #1 真跑）：提醒在 r8 发出，之后它仍读到 r10（r4 就读了一个新文件 daemon.py，
+    于是空转计数被清零、循环接着跑），整轮烧掉约 19 万 prompt tokens。所以提醒之后必须堵死这条
+    路：要么写，要么明确放弃，都要**有界**。
+    """
+    settings.auto_fix.stall_rounds = 4
+    for name in ("README.md", "OTHER.md", "THIRD.md"):
+        workspace.write(name, f"# {name}\n")
+    # 前 5 轮反复读同一个文件（无进展）→ 第 6 轮命中提醒；第 6 轮的回复去读**新**文件
+    steps = [{"action": "read", "paths": ["README.md"]} for _ in range(5)]
+    steps += [
+        {"action": "read", "paths": ["OTHER.md"]},
+        {"action": "read", "paths": ["THIRD.md"]},
+    ]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx"
+    )
+
+    assert any("read 已被禁用" in a for a in trace.actions), trace.actions[-8:]
+    # 关键判别：提醒之后那个「新文件」绝不能进到上下文里（以前它能借此清零空转计数）
+    assert "OTHER.md" not in trace.read_paths, "提醒之后不许再读到新文件"
+    assert llm.calls == 6, f"提醒之后应当立刻收敛，实际烧了 {llm.calls} 次"
+    assert attempt.outcome is not FixOutcome.SUCCESS, "空转就该收工"
+
+
 def test_fix_agent_prompt_carries_the_regression_feedback(sample_issue) -> None:
     """回归门失败后重跑时，失败反馈必须摆进提示词（否则模型不知道该修什么）。
 
