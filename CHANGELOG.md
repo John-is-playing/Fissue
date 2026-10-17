@@ -34,6 +34,8 @@
 - **常驻服务的验证开关**：`schedule.verify_enabled`（关掉即把验证交给人工 `fissue verify`）与 `schedule.verify_batch_limit`（每轮最多验多少条，默认 30；积压由后续轮次继续消化）
 - **`sandbox.git_readonly`**：把工作区里的 `.git` 以只读挂进容器（`index` 除外），默认开启；测试套件需要容器写 git 时可关掉
 
+- **入站 webhook（事件驱动发现新条目）**：`webhooks.enabled: true` 时注册 `POST {api.prefix}/webhooks/<平台>`，平台一推就后台跑一轮（抓取 → 评测 → 验证 → flush → 修复），不必再等一个轮询间隔。GitHub 用 HMAC-SHA256（`X-Hub-Signature-256`），GitLab / Gitee / AtomGit 用共享密钥头，一律常数时间比对；只接受 `repos` 里登记且启用的仓库；**没配密钥时配置层拒绝启动、请求期再拦一道 403**（fail-closed）。该端点刻意不带 bearer 鉴权（平台不会带），所以它豁免 `FISSUE_API_TOKEN` 那套与两道写补刀——边界改为「签名 + 仓库白名单」，见 `SECURITY.md`
+
 ### 变更
 
 - 重复检测：中文分词由**单字**改为**字符二元组（bigram）**，相似度由 Jaccard 改为**包含度**（交 / 较短一侧），阈值经实测标定为 **0.22**

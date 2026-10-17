@@ -494,6 +494,34 @@ class PlatformTokens(BaseModel):
         return getattr(self, platform.value, "") or ""
 
 
+class WebhookSecrets(BaseModel):
+    """各平台 webhook 的**签名密钥**（与 API token 是两回事，别混用）。"""
+
+    github: str = Field(default="", repr=False)
+    gitee: str = Field(default="", repr=False)
+    atomgit: str = Field(default="", repr=False)
+    gitlab: str = Field(default="", repr=False)
+
+    def get(self, platform: Platform) -> str:
+        return getattr(self, platform.value, "") or ""
+
+
+class WebhookConfig(BaseModel):
+    """入站 webhook：让平台把「新 Issue / 新 PR」推过来，省掉一个轮询间隔。
+
+    默认**关闭**。开启后某个平台**没配密钥就一律 403**（fail-closed）——这个端点天然带不了
+    bearer 令牌（平台不会带），所以**签名/密钥就是它的身份证明**；而且只有 `repos` 里登记且
+    启用的仓库才会被接受，其余事件一律忽略（返回 202 并写明原因）。
+
+    各平台的校验方式：GitHub 用 HMAC-SHA256（``X-Hub-Signature-256``）；GitLab / Gitee /
+    AtomGit 用共享密钥头（``X-Gitlab-Token`` / ``X-Gitee-Token``），一律**常数时间**比对。
+    细节见 ``web/hooks.py``。
+    """
+
+    enabled: bool = False
+    secrets: WebhookSecrets = Field(default_factory=WebhookSecrets)
+
+
 # ---------------------------------------------------------------------------
 # 总配置
 # ---------------------------------------------------------------------------
@@ -543,6 +571,7 @@ class Settings(BaseModel):
     export: ExportConfig = Field(default_factory=ExportConfig)
     platforms: PlatformConfig = Field(default_factory=PlatformConfig)
     tokens: PlatformTokens = Field(default_factory=PlatformTokens)
+    webhooks: WebhookConfig = Field(default_factory=WebhookConfig)
 
     # 运行期元信息（不写入文件）
     config_path: str | None = None
@@ -609,6 +638,26 @@ class Settings(BaseModel):
                 "建议现在就设置 FISSUE_API_TOKEN",
                 self.web.host,
             )
+        # 入站 webhook：开了却没有密钥 = 那个端点对外裸奔，**直接拒绝启动**（fail-closed）。
+        # 这里是构造期路径，正是把配置错误拦在最早的时刻；请求期还会再拦一道（见 web/hooks.py）。
+        if self.webhooks.enabled:
+            if not self.api.enabled:
+                raise ConfigError(
+                    "webhooks.enabled=true 需要 api.enabled=true：端点挂在 API 前缀下，"
+                    "api 关掉等于它从未存在。请开 api.enabled，或关掉 webhooks.enabled。"
+                )
+            need = sorted({r.platform.value for r in self.enabled_repos()})
+            missing = [p for p in need if not self.webhooks.secrets.get(Platform(p))]
+            if missing:
+                raise ConfigError(
+                    "webhooks.enabled=true，但以下已启用平台的 webhook 密钥是空的："
+                    + "、".join(missing)
+                    + "。请在 .env 里设置 "
+                    + "、".join(f"{ENV_PREFIX}WEBHOOK_{m.upper()}_SECRET" for m in missing)
+                    + "（或写进 config.yaml 的 webhooks.secrets）——"
+                    "否则那些平台的推送一律会被拒绝处理。"
+                )
+
         # 注意：「绑本机但 api.enabled 且无鉴权」的告警**不在这里发**：这里是每条命令都会
         # 走的构造期路径，而那条告警讲的是「即将对外提供 API」，发在 `web.app.create_app`
         # 更贴切。（它历史上还额外打坏过 `fissue status --json`——那是日志写到了 stdout
@@ -676,6 +725,22 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
     for plat in ("GITHUB", "GITEE", "ATOMGIT", "GITLAB"):
         if v := env_of(plat + "_TOKEN"):
             tokens[plat.lower()] = v
+
+    # 入站 webhook：开关与各平台密钥都支持环境变量（容器部署时不方便改 config.yaml）
+    wh = merged.setdefault("webhooks", {})
+    if v := env_of("WEBHOOK_ENABLED"):
+        wh["enabled"] = v.strip().lower() in ("1", "true", "yes", "on")
+    wh_secrets = wh.setdefault("secrets", {})
+    # 密钥名**写成字面量、不循环拼**：`tests/test_env.py` 会逐字核对「.env.example 里写的 =
+    # 代码真的读的」，而拼出来的名字它认不出——那条守卫正是用来防「文档写了、代码不读」的。
+    if v := env_of("WEBHOOK_GITHUB_SECRET"):
+        wh_secrets["github"] = v
+    if v := env_of("WEBHOOK_GITEE_SECRET"):
+        wh_secrets["gitee"] = v
+    if v := env_of("WEBHOOK_ATOMGIT_SECRET"):
+        wh_secrets["atomgit"] = v
+    if v := env_of("WEBHOOK_GITLAB_SECRET"):
+        wh_secrets["gitlab"] = v
 
     # 标签名缓存时长（秒；0 = 不缓存）
     if v := env_of("LABEL_CACHE_TTL"):

@@ -715,6 +715,42 @@ fissue fetch -r psf/requests && fissue eval --all && fissue verify -r psf/reques
 fissue serve --with-web
 ```
 
+### 8.5 让平台推事件过来（入站 webhook）
+
+常驻服务默认是**轮询**（`schedule.scan_interval_seconds`，默认 1 小时）——新 Issue/PR 最坏要等
+一个间隔才被发现。接上 webhook 就变成**事件驱动**：平台一推，后台立刻跑一轮。
+
+```yaml
+# config.yaml
+webhooks:
+  enabled: true
+```
+```bash
+# .env：每个已启用平台都必须配（密钥与平台 Token 是两回事，别复用）
+FISSUE_WEBHOOK_GITHUB_SECRET=<仓库 Webhook 里填的那个 Secret>
+```
+
+然后在平台的仓库设置里加 webhook：
+
+| 平台 | Payload URL | 订阅事件 | 密钥 |
+|---|---|---|---|
+| GitHub | `https://你的域名/api/v1/webhooks/github` | Issues、Pull requests | Secret（`X-Hub-Signature-256`，HMAC-SHA256） |
+| GitLab | `…/api/v1/webhooks/gitlab` | Issue events、Merge request events | Secret token（`X-Gitlab-Token`） |
+| Gitee / AtomGit | `…/api/v1/webhooks/gitee`（或 `…/atomgit`） | Issue、Pull Request | Webhook 密码（`X-Gitee-Token`） |
+
+**它会怎么反应**：验签通过且仓库**已登记** → 回 `202`，并在**后台**跑一轮（抓取 → 评测 → 验证 →
+flush → 修复）；这一轮**同样在写锁内**，已有写进程在跑时直接跳过（下一轮扫描会把它带上），所以
+连着推几次不会堆叠。验签不过回 `403`；仓库没登记回 `202` 但 `accepted: false` 并写明原因；不是
+条目类事件（如 GitHub 的 ping）同样只记一条日志。
+
+> ⚠️ 三件最容易踩的：
+> ① 这个端点**不带 bearer 鉴权**（平台不会带令牌），**密钥就是它的身份证明**——也别把 API token
+>    拿来当 webhook 密钥；
+> ② 它必须能被**平台服务器**访问到：只绑回环、或反代不放行 `/api/v1/webhooks/*`，推送永远到不了
+>    （判断方法很直接：日志里一条 webhook 都没有）；
+> ③ 开着 `webhooks.enabled` 却没给某个已启用平台配密钥，**启动就会失败**（fail-closed），
+>    这是刻意的——免得端点对外裸奔。
+
 ---
 
 ## 9. 典型场景

@@ -1275,3 +1275,41 @@ HEAD 上全部失败**（选中集 16 条里 16 条失败），即它们真的�
 
 **验证**：全量 **729 passed**；ruff 与 mypy 双绿（70 个源文件）；本批 **12 条新用例在未修改的
 HEAD 上全部失败**（12 选中、12 全灭），即它们真的守得住这些缺陷。
+
+### 4.20 新增：入站 webhook —— 让平台推事件（2026-10-17）
+
+由来：`serve` 是**轮询**式的（`schedule.scan_interval_seconds`，默认 3600s），新 Issue/PR 最坏要
+等一个间隔才被发现。这一节把「发现」变成**事件驱动**。
+
+**做了什么**
+
+* 配置：`webhooks.enabled`（默认关）+ `webhooks.secrets.<平台>`，并支持 `FISSUE_WEBHOOK_ENABLED`
+  与 `FISSUE_WEBHOOK_<平台>_SECRET`。
+* `web/hooks.py`：签名校验（GitHub HMAC-SHA256 / GitLab·Gitee·AtomGit 共享密钥头，一律
+  `hmac.compare_digest`）+ **形状容忍**的事件解析（认 `repository.full_name`、
+  `project.path_with_namespace`、`issue.number`、`pull_request.number`、`object_attributes.iid`）。
+* `POST {api.prefix}/webhooks/<平台>`：验签 → 解析 → 仓库白名单 → 回 `202` 并**在后台跑一轮**
+  （抓取 → 评测 → 验证 → flush → 修复）。
+* 边界：该端点**不带 bearer 鉴权**（平台不会带令牌），因此豁免 `FISSUE_API_TOKEN` 那套与两道写
+  补刀；边界改为「签名/密钥 + 仓库白名单」，且**配置层与请求期各一道 fail-closed**
+  （开着却没配密钥 → 拒绝启动 / 403）。详见 `SECURITY.md` 与 `docs/USAGE.md` §8.5。
+
+**刻意的取舍**
+
+* 选「跑一轮」而不是「只抓那一条」：条目的后续处理（打标签、派发修复）本来就是独立循环，只有跑完
+  一轮它才真正走完整条链路；一轮同样在**写锁**内，已有写进程在跑就跳过（不排队，避免 webhook 风暴堆叠）。
+* 事件体**只解析、不信任**：解析出的仓库/编号会再走一遍正常抓取口径（游标、标签过滤、早停都在），
+  伪造一条「新 Issue」最多让我们多拉一次。
+* 只回 `202`：平台对回调有超时与重试，而一轮是分钟级的（LLM + 沙盒）。
+
+**过程中自己抓出的两处问题**（再次说明「守卫要能判别」）：
+
+* 第一版「未启用 → 404」的用例**判别不出来**：端点在 HEAD 上根本不存在，也是 404，于是它在未修的
+  HEAD 上照样通过。已改成同一构建内做**前后对比**（未启用 404 ↔ 启用后必须 202）。
+* `.env.example` 的交叉核对守卫只认**字面量** `env_of("X")`，而 webhook 密钥名最初是循环拼的
+  （`"WEBHOOK_" + plat + "_SECRET"`）→ 守卫判为「写了不生效」。已改成四个字面量调用（并注明原因）——
+  这比放宽守卫诚实。
+
+**验证**：`tests/test_web.py` 新增 10 条 + `tests/test_config_models.py` 新增 1 条；全量 **740
+passed**；ruff 与 mypy 双绿（71 个源文件）；这 **11 条新用例在未修改的 HEAD 上全部失败**
+（3 failed + 8 errors，0 passed）。

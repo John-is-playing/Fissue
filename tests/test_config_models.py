@@ -245,6 +245,32 @@ def test_pr_strategy_no_longer_has_auto_submit() -> None:
     assert PRStrategy(auto_submit=False).mode == "fork"  # type: ignore[call-arg]
 
 
+def test_webhooks_require_a_secret_for_every_enabled_platform() -> None:
+    """开了 webhook 却没给已启用平台配密钥 → **拒绝启动**（fail-closed）。
+
+    这个端点不带 bearer 鉴权（平台不会带令牌），密钥就是它的身份证明；配置层不拦，
+    它就会对外裸奔——任何人都能推一条假事件来触发抓取。
+    """
+    from fissue.config import APIConfig, RepoConfig, Settings, WebhookConfig, WebhookSecrets
+    from fissue.errors import ConfigError
+    from fissue.models import Platform
+
+    repos = [RepoConfig(platform=Platform.GITHUB, owner="a", name="b")]
+
+    with pytest.raises(ConfigError, match="webhook 密钥"):
+        Settings(webhooks=WebhookConfig(enabled=True), repos=repos)
+
+    with pytest.raises(ConfigError, match="api.enabled"):
+        Settings(
+            webhooks=WebhookConfig(enabled=True, secrets=WebhookSecrets(github="x")),
+            api=APIConfig(enabled=False),
+            repos=repos,
+        )
+
+    ok = Settings(webhooks=WebhookConfig(enabled=True, secrets=WebhookSecrets(github="x")), repos=repos)
+    assert ok.webhooks.secrets.get(Platform.GITHUB) == "x"
+
+
 def test_unknown_config_keys_are_reported_with_a_hint(tmp_path: Path) -> None:
     """拼错的配置键必须能被**指出来**：老键仍不报错，但不能一声不响地忽略。
 

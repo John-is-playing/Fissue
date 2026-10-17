@@ -16,12 +16,13 @@ from __future__ import annotations
 
 import functools
 import ipaddress
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -30,7 +31,8 @@ from ..config import Settings, load_settings
 from ..errors import FissueError
 from ..lockfile import WRITE_GATE, single_flight
 from ..logging_setup import get_logger, setup_logging
-from ..models import Category, ItemStatus, ItemType, Priority, QueueName
+from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
+from .hooks import parse_event, signature_ok
 
 log = get_logger(__name__)
 
@@ -89,6 +91,24 @@ def _enum_param(value: str | None, enum_cls: Any, *, name: str) -> Any:
         raise HTTPException(
             status_code=400, detail=f"{name} 取值非法：{value!r}；可选：{allowed}"
         ) from exc
+
+
+async def _run_round_after_hook(settings: Settings) -> None:
+    """webhook 触发的后台一轮：抓取 → 评测 → 验证 → flush → 修复。
+
+    为什么跑**整轮**而不是只抓那一条：条目的后续处理（打标签、派发修复）本来就是独立循环，
+    只有跑完一轮它才真正走完整条链路。写锁被占时**直接跳过**——说明已经有写进程在跑，
+    下一轮会把它带上，排队只会互相等（也避免 webhook 风暴把机器堆满）。
+    """
+    from ..service.daemon import FissueService
+
+    try:
+        out = await FissueService(settings).run_once()
+        log.info("webhook 触发的一轮完成：%s", out)
+    except FissueError as exc:
+        log.info("webhook 触发的一轮跳过（已有写进程在跑）：%s", exc)
+    except Exception:
+        log.exception("webhook 触发的一轮失败")
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -651,6 +671,70 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         return {"key": key, "approved": True, "note": "已打 merge-approved 标签，请人工在平台上合并"}
 
     # -- 导出 -------------------------------------------------------------
+
+    # -- 入站 webhook：平台主动推「新 Issue / 新 PR」 ---------------------------
+    #
+    # 这个端点**刻意不挂** `Depends(auth)`、`_require_writable` 与两道写补刀：平台既不会带
+    # `Authorization`，也不会带我们的转发头，它就带自己的签名——把那些守卫挂上来，在真实部署
+    # （尤其挂了反向代理时）这个端点会永远收不到事件。边界因此换成了：
+    # **签名/密钥 + 只认已登记且启用的仓库**（配置层与 web/hooks.py 各有一道 fail-closed）。
+
+    @app.post(f"{prefix}/webhooks/{{platform}}", status_code=202)
+    async def webhook(
+        platform: str, request: Request, background: BackgroundTasks
+    ) -> dict[str, Any]:
+        if not settings.webhooks.enabled:
+            # 没启用就当它不存在（不告诉外面「这里有个端点」）
+            raise HTTPException(status_code=404, detail="webhook 未启用")
+
+        try:
+            plat = Platform(platform)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=f"未知平台：{platform}") from exc
+
+        body = await request.body()
+        secret = settings.webhooks.secrets.get(plat)
+        if not signature_ok(plat, secret, body, request.headers):
+            # 日志里只说「不匹配或未配置」，不回显签名与密钥
+            log.warning("webhook 校验失败（%s）：签名不匹配，或该平台未配置密钥", plat.value)
+            raise HTTPException(status_code=403, detail="签名校验失败")
+
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=400, detail=f"事件体不是合法 JSON：{exc}") from exc
+
+        event = parse_event(plat, payload)
+        if not event.usable:
+            log.info("webhook（%s）不处理：%s", plat.value, event.reason)
+            return {"accepted": False, "reason": event.reason}
+
+        cfg = next(
+            (
+                r
+                for r in settings.enabled_repos()
+                if r.platform is plat and r.slug == event.repo_slug
+            ),
+            None,
+        )
+        if cfg is None:
+            log.info("webhook（%s）忽略未登记/未启用的仓库：%s", plat.value, event.repo_slug)
+            return {"accepted": False, "reason": f"仓库未登记或未启用：{event.repo_slug}"}
+
+        # 立刻回 202，重活交给后台：平台对回调有超时与重试，不能让它们等着我们跑完一轮。
+        background.add_task(_run_round_after_hook, settings)
+        log.info(
+            "webhook（%s）%s %s#%s 已接受，后台触发一轮",
+            plat.value, event.action or "-", event.repo_slug, event.number,
+        )
+        return {
+            "accepted": True,
+            "repo": event.repo_slug,
+            "number": event.number,
+            "item_type": event.item_type.value,
+            "action": event.action,
+            "note": "已在后台触发一轮（抓取 → 评测 → 验证 → flush → 修复）",
+        }
 
     @app.get(f"{prefix}/export")
     async def export_endpoint(

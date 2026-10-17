@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import quote
 
 import pytest
@@ -88,6 +89,217 @@ def test_items_list_reports_real_comment_counts(client) -> None:
     data = client.get("/api/v1/items", params={"limit": 10}).json()
     assert data["items"], "夹具应当至少有一条条目"
     assert any(i["comments"] >= 1 for i in data["items"]), f"评论数不该全是 0：{data['items']}"
+
+
+# ---------------------------------------------------------------------------
+# 入站 webhook
+# ---------------------------------------------------------------------------
+
+
+def _github_headers(secret: str, body: bytes) -> dict[str, str]:
+    import hashlib
+    import hmac
+
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return {"X-Hub-Signature-256": f"sha256={digest}"}
+
+
+def _github_payload(repo: str = "psf/requests", number: int = 42) -> bytes:
+    import json
+
+    return json.dumps(
+        {
+            "action": "opened",
+            "repository": {"full_name": repo},
+            "issue": {"number": number},
+        }
+    ).encode()
+
+
+@pytest.fixture
+def hook_client(settings, repo, monkeypatch):
+    """开了 webhook 的客户端；平台密钥固定 `hook-secret`，并把「后台那一轮」打桩。
+
+    真跑那一轮会烧 token、还会写平台，所以这里只记录「被调度过」。
+    """
+    from fastapi.testclient import TestClient
+
+    from fissue.service.daemon import FissueService
+    from fissue.web.app import create_app
+
+    settings.webhooks.enabled = True
+    settings.webhooks.secrets.github = "hook-secret"
+    settings.webhooks.secrets.gitlab = "hook-secret"
+
+    rounds: list[str] = []
+
+    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+        rounds.append("round")
+        return {}
+
+    monkeypatch.setattr(FissueService, "run_once", fake_round)
+    with TestClient(create_app(settings)) as c:
+        c.rounds = rounds
+        yield c
+
+
+def test_webhook_endpoint_is_404_until_enabled(settings, repo, monkeypatch) -> None:
+    """没开 webhook 时端点就当不存在（404），开了之后**同一请求必须变成 202**。
+
+    为什么写成前后对比：单看「未启用 → 404」是**判别不出来**的——端点根本不存在时也是 404。
+    只有把「开了就 202」摆在一起，才说明那个 404 来自「没开」而不是「没实现」。
+    """
+    from fastapi.testclient import TestClient
+
+    from fissue.service.daemon import FissueService
+    from fissue.web.app import create_app
+
+    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+        return {}
+
+    monkeypatch.setattr(FissueService, "run_once", fake_round)
+    body = _github_payload()
+    headers = _github_headers("hook-secret", body)
+
+    with TestClient(create_app(settings)) as c:
+        r = c.post("/api/v1/webhooks/github", content=body, headers=headers)
+        assert r.status_code == 404, r.text
+
+    settings.webhooks.enabled = True
+    settings.webhooks.secrets.github = "hook-secret"
+    with TestClient(create_app(settings)) as c:
+        r = c.post("/api/v1/webhooks/github", content=body, headers=headers)
+        assert r.status_code == 202, r.text
+
+
+def test_webhook_rejects_a_bad_signature(hook_client) -> None:
+    """签名不对一律 403，而且**不触发任何一轮**（否则任何人都能拿平台当跳板。"""
+    r = hook_client.post(
+        "/api/v1/webhooks/github",
+        content=_github_payload(),
+        headers={"X-Hub-Signature-256": "sha256=deadbeef"},
+    )
+    assert r.status_code == 403
+    assert hook_client.rounds == [], "校验没过就不该调度任何工作"
+
+
+def test_webhook_fails_closed_when_the_secret_is_missing(hook_client, settings) -> None:
+    """密钥为空时**拒绝处理**（fail-closed）——这个端点没有别的身份证明。
+
+    配置层在启动时就拒绝「开着却没配密钥」，这里守的是运行期被改掉/漏配的那条路。
+    """
+    body = _github_payload()
+    headers = _github_headers("hook-secret", body)
+    settings.webhooks.secrets.github = ""
+
+    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=headers)
+    assert r.status_code == 403
+    assert hook_client.rounds == []
+
+
+def test_webhook_accepts_a_github_push_and_schedules_a_round(hook_client) -> None:
+    """签名对 + 仓库已登记 → 202 立刻返回，并且**后台确实触发了一轮**。"""
+    body = _github_payload()
+    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body))
+
+    assert r.status_code == 202, r.text
+    data = r.json()
+    assert data["accepted"] is True and data["repo"] == "psf/requests" and data["number"] == 42
+    assert hook_client.rounds == ["round"], "应当调度一次后台一轮"
+
+
+def test_webhook_ignores_an_unregistered_repo(hook_client) -> None:
+    """未登记 / 未启用的仓库一律忽略——事件体说了不算。"""
+    body = _github_payload(repo="someone/else")
+    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body))
+
+    assert r.status_code == 202
+    assert r.json()["accepted"] is False
+    assert hook_client.rounds == []
+
+
+def test_webhook_ignores_non_item_events(hook_client) -> None:
+    """不是条目类事件（比如 GitHub 的 ping）→ 202 但要写明忽略原因。"""
+    import json
+
+    body = json.dumps({"zen": "Design for failure.", "hook_id": 1}).encode()
+    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body))
+
+    assert r.status_code == 202
+    assert r.json()["accepted"] is False
+    assert hook_client.rounds == []
+
+
+def test_webhook_rejects_unknown_platform_and_bad_json(hook_client) -> None:
+    """未知平台 404；签名过了但事件体不是 JSON → 400（而不是 500）。"""
+    assert hook_client.post("/api/v1/webhooks/nope", content=b"{}").status_code == 404
+
+    bad = b"{not json"
+    r = hook_client.post("/api/v1/webhooks/github", content=bad, headers=_github_headers("hook-secret", bad))
+    assert r.status_code == 400
+
+
+def test_webhook_works_behind_api_auth_without_a_bearer_token(hook_client, settings) -> None:
+    """**这是这个端点的设计要点**：平台不会带 bearer 令牌，所以它在鉴权开启时也要照常工作。
+
+    而普通 API 路由在同样设置下必须要求令牌——两条一起断言，免得将来有人「顺手」给 webhook
+    挂上 `Depends(auth)`，把真实部署（尤其挂了反代）变成永远收不到推送。
+    """
+    settings.api.auth_required = True
+    settings.api.token = "api-token"
+
+    body = _github_payload()
+    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body))
+    assert r.status_code == 202, r.text
+
+    assert hook_client.get("/api/v1/items").status_code == 401, "普通 API 路由仍必须要求令牌"
+
+
+def test_webhook_accepts_a_gitlab_token_header(hook_client, settings) -> None:
+    """GitLab 用的是共享密钥头（`X-Gitlab-Token`），不是 HMAC。"""
+    import json
+
+    from fissue.config import RepoConfig
+
+    # 夹具里只登记了 github 的 psf/requests；平台必须对得上，所以补一条 gitlab 登记。
+    settings.repos.append(RepoConfig(platform=Platform.GITLAB, owner="psf", name="requests"))
+    body = json.dumps(
+        {
+            "object_attributes": {"iid": 7, "action": "open"},
+            "project": {"path_with_namespace": "psf/requests"},
+        }
+    ).encode()
+
+    r = hook_client.post(
+        "/api/v1/webhooks/gitlab", content=body, headers={"X-Gitlab-Token": "hook-secret"}
+    )
+    assert r.status_code == 202, r.text
+    assert r.json()["accepted"] is True and r.json()["item_type"] == "pr"
+
+    bad = hook_client.post(
+        "/api/v1/webhooks/gitlab", content=body, headers={"X-Gitlab-Token": "wrong"}
+    )
+    assert bad.status_code == 403
+
+
+def test_parse_event_handles_the_v5_shapes() -> None:
+    """GitLab / Gitee（v5 同形状）的两种事件体都要认得出来。"""
+    from fissue.web.hooks import parse_event
+
+    mr = parse_event(
+        Platform.GITLAB,
+        {"object_attributes": {"iid": 12, "action": "update"}, "project": {"path_with_namespace": "a/b"}},
+    )
+    assert (mr.repo_slug, mr.number, mr.item_type.value) == ("a/b", 12, "pr")
+
+    issue = parse_event(
+        Platform.GITEE,
+        {"repository": {"full_name": "a/b"}, "issue": {"number": 3}},
+    )
+    assert (issue.repo_slug, issue.number, issue.item_type.value) == ("a/b", 3, "issue")
+
+    nothing = parse_event(Platform.GITHUB, {"zen": "hi"})
+    assert nothing.usable is False and nothing.reason
 
 
 def test_health_and_stats(client) -> None:
