@@ -44,6 +44,7 @@ from ..verifier.regression import REGRESSION_STAGE_BASE
 from ..verifier.runner import VerifyContext, judge_regression
 from ..workspace import GitError, RepoWorkspace
 from .agent import AgentTrace, FixAgent, branch_name
+from .reviewer import PatchReviewer, ReviewResult
 
 log = get_logger(__name__)
 
@@ -383,6 +384,9 @@ class PRCreator:
         if trace.written_files:
             lines.append("\n## 改动文件\n")
             lines.extend(f"- `{p}`" for p in trace.written_files[:20])
+        if trace.review:
+            lines.append("\n## 自动评审意见\n")
+            lines.extend(f"- {line}" for line in trace.review[:20])
         if trace.summary:
             lines.append(f"\n## 说明\n\n{trace.summary}\n")
         lines.append(
@@ -459,11 +463,16 @@ class AutoFixer:
             workspace = await self._clone_with_retry(repo_cfg, item)
             repo_context = self._repo_context(workspace, repo_cfg)
 
-            # 1) Agent 循环修复。最后两道关（完整 F2P、既有测试回归门）失败时**带着反馈重跑**，
-            #    次数由 `auto_fix.regression_retries` 限定（默认 1，0 = 旧行为）。
+            # 1) Agent 循环修复。之后三条关：
+            #    * 完整 F2P / 既有测试回归门失败 → 带反馈重跑（`auto_fix.regression_retries`）
+            #    * 自动评审给出 critical/major → 带评审意见重跑（`auto_fix.review_rounds`）
             retries_limit = max(0, int(self.settings.auto_fix.regression_retries))
+            review_limit = max(0, int(self.settings.auto_fix.review_rounds))
+            reviewer = None if review_limit <= 0 else PatchReviewer(self.ctx.llm, self.settings)
             prior_failure: str | None = None
-            for attempt_index in range(retries_limit + 1):
+            used_regression = 0
+            used_review = 0
+            for _ in range(retries_limit + review_limit + 1):
                 attempt, trace = await self.agent.run(
                     item=item,
                     workspace=workspace,
@@ -482,6 +491,22 @@ class AutoFixer:
                 if attempt.outcome is not FixOutcome.SUCCESS:
                     return await self._handle_failure(item, attempt, trace, spec)
 
+                # 快照必须在进沙盒那两步**之前**抓：回归门会临时挪走工作区的测试文件再还原，
+                # 之后的工作区就不再稳定了（评审只吃这份副本，所以它能并行）。
+                snapshot_diff = workspace.diff()
+                snapshot_files = self._snapshot_changed(workspace)
+                review_task: asyncio.Task[ReviewResult] | None = None
+                if reviewer is not None:
+                    review_task = asyncio.create_task(
+                        reviewer.review(
+                            item=item,
+                            spec=spec,
+                            diff=snapshot_diff,
+                            changed_files=snapshot_files,
+                            repo_context=repo_context,
+                        )
+                    )
+
                 # 2) 提 PR 前再跑一次完整 F2P（防止 Agent 自说自话）
                 ctx_verify = VerifyContext(
                     workspace=workspace,
@@ -493,42 +518,52 @@ class AutoFixer:
                 final = await self.ctx.verifier.verify_fix(
                     ctx_verify, verifier_id=verifier_id
                 )
-                if not final.f2p_satisfied and self.settings.verifier.require_f2p:
-                    reason = f"最终 F2P 未通过：{final.conclusion}"
-                    if attempt_index < retries_limit:
-                        prior_failure = _retry_feedback(reason)
-                        log.warning(
-                            "%s：最终 F2P 未过，带着反馈重跑修复（第 %d 次）",
-                            item.key, attempt_index + 2,
-                        )
-                        continue
-                    attempt.outcome = FixOutcome.NEEDS_MANUAL
-                    attempt.error = reason
-                    return await self._handle_failure(item, attempt, trace, spec)
+                f2p_ok = final.f2p_satisfied or not self.settings.verifier.require_f2p
 
                 # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
                 # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
+                # 与上一步**串行**：两者都跑在同一个工作区上，并着跑必然互相踩。
                 reg_ok, reg_why = await self._run_regression_gate(
                     item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
                     verifier_id=verifier_id,
                 )
+
+                # 评审判定在这儿汇合——它从快照开始跑，通常已经跑完，等它几乎不花时间。
+                review = (await review_task) if review_task is not None else None
+                if review is not None:
+                    trace.review.extend(review.summary_lines())
+                    if review.dropped:
+                        trace.note(f"    评审丢弃 {len(review.dropped)} 条（引用不实或越界）")
+
+                problems: list[str] = []
+                if not f2p_ok:
+                    problems.append(f"最终 F2P 未通过：{final.conclusion}")
                 if not reg_ok:
-                    # 失败信息（**哪几条既有用例被改坏**）本身就是最好的下一步提示。实测
-                    # （Fissue #1）：第一次修复让自写验证器过了、却破坏了 `parse_event` 的既有
-                    # 契约，当场收工等于把「模型再试一次就能改对」的机会直接扔掉。
-                    if attempt_index < retries_limit:
-                        prior_failure = _retry_feedback(f"回归门未通过：{reg_why}")
-                        log.warning(
-                            "%s：回归门未过，带着反馈重跑修复（第 %d 次）",
-                            item.key, attempt_index + 2,
-                        )
-                        continue
+                    problems.append(f"回归门未通过：{reg_why}")
+                if review is not None and review.blocking:
+                    problems.append(review.feedback())
+                blocking = [] if review is None else review.blocking
+
+                if not problems:
+                    break                      # 三关全过 → 继续 diff / 提 PR
+
+                # 还有余额就带着反馈返修：F2P/回归门用各自的预算，评审用评审预算。
+                if (not f2p_ok or not reg_ok) and used_regression < retries_limit:
+                    used_regression += 1
+                elif blocking and used_review < review_limit:
+                    used_review += 1
+                else:
+                    # 余额用尽：把这些意见原样交给人工（含评审的原文片段，便于直接按图索骥）。
                     attempt.outcome = FixOutcome.NEEDS_MANUAL
-                    attempt.error = f"回归门未通过：{reg_why}"
+                    attempt.error = "；".join(problems)[:2000]
                     return await self._handle_failure(
-                        item, attempt, trace, spec, regression_note=reg_why
+                        item, attempt, trace, spec, regression_note=attempt.error
                     )
-                break          # 两道关都过了 → 继续 diff / 提 PR
+                prior_failure = _retry_feedback("\n\n".join(problems))
+                log.warning(
+                    "%s：带着反馈重跑修复（第 %d 次）",
+                    item.key, used_regression + used_review + 1,
+                )
 
             attempt.diff = attempt.diff or workspace.diff()
 
@@ -539,6 +574,15 @@ class AutoFixer:
                 attempt.patch_path = path
                 attempt.pr_url = None
                 attempt.error = "dry-run：仅产出补丁，未提交 PR"
+                # dry-run 这条路**不写人工报告**（那只在 needs_manual 时走），而它恰恰是人看补丁的
+                # 入口——评审的非阻断意见在这里丢掉，就等于这一步白评。所以落到补丁旁边的旁挂文件，
+                # 并逐条 warning（控制台里也看得见）。
+                if trace.review:
+                    for line in trace.review:
+                        log.warning("自动评审 %s：%s", item.key, line)
+                    review_path = Path(path).with_suffix(".review.txt")
+                    review_path.write_text("\n".join(trace.review) + "\n", encoding="utf-8")
+                    attempt.error += f"｜自动评审意见见 {review_path}"
                 self.ctx.repo.save_fix_attempt(attempt)
                 # 干跑没产出 PR，条目等于还没修：放回待修队列，否则一趟 dry-run
                 # 就把待修队列消费掉（条目会卡在 fixing/needs_manual），
@@ -570,6 +614,25 @@ class AutoFixer:
                     workspace.cleanup()
 
     # -- 工作区 -----------------------------------------------------------
+
+    def _snapshot_changed(self, workspace: RepoWorkspace, *, limit: int = 10) -> dict[str, str]:
+        """抓「改动后文件内容」的快照，供评审使用（读不到的文件跳过）。
+
+        为什么必须单独抓：评审**不能**直接读工作区——回归门会临时挪走工作区里的测试文件再
+        还原，谁读它的工作区谁就踩到中间态。所以内容在这里一次性读进内存，之后评审全程只吃
+        这份副本，于是它能与回归门**并行**，而不必等它跑完那两分钟。
+        """
+        out: dict[str, str] = {}
+        try:
+            changed = workspace.changed_files()
+        except Exception:                       # pragma: no cover - 拿不到就当没有
+            return out
+        for path in changed[:limit]:
+            try:
+                out[path] = workspace.read(path)
+            except Exception:                   # 新增文件读不到之类，跳过即可
+                continue
+        return out
 
     async def _clone_with_retry(self, repo_cfg: RepoConfig, item: RawItem) -> RepoWorkspace:
         """克隆工作区，对**瞬时**失败做有限重试。
@@ -723,6 +786,7 @@ class AutoFixer:
             f"- 验证器：`{spec.name}`（{spec.kind.value}）",
             f"- 验证器命令：`{spec.command or '(清单型)'}`",
             "",
+            *(["## 自动评审意见", "", *[f"- {line}" for line in trace.review], ""] if trace.review else []),
             "## Agent 动作轨迹",
             "",
             "```text",

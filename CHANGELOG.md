@@ -35,6 +35,7 @@
 - **`sandbox.git_readonly`**：把工作区里的 `.git` 以只读挂进容器（`index` 除外），默认开启；测试套件需要容器写 git 时可关掉
 
 - **入站 webhook（事件驱动发现新条目）**：`webhooks.enabled: true` 时注册 `POST {api.prefix}/webhooks/<平台>`，平台一推就后台跑一轮（抓取 → 评测 → 验证 → flush → 修复），不必再等一个轮询间隔。GitHub 用 HMAC-SHA256（`X-Hub-Signature-256`），GitLab / Gitee / AtomGit 用共享密钥头，一律常数时间比对；只接受 `repos` 里登记且启用的仓库；**没配密钥时配置层拒绝启动、请求期再拦一道 403**（fail-closed）。该端点刻意不带 bearer 鉴权（平台不会带），所以它豁免 `FISSUE_API_TOKEN` 那套与两道写补刀——边界改为「签名 + 仓库白名单」，见 `SECURITY.md`
+- **自动修复新增「评审」环节**（`auto_fix.review_rounds`，默认 1，0 = 关闭）：F2P 与回归门挡得住「弄坏别处」，**挡不住「写得脏」**——真跑里那份三关全过的补丁把投递去重写成了模块级可变全局，靠调用顺序隐式传值。评审**只看改动快照**（因此能与回归门**并行**：回归门两分钟，评审不叠在上面），输出结构化发现（严重度 + 文件 + **原样引用** + 理由 + 建议），并做反幻觉过滤（引用不实/越界的条目直接丢弃）；只有 `critical`/`major` 触发返修（走与回归门同一套反馈通道），`nit` 只记录且落在 dry-run 的 `<patch>.review.txt`、人工报告与 PR 正文里。`auto_fix.review_model` 可给评审单独配模型（写与审不同模型，盲点不重合）
 
 ### 变更
 

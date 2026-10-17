@@ -185,6 +185,23 @@ async def test_agent_disabled_returns_skipped(settings, workspace, sample_issue)
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _stub_patch_reviewer(monkeypatch):
+    """把评审打桩成「没有问题」。
+
+    为什么必须桩：`auto_fix.review_rounds` 默认 1，而真实评审会去连 LLM 端点——本仓库 conftest
+    的网络守卫只放行 localhost，而 httpx 的真实请求在那道守卫下**既不报错也不被拦截**，只会一路
+    重试到超时（表现为 pytest 假死）。要断言评审行为的用例，在自己体内再 monkeypatch 一次即可
+    （测试体内的 setattr 在 fixture 之后生效，覆盖它）。
+    """
+    from fissue.fixer.reviewer import PatchReviewer, ReviewResult
+
+    async def _no_findings(self, **kwargs):
+        return ReviewResult(conclusion="（测试默认：无意见）")
+
+    monkeypatch.setattr(PatchReviewer, "review", _no_findings)
+
+
 @pytest.fixture
 def fixer_ctx(settings, repo):
     """构造一个只够跑策略闸门的 AutoFixer 上下文。"""
@@ -983,6 +1000,210 @@ async def test_dry_run_keeps_item_in_fix_queue(fixer_ctx, repo, sample_issue, mo
     assert attempt.patch_path == "/tmp/x.patch"
     # 关键：仍在待修队列里，真跑才取得到
     assert repo.get_item_row(sample_issue.key).status == ItemStatus.FIX_QUEUED.value
+
+
+def _fixable(repo, item) -> None:
+    """把条目推到「可自动修复」的状态（有评测、tier1、已入修复队列、有可执行验证器）。"""
+    _register(repo, item)
+    repo.save_evaluation(item.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(item.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(item.key,
+                       VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
+
+
+def _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch, *, gate=None):
+    """把克隆 / Agent / 完整 F2P / 回归门 / 补丁落盘都打桩，只留待测环节是真的。
+
+    返回「每次 Agent 调用收到的 prior_failure」列表——返修断言全靠它。
+    """
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt, VerifierResult
+
+    feedback: list[str | None] = []
+
+    async def fake_clone(repo_cfg, **kwargs):
+        return _FakeWS()
+
+    async def fake_agent(**kwargs):
+        feedback.append(kwargs.get("prior_failure"))
+        return FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS), AgentTrace(rounds=1)
+
+    async def fake_verify(ctx_verify, *, verifier_id=None, base_run=None):
+        # 真实的完整 F2P 会 await 沙盒（几十秒），这里用 sleep(0) 模拟那个**让出点**：
+        # 没有它，`create_task` 起来的评审任务永远没机会开跑，并行性就无从断言。
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(0)
+        return VerifierResult(kind=VerifierKind.EXECUTABLE, f2p_satisfied=True, conclusion="ok")
+
+    async def ok_gate(**kwargs):
+        return True, ""
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(fixer.agent, "run", fake_agent)
+    monkeypatch.setattr(fixer_ctx.verifier, "verify_fix", fake_verify)
+    monkeypatch.setattr(fixer, "_run_regression_gate", gate or ok_gate)
+    monkeypatch.setattr(fixer.pr_creator, "_save_patch", lambda item, diff: "/tmp/x.patch")
+    return feedback
+
+
+def test_review_prompt_states_the_checklist_and_hard_rules(sample_issue) -> None:
+    """评审提示词必须带上「真实踩过的坑」清单与反幻觉硬约束——它是这一步的全部依据。"""
+    from fissue.ai import prompts
+
+    text = prompts.fix_review_prompt(
+        sample_issue,
+        diff="+_seen = {}\n",
+        changed_files={"src/x.py": "_seen = {}\n"},
+        verifier_command="python -m pytest -q",
+    )[0]["content"]
+
+    for key in (
+        "模块级可变全局",           # 这次的真实缺陷
+        "改动层次",                 # 塞进解析函数会破坏契约
+        "为了过测试而动测试",
+        "fail-closed",
+        "无界增长",
+        "原样出现的代码片段",       # 反幻觉：引用不出原文就不算数
+        "返回空数组",               # 不许为了显得尽职而编问题
+        "只有前两级会触发返修",     # 严重度分级
+    ):
+        assert key in text, f"评审提示词缺少约束：{key}"
+
+
+def test_parse_review_drops_fabricated_or_out_of_scope_findings() -> None:
+    """反幻觉：越界文件、引用不实、没说为什么 → 一律丢弃；拼错的严重度降级为 nit。"""
+    from fissue.fixer.reviewer import parse_review
+
+    files = {"src/x.py": "_seen = {}\n"}
+    result = parse_review(
+        {
+            "conclusion": "总评",
+            "findings": [
+                {"severity": "critical", "file": "src/x.py", "quote": "_seen = {}", "why": "全局"},
+                {"severity": "weird", "file": "src/x.py", "quote": "_seen = {}", "why": "拼错"},
+                {"severity": "major", "file": "src/y.py", "quote": "_seen = {}", "why": "越界"},
+                {"severity": "major", "file": "src/x.py", "quote": "这段不在改动里", "why": "臆造"},
+                {"severity": "nit", "file": "src/x.py", "quote": "_seen = {}", "why": ""},
+            ],
+        },
+        changed_files=files,
+        diff="+_seen = {}\n",
+    )
+
+    assert [(f.severity, f.blocking) for f in result.findings] == [("critical", True), ("nit", False)]
+    assert len(result.dropped) == 3, result.dropped
+    assert "片段：" in result.feedback() and "_seen = {}" in result.feedback()
+    # 没有意见是完全合法的结果（而且我们希望它常见）
+    assert parse_review({"findings": []}, changed_files=files).findings == []
+
+
+async def test_review_blocking_findings_trigger_a_retry(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """评审报 critical → 带着评审意见（含原文片段）重跑一次；第二次干净就通过。"""
+    from fissue.fixer.reviewer import PatchReviewer, ReviewFinding, ReviewResult
+
+    _fixable(repo, sample_issue)
+    fixer = AutoFixer(fixer_ctx)
+    feedback = _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch)
+    reviews = [
+        ReviewResult(conclusion="有问题", findings=[ReviewFinding(
+            severity="critical", file="src/fissue/web/hooks.py",
+            quote="_seen = {}", why="模块级可变全局", suggestion="走显式数据流")]),
+        ReviewResult(conclusion="干净"),
+    ]
+
+    async def fake_review(self, **kwargs):
+        return reviews.pop(0)
+
+    monkeypatch.setattr(PatchReviewer, "review", fake_review)
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert len(feedback) == 2, "评审报严重问题时应当返修一次"
+    assert feedback[0] is None, "第一次不该带反馈"
+    assert feedback[1] and "模块级可变全局" in feedback[1] and "_seen = {}" in feedback[1]
+    assert attempt.dry_run is True
+
+
+async def test_review_nits_are_recorded_without_a_retry(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """nit 不触发返修，但**必须记录**——人工复核要看得到（否则等于白评）。"""
+    from pathlib import Path
+
+    from fissue.fixer.reviewer import PatchReviewer, ReviewFinding, ReviewResult
+
+    _fixable(repo, sample_issue)
+    fixer = AutoFixer(fixer_ctx)
+    feedback = _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch)
+
+    async def fake_review(self, **kwargs):
+        return ReviewResult(
+            conclusion="能用",
+            findings=[ReviewFinding(severity="nit", file="src/fissue/web/hooks.py",
+                                    quote="_seen = {}", why="命名像私有但其实没必要")],
+        )
+
+    monkeypatch.setattr(PatchReviewer, "review", fake_review)
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert len(feedback) == 1, "nit 不该触发返修"
+    # dry-run 不写人工报告（那条只在 needs_manual 时走），意见落在补丁旁边的旁挂文件里
+    assert attempt.error and "评审意见见" in attempt.error
+    assert attempt.patch_path, "dry-run 应当给出补丁路径"
+    sidecar = Path(attempt.patch_path).with_suffix(".review.txt")
+    assert sidecar.exists(), f"应当留下评审意见：{sidecar}"
+    assert "命名像私有但其实没必要" in sidecar.read_text(encoding="utf-8")
+
+
+async def test_review_can_be_disabled(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """`review_rounds=0` → 一次评审都不调用（关掉这一步的开关）。"""
+    from fissue.fixer.reviewer import PatchReviewer, ReviewResult
+
+    fixer_ctx.settings.auto_fix.review_rounds = 0
+    _fixable(repo, sample_issue)
+    fixer = AutoFixer(fixer_ctx)
+    _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch)
+    calls = {"n": 0}
+
+    async def fake_review(self, **kwargs):
+        calls["n"] += 1
+        return ReviewResult()
+
+    monkeypatch.setattr(PatchReviewer, "review", fake_review)
+
+    await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert calls["n"] == 0, "关掉之后不该再调用评审"
+
+
+async def test_review_overlaps_the_regression_gate(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """评审必须与 F2P/回归门**并行**（它只吃快照，不碰工作区）。
+
+    这是这一步的墙钟保证：回归门要跑两分钟，评审若串在它后面，每次修复都平白多等一轮——那样
+    用户会直接把这一步关掉。用「回归门开跑时，评审必须已经开始」来断言重叠。
+    """
+    import asyncio as _asyncio
+
+    from fissue.fixer.reviewer import PatchReviewer, ReviewResult
+
+    _fixable(repo, sample_issue)
+    fixer = AutoFixer(fixer_ctx)
+    started = _asyncio.Event()
+
+    async def fake_review(self, **kwargs):
+        started.set()
+        return ReviewResult(conclusion="干净")
+
+    async def gate_asserting_overlap(**kwargs):
+        assert started.is_set(), "评审应当与回归门并行，而不是等它跑完"
+        return True, ""
+
+    monkeypatch.setattr(PatchReviewer, "review", fake_review)
+    _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch, gate=gate_asserting_overlap)
+
+    await fixer.fix_item(repo.get_item(sample_issue.key), dry_run=True)
+
+    assert started.is_set()
 
 
 def test_fix_agent_prompt_carries_the_regression_feedback(sample_issue) -> None:

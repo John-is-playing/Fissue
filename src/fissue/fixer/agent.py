@@ -58,6 +58,9 @@ class AgentTrace:
     written_files: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
+    #: 自动评审的意见（**含 nit**）。不阻断产出的也要留下——人工复核时它们同样有价值，
+    #: 而「只记录不返修」正是我们的取舍，不能因为不返修就把意见丢了。
+    review: list[str] = field(default_factory=list)
     #: 上一轮验证器输出的指纹，与 :attr:`identical_output_streak` 一起用于给出提示。
     last_verifier_digest: str | None = None
     #: 验证器输出**逐字节**相同的轮数（首次出现记 1）。
