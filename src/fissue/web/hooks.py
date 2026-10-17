@@ -53,6 +53,57 @@ TOKEN_HEADER = {
 #: GitHub 的签名头（sha256 是默认；老式的 sha1 头不再接受——现在的 GitHub 两个都发）。
 GITHUB_SIGNATURE_HEADER = "x-hub-signature-256"
 
+#: 投递标识头：平台重推同一条投递时会带同样的值，用它做幂等（认领见 ``web/delivery.py``）。
+DELIVERY_HEADERS = {
+    Platform.GITHUB: ("x-github-delivery",),
+    Platform.GITLAB: ("x-gitlab-event-uuid", "x-github-delivery"),
+    Platform.GITEE: ("x-gitee-event-id", "x-github-delivery"),
+    Platform.ATOMGIT: ("x-gitee-event-id", "x-github-delivery"),
+}
+
+#: 只有**可能改变条目内容**的动作才值得跑一整轮（抓取 + 评测 + 验证 + 修复）。
+#:
+#: 为什么需要：open / reopened / edited / synchronize 这类会改内容，而 closed / labeled /
+#: assigned / unassigned 只动外围状态——一次批量打标签能在几秒内灌进几十个事件，而一个事件一轮
+#: 的代价（LLM + 沙盒）远高于开着轮询。
+MUTATING_ACTIONS = frozenset(
+    {
+        # GitHub issues / pull_request
+        "opened",
+        "reopened",
+        "edited",
+        "synchronize",
+        "ready_for_review",
+        # GitLab / Gitee 的等价写法
+        "open",
+        "reopen",
+        "update",
+    }
+)
+
+
+def delivery_id(platform: Platform, headers: Mapping[str, Any]) -> str:
+    """取这次投递的标识（平台没给就返回空串，那时不做去重）。"""
+    for name in DELIVERY_HEADERS.get(platform, ()):
+        value = _header(headers, name)
+        if value:
+            return f"{platform.value}:{value}"
+    return ""
+
+
+def is_mutating_action(action: str) -> bool:
+    """这个动作会不会改变条目内容——只有会的才值得跑一整轮。
+
+    刻意**不**塞进 :attr:`HookEvent.usable`：那条是既有公开语义（「解析成功、认得出是哪条条目」），
+    把「动作要不要跑」这条策略混进去会静默改掉所有按 ``usable`` 判断「解析成功」的调用方，
+    而且再也表达不了「认得出、但不用跑一轮」。策略在这儿，由调用方（路由）按需取用。
+    """
+    text = (action or "").strip().lower()
+    if not text:
+        # 平台没给动作（个别 payload 形态如此）→ 判不了，**宁可多跑一轮，也不静默丢掉事件**。
+        return True
+    return text in MUTATING_ACTIONS
+
 
 @dataclass
 class HookEvent:

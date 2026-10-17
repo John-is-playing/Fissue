@@ -32,7 +32,8 @@ from ..errors import FissueError
 from ..lockfile import WRITE_GATE, single_flight
 from ..logging_setup import get_logger, setup_logging
 from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
-from .hooks import parse_event, signature_ok
+from .delivery import DeliveryLedger
+from .hooks import delivery_id, is_mutating_action, parse_event, signature_ok
 
 log = get_logger(__name__)
 
@@ -346,6 +347,11 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
 
     prefix = settings.api.prefix
     auth = _auth_dependency(settings)
+
+    # 投递幂等账本：**每 app 一份**（`create_app` 只调本函数一次），由 webhook 路由闭包持有。
+    # 刻意不进模块级全局、也不用 id() 做键——那种写法会跨 app / 跨事件循环串味
+    # （地址被回收复用后，新 app 会继承旧 app 的投递记忆）。
+    ledger = DeliveryLedger()
 
     # -- 统计 -------------------------------------------------------------
 
@@ -699,15 +705,30 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             log.warning("webhook 校验失败（%s）：签名不匹配，或该平台未配置密钥", plat.value)
             raise HTTPException(status_code=403, detail="签名校验失败")
 
+        # 认领投递**必须在验签之后**：在验签之前认领，未认证的请求就能用一个猜到的 delivery id
+        # 占坑，把真实的平台投递挡在门外。同一投递在「处理中」或「TTL 内处理过」都会被拒。
+        token = delivery_id(plat, request.headers)
+        if not await ledger.claim(token):
+            log.info("webhook（%s）重复投递，忽略：%s", plat.value, token)
+            return {"accepted": False, "reason": "重复投递（同一个 delivery id 已处理过）"}
+
         try:
             payload = json.loads(body or b"{}")
         except json.JSONDecodeError as exc:
+            # 事件体有问题：放掉认领，让平台的重推还有机会被处理
+            await ledger.rollback(token)
             raise HTTPException(status_code=400, detail=f"事件体不是合法 JSON：{exc}") from exc
 
         event = parse_event(plat, payload)
-        if not event.usable:
-            log.info("webhook（%s）不处理：%s", plat.value, event.reason)
-            return {"accepted": False, "reason": event.reason}
+        # 动作过滤是**策略**，所以放在路由里，而不是塞进 `parse_event`：`usable` 的既有语义是
+        # 「解析成功、认得出是哪条条目」，把策略混进去会静默改掉所有按它判断的调用方。
+        if not event.usable or not is_mutating_action(event.action):
+            await ledger.confirm(token)
+            reason = event.reason or (
+                f"动作 {event.action or '(未知)'} 不改变条目内容，忽略（不触发整轮）"
+            )
+            log.info("webhook（%s）不处理：%s", plat.value, reason)
+            return {"accepted": False, "reason": reason}
 
         cfg = next(
             (
@@ -718,11 +739,27 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             None,
         )
         if cfg is None:
+            await ledger.confirm(token)
             log.info("webhook（%s）忽略未登记/未启用的仓库：%s", plat.value, event.repo_slug)
             return {"accepted": False, "reason": f"仓库未登记或未启用：{event.repo_slug}"}
 
+        async def _scheduled_round() -> None:
+            """跑一轮，跑完再决定「确认」还是「回滚」认领。
+
+            为什么不能**调度完就登记**：Starlette 的 BackgroundTasks 是在响应发完之后、同一次
+            ASGI 调用里执行的，而整轮要跑几分钟（抓取 + 评测 + 沙盒）——这期间平台因超时重推的
+            同一条投递完全能再进来一轮。所以认领要一直握到轮次结束：成功 → 记进 seen；抛异常 →
+            放掉，让重推还能被处理。
+            """
+            try:
+                await _run_round_after_hook(settings)
+            except Exception:
+                await ledger.rollback(token)
+                raise
+            await ledger.confirm(token)
+
         # 立刻回 202，重活交给后台：平台对回调有超时与重试，不能让它们等着我们跑完一轮。
-        background.add_task(_run_round_after_hook, settings)
+        background.add_task(_scheduled_round)
         log.info(
             "webhook（%s）%s %s#%s 已接受，后台触发一轮",
             plat.value, event.action or "-", event.repo_slug, event.number,
