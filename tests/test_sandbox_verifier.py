@@ -25,7 +25,12 @@ from fissue.sandbox.protocol import (
     result_from_dict,
     result_to_dict,
 )
-from fissue.verifier.generator import VerifierGenerator, _safe_relpath, validate_spec
+from fissue.verifier.generator import (
+    VerifierGenerator,
+    _safe_relpath,
+    narrow_pytest_command,
+    validate_spec,
+)
 from fissue.verifier.runner import classify_outcome, judge_f2p, verifier_self_error
 
 # ---------------------------------------------------------------------------
@@ -388,6 +393,52 @@ def test_validate_spec_drops_bad_paths_and_flags_suspicious() -> None:
     assert list(spec.files) == ["tests/ok.py"]
     assert any("可疑" in w for w in warns)
     assert any("非法路径" in w for w in warns)
+
+
+def test_narrow_pytest_command_only_when_it_targets_nothing() -> None:
+    """不带路径的 pytest 命令要收窄到验证器自己的文件；其余一律不动。
+
+    回归：`python -m pytest -q` 会跑**整个既有测试套件**（真跑里一轮 268s），既有套件里的失败
+    会被混进验证器结论——「base 失败」于是不再等于「问题复现」。
+    """
+    files = {"tests/test_webhook_trigger_scope.py": "def test_x(): pass\n"}
+
+    for cmd in ("python -m pytest -q", "pytest -q", "python3 -m pytest", "pytest"):
+        narrowed, changed = narrow_pytest_command(cmd, files)
+        assert changed is True, cmd
+        assert narrowed is not None, cmd
+        assert narrowed.endswith("tests/test_webhook_trigger_scope.py"), narrowed
+
+    # 已经带路径 → 不动（不替调用方改主意）
+    for cmd in (
+        "python -m pytest tests/test_x.py -q",
+        "python -m pytest tests/ -q",
+        "python -m pytest -q --ignore=tests/slow",
+    ):
+        assert narrow_pytest_command(cmd, files) == (cmd, False), cmd
+
+    # 不是 pytest → 不动
+    for raw in ("sh run.sh", "node test.js", "python verify.py", "", None):
+        assert narrow_pytest_command(raw, files) == (raw, False), raw
+
+    # 没有任何 .py 文件 → 不瞎编路径
+    assert narrow_pytest_command("python -m pytest -q", {"notes.txt": "x"}) == (
+        "python -m pytest -q",
+        False,
+    )
+
+
+def test_validate_spec_narrows_a_whole_suite_command() -> None:
+    """`validate_spec` 是唯一的收窄点——生成与重写两条路都经过它。"""
+    spec = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE,
+        command="python -m pytest -q",
+        files={"tests/test_mine.py": "def test_x():\n    assert True\n"},
+    )
+
+    validate_spec(spec)
+
+    assert spec.command == "python -m pytest -q tests/test_mine.py", spec.command
 
 
 def test_validate_spec_flags_missing_pieces() -> None:

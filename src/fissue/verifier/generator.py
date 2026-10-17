@@ -70,6 +70,38 @@ def _safe_relpath(path: str) -> str | None:
     return "/".join(parts)
 
 
+#: pytest 的几种调用形态（只看命令开头）。只在这些形态上做「收窄到自己的文件」。
+_PYTEST_HEAD = re.compile(r"^(?:python[0-9.]*\s+-m\s+pytest|pytest|py\.test)\b")
+
+#: 「看起来像路径」的令牌：含 `/`，或以 `.py` 结尾。
+_PATHISH = re.compile(r"(/|\.py$)")
+
+
+def narrow_pytest_command(
+    command: str | None, files: dict[str, str]
+) -> tuple[str | None, bool]:
+    """把「不带路径的 pytest 命令」收窄到**验证器自己写的那份文件**上。
+
+    为什么要收：不带路径的 `python -m pytest -q` 会跑**整个既有测试套件**——既慢（实测一轮
+    268s，而那套跑完要 4~6 分钟），又会把既有套件里的失败混进验证器的结论里（「既有用例在 base
+    就失败」被读成「问题已复现」属于这一类混淆）。收窄之后，验证器的 pass/fail 只反映它自己
+    那几条断言。
+
+    只在命令确实是 pytest、且**没有任何路径令牌**时才动它；其余情况（已带路径、或根本不是
+    pytest）原样返回——不替调用方改主意。
+    """
+    cmd = (command or "").strip()
+    if not cmd or not _PYTEST_HEAD.match(cmd):
+        return command, False
+    if any(_PATHISH.search(tok) for tok in cmd.split()[1:]):
+        return command, False
+    pys = sorted(p for p in files if p.endswith(".py"))
+    targets = [p for p in pys if "test" in p.rsplit("/", 1)[-1].lower()] or pys
+    if not targets:
+        return command, False          # 没有任何 .py 文件：不瞎编路径
+    return f"{cmd} {' '.join(targets)}", True
+
+
 def validate_spec(spec: VerifierSpec) -> list[str]:
     """静态安全校验：返回警告列表；致命问题通过抛异常表达由调用方处理。"""
     warnings: list[str] = []
@@ -89,6 +121,11 @@ def validate_spec(spec: VerifierSpec) -> list[str]:
 
     # 2. 命令
     cmd = spec.command or ""
+    narrowed, changed = narrow_pytest_command(cmd, spec.files)
+    if changed and narrowed is not None:
+        log.info("验证器命令没限定文件，收窄到自己的文件：%s → %s", cmd[:120], narrowed[:160])
+        spec.command = narrowed
+        cmd = narrowed
     for pattern in _SUSPICIOUS_PATTERNS:
         if pattern.search(cmd):
             warnings.append(f"命令含可疑片段（{pattern.pattern}）：{cmd[:120]}")
