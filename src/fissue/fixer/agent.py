@@ -77,6 +77,11 @@ class AgentTrace:
     #: Agent 根本不会触发验证器执行**——那条判据永远成立不了，于是它能把全部轮次
     #: 空烧完（实测 envkit #1：12 轮只发 read、一个文件没写）。
     barren_streak: int = 0
+    #: 连续多少轮**一个文件都没改**（只被 write 清零，与「有没有读到新文件」无关）。
+    #:
+    #: 为什么另立一个：`barren_streak` 把「读到新文件」也算进展（刻意宽松，防误杀跨模块探查），
+    #: 而真跑里正是它把计数一次次清零——9 轮只读不写里有 5 次新文件读取，于是拖到第 9 轮才到阈值。
+    no_write_streak: int = 0
     #: 已读到的**唯一**文件路径。用来判断一轮有没有取得「信息上的进展」——
     #: 判据只数写入会误杀真正的多轮探查（见 `run` 里空转闸门的说明）。
     read_paths: set[str] = field(default_factory=set)
@@ -161,24 +166,41 @@ class FixAgent:
                 trace.barren_streak += 1
             written_seen = len(trace.written_files)
             read_seen = len(trace.read_paths)
-            if self._barren_reached(trace):
+            # 「从未动笔」另立一个计数器：**只被 write 清零**，与「有没有读到新文件」无关。
+            # 实测（Fissue #1 真跑）：9 轮只读不写里有 5 次新文件读取，每次都把空转计数整体清零，
+            # 于是它拖到第 9 轮才累计到阈值。编辑者一直不动笔，这件事本身就已经够了。
+            trace.no_write_streak = 0 if wrote else trace.no_write_streak + 1
+
+            # 两个闸门**共用一次提醒**。为什么必须合并：它们可能在同一轮同时命中，而先判到的那个
+            # 把 `nudged` 置真之后，后判到的就会「已经提醒过了」直接收工——那一轮连模型都没调用，
+            # 提醒等于白设（实测就这么撞过一次）。所以：任一命中 → 提醒一次并**照常跑这一轮**；
+            # 提醒过再命中 → 收工（两条都命中时优先报「从未动笔」，那条更具体）。
+            barren_hit = self._barren_reached(trace)
+            no_write_hit = self._no_write_reached(trace)
+            if barren_hit or no_write_hit:
                 if not nudged:
                     nudged = True
+                    reasons = []
+                    if barren_hit:
+                        reasons.append(f"连续 {trace.barren_streak} 轮只读不写")
+                    if no_write_hit:
+                        reasons.append(f"连续 {trace.no_write_streak} 轮一个文件都没改过")
                     last_output = (
-                        f"你已经连续 {trace.barren_streak} 轮只读不写。现在必须二选一："
-                        '① 给出 `write`（改几行就用片段替换 `{"find": …, "replace": …}`）；'
-                        "② 或者 `give_up` 并说明为什么做不了。"
+                        "、".join(reasons)
+                        + "。现在必须二选一："
+                        '① `write`（改几行就用片段替换 `{"find": …, "replace": …}`）；'
+                        "② `give_up` 并说明为什么做不了。"
                         "**不要再读文件——从现在起 `read` 会被直接拒绝。**"
                     )
-                    trace.note("    空转提醒：要求给出改动或放弃")
+                    trace.note("    停摆提醒：要求给出改动或放弃")
                     # **不能 continue**：提醒要随这一轮的提示词一起送出去。跳过模型调用的话，
                     # 提醒就永远到不了模型眼前——等于只把「最后一句话」改得更委婉而已。
                 else:
-                    # 提醒过还是不动笔 → 按原来的口径收工（只提醒一次：否则它可以把提醒本身
-                    # 当成「进展」，无限拖下去）。
-                    barren = self._barren_stop(attempt, trace, workspace)
-                    if barren is not None:
-                        return barren
+                    stop = self._no_write_stop(attempt, trace, workspace) if no_write_hit else None
+                    if stop is None:
+                        stop = self._barren_stop(attempt, trace, workspace)
+                    if stop is not None:
+                        return stop
 
             read_files = self._pick_context(workspace, read_files, locked_files=spec.files)
 
@@ -220,27 +242,33 @@ class FixAgent:
                     )
                     continue
                 paths = [str(p) for p in (data.get("paths") or []) if str(p).strip()]
+                served: list[str] = []
+                refused: list[str] = []
                 for p in paths[:10]:
                     content = self._safe_read(workspace, p, trace, locked_files=spec.files)
                     if content is None:
                         continue
                     if seen_content.get(p) == content:
-                        # 内容没变 → 只回一句提示，不把正文重贴一遍。重读同一批本来就不带
-                        # 新信息，而**把正文再塞回上下文反而在鼓励它继续读**（实测：连续 7 轮
-                        # 只读不写，读的就是同样两个文件）。提示里顺手推它去写。
-                        read_files[p] = (
-                            "（该文件自你上次读后**没有变化**，正文不再重复；"
-                            "要改它就给片段替换。）"
-                        )
-                        trace.note(f"    读了 {p}（内容未变，未重复正文）")
+                        # 内容未变 → **拒绝**，而不是只回一句提示。实测（Fissue #1 真跑）：它把
+                        # 「再看一眼」当成了常规操作——9 轮里 8 次读的都是「内容未变」的那两个文件，
+                        # 每一次都算一个动作、把轮次耗掉。内容早就在它上下文里，再索取一次毫无意义。
+                        refused.append(p)
                         continue
                     seen_content[p] = content
                     read_files[p] = content
                     trace.read_paths.add(p)
+                    served.append(p)
                     # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
                     # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
                     # 一行提示，读成功反而没有，信息最不对称。
                     trace.note(f"    读了 {p}")
+                for p in refused:
+                    trace.note(f"    拒绝重复读 {p}（内容未变，已在上下文里）")
+                if refused and not served:
+                    last_output = (
+                        "这些文件的内容没有变化，而且**早就在你的上下文里了**——不要重复索取。"
+                        '能改就 `write`（改几行用片段替换），改不了就 `give_up` 并说明原因。'
+                    )
                 continue
 
             if action == "write":
@@ -654,6 +682,45 @@ class FixAgent:
         """
         limit = self._stall_rounds()
         return limit > 1 and trace.barren_streak >= limit
+
+    def _no_write_rounds(self) -> int:
+        """「从未动笔」闸门的轮数阈值（``<=1`` 表示关闭）。"""
+        try:
+            return int(getattr(self.cfg, "no_write_rounds", 6))
+        except (TypeError, ValueError):  # pragma: no cover - 配置异常时用默认值
+            return 6
+
+    def _no_write_reached(self, trace: AgentTrace) -> bool:
+        """「一个文件都没改」是否已达阈值。"""
+        limit = self._no_write_rounds()
+        return limit > 1 and trace.no_write_streak >= limit
+
+    def _no_write_stop(
+        self,
+        attempt: FixAttempt,
+        trace: AgentTrace,
+        workspace: RepoWorkspace,
+    ) -> tuple[FixAttempt, AgentTrace] | None:
+        """连续多轮**一个文件都没改** → 提前收工。
+
+        与 :meth:`_barren_stop` 的区别：那条把「读到新文件」也算进展（刻意宽松，防误杀跨模块探查），
+        这条**只看写入**。为什么需要它：真跑（Fissue #1）里 9 轮只读不写、其中 5 次是新文件读取，
+        每次都把空转计数整体清零，于是拖到第 9 轮才停。而「一直没产出**任何**改动」本身就已经说明
+        模型没在干活——它不需要等到连读都读不动了才该被喊停。
+        """
+        if not self._no_write_reached(trace):
+            return None
+        reason = (
+            f"连续 {trace.no_write_streak} 轮一个文件都没改过"
+            f"（第 {trace.rounds} 轮提前收工，上限 {self._no_write_rounds()} 轮）——"
+            "模型反复浏览却始终不动笔，并非「修了很多次没修好」"
+        )
+        trace.give_up_reason = reason
+        trace.summary = reason
+        attempt.outcome = FixOutcome.FAILED
+        attempt.rounds = trace.rounds
+        attempt.error = reason
+        return self._finalize(attempt, trace, workspace)
 
     def _maybe_escalate(self, trace: AgentTrace, last_output: str) -> str:
         """出现停滞迹象时，给模型一次**改变思路**的明确提示。

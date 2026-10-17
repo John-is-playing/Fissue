@@ -1807,10 +1807,11 @@ async def test_barren_read_only_loop_stops_early(settings, workspace, sample_iss
     # 阈值 4：第 6 轮命中 → 先提醒一轮（这一轮照常调用模型），第 7 轮才真的收工
     assert llm.calls == 6, "命中闸门后要先提醒一轮，再收工"
     assert attempt.rounds == 7, "收工在「第 7 轮」这个名义轮次上"
-    assert any("空转提醒" in a for a in trace.actions), "必须留下提醒的痕迹"
+    assert any("停摆提醒" in a for a in trace.actions), "必须留下提醒的痕迹"
     assert "不要再读文件" in str(llm.history[-1]), "提醒必须真的进了下一轮的提示词"
-    assert "空转" in (attempt.error or "")
-    assert "没有读到任何新文件" in (attempt.error or "")
+    # v1.0.0-b8 起还有一条「从未动笔」闸门，两条都命中时优先报后者（更具体）
+    assert "一个文件都没改过" in (attempt.error or "")
+    assert "修了很多次没修好" in (attempt.error or "")
     assert runner.runs == 0, "从未写入，验证器不该被执行"
 
 
@@ -1861,31 +1862,30 @@ async def test_fragment_replacement_refuses_to_guess(settings, workspace, sample
     assert agent._resolve_content(workspace, "dup.py", "整份内容", trace=trace) == ("整份内容", None)
 
 
-async def test_repeated_read_returns_a_notice_instead_of_the_body(
+async def test_repeated_read_of_an_unchanged_file_is_refused(
     settings, workspace, sample_issue
 ) -> None:
-    """同一文件第二次读 → 只回「没有变化」，**不再把正文塞回上下文**。
+    """同一文件第二次读 → **直接拒绝**（不再只回一句「没有变化」），且不重复供给正文。
 
-    为什么：重读本来就不带新信息，而把正文一遍遍塞回去反而在鼓励模型继续读——实测
-    Fissue #1 连续 7 轮只读不写，读的就是同样两个文件。
+    为什么从「回提示」改成「拒绝」（v1.0.0-b8）：实测（Fissue #1 真跑）它把「再看一眼」当成了
+    常规操作——9 轮里 8 次读的都是「内容未变」的那两个文件，每一次都算一个动作、把轮次耗掉。
+    内容本来就在它上下文里，再索取一次毫无意义。
     """
-    settings.auto_fix.stall_rounds = 12          # 关掉空转闸门，专心看读去重
+    settings.auto_fix.stall_rounds = 12          # 关掉两条闸门，专心看读拒绝
+    settings.auto_fix.no_write_rounds = 0
     workspace.write("README.md", "# HELLO-MARKER\n")
-    steps = [
-        {"action": "read", "paths": ["README.md"]},
-        {"action": "read", "paths": ["README.md"]},
-        {"action": "read", "paths": ["README.md"]},
-    ]
+    steps = [{"action": "read", "paths": ["README.md"]} for _ in range(3)]
     agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
 
-    await agent.run(
+    _attempt, trace = await agent.run(
         item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=3
     )
 
     assert "HELLO-MARKER" in str(llm.history[0]), "第一次读要把正文给出去"
-    # 去重是在**下一轮**提示词才体现的：模型的动作是在它读到的那条提示之后才被处理的
-    assert "没有变化" in str(llm.history[2]), "第二次读的结论要出现在随后的提示里"
-    assert "HELLO-MARKER" not in str(llm.history[2]), "此后不该再把正文塞回上下文"
+    assert any("拒绝重复读" in a for a in trace.actions), "重复读要被明确拒绝"
+    # 拒绝是在**下一轮**提示词才体现的：模型的动作在它读到的那条提示之后才被处理
+    assert "早就在你的上下文里" in str(llm.history[2]), "拒绝理由要回给模型"
+    assert "不要重复索取" in str(llm.history[2])
 
 
 async def test_barren_guard_does_not_punish_exploration(settings, workspace, sample_issue) -> None:
@@ -1895,8 +1895,12 @@ async def test_barren_guard_does_not_punish_exploration(settings, workspace, sam
     （实测 r1 读 5 个 → r2 读 6 个 → r3 读 8 个，每轮都在扩大范围）。而这个判据最初
     只看「有没有写入」，于是在第 4 轮把这种正当探查判成空转、直接收工——两个 pipekit
     条目都因此被判要人工，而问题其实出在判据上。
+
+    注意：本条只测**空转闸门**，所以把 v1.0.0-b8 新增的「从未动笔」闸门关掉（那条另有用例
+    ``test_never_writing_exploration_is_bounded`` 在守）。
     """
     settings.auto_fix.stall_rounds = 4
+    settings.auto_fix.no_write_rounds = 0        # 本条只测空转判据
     spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
     for i in range(6):
         (workspace.root / f"mod{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
@@ -1910,6 +1914,32 @@ async def test_barren_guard_does_not_punish_exploration(settings, workspace, sam
     assert llm.calls >= 6, "每轮都读到新文件，不该被空转闸门提前砍掉（旧判据第 4 轮就砍）"
     # 读完 6 个新文件后确实没有新信息了 → 仍应正常收工，而不是烧满 12 轮
     assert "没有读到任何新文件" in (attempt.error or ""), attempt.error
+
+
+async def test_never_writing_exploration_is_bounded(settings, workspace, sample_issue) -> None:
+    """一直只读不写（**哪怕每轮都读到新文件**）→ 「从未动笔」闸门兜住，不再拖到轮次上限。
+
+    回归（Fissue #1 真跑）：9 轮只读不写里有 5 次「读到新文件」，每一次都把空转计数**整体清零**，
+    于是它拖到第 9 轮才停；而「一直没产出任何改动」这件事本身早就够了。所以另立一个**只被 write
+    清零**的计数器——正当的多轮探查照旧（那条判据另有用例在守），只是不再允许它拖到底。
+    """
+    settings.auto_fix.stall_rounds = 12          # 关掉空转闸门，只看「从未动笔」
+    settings.auto_fix.no_write_rounds = 6
+    spec = VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q")
+    for i in range(12):
+        (workspace.root / f"mod{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
+    steps = [{"action": "read", "paths": [f"mod{i}.py"]} for i in range(12)]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=spec, repo_context=""
+    )
+
+    # 第 6 轮命中 → 提醒一轮（这一轮照常调用模型）→ 第 7 轮收工
+    assert llm.calls == 6, f"应当第 6 轮提醒、第 7 轮收工，实际烧了 {llm.calls} 次"
+    assert any("停摆提醒" in a for a in trace.actions), "要先提醒一次"
+    assert "一个文件都没改过" in (attempt.error or ""), attempt.error
+    assert attempt.outcome is FixOutcome.FAILED
 
 
 async def test_barren_streak_resets_after_a_write(settings, workspace, sample_issue) -> None:
