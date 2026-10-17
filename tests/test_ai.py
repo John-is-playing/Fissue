@@ -657,6 +657,61 @@ async def test_chat_json_retries_once_when_content_unparseable() -> None:
     assert "JSON" in seen[1][-1]["content"]
 
 
+async def test_chat_json_handles_a_tool_call_response(caplog) -> None:
+    """模型把回复放进 `tool_calls` 时：既要重试，也要把工具名与参数报出来。
+
+    回归：自维护实测（Fissue #1）修复 Agent 收到 `finish_reason=tool_calls`、content 长度 0，
+    日志里只有一句「无法解析为 JSON」，运维无法判断是端点行为还是模型自己的选择；而重试提示
+    也没让它别调工具，于是第二轮大概率再撞一次。
+    """
+    import logging
+
+    from fissue.ai.client import LLMClient, LLMResponse, Usage
+    from fissue.config import LLMConfig
+
+    client = LLMClient(LLMConfig(api_key="k"))
+    seen: list[list] = []
+
+    async def fake_chat(messages, **kwargs):
+        seen.append(list(messages))
+        if len(seen) == 1:
+            return LLMResponse(
+                content="",
+                model="m",
+                usage=Usage(),
+                raw={
+                    "choices": [
+                        {
+                            "finish_reason": "tool_calls",
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path": "a.py"}',
+                                        }
+                                    }
+                                ]
+                            },
+                        }
+                    ]
+                },
+            )
+        return LLMResponse(content='{"action": "read"}', model="m", usage=Usage(),
+                           raw={"choices": [{"finish_reason": "stop"}]})
+
+    client.chat = fake_chat  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING):
+        data, _usage = await client.chat_json([{"role": "user", "content": "x"}], purpose="test")
+
+    assert data == {"action": "read"}
+    assert len(seen) == 2, "遇到 tool_calls 也要重试一次"
+    assert "不要调用工具" in seen[1][-1]["content"], "重试提示必须明确要求纯 JSON"
+    assert "工具调用" in caplog.text, "要把「这是工具调用」说清楚"
+    assert "read_file" in caplog.text, "要报出工具名"
+    assert "a.py" in caplog.text, "要报出参数（便于判断是不是端点切模板搞的）"
+
+
 async def test_chat_json_gives_default_after_all_attempts_fail() -> None:
     """每轮都解析不出来 → 仍返回 default 且不抛异常（上层可降级继续）。"""
     from fissue.ai.client import LLMClient, LLMResponse, Usage

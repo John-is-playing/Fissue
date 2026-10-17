@@ -126,9 +126,13 @@ class FixAgent:
 
         locked = set(spec.files.keys())          # 验证器文件在修复期间锁定
         read_files: dict[str, str] = {}
+        #: 上次**真正**返回给模型的正文（path → 内容）。片段替换的「未变化」判定要用它，
+        #: 不能看 `read_files`：那一项可能已经被换成了「没有变化」的提示语。
+        seen_content: dict[str, str] = {}
         last_output: str | None = None
         written_seen = 0                          # 上一轮结束时的写入文件数（判空转用）
         read_seen = 0                             # 上一轮结束时的已读文件数（同上）
+        nudged = False                            # 空转提醒是否已用过（只提醒一次）
 
         for round_index in range(1, rounds_limit + 1):
             trace.rounds = round_index
@@ -147,9 +151,23 @@ class FixAgent:
                 trace.barren_streak += 1
             written_seen = len(trace.written_files)
             read_seen = len(trace.read_paths)
-            barren = self._barren_stop(attempt, trace, workspace)
-            if barren is not None:
-                return barren
+            if self._barren_reached(trace):
+                if not nudged:
+                    nudged = True
+                    last_output = (
+                        f"你已经连续 {trace.barren_streak} 轮只读不写。现在必须二选一："
+                        '① 给出 `write`（改几行就用片段替换 `{"find": …, "replace": …}`）；'
+                        "② 或者 `give_up` 并说明为什么做不了。**不要再读文件。**"
+                    )
+                    trace.note("    空转提醒：要求给出改动或放弃")
+                    # **不能 continue**：提醒要随这一轮的提示词一起送出去。跳过模型调用的话，
+                    # 提醒就永远到不了模型眼前——等于只把「最后一句话」改得更委婉而已。
+                else:
+                    # 提醒过还是不动笔 → 按原来的口径收工（只提醒一次：否则它可以把提醒本身
+                    # 当成「进展」，无限拖下去）。
+                    barren = self._barren_stop(attempt, trace, workspace)
+                    if barren is not None:
+                        return barren
 
             read_files = self._pick_context(workspace, read_files, locked_files=spec.files)
 
@@ -178,13 +196,25 @@ class FixAgent:
                 paths = [str(p) for p in (data.get("paths") or []) if str(p).strip()]
                 for p in paths[:10]:
                     content = self._safe_read(workspace, p, trace, locked_files=spec.files)
-                    if content is not None:
-                        read_files[p] = content
-                        trace.read_paths.add(p)
-                        # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
-                        # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
-                        # 一行提示，读成功反而没有，信息最不对称。
-                        trace.note(f"    读了 {p}")
+                    if content is None:
+                        continue
+                    if seen_content.get(p) == content:
+                        # 内容没变 → 只回一句提示，不把正文重贴一遍。重读同一批本来就不带
+                        # 新信息，而**把正文再塞回上下文反而在鼓励它继续读**（实测：连续 7 轮
+                        # 只读不写，读的就是同样两个文件）。提示里顺手推它去写。
+                        read_files[p] = (
+                            "（该文件自你上次读后**没有变化**，正文不再重复；"
+                            "要改它就给片段替换。）"
+                        )
+                        trace.note(f"    读了 {p}（内容未变，未重复正文）")
+                        continue
+                    seen_content[p] = content
+                    read_files[p] = content
+                    trace.read_paths.add(p)
+                    # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
+                    # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
+                    # 一行提示，读成功反而没有，信息最不对称。
+                    trace.note(f"    读了 {p}")
                 continue
 
             if action == "write":
@@ -261,6 +291,81 @@ class FixAgent:
 
     # -- 写入控制 ---------------------------------------------------------
 
+    #: 片段替换允许的字段对。模型对这几组名字的熟悉度最高，全收——多认几个名字，
+    #: 比让弱模型去猜「你们家叫法是什么」划算。
+    _EDIT_FIELDS = (("find", "replace"), ("old_string", "new_string"), ("search", "replace"))
+
+    @classmethod
+    def _parse_edit(cls, item: Any) -> tuple[str, str] | str:
+        """``{"find": …, "replace": …}`` → ``(find, replace)``；解析不了则返回原因。"""
+        if not isinstance(item, dict):
+            return "既不是完整内容字符串，也不是 {find, replace} 对象"
+        for find_key, replace_key in cls._EDIT_FIELDS:
+            if find_key in item or replace_key in item:
+                old, new = item.get(find_key), item.get(replace_key)
+                if isinstance(old, str) and isinstance(new, str):
+                    return old, new
+                return f"{find_key}/{replace_key} 必须是字符串"
+        return "缺少 find/replace（也接受 old_string/new_string）"
+
+    @staticmethod
+    def _apply_edits(current: str, edits: list[tuple[str, str]]) -> tuple[str, str | None]:
+        """顺序应用片段替换；每段必须在**当时的内容**里唯一匹配。
+
+        为什么要求唯一：多义匹配会让模型以为改的是 A、实际改的是 B。宁可拒绝并告诉它
+        「匹配到 N 处，给更长的上下文」，也不要替它猜。
+        """
+        text = current
+        for old, new in edits:
+            hits = text.count(old)
+            if hits == 0:
+                return "", f"片段没找到（前 40 字：{old[:40]!r}）"
+            if hits > 1:
+                return "", f"片段匹配到 {hits} 处，请给出更长的上下文以唯一确定"
+            text = text.replace(old, new, 1)
+        return text, None
+
+    def _resolve_content(
+        self, workspace: RepoWorkspace, path: str, raw: Any, *, trace: AgentTrace
+    ) -> tuple[str, str | None]:
+        """把模型的写入意图解析成**最终文件内容**（历史形态完全兼容）。
+
+        * 字符串 → 整份内容（与从前行为一致）；
+        * ``{"find": …, "replace": …}`` → 在当前内容上做一次片段替换；
+        * 上面这种对象的数组 → 依次替换。
+
+        为什么加片段替换：`write` 原本只认「整份文件内容」，而实测里模型对着 700 行的
+        ``src/fissue/web/app.py`` **连续 7 轮只读不写**——完整重排一份大文件对它代价太大
+        （输出长、易错、还可能被截断），于是它宁可再读一遍，最后被空转闸门判停。片段替换
+        把小改动变成小输出，才是它愿意走的那条路。
+
+        注意这里读当前内容**不记账**：片段替换不是「探查式阅读」，不能算进展，否则一次
+        写入会被读路径一并算成 `read_new`，把空转判据搅乱。
+        """
+        if isinstance(raw, str):
+            return raw, None
+
+        items = raw if isinstance(raw, list) else [raw]
+        edits: list[tuple[str, str]] = []
+        for item in items:
+            parsed = self._parse_edit(item)
+            if isinstance(parsed, str):
+                return "", parsed
+            edits.append(parsed)
+        if not edits:
+            return "", "空的替换列表"
+        if not workspace.exists(path):
+            return "", "文件不存在（片段替换只能改已有文件；新增文件请直接给完整内容）"
+        try:
+            current = workspace.read(path)
+        except (FissueError, OSError) as exc:
+            return "", f"读取当前内容失败：{exc}"
+        text, err = self._apply_edits(current, edits)
+        if err is not None:
+            return "", err
+        trace.note(f"    {path}: 片段替换 {len(edits)} 处")
+        return text, None
+
     def _apply_writes(
         self,
         workspace: RepoWorkspace,
@@ -279,10 +384,11 @@ class FixAgent:
             trace.rejected.append(reason)
             return [], reason
 
-        for raw_path, content in files.items():
+        for raw_path, raw_content in files.items():
             path = str(raw_path).replace("\\", "/").lstrip("/")
-            if not isinstance(content, str):
-                trace.rejected.append(f"{path}: 内容非字符串")
+            content, resolve_err = self._resolve_content(workspace, path, raw_content, trace=trace)
+            if resolve_err is not None:
+                trace.rejected.append(f"{path}: {resolve_err}")
                 continue
 
             # 1) 验证器文件锁定
@@ -514,6 +620,15 @@ class FixAgent:
         except (TypeError, ValueError):  # pragma: no cover - 配置异常时用默认值
             return 4
 
+    def _barren_reached(self, trace: AgentTrace) -> bool:
+        """空转闸门是否已达阈值（``_stall_rounds() <= 1`` 表示关闭）。
+
+        抽出来是为了让「先提醒一次」与「真的收工」用**同一个**判据——两处各写一遍，
+        迟早会出现「提醒了但没拦」或「拦了却没提醒」的不一致。
+        """
+        limit = self._stall_rounds()
+        return limit > 1 and trace.barren_streak >= limit
+
     def _maybe_escalate(self, trace: AgentTrace, last_output: str) -> str:
         """出现停滞迹象时，给模型一次**改变思路**的明确提示。
 
@@ -594,7 +709,7 @@ class FixAgent:
         区分开。
         """
         limit = self._stall_rounds()
-        if limit <= 1 or trace.barren_streak < limit:
+        if not self._barren_reached(trace):
             return None
         reason = (
             f"连续 {trace.barren_streak} 轮既没有写入、也没有读到任何新文件，判定为空转"

@@ -371,6 +371,7 @@ class LLMClient:
         last_content = ""
         last_finish = ""
         cur_max_tokens = max_tokens
+        tool_call_seen = False                     # 上一轮是不是把回复放进了工具调用
 
         for attempt in range(1, attempts + 1):
             msgs = list(messages)
@@ -383,7 +384,13 @@ class LLMClient:
                         "content": (
                             f"上面这轮没有返回可解析的 JSON"
                             f"{f'（finish_reason={last_finish}）' if last_finish else ''}。"
-                            "请**只输出一个 JSON 对象**，不要任何解释、前言或 Markdown 代码块；"
+                            + (
+                                "**你返回的是工具调用，而这里不需要任何工具**——"
+                                "不要调用工具或函数，直接把结果写成 JSON。"
+                                if tool_call_seen
+                                else ""
+                            )
+                            + "请**只输出一个 JSON 对象**，不要任何解释、前言或 Markdown 代码块；"
                             "务必输出完整闭合的 JSON（不要被长度截断）。"
                         ),
                     },
@@ -399,10 +406,27 @@ class LLMClient:
             usage = _merge_usage(usage, resp.usage)
             last_content = resp.content or ""
             last_finish = str((resp.raw.get("choices") or [{}])[0].get("finish_reason") or "")
+            message = ((resp.raw.get("choices") or [{}])[0].get("message") or {})
+            tool_calls = message.get("tool_calls") or []
 
             parsed = extract_json(resp.content)
             if parsed is not None:
                 return parsed, usage
+
+            if tool_calls:
+                # 模型把回复放进了**工具调用**里（实测：finish_reason=tool_calls、content 长度 0）。
+                # Fissue 从不需要工具，这个协议只会让每一轮都拿到空内容——报出来，别让运维
+                # 对着一句「无法解析为 JSON」猜。下一轮的重试提示会明确要求纯 JSON。
+                tool_call_seen = True
+                names = "、".join(
+                    str((c.get("function") or {}).get("name") or "?") for c in tool_calls
+                )[:200]
+                preview = str(((tool_calls[0].get("function") or {}).get("arguments")) or "")[:200]
+                log.warning(
+                    "LLM[%s] 这一轮回的是**工具调用**而不是 JSON（%s；参数前 200 字：%s）——"
+                    "Fissue 不需要任何工具，若持续如此请在端点/模型侧关掉工具调用",
+                    purpose, names, preview,
+                )
 
             log.warning(
                 "LLM[%s] 返回内容无法解析为 JSON，长度=%d finish_reason=%s（第 %d/%d 次）",

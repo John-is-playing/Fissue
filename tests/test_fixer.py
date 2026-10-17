@@ -1416,11 +1416,88 @@ async def test_barren_read_only_loop_stops_early(settings, workspace, sample_iss
 
     attempt, trace = await agent.run(item=sample_issue, workspace=workspace, spec=spec, repo_context="")
 
-    assert llm.calls == 5, "反复重读同一文件不算进展；首轮读取后尚需一轮才累计到阈值"
-    assert attempt.rounds == 6, "收工在「第 6 轮」这个名义轮次上"
+    # 阈值 4：第 6 轮命中 → 先提醒一轮（这一轮照常调用模型），第 7 轮才真的收工
+    assert llm.calls == 6, "命中闸门后要先提醒一轮，再收工"
+    assert attempt.rounds == 7, "收工在「第 7 轮」这个名义轮次上"
+    assert any("空转提醒" in a for a in trace.actions), "必须留下提醒的痕迹"
+    assert "不要再读文件" in str(llm.history[-1]), "提醒必须真的进了下一轮的提示词"
     assert "空转" in (attempt.error or "")
     assert "没有读到任何新文件" in (attempt.error or "")
     assert runner.runs == 0, "从未写入，验证器不该被执行"
+
+
+async def test_write_accepts_fragment_replacement(settings, workspace, sample_issue) -> None:
+    """`files` 的值可以是 `{find, replace}`：只改片段，不必重写整份文件。
+
+    回归（Fissue #1 自维护实测）：模型对着 700 行的 `src/fissue/web/app.py` **连续 7 轮
+    只读不写**——`write` 只认整份内容，完整重排一份大文件对它代价太大（输出长、易错、
+    还可能被截断），于是它宁可再读一遍，最后被空转闸门判停。
+    """
+    workspace.write("app.py", "a = 1\nb = 2\nc = 3\n")
+    steps = [{"action": "write", "files": {"app.py": {"find": "b = 2", "replace": "b = 22"}}}]
+    agent, _llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx"
+    )
+
+    assert workspace.read("app.py") == "a = 1\nb = 22\nc = 3\n"
+    assert "app.py" in trace.written_files
+    assert any("片段替换" in a for a in trace.actions)
+
+
+async def test_fragment_replacement_refuses_to_guess(settings, workspace, sample_issue) -> None:
+    """片段不唯一 / 找不到 / 文件不存在 → 拒绝并给可操作理由；字符串形态保持兼容。"""
+    from fissue.fixer.agent import AgentTrace
+
+    agent, _llm, _runner = _agent_with_runner(settings, [], _StubRunner(None))
+    trace = AgentTrace()
+    workspace.write("dup.py", "k = 1\nk = 1\n")
+
+    got, err = agent._resolve_content(
+        workspace, "dup.py", {"find": "k = 1", "replace": "k = 2"}, trace=trace
+    )
+    assert got == "" and err is not None and "匹配到 2 处" in err
+
+    got, err = agent._resolve_content(
+        workspace, "dup.py", {"find": "nope", "replace": "x"}, trace=trace
+    )
+    assert got == "" and err is not None and "没找到" in err
+
+    got, err = agent._resolve_content(
+        workspace, "missing.py", {"find": "a", "replace": "b"}, trace=trace
+    )
+    assert got == "" and err is not None and "文件不存在" in err
+
+    # 老形态（整份内容字符串）必须原样通过——兼容性是硬要求
+    assert agent._resolve_content(workspace, "dup.py", "整份内容", trace=trace) == ("整份内容", None)
+
+
+async def test_repeated_read_returns_a_notice_instead_of_the_body(
+    settings, workspace, sample_issue
+) -> None:
+    """同一文件第二次读 → 只回「没有变化」，**不再把正文塞回上下文**。
+
+    为什么：重读本来就不带新信息，而把正文一遍遍塞回去反而在鼓励模型继续读——实测
+    Fissue #1 连续 7 轮只读不写，读的就是同样两个文件。
+    """
+    settings.auto_fix.stall_rounds = 12          # 关掉空转闸门，专心看读去重
+    workspace.write("README.md", "# HELLO-MARKER\n")
+    steps = [
+        {"action": "read", "paths": ["README.md"]},
+        {"action": "read", "paths": ["README.md"]},
+        {"action": "read", "paths": ["README.md"]},
+    ]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=3
+    )
+
+    assert "HELLO-MARKER" in str(llm.history[0]), "第一次读要把正文给出去"
+    # 去重是在**下一轮**提示词才体现的：模型的动作是在它读到的那条提示之后才被处理的
+    assert "没有变化" in str(llm.history[2]), "第二次读的结论要出现在随后的提示里"
+    assert "HELLO-MARKER" not in str(llm.history[2]), "此后不该再把正文塞回上下文"
 
 
 async def test_barren_guard_does_not_punish_exploration(settings, workspace, sample_issue) -> None:
