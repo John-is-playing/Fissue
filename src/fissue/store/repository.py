@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
-from sqlalchemy import Select, and_, delete, func, select, update
+from sqlalchemy import Select, and_, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, selectinload
 
@@ -56,6 +56,27 @@ from .tables import (
 )
 
 log = get_logger(__name__)
+
+#: 允许作为 ``list_items(order_by=...)`` 的列。**必须是白名单**：这个参数现在直接来自
+#: Web 的查询串，而原先的 ``getattr(ItemRow, order_by, ...)`` 拿到的**不一定是列**——
+#: ``metadata`` 拿到 MetaData、``query`` 拿到描述符、``registry`` 拿到 registry，
+#: 它们都没有 ``.desc()``，一律炸成 500。非白名单键回落到 ``updated_at``。
+ITEM_SORT_COLUMNS = {
+    "updated_at": ItemRow.updated_at,
+    "created_at": ItemRow.created_at,
+    "fetched_at": ItemRow.fetched_at,
+    "number": ItemRow.number,
+    "title": ItemRow.title,
+    "author": ItemRow.author,
+    "repo_slug": ItemRow.repo_slug,
+    "category": ItemRow.category,
+    "priority": ItemRow.priority,
+    "status": ItemRow.status,
+}
+
+#: 搜索（``query``）命中的列。正文也算：Issue 的结论往往写在正文里，而页面上不搜正文
+#: 等于搜不到。
+ITEM_SEARCH_COLUMNS = (ItemRow.title, ItemRow.body, ItemRow.author)
 
 
 def _now() -> datetime:
@@ -447,23 +468,22 @@ class Repository:
         status: ItemStatus | None = None,
         category: Category | None = None,
         priority: Priority | None = None,
+        query: str | None = None,
         limit: int = 100,
         offset: int = 0,
         order_by: str = "updated_at",
         desc: bool = True,
     ) -> list[RawItem]:
-        stmt: Select = select(ItemRow)
-        if repo_slug:
-            stmt = stmt.where(ItemRow.repo_slug == repo_slug)
-        if item_type:
-            stmt = stmt.where(ItemRow.item_type == item_type.value)
-        if status:
-            stmt = stmt.where(ItemRow.status == status.value)
-        if category:
-            stmt = stmt.where(ItemRow.category == category.value)
-        if priority:
-            stmt = stmt.where(ItemRow.priority == priority.value)
-        col = getattr(ItemRow, order_by, ItemRow.updated_at)
+        stmt = self._item_filtered(
+            select(ItemRow),
+            repo_slug=repo_slug,
+            item_type=item_type,
+            status=status,
+            category=category,
+            priority=priority,
+            query=query,
+        )
+        col = ITEM_SORT_COLUMNS.get(order_by, ItemRow.updated_at)
         stmt = stmt.order_by(col.desc() if desc else col.asc()).limit(limit).offset(offset)
         with self.db.session() as s:
             rows = list(s.scalars(stmt))
@@ -638,14 +658,32 @@ class Repository:
         with self.db.session() as s:
             s.execute(update(ItemRow).where(ItemRow.key == key).values(category=category.value))
 
-    def count_items(self, **filters: Any) -> int:
-        stmt = select(func.count()).select_from(ItemRow)
-        if repo_slug := filters.get("repo_slug"):
-            stmt = stmt.where(ItemRow.repo_slug == repo_slug)
-        if item_type := filters.get("item_type"):
-            stmt = stmt.where(ItemRow.item_type == item_type.value)
-        if status := filters.get("status"):
-            stmt = stmt.where(ItemRow.status == status.value)
+    def count_items(
+        self,
+        *,
+        repo_slug: str | None = None,
+        item_type: ItemType | None = None,
+        status: ItemStatus | None = None,
+        category: Category | None = None,
+        priority: Priority | None = None,
+        query: str | None = None,
+    ) -> int:
+        """当前筛选条件下的**总数**，与 :meth:`list_items` 同口径。
+
+        分页必须靠它：``list_items`` 只回一页，页面上看不出「这 50 条是全部、还是共 300
+        条里的前 50」。原先只认 repo_slug / item_type / status，且自己写了一套 where——
+        与明细口径不一致正是 ``summarize`` 那个「概览与明细条数对不上」的老毛病，所以这里
+        一并改成走 :meth:`_item_filtered`。
+        """
+        stmt = self._item_filtered(
+            select(func.count()).select_from(ItemRow),
+            repo_slug=repo_slug,
+            item_type=item_type,
+            status=status,
+            category=category,
+            priority=priority,
+            query=query,
+        )
         with self.db.session() as s:
             return int(s.scalar(stmt) or 0)
 
@@ -665,6 +703,68 @@ class Repository:
         with self.db.session() as s:
             rows = list(s.scalars(select(ItemRow).where(ItemRow.key.in_(list(keys)))))
             return [_item_to_domain(r, with_comments=False) for r in rows]
+
+    def item_exists(self, key: str) -> bool:
+        """库里有没有这条条目。
+
+        抓取侧靠它区分两种情况（见 ``Fetcher`` 里对已关闭条目的处理）：
+        **已经在跟踪的**条目即便关了也要更新进来（否则本地状态永远停在 open）；
+        **从没见过的**已关闭条目则不必建行——流水线到验证阶段才会跳过它，而那时已经白花了
+        一次评测。
+        """
+        with self.db.session() as s:
+            return s.scalar(select(ItemRow.id).where(ItemRow.key == key).limit(1)) is not None
+
+    def delete_items(self, keys: Sequence[str]) -> dict[str, int]:
+        """删除条目及其**全部**关联数据，返回每张表删掉的行数。
+
+        为什么要手工清那三张表：``comments`` / ``evaluations`` / ``verifiers`` 对
+        ``items.id`` 有 ``ondelete="CASCADE"`` 外键（连接上强制开了 ``PRAGMA foreign_keys``，
+        见 ``store/db.py``），删父行会被数据库自动带走；但 ``verifier_runs`` /
+        ``fix_attempts`` / ``batch_conclusions`` 是按 **item_key 字符串**关联的，**没有外键**。
+
+        留成孤儿数据的后果很具体：同一条条目被删之后又被抓回来（key 不变，因为 key 由
+        平台+仓库+编号决定），这些旧记录会摇身变成它的「历史」——验证结果、修复尝试、
+        批量结论全部张冠李戴，而且看不出任何异常。
+
+        ``queue_entries`` 虽然也有 CASCADE，但它的 ``item_id`` **可空**：没带 item_id 入队的
+        那些不会被级联带走，所以按 item_key 再删一遍。
+        """
+        wanted = [str(k) for k in keys]
+        if not wanted:
+            return {}
+        counts: dict[str, int] = {}
+        with self.db.session() as s:
+            item_ids = list(s.scalars(select(ItemRow.id).where(ItemRow.key.in_(wanted))))
+
+            # 先把「会跟着一起消失的东西」数出来：破坏性操作只回一句「成功」没法让人核对。
+            for table in (CommentRow, EvaluationRow, VerifierRow):
+                counts[table.__tablename__] = (
+                    int(
+                        s.scalar(
+                            select(func.count())
+                            .select_from(table)
+                            .where(table.item_id.in_(item_ids))
+                        )
+                        or 0
+                    )
+                    if item_ids
+                    else 0
+                )
+
+            # 按 item_key 关联、**没有外键**的三张表：必须显式删。
+            for table in (VerifierRunRow, FixAttemptRow, BatchConclusionRow):
+                result = s.execute(delete(table).where(table.item_key.in_(wanted)))
+                counts[table.__tablename__] = int(result.rowcount or 0)
+
+            result = s.execute(delete(QueueEntryRow).where(QueueEntryRow.item_key.in_(wanted)))
+            counts["queue_entries"] = int(result.rowcount or 0)
+
+            # 剩下的子行交给数据库 CASCADE。
+            result = s.execute(delete(ItemRow).where(ItemRow.key.in_(wanted)))
+            counts["items"] = int(result.rowcount or 0)
+        log.info("已删除条目 %d 条：%s", counts["items"], "、".join(f"{k} {v}" for k, v in counts.items()))
+        return counts
 
     # -- 评测 -------------------------------------------------------------
 
@@ -1281,8 +1381,11 @@ class Repository:
         self,
         *,
         repo_slug: str | None = None,
+        item_type: ItemType | None = None,
         status: ItemStatus | None = None,
         category: Category | None = None,
+        priority: Priority | None = None,
+        query: str | None = None,
     ) -> list[str]:
         """只取 key（不构造领域对象）。
 
@@ -1290,7 +1393,13 @@ class Repository:
         全加载进内存。
         """
         stmt = self._item_filtered(
-            select(ItemRow.key), repo_slug=repo_slug, status=status, category=category
+            select(ItemRow.key),
+            repo_slug=repo_slug,
+            item_type=item_type,
+            status=status,
+            category=category,
+            priority=priority,
+            query=query,
         )
         with self.db.session() as s:
             return [str(k) for k in s.scalars(stmt)]
@@ -1318,19 +1427,29 @@ class Repository:
         self,
         *,
         repo_slug: str | None = None,
+        item_type: ItemType | None = None,
         status: ItemStatus | None = None,
         category: Category | None = None,
+        priority: Priority | None = None,
+        query: str | None = None,
     ) -> dict[str, Any]:
         """概览计数走**聚合查询**（一行 GROUP BY），不把条目对象加载进内存。
 
         与逐条 ``Counter`` 完全等价：每条只属于一个分组，而分组把自己的 count 分别加到四个
         计数器上——「每种类型/分类/优先级/状态各多少」四组数字都由此得出。
+
+        过滤条件与 :meth:`list_items` 逐项对齐（同一个 :meth:`_item_filtered`），因此
+        ``total`` 恒等于同条件下 :meth:`count_items` 的结果——页面上「概览」与「列表」
+        不会互相矛盾。
         """
         stmt = self._item_filtered(
             select(ItemRow.item_type, ItemRow.category, ItemRow.priority, ItemRow.status, func.count()),
             repo_slug=repo_slug,
+            item_type=item_type,
             status=status,
             category=category,
+            priority=priority,
+            query=query,
         )
         stmt = stmt.group_by(ItemRow.item_type, ItemRow.category, ItemRow.priority, ItemRow.status)
         by_type: dict[str, int] = {}
@@ -1359,16 +1478,44 @@ class Repository:
         stmt: Select,
         *,
         repo_slug: str | None = None,
+        item_type: ItemType | None = None,
         status: ItemStatus | None = None,
         category: Category | None = None,
+        priority: Priority | None = None,
+        query: str | None = None,
     ) -> Select:
-        """条目查询的公共过滤（与 :meth:`list_items` 同口径）。"""
+        """条目查询的公共过滤——**唯一的一份口径**。
+
+        ``list_items``（明细）/ ``count_items``（总数）/ ``item_keys`` / ``item_stats``
+        （概览）都走这里。它们原先各写各的 where，于是 ``fissue export --status x`` 里
+        「已过滤的明细」与「概览」的条数会对不上（见 :func:`..store.export.summarize`）。
+        加过滤条件时改这一处即可。
+
+        ``query`` 是模糊搜索（标题 / 正文 / 作者）。通配符要转义：``_`` 和 ``%`` 在 LIKE 里
+        有特殊含义，而 ``get_bool``、``snake_case`` 这类含下划线的词恰是最常见的搜索词，
+        不转义就会变成「任意单字符」，搜出大量无关条目。
+        """
         if repo_slug:
             stmt = stmt.where(ItemRow.repo_slug == repo_slug)
+        if item_type:
+            stmt = stmt.where(ItemRow.item_type == item_type.value)
         if status:
             stmt = stmt.where(ItemRow.status == status.value)
         if category:
             stmt = stmt.where(ItemRow.category == category.value)
+        if priority:
+            stmt = stmt.where(ItemRow.priority == priority.value)
+        if query and query.strip():
+            term = (
+                query.strip()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            # SQLite 没有 ILIKE：SQLAlchemy 会把它翻译成 lower(..) LIKE lower(..)，两边都认。
+            stmt = stmt.where(
+                or_(*[col.ilike(f"%{term}%", escape="\\") for col in ITEM_SEARCH_COLUMNS])
+            )
         return stmt
 
     # -- 修复尝试 ---------------------------------------------------------
@@ -1490,6 +1637,21 @@ class Repository:
         }
 
     # -- 扫描记录 ---------------------------------------------------------
+
+    def list_scan_runs(self, *, repo_key: str | None = None, limit: int = 20) -> list[ScanRunRow]:
+        """最近几次抓取（按开始时间倒序）。
+
+        `scan_runs` 表一直在写，但此前**只有写入口没有读入口**——于是界面上只能显示
+        `repos.last_scanned_at` 一个时间戳，看不出那次抓了多少条、有没有报错。
+        """
+        stmt = select(ScanRunRow).order_by(ScanRunRow.started_at.desc(), ScanRunRow.id.desc())
+        if repo_key:
+            stmt = stmt.where(ScanRunRow.repo_key == repo_key)
+        with self.db.session() as s:
+            rows = list(s.scalars(stmt.limit(limit)))
+            for row in rows:
+                s.expunge(row)
+            return rows
 
     def start_scan(self, repo_key: str) -> int:
         with self.db.session() as s:

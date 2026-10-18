@@ -36,6 +36,23 @@ ENV_PREFIX = "FISSUE_"
 
 DEFAULT_CONFIG_FILE = "config.yaml"
 DEFAULT_ENV_FILE = ".env"
+#: 覆盖层：WebUI / `fissue onboard` 改配置时**只写这一份**，不碰人手写的 config.yaml。
+#: 理由与写入规则见 ``fissue/configio.py`` 的模块说明。
+DEFAULT_OVERLAY_FILE = "config.local.yaml"
+
+
+def overlay_path_for(config_path: str | Path | None) -> Path:
+    """覆盖层文件的位置：默认与 config.yaml 同目录、同名换成 ``config.local.yaml``。
+
+    ``FISSUE_CONFIG_LOCAL`` 可以整体改掉它（容器 / 多环境部署时把覆盖层放到别处）。
+    这个读取**刻意留在 config.py**：``tests/test_env.py`` 会用正则扫 config.py 与 net.py 来
+    核对「.env.example 里承诺的每个变量都真的被读」，写在别的模块里它就看不见。
+    """
+    explicit = os.environ.get(ENV_PREFIX + "CONFIG_LOCAL")
+    if explicit:
+        return Path(explicit).expanduser()
+    base = Path(config_path).expanduser() if config_path is not None else Path(DEFAULT_CONFIG_FILE)
+    return base.with_name(DEFAULT_OVERLAY_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +514,15 @@ class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
     read_only: bool = False
+    #: 「配置写入」类操作（初始化向导 / 仓库管理 / 设置页）的额外边界。
+    #:
+    #: 默认 False = **本机回环**才允许写配置；来源不是回环时，必须开鉴权（FISSUE_API_TOKEN）。
+    #: 打开它 = 「我明白风险，强制允许非本机来源改写配置」——给「内网无口令自用」这种部署留的
+    #: 出口，页面上会以显式开关呈现并带警告，而不是悄悄放行。
+    #:
+    #: 与 `read_only` 的分工：`read_only` 管的是「要不要去平台上打标签/提 PR」，
+    #: 这个开关管的是「能不能改本机的配置文件」。两件不同的事，别互相借用语义。
+    allow_remote_config_write: bool = False
     # 这里曾有 `allow_repo_management`（文档说它控制「仓库与密钥管理界面」），
     # 但那个界面从未实现、背后没有任何路由，属于「配置写了不生效」，已删除。
     # 真正的写操作闸门是上面的 `read_only`（见 web/app.py 的 _require_writable）。
@@ -609,6 +635,17 @@ class Settings(BaseModel):
     # 运行期元信息（不写入文件）
     config_path: str | None = None
     env_path: str | None = None
+    #: 覆盖层（WebUI / onboard 的写回目标）。不存在时为 None——「设置」页据此决定
+    #: 是提示「还没有覆盖层」还是「改过这些键」。
+    overlay_path: str | None = None
+    #: **解析后的输入路径**，文件不存在时同样记录。
+    #:
+    #: 为什么不能只用上面那两个：`config_path` / `env_path` 在文件不存在时是 None，而热重载
+    #: （`web/setup.py::reload_state`）拿 None 再走一遍 `load_settings` 会**回落到 cwd 下的
+    #: 默认文件**。具体后果实测过：用 `--config /tmp/x.yaml` 起的服务，保存一次仓库配置后
+    #: 数据库就从 `/tmp/t.db` 悄悄换成了 `./fissue.db`——用户不会想到「改个仓库列表会换库」。
+    config_source: str | None = None
+    env_source: str | None = None
 
     # -- 便捷方法 ---------------------------------------------------------
 
@@ -887,6 +924,23 @@ def load_settings(
         # 显式指定却不存在 → 报错，避免静默用错配置
         raise ConfigError(f"配置文件不存在：{cfg_path}")
 
+    # 覆盖层（WebUI / `fissue onboard` 的写回目标）夹在 config.yaml 与 .env 之间：
+    #
+    #     进程环境 > .env > config.local.yaml > config.yaml > 内置默认值
+    #
+    # 为什么在 .env **之下**：.env 装的是密钥与部署项（更贴近这次具体部署），两者冲突时它该赢；
+    # 为什么在 config.yaml **之上**：它是「人通过 WebUI 明确改过的值」，语义上就是补丁。
+    # 本函数只**读**覆盖层；写入规则与「不许丢数据」的约束见 `fissue/configio.py`。
+    #
+    # 为什么在这里才 import：configio 需要 config 里的常量与 _deep_merge，模块级互相 import
+    # 会成环。
+    from .configio import read_yaml_mapping  # noqa: PLC0415 —— 规避模块级循环导入
+
+    ol_path = overlay_path_for(cfg_path)
+    overlay = read_yaml_mapping(ol_path)
+    if overlay:
+        raw = _deep_merge(raw, overlay)
+
     env_values = _read_env_file(env_file)
     # .env 的值必须让 TLS 判定也能看到：``net`` 读的是 ``os.getenv``，而 .env 是
     # ``dotenv_values`` 读成的字典（不导出到进程环境），不登记的话「在 .env 里设
@@ -914,6 +968,12 @@ def load_settings(
 
     settings.config_path = str(cfg_path) if cfg_path.exists() else None
     settings.env_path = str(env_file) if env_file.exists() else None
+    # 覆盖层同理：**存在才记**（页面据此区分「还没生成」与「已经改过这些键」）。
+    # 别把它跟 config_source / env_source 混了——那两个是「解析出的输入路径」，不存在也记。
+    settings.overlay_path = str(ol_path) if ol_path.exists() else None
+    # 无论存在与否都记下**解析结果**：热重载靠它复现同一次加载，不会回落到 cwd 的默认文件。
+    settings.config_source = str(cfg_path)
+    settings.env_source = str(env_file)
 
     setup_logging(settings.app.log_level)
 

@@ -134,6 +134,7 @@ fissue web
 
 | 命令 | 说明 |
 |---|---|
+| `fissue onboard` | **初始化向导**：交互式配好模型 / 数据库 / 平台凭据 / 监控仓库，并抓第一轮（无头机器用 `--yes` + 参数走非交互） |
 | `fissue db init` | 建表 / 迁移 |
 | `fissue fetch` | 抓取 Issue/PR（增量） |
 | `fissue eval` | AI 评测（四维评分 + 标签 + 反刷子） |
@@ -145,7 +146,7 @@ fissue web
 | `fissue export` | 导出全量数据 |
 | `fissue status` | 查看当前状态：条目统计、队列情况、模型用量、沙盒可用性 |
 | `fissue serve` | 常驻服务：增量扫描 + 队列调度 + 阈值通知（**也含验证**；`--with-web` 同进程带起 Web/API，`--once` 只跑一轮） |
-| `fissue web` | Web 仪表盘 + REST API |
+| `fissue web` | Web 工作台 + REST API：总览 / 条目 / 队列 / 任务 / 监控仓库 / 状态监测 / 初始化向导 / 设置 |
 | `fissue sandbox serve` | 起沙盒转发组件（宿主侧常驻，沙盒执行的唯一通道）；`fissue sandbox check` 检查沙盒环境是否就绪 |
 | `fissue bench` | 跑分基线：`capture` 冻结 / `diff` 逐项对比（先判可比性）/ `list` 列出 |
 

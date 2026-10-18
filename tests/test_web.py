@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -11,6 +13,7 @@ from fissue.models import (
     Category,
     DimensionScore,
     Evaluation,
+    ItemStatus,
     Platform,
     Priority,
     RepoRef,
@@ -356,11 +359,18 @@ def test_export_endpoints(client) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dashboard_renders_and_encodes_links(client) -> None:
-    html = client.get("/").text
-    assert "Fissue" in html
-    assert "真实缺陷" in html
-    assert quote(KEY, safe="") in html or "%23" in html
+def test_overview_and_items_pages_render(client) -> None:
+    """总览与「条目」是两个页面：前者回答「有没有问题」，后者回答「这一条是什么」。
+
+    原先什么都堆在一页上——筛选器一铺，告警就被挤到看不见的地方。
+    """
+    overview = client.get("/").text
+    assert "Fissue" in overview
+    assert "总览" in overview
+
+    items = client.get("/items").text
+    assert "真实缺陷" in items
+    assert quote(KEY, safe="") in items or "%23" in items
 
 
 def test_item_page_renders_sections(client) -> None:
@@ -538,3 +548,437 @@ def test_write_endpoint_allows_an_unparseable_peer(client) -> None:
     """
     r = client.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
     assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# 新的展示能力：正文 / 评论 / 真实状态 / 搜索 / 分页 / 静态资源
+# ---------------------------------------------------------------------------
+
+
+def test_item_payload_carries_body_comments_and_pipeline_status(client) -> None:
+    """详情 payload 要带正文、评论正文与流水线状态。
+
+    回归：`item_to_dict` 原先只发一个评论**计数**，正文与评论内容整颗丢掉——一个分诊工具，
+    打开一条 Issue 却读不到它说了什么，只能点「在平台打开」跳出去；而列表 payload 里
+    连 `status` 都没有，于是看板的「状态」列只能拿「有没有评测」凑数。
+    """
+    detail = client.get(f"/api/v1/items/{KEY_ENC}").json()
+    assert "复现步骤" in detail["body"]
+    assert detail["status"] in {s.value for s in ItemStatus}
+    assert detail["comments"] == 1
+    assert detail["comment_thread"][0]["author"] == "maintainer"
+    assert "已确认" in detail["comment_thread"][0]["body"]
+
+
+def test_item_page_renders_body_and_comment_thread(client) -> None:
+    html = client.get(f"/item/{KEY_ENC}").text
+    assert "复现步骤" in html, "详情页必须能读到正文"
+    assert "已确认，我来看看" in html, "详情页必须能看到评论内容"
+    assert "讨论（1 条）" in html
+
+
+def test_items_list_reports_total_and_searches(client) -> None:
+    """列表要给出**筛选后的总数**与搜索。
+
+    分页靠 `total`：`count` 只是这一页的条数，没有 total 就看不出「这 1 条是全部、
+    还是共 300 条里的第 1 条」。
+    """
+    page = client.get("/api/v1/items", params={"limit": 1}).json()
+    assert page["count"] == 1
+    assert page["total"] >= 1
+    assert page["limit"] == 1 and page["offset"] == 0
+
+    assert client.get("/api/v1/items", params={"q": "崩溃"}).json()["count"] == 1
+    miss = client.get("/api/v1/items", params={"q": "绝对不存在的关键词"}).json()
+    assert miss["count"] == 0 and miss["total"] == 0
+
+
+def test_items_list_survives_an_unknown_sort_key(client) -> None:
+    """排序键非法不炸。
+
+    `order_by` 原先走 `getattr(ItemRow, name)`，而它拿到的不一定是列——`metadata` 是
+    MetaData、`query` 是描述符，都没有 `.desc()`，于是这个参数一旦来自查询串就是 500。
+    """
+    assert client.get("/api/v1/items", params={"sort": "metadata"}).status_code == 200
+
+
+def test_static_assets_are_served(client) -> None:
+    """样式与脚本是挂出来的静态文件，不再各自内联在两个模板里。"""
+    css = client.get("/static/app.css")
+    js = client.get("/static/app.js")
+    assert css.status_code == 200 and js.status_code == 200
+    assert "--accent" in css.text
+    assert "window.Fissue" in js.text
+
+
+def test_overview_shows_alerts_queue_and_usage(client) -> None:
+    """总览要落地后端一直算好、旧版却没渲染的东西：告警、队列积压、模型用量。"""
+    overview = client.get("/").text
+    assert "队列积压" in overview
+    assert "模型用量" in overview
+    assert "控制面板" in overview
+    assert "待定论" in overview
+    # 配置告警：这台测试机没配平台 token，必须有一条 warn 提醒（新手最缺的就是这个提示）
+    assert "alert" in overview and "未配置任何平台 Token" in overview
+    # 最近抓取：scan_runs 一直有写、此前没有读入口
+    assert "最近抓取" in overview
+
+
+def test_items_table_shows_the_real_pipeline_status(client) -> None:
+    """表格里的状态列必须是真实的流水线状态。
+
+    旧版写的是 `row.evaluation and '已评测' or '待评测'`——筛了 status、表格里却看不到
+    status，而且当时 payload 里根本没有它。
+    """
+    status = client.get(f"/api/v1/items/{KEY_ENC}").json()["status"]
+    items = client.get("/items").text
+    assert f"status-{status}" in items, "表格里必须看得到真实的流水线状态"
+    assert "待评测</span>" not in items, "旧的假状态列不该回来"
+
+
+def test_items_page_renders_a_page_not_json_for_a_bad_filter(client) -> None:
+    """筛选值非法时页面照常渲染并提示，而不是给浏览器一坨 JSON。
+
+    `_enum_param` 抛的 400 是给 API 用的错误体；同一套解析也挂在 HTML 路由上，
+    原先 `?status=foo` 会让用户看到一个 JSON 错误页。
+    """
+    r = client.get("/items", params={"status": "nope"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "取值非法" in r.text and "可选" in r.text
+    # API 那边仍然是 400 —— 那次真的是客户端的错，而且要写清可选值
+    api = client.get("/api/v1/items", params={"status": "nope"})
+    assert api.status_code == 400 and "status" in api.json()["detail"]
+
+
+def test_items_page_paginates_and_keeps_filters_in_sort_links(client, sample_issue) -> None:
+    """分页可见，且表头排序链接**带着当前筛选**。
+
+    手拼 URL 漏一个参数，用户一点排序就把筛选条件丢了——所以这串是 Python 侧编码好交付的。
+    """
+    rid = client.repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    client.repo.upsert_item(rid, sample_issue.model_copy(update={"number": 77, "title": "第二个条目"}))
+
+    page1 = client.get("/items", params={"limit": 1, "page": 1}).text
+    page2 = client.get("/items", params={"limit": 1, "page": 2}).text
+    assert "第 1–1 条 / 共 2 条" in page1
+    assert "第 2–2 条 / 共 2 条" in page2
+
+    filtered = client.get("/items", params={"item_type": "issue", "limit": 1, "sort": "title"}).text
+    assert "item_type=issue" in filtered, "排序链接必须带上当前筛选"
+    assert "sort=title" in filtered
+
+
+# ---------------------------------------------------------------------------
+# 作业（长任务）：提交 / 轮询 / 互斥 / 只读
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_job(client, job_id: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """轮询到作业结束。"""
+    deadline = time.monotonic() + timeout
+    job = client.get(f"/api/v1/jobs/{job_id}").json()
+    while job["live"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+        job = client.get(f"/api/v1/jobs/{job_id}").json()
+    return job
+
+
+def test_job_lifecycle_reports_progress_and_result(client) -> None:
+    """提交 → 202 + job id → 轮询到结束。
+
+    用 flush 做样本：队列空时它不发 LLM、不进沙盒，几毫秒就结束，正好能测「作业化」本身
+    （提交、进度日志、结果、结束态）。
+    """
+    r = client.post("/api/v1/jobs/flush", json={"queue": "verify", "force": True})
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job"]["id"]
+    assert job_id
+
+    job = _wait_for_job(client, job_id)
+    assert job["status"] == "done", job
+    assert job["kind"] == "flush"
+    assert job["log"], "作业应当留下进度日志（前端就靠它显示进行到哪一步）"
+    assert job["result"]["results"][0]["queue"] == "verify"
+    assert job["duration_seconds"] >= 0
+
+    assert [j["id"] for j in client.get("/api/v1/jobs").json()["jobs"]][0] == job_id
+
+
+def test_job_unknown_kind_lists_the_valid_ones(client) -> None:
+    r = client.post("/api/v1/jobs/rm-rf", json={})
+    assert r.status_code == 400
+    assert "flush" in r.json()["detail"] and "可选" in r.json()["detail"]
+
+
+def test_job_404_for_an_unknown_id(client) -> None:
+    assert client.get("/api/v1/jobs/nope").status_code == 404
+
+
+def test_second_job_is_rejected_while_one_is_running(client) -> None:
+    """同进程同时只允许一个作业：并行跑只会重复调 LLM、重复写平台。"""
+    from fissue.web import jobs as jobs_mod
+
+    registry = client.app.state.jobs
+    busy = jobs_mod.Job(id="busy", kind="flush")
+    busy.status = jobs_mod.RUNNING
+    registry._jobs["busy"] = busy
+    try:
+        r = client.post("/api/v1/jobs/flush", json={})
+        assert r.status_code == 409, r.text
+        assert "已有任务在运行" in r.json()["detail"]
+    finally:
+        registry._jobs.pop("busy", None)
+
+
+def test_a_running_job_holds_the_write_gate(client, monkeypatch) -> None:
+    """作业在跑时，同步写端点是 409 —— 证明闸门是**作业自己**全程握着的。
+
+    如果闸门只是「提交作业的那个请求」握的，请求一返回就放了，而作业还在跑：并发的第二次写
+    就能同时进行，重复调 LLM、重复写平台标签——正是 `WRITE_GATE` 要防的事。
+    """
+    import threading
+
+    from fissue.web import app as webapp
+
+    started = threading.Event()
+    release = threading.Event()
+
+    async def slow_work(app, params, report):  # noqa: ANN001, ARG001
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {"ok": True}
+
+    monkeypatch.setitem(webapp._JOB_WORK, "flush", slow_work)
+    r = client.post("/api/v1/jobs/flush", json={})
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job"]["id"]
+    try:
+        assert started.wait(5), "作业没跑起来"
+        assert client.post("/api/v1/queues/flush", json={"force": True}).status_code == 409
+        assert client.get("/api/v1/stats").status_code == 200, "只读不受影响"
+    finally:
+        release.set()
+    assert _wait_for_job(client, job_id)["status"] == "done"
+
+
+def test_jobs_are_blocked_in_read_only(settings, repo, sample_issue) -> None:
+    from fastapi.testclient import TestClient
+
+    s = settings.model_copy(deep=True)
+    s.web.read_only = True
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    with TestClient(create_app(s)) as c:
+        r = c.post("/api/v1/jobs/flush", json={})
+        assert r.status_code == 403
+        assert c.get("/api/v1/jobs").status_code == 200, "只读时看历史任务仍是只读操作"
+
+
+# ---------------------------------------------------------------------------
+# 取消作业
+# ---------------------------------------------------------------------------
+
+
+def _slow_job(monkeypatch, *, started: Any, release: Any) -> None:
+    """把 flush 换成「一直跑，直到 release 被置位」的作业，用来测取消。"""
+    from fissue.web import app as webapp
+
+    async def slow_work(app, params, report):  # noqa: ANN001, ARG001
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.02)
+        return {"ok": True}
+
+    monkeypatch.setitem(webapp._JOB_WORK, "flush", slow_work)
+
+
+def test_cancel_a_running_job(client, monkeypatch) -> None:
+    """取消一个正在跑的作业：状态变 canceled，并且**写闸门被释放**。
+
+    闸门这条是关键：取消靠 `task.cancel()` 在下一个 await 点投递 CancelledError，
+    作业的 `async with` 随之退出并放锁。如果实现里手工解锁或漏了某条路径，
+    闸门会被永久占住——之后任何写操作都 409，而页面上只会看到「一直失败」。
+    """
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    _slow_job(monkeypatch, started=started, release=release)
+
+    job_id = client.post("/api/v1/jobs/flush", json={}).json()["job"]["id"]
+    assert started.wait(5), "作业没跑起来"
+
+    r = client.post(f"/api/v1/jobs/{job_id}/cancel")
+    assert r.status_code == 200, r.text
+    assert "已请求取消" in r.json()["note"]
+
+    job = _wait_for_job(client, job_id)
+    assert job["status"] == "canceled", job
+    assert "取消" in job["error"]
+    assert job["live"] is False
+
+    # 闸门必须已经放开：能再提交一个（原实现若漏了解锁，这里会 409）
+    release.set()
+    again = client.post("/api/v1/jobs/flush", json={})
+    assert again.status_code == 202, f"闸门没释放：{again.text}"
+    _wait_for_job(client, again.json()["job"]["id"])
+
+
+def test_cancel_rejects_finished_and_unknown_jobs(client) -> None:
+    """已经结束的作业没什么可取消（409），不存在的作业是 404——两者要分清。"""
+    job_id = _wait_for_job(client, client.post("/api/v1/jobs/flush", json={}).json()["job"]["id"])
+    assert not job_id["live"]
+
+    r = client.post(f"/api/v1/jobs/{job_id['id']}/cancel")
+    assert r.status_code == 409, r.text
+    assert "已经结束" in r.json()["detail"]
+
+    assert client.post("/api/v1/jobs/nope/cancel").status_code == 404
+
+
+def test_cancel_is_blocked_in_read_only(settings, repo, sample_issue) -> None:
+    """只读部署不该能取消任务——它和提交任务是同一类「写」。"""
+    from fastapi.testclient import TestClient
+
+    s = settings.model_copy(deep=True)
+    s.web.read_only = True
+    with TestClient(create_app(s)) as c:
+        assert c.post("/api/v1/jobs/whatever/cancel").status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 删除条目
+# ---------------------------------------------------------------------------
+
+
+def test_delete_item_removes_related_and_queued_rows(client) -> None:
+    """删除条目要连关联数据一起清干净。
+
+    关联分两类，处理方式不同（见 `Repository.delete_items`）：
+    * `comments` / `evaluations` / `verifiers` 有 `items.id` 的 CASCADE 外键 → 数据库会自动带走；
+    * `verifier_runs` / `fix_attempts` / `batch_conclusions` **只按 item_key 字符串关联、没有外键**
+      → 必须显式删。否则同一条被重新抓回来（key 由平台+仓库+编号决定，不变）时，
+      这些旧记录会冒充它的「历史」：验证结果、修复尝试全都张冠李戴。
+    """
+    from fissue.models import FixAttempt, FixOutcome, QueueName, VerifierOutcome, VerifierRun
+
+    repo = client.app.state.repo
+    verifier = repo.latest_verifier(KEY)
+    assert verifier is not None
+    repo.save_verifier_run(
+        VerifierRun(
+            verifier_id=verifier[0], item_key=KEY, stage="base", outcome=VerifierOutcome.FAIL
+        )
+    )
+    repo.save_fix_attempt(FixAttempt(item_key=KEY, outcome=FixOutcome.SKIPPED))
+    repo.enqueue(QueueName.VERIFY, KEY)
+
+    # 动手之前，这些数据确实都在
+    assert repo.get_item(KEY) is not None
+    assert repo.comment_counts([KEY])[KEY] == 1
+    assert repo.latest_evaluation(KEY) is not None
+    assert len(repo.verifier_runs(KEY)) == 1
+    assert repo.fix_attempts(KEY)
+    assert repo.queue_pending_count(QueueName.VERIFY) >= 1
+
+    r = client.delete(f"/api/v1/items/{KEY_ENC}")
+    assert r.status_code == 200, r.text
+    counts = r.json()["counts"]
+    assert counts["items"] == 1
+    assert counts["verifier_runs"] == 1, counts
+    assert counts["fix_attempts"] == 1, counts
+    assert counts["queue_entries"] >= 1, counts
+    assert counts["comments"] == 1 and counts["evaluations"] == 1, counts
+    assert "平台" in r.json()["note"], "要讲清只删了本地数据"
+
+    # 动手之后，一条都不该留下
+    assert repo.get_item(KEY) is None
+    assert repo.comment_counts([KEY]) == {}
+    assert repo.latest_evaluation(KEY) is None
+    assert repo.latest_verifier(KEY) is None
+    assert repo.verifier_runs(KEY) == []
+    assert repo.fix_attempts(KEY) == []
+    assert repo.queue_pending_count(QueueName.VERIFY) == 0
+
+
+def test_delete_nonexistent_item_is_404(client) -> None:
+    assert client.delete(f"/api/v1/items/{quote('github:a/b#999', safe='')}").status_code == 404
+
+
+def test_purge_items_reports_deleted_and_missing(client) -> None:
+    """批量删除：不存在的 key 不该让整批失败，但要如实列在 missing 里。"""
+    missing_key = "github:psf/requests#999"
+    r = client.post("/api/v1/items/purge", json={"keys": [KEY, missing_key]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deleted"] == [KEY]
+    assert body["missing"] == [missing_key]
+    assert body["counts"]["items"] == 1
+    assert client.app.state.repo.get_item(KEY) is None
+
+
+def test_purge_items_rejects_an_empty_key_list(client) -> None:
+    """空 keys 是调用方搞错了，必须报错——静默「删了 0 条」会被当成成功。"""
+    r = client.post("/api/v1/items/purge", json={"keys": []})
+    assert r.status_code == 400
+    assert "keys" in r.json()["detail"]
+
+
+def test_delete_item_is_blocked_in_read_only(settings, repo, sample_issue) -> None:
+    from fastapi.testclient import TestClient
+
+    s = settings.model_copy(deep=True)
+    s.web.read_only = True
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    with TestClient(create_app(s)) as c:
+        assert c.delete(f"/api/v1/items/{KEY_ENC}").status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 新功能的界面入口（只有后端、没有按钮 = 功能等于不存在）
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_button_is_present_on_job_pages(client) -> None:
+    """「取消」按钮要在总览的任务面板与「任务」页都出现，且接线在共用的 app.js 里。
+
+    接线做成共用的一处（`data-act=cancel-job` + app.js 的委托监听）：两个页面各写一份
+    onclick 就是两份会分叉的实现——这个坑本项目已经在 `act()` 上踩过一次。
+    """
+    from fissue.web import jobs as jobs_mod
+
+    js = client.get("/static/app.js").text
+    assert "function cancelJob" in js
+    assert "data-act=cancel-job" in js, "委托监听应当在 app.js 里（两页共用）"
+
+    # 按钮只在作业**真的在跑**时出现，所以先造一个在跑的（夹具里没有作业）。
+    registry = client.app.state.jobs
+    live = jobs_mod.Job(id="live1", kind="scan")
+    live.status = jobs_mod.RUNNING
+    registry._jobs["live1"] = live
+    try:
+        for path in ("/", "/jobs"):
+            html = client.get(path).text
+            assert 'data-act="cancel-job" data-job="live1"' in html, f"{path} 上没有取消按钮"
+    finally:
+        registry._jobs.pop("live1", None)
+
+    # 反面：没有在跑的任务时不该出现——否则用户点下去只会拿到 409。
+    assert 'data-act="cancel-job"' not in client.get("/jobs").text
+
+
+def test_delete_entry_points_are_present(client) -> None:
+    """两个删除入口：条目页的「删除选中」与详情页的「删除本地数据」，都要二次确认。"""
+    items = client.get("/items").text
+    assert 'onclick="bulkDelete()"' in items
+    assert "function bulkDelete" in items
+    assert "Fissue.confirm(" in items, "破坏性操作必须二次确认"
+
+    detail = client.get(f"/item/{KEY_ENC}").text
+    assert 'onclick="deleteItem()"' in detail
+    assert "function deleteItem" in detail
+    assert "Fissue.confirm(" in detail
+    # 措辞必须点明「只删本地」——否则用户会以为平台上的 Issue 也被删了
+    assert "本地数据" in detail

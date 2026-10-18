@@ -116,6 +116,20 @@ class Fetcher:
                 if not self._accept(item, repo):
                     stats.skipped += 1
                     continue
+                # 已关闭/已合并的条目：**已经在跟踪的照常入库，从没见过的直接跳过**。
+                #
+                # 为什么不能简单地改成只抓 open（那是更省事但更错的解法）：条目在平台侧被关闭后，
+                # 只有「state=all 仍然把它返回」我们才知道这件事。改问 state=open 的话，本地状态
+                # 会永远停在 open——流水线接着去验证、打标签、甚至为一条早已关闭的 issue 自动修复
+                # 提 PR，而这一切都没有任何报错。
+                #
+                # 为什么又要跳过没见过的：首次抓取一个新仓库时 state=all 会把历史上已关闭的条目
+                # 一并带回，而流水线要到**验证阶段**才跳过它们（stages.PRVerifyStage）。那之前
+                # 已经白花了一次评测——实测：一条已关闭 PR 花了 2185/2379 tokens、$0.0056，
+                # 换来的只是一行「PR 已关闭」。
+                if item.is_closed and not self.ctx.repo.item_exists(item.key):
+                    stats.skipped += 1
+                    continue
                 stats.fetched += 1
                 try:
                     _item_id, created, changed = self.ctx.repo.upsert_item(repo_id, item)

@@ -1,0 +1,259 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 监控仓库{% endblock %}
+{% block heading %}监控仓库{% endblock %}
+{% block subtitle %}改动写进覆盖层 <code>{{ view.overlay }}</code>，你手写的 config.yaml 一字不动{% endblock %}
+
+{% block header_extra %}
+  <span class="sub">{{ view.repos | length }} 个</span>
+{% endblock %}
+
+{% block content %}
+
+{% if not view.writable %}
+<div class="alert error">
+  <span class="a-level">已锁</span>
+  <div>
+    <div>这台机器当前不允许从浏览器改写配置。</div>
+    <div class="small muted">{{ view.blocked_reason }}</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>添加监控仓库</h2>
+  <div class="row">
+    <label class="inline">平台
+      <select id="add-platform">
+        {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="inline">owner
+      <input type="text" id="add-owner" placeholder="John-is-playing" style="width:170px">
+    </label>
+    <label class="inline">name
+      <input type="text" id="add-name" placeholder="envkit" style="width:150px">
+    </label>
+    <button type="button" onclick="probeRepo()">探测</button>
+    <span class="muted small" id="probe-result"></span>
+  </div>
+
+  <div class="row mt">
+    <label class="inline">base 分支
+      <input type="text" id="add-base" placeholder="探测结果或留空自动" style="width:140px">
+    </label>
+    <label class="inline">测试命令
+      <input type="text" id="add-test-hint" value="{{ suggested_test_hint }}" style="width:210px">
+    </label>
+    <label class="inline">时间窗（天）
+      <input type="number" id="add-since" value="30" min="0" style="width:80px">
+    </label>
+    <label class="inline"><input type="checkbox" id="add-issue" checked> 收 Issue</label>
+    <label class="inline"><input type="checkbox" id="add-pr" checked> 收 PR</label>
+  </div>
+  <div class="muted small mt">
+    测试命令是**给自动修复跑回归门用的**，会原样在沙盒里执行。这里有默认值但没有替你探测——
+    猜错的代价是白跑一轮并给出假结论，所以请按仓库实际情况确认。
+  </div>
+  <div class="row mt">
+    <button class="primary" onclick="addRepo()" {% if not view.writable %}disabled{% endif %}>加入监控</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>已登记的仓库</h2>
+  {% if view.repos %}
+  <div class="table-scroll">
+  <table>
+    <thead><tr>
+      <th>仓库</th><th>平台</th><th class="num">条目</th><th>最近抓取</th>
+      <th>参数</th><th>操作</th>
+    </tr></thead>
+    <tbody>
+    {% for r in view.repos %}
+      {% set slug = r.slug.split('/') %}
+      <tr>
+        <td>
+          <code>{{ r.slug }}</code>
+          {% if not r.enabled %}<span class="tag none">已停用</span>{% endif %}
+          {% if r.orphan %}<span class="tag tier1" title="库里有历史数据，但配置里没有它">不在配置中</span>{% endif %}
+          <div class="muted small">
+            {% if r.collection %}收 {{ r.collection | join('+') }}{% endif %}
+            {% if r.since_days is not none %} · 时间窗 {{ r.since_days }} 天{% endif %}
+          </div>
+        </td>
+        <td>{{ r.platform }}</td>
+        <td class="num">{{ r.items }}</td>
+        <td class="muted small">
+          {% if r.last_scanned_at %}{{ r.last_scanned_at[:19].replace('T', ' ') }}{% else %}从未抓取{% endif %}
+        </td>
+        <td>
+          {% if not r.orphan %}
+          <div class="row">
+            <input type="text" size="14" placeholder="base 分支" value="{{ r.base_branch or '' }}"
+                   id="base-{{ loop.index }}">
+            <input type="text" size="20" placeholder="测试命令" value="{{ r.test_hint or '' }}"
+                   id="hint-{{ loop.index }}">
+            <input type="number" size="4" min="0" value="{{ r.since_days if r.since_days is not none else 30 }}"
+                   id="since-{{ loop.index }}" style="width:74px">
+          </div>
+          {% else %}
+          <span class="muted small">—</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if not r.orphan %}
+          {# 参数与动作都走 data-*，**不在 onclick 里插值**：`onclick="fn({{ x | tojson }})"`
+              会渲染成 `onclick="fn("x")"`——JSON 的双引号直接把属性截断，按钮点了毫无反应，
+              而页面上不报任何错（这次的 bug 就是这么来的）。data-* 由 Jinja 自动转义，
+              引号问题不存在。 #}
+          <div class="row">
+            <button data-act="save"
+                    data-platform="{{ r.platform }}" data-owner="{{ slug[0] }}" data-name="{{ slug[1] }}"
+                    data-index="{{ loop.index }}"
+                    {% if not view.writable %}disabled{% endif %}>保存参数</button>
+            <button data-act="toggle"
+                    data-platform="{{ r.platform }}" data-owner="{{ slug[0] }}" data-name="{{ slug[1] }}"
+                    data-toggle="{{ 'false' if r.enabled else 'true' }}"
+                    {% if not view.writable %}disabled{% endif %}>{{ '启用' if not r.enabled else '停用' }}</button>
+            <button class="danger" data-act="remove"
+                    data-platform="{{ r.platform }}" data-owner="{{ slug[0] }}" data-name="{{ slug[1] }}"
+                    data-items="{{ r.items }}"
+                    {% if not view.writable %}disabled{% endif %}>移出</button>
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="muted">还没有监控仓库。用上面的表单加一个，或到<a href="/setup">初始化向导</a>。</div>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>配置来源</h2>
+  <div class="kv">
+    <div class="k">config.yaml</div>
+    <div class="v">{% if view.config_path %}<code>{{ view.config_path }}</code>{% else %}<span class="muted">（不存在）</span>{% endif %}</div>
+    <div class="k">覆盖层</div>
+    <div class="v">
+      <code>{{ view.overlay }}</code>
+      {% if not view.overlay_active %}<span class="muted small">（还没生成，第一次保存时创建）</span>{% endif %}
+    </div>
+  </div>
+  <div class="muted small mt">
+    合并优先级：进程环境变量 &gt; .env &gt; 覆盖层 &gt; config.yaml &gt; 内置默认值。
+    覆盖层里的 <code>repos</code> 是**完整一份**（第一次改的时候会把 config.yaml 里现有的仓库
+    搬进来做种子），否则列表整体替换会把没写的那些静默删掉。
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  var WRITABLE = {{ view.writable | tojson }};
+
+  function needWritable() {
+    if (!WRITABLE) { Fissue.toast("本机当前不允许从浏览器改写配置。", "bad"); return false; }
+    return true;
+  }
+
+  function after(result, okMsg) {
+    Fissue.toast(okMsg + "（共 " + result.repos.length + " 个仓库）", "ok", {timeout: 2500});
+    setTimeout(function () { location.reload(); }, 800);
+  }
+
+  function fail(err) {
+    Fissue.toast("操作失败", "bad", {detail: err.message, timeout: 0});
+  }
+
+  function formRepo() {
+    var collect = [];
+    if (document.getElementById("add-issue").checked) collect.push("issue");
+    if (document.getElementById("add-pr").checked) collect.push("pr");
+    return {
+      platform: document.getElementById("add-platform").value,
+      owner: document.getElementById("add-owner").value.trim(),
+      name: document.getElementById("add-name").value.trim(),
+      base_branch: document.getElementById("add-base").value.trim() || null,
+      test_hint: document.getElementById("add-test-hint").value.trim() || null,
+      since_days: +document.getElementById("add-since").value || 0,
+      collect: collect,
+      enabled: true,
+    };
+  }
+
+  function probeRepo() {
+    var body = formRepo();
+    var out = document.getElementById("probe-result");
+    out.textContent = "探测中…";
+    Fissue.api("/repos/probe", {method: "POST", body: {platform: body.platform, owner: body.owner, name: body.name}})
+      .then(function (r) {
+        if (r.ok) {
+          out.innerHTML = '<span class="ok">存在</span>，默认分支 <code>' + Fissue.escapeHtml(r.default_branch || "?") + "</code>（" + r.seconds + "s）";
+          if (r.default_branch && !document.getElementById("add-base").value) {
+            document.getElementById("add-base").value = r.default_branch;
+          }
+        } else {
+          out.innerHTML = '<span class="bad">探测失败：' + Fissue.escapeHtml(r.error || "未知") + "</span>";
+        }
+      })
+      .catch(function (err) { out.innerHTML = '<span class="bad">' + Fissue.escapeHtml(err.message) + "</span>"; });
+  }
+
+  function addRepo() {
+    if (!needWritable()) return;
+    var body = formRepo();
+    if (!body.owner || !body.name) { Fissue.toast("owner 与 name 都要填。", "bad"); return; }
+    Fissue.api("/repos", {method: "POST", body: body})
+      .then(function (r) { after(r, "已加入监控：" + body.owner + "/" + body.name); })
+      .catch(fail);
+  }
+
+  function saveRepo(platform, owner, name, index) {
+    if (!needWritable()) return;
+    var base = document.getElementById("base-" + index).value.trim();
+    var hint = document.getElementById("hint-" + index).value.trim();
+    var since = +document.getElementById("since-" + index).value;
+    // 空串 = 清掉该字段（后端把空串翻成 null），而不是「不改动」
+    Fissue.api("/repos/" + platform + "/" + owner + "/" + name, {
+      method: "PATCH",
+      body: {base_branch: base, test_hint: hint, since_days: since}
+    }).then(function (r) { after(r, "已保存 " + owner + "/" + name); }).catch(fail);
+  }
+
+  function toggleRepo(platform, owner, name, enabled) {
+    if (!needWritable()) return;
+    Fissue.api("/repos/" + platform + "/" + owner + "/" + name, {method: "PATCH", body: {enabled: enabled}})
+      .then(function (r) { after(r, (enabled ? "已启用 " : "已停用 ") + owner + "/" + name); })
+      .catch(fail);
+  }
+
+  function removeRepo(platform, owner, name, items) {
+    if (!needWritable()) return;
+    Fissue.confirm("把 " + owner + "/" + name + " 移出监控？",
+        "只停止监控，库里的 " + items + " 条历史数据会保留（想连数据一起删，可用 CLI/API 传 purge_data=true）。")
+      .then(function (ok) {
+        if (!ok) return;
+        Fissue.api("/repos/" + platform + "/" + owner + "/" + name, {method: "DELETE"})
+          .then(function (r) { after(r, "已移出监控：" + owner + "/" + name); })
+          .catch(fail);
+      });
+  }
+
+  // 行内按钮的**唯一**接线点：读按钮上的 data-* 再调对应函数。
+  // 用事件委托而不是每个按钮写 onclick，是因为 onclick 里插值会被 JSON 的双引号截断
+  // （见表格上方的注释）；而 data-* 由 Jinja 自动转义，值里带引号也没事。
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest("button[data-act]") : null;
+    if (!btn) return;
+    var d = btn.dataset;
+    if (d.act === "save") saveRepo(d.platform, d.owner, d.name, d.index);
+    else if (d.act === "toggle") toggleRepo(d.platform, d.owner, d.name, d.toggle === "true");
+    else if (d.act === "remove") removeRepo(d.platform, d.owner, d.name, d.items);
+  });
+</script>
+{% endblock %}

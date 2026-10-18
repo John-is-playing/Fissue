@@ -2274,3 +2274,81 @@ def test_num_key_handles_mixed_number_forms() -> None:
     assert sorted([_num_key("IKKIOZ"), _num_key(3), _num_key("10")]) == [
         _num_key(3), _num_key("10"), _num_key("IKKIOZ")
     ]
+
+
+# ---------------------------------------------------------------------------
+# 已关闭条目：只更新，不新建
+#
+# 抓取问的是 `state=all`（默认值，见 platforms/base.py 的 `fetch_items`），所以历史上已关闭
+# 的条目也会被返回。原先它们一律入库，而流水线要到**验证阶段**才跳过——那之前已经白花一次
+# 评测。实测：一条已关闭 PR 花了 2185/2379 tokens、$0.0056，换来的只是一行「PR 已关闭」。
+#
+# 但**不能**改成只抓 open：条目在平台侧被关闭后，只有 state=all 仍返回它我们才知道；
+# 漏掉的话本地状态永远停在 open，流水线会接着验证、打标签，甚至为一条早已关闭的 issue
+# 自动修复提 PR，而且全程没有任何报错。
+# ---------------------------------------------------------------------------
+
+
+def _closed_item(number: int) -> RawItem:
+    item = _fetched_item(number, "2026-01-09T00:00:00+00:00")
+    item.state = "closed"
+    return item
+
+
+async def test_fetcher_skips_a_closed_item_it_never_tracked(settings, ctx, monkeypatch) -> None:
+    """从没见过的已关闭条目**不建行**，但同一批里还开着的照常入库。"""
+    cfg = _repo_cfg()
+    fetcher = _wire_adapter(
+        ctx,
+        monkeypatch,
+        _StubFetchAdapter([_closed_item(1), _fetched_item(2, "2026-01-09T00:00:00+00:00")]),
+    )
+
+    stats = await fetcher.fetch_repo(cfg)
+
+    assert stats.created == 1, f"只该入库那条还开着的：{stats}"
+    assert stats.skipped == 1, "已关闭且从未跟踪的那条应当计入过滤"
+    assert ctx.repo.item_exists("github:psf/requests#1") is False
+    assert ctx.repo.item_exists("github:psf/requests#2") is True
+
+
+async def test_fetcher_still_updates_a_closed_item_it_already_tracks(
+    settings, ctx, monkeypatch
+) -> None:
+    """**已经在跟踪的**条目即便关了也要更新进来——否则本地状态会永远停在 open。"""
+    cfg = _repo_cfg()
+    first = _wire_adapter(
+        ctx, monkeypatch, _StubFetchAdapter([_fetched_item(1, "2026-01-01T00:00:00+00:00")])
+    )
+    await first.fetch_repo(cfg)
+    item = ctx.repo.get_item("github:psf/requests#1")
+    assert item is not None and item.state == "open"
+
+    # 下一轮它在平台上关了：必须更新进来，而不是被当成「已关闭的噪声」丢掉
+    second = _wire_adapter(ctx, monkeypatch, _StubFetchAdapter([_closed_item(1)]))
+    stats = await second.fetch_repo(cfg)
+
+    assert stats.updated == 1, f"已关闭这个事实没被更新：{stats}"
+    updated = ctx.repo.get_item("github:psf/requests#1")
+    assert updated is not None and updated.state == "closed"
+
+
+def test_is_closed_covers_every_platform_wording() -> None:
+    """`is_closed` 要覆盖四个平台的写法，且**只在这些写法上**成立。
+
+    写成白名单（只认 open）会在遇到 Gitee 的 `progressing` 或 GitLab 原样的 `opened` 时，
+    把还开着的条目当成已关闭丢掉——那等于我们永远不再处理它，比多抓一条已关闭的条目严重得多。
+    """
+
+    def pr(state: str, *, merged: bool = False) -> RawItem:
+        return RawItem(
+            platform=Platform.GITHUB, repo="a/b", number=1, item_type=ItemType.PR,
+            title="t", state=state, merged=merged,
+        )
+
+    for closed in ("closed", "merged", "locked", "rejected", "CLOSED", " closed "):
+        assert pr(closed).is_closed is True, closed
+    for openish in ("open", "opened", "progressing", "reopened", ""):
+        assert pr(openish).is_closed is False, openish
+    # `merged` 标志比 state 更直接（GitHub 已合并 PR 的 state 也是 closed）
+    assert pr("open", merged=True).is_closed is True

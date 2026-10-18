@@ -1,0 +1,294 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 状态监测{% endblock %}
+{% block heading %}状态监测{% endblock %}
+{% block subtitle %}自动刷新（忙时 2 秒、闲时 5 秒）；数据来自 <code>{{ api_prefix }}/status</code>{% endblock %}
+
+{% block header_extra %}
+  <span class="sub" id="st-updated">正在读取…</span>
+{% endblock %}
+
+{% block content %}
+
+{# 渲染只有**一份**：在下面的脚本里。首屏那份快照由服务端塞进 window.FISSUE_STATUS，
+   前端拿到后立刻渲染一次、随后接管轮询。这样不会出现「服务端渲染的样子和刷新后的样子不一样」。
+   禁用 JS 时下面那个 <details> 里的原始 JSON 仍然可读。 #}
+<div id="st-alerts"></div>
+
+<div class="cards" id="st-cards"></div>
+
+<div class="grid-2">
+  <div class="panel">
+    <h2>运行时</h2>
+    <div class="kv" id="st-app"></div>
+  </div>
+  <div class="panel">
+    <h2>沙盒</h2>
+    <div class="kv" id="st-sandbox"></div>
+    <div class="row mt">
+      <button id="probe-sandbox" type="button">探测沙盒可用性</button>
+      <span class="muted small">会真的调一次 Docker；平时不探测，免得每 2 秒都去敲它。</span>
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>模型与数据库</h2>
+  <div class="kv" id="st-llm"></div>
+</div>
+
+<div class="panel">
+  <h2>队列</h2>
+  <div id="st-queues"></div>
+</div>
+
+<div class="panel">
+  <h2>当前任务</h2>
+  <div id="st-job"></div>
+</div>
+
+<div class="panel">
+  <h2>监控仓库</h2>
+  <div id="st-repos"></div>
+  <div class="mt"><a href="/repos" class="small">管理监控仓库 →</a></div>
+</div>
+
+<div class="panel">
+  <h2>最近抓取</h2>
+  <div id="st-scans"></div>
+</div>
+
+<details class="panel collapsible">
+  <summary>原始 JSON（禁 JS 时也能读）</summary>
+  <pre>{{ snapshot | tojson(indent=2) }}</pre>
+</details>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  var esc = Fissue.escapeHtml;
+  var first = true;
+
+  // 首屏快照由服务端注入：省掉一次「先白屏再拉」的等待，也让控制台里能直接查
+  // `FISSUE_STATUS.alerts`。之后的轮询覆盖它。
+  window.FISSUE_STATUS = {{ snapshot | tojson }};
+
+  function pairs(el, items) {
+    el.innerHTML = items.map(function (it) {
+      return '<div class="k">' + esc(it[0]) + '</div><div class="v">' + it[1] + '</div>';
+    }).join("");
+  }
+
+  function table(el, headers, rows, emptyText) {
+    if (!rows.length) {
+      el.innerHTML = '<div class="muted">' + esc(emptyText) + '</div>';
+      return;
+    }
+    var head = headers.map(function (h) {
+      return '<th' + (h[1] ? ' class="' + h[1] + '"' : "") + ">" + esc(h[0]) + "</th>";
+    }).join("");
+    var body = rows.map(function (cells) {
+      return "<tr>" + cells.map(function (c) { return "<td>" + c + "</td>"; }).join("") + "</tr>";
+    }).join("");
+    el.innerHTML = '<div class="table-scroll"><table><thead><tr>' + head +
+      "</tr></thead><tbody>" + body + "</tbody></table></div>";
+  }
+
+  function tag(text, cls) {
+    return '<span class="tag ' + (cls || "") + '">' + esc(text) + "</span>";
+  }
+
+  function num(n) { return '<span class="mono">' + esc(n) + "</span>"; }
+
+  function renderStatus(st) {
+    // 告警
+    var alerts = document.getElementById("st-alerts");
+    alerts.innerHTML = (st.alerts || []).map(function (a) {
+      return '<div class="alert ' + esc(a.level) + '"><span class="a-level">' +
+        esc({error: "错误", warn: "注意", info: "提示"}[a.level] || a.level) +
+        "</span><div><div>" + esc(a.message) + "</div>" +
+        (a.hint ? '<div class="small muted">' + esc(a.hint) + "</div>" : "") +
+        "</div></div>";
+    }).join("");
+
+    // 顶部数字
+    var running = (st.scans || []).filter(function (s) { return s.running; }).length;
+    var waiting = (st.queues || []).reduce(function (n, q) { return n + (q.waiting || 0); }, 0);
+    var pending = (st.queues || []).reduce(function (n, q) { return n + (q.pending || 0); }, 0);
+    document.getElementById("st-cards").innerHTML = [
+      ['<div class="k">写操作</div><div class="v">' + (st.writer.busy ? "进行中" : "空闲") + "</div>"],
+      ['<div class="k">条目</div><div class="v mono">' + st.database.items + "</div>"],
+      ['<div class="k">监控仓库</div><div class="v mono">' + (st.repos || []).length + "</div>"],
+      ['<div class="k">队列待处理</div><div class="v mono">' + pending + "</div>"],
+      ['<div class="k">待定论</div><div class="v mono">' + waiting + "</div>"],
+      ['<div class="k">今日 tokens</div><div class="v mono">' + (st.llm.today.total_tokens || 0) + "</div>"],
+      ['<div class="k">今日花费</div><div class="v mono">$' + (st.llm.today.cost_usd || 0).toFixed(4) + "</div>"],
+      ['<div class="k">抓取进行中</div><div class="v mono">' + running + "</div>"],
+    ].map(function (c) { return '<div class="card">' + c[0] + "</div>"; }).join("");
+
+    // 运行时
+    pairs(document.getElementById("st-app"), [
+      ["版本", esc(st.app.version) + " · pid " + esc(st.app.pid)],
+      ["已运行", st.app.uptime_seconds === null ? "—" : fmtDur(st.app.uptime_seconds)],
+      ["写闸门", st.writer.busy
+        ? tag("进行中：" + (st.writer.who || "未知"), "tier1")
+        : tag("空闲", "status-pr_created")],
+      ["跨进程互斥", st.writer.locks_supported
+        ? tag("可用（flock）", "status-pr_created")
+        : tag("不可用（本平台无 flock）", "tier1")],
+      ["模式", st.app.read_only ? tag("只读", "stale") : "可写"],
+      ["鉴权", st.app.auth_required ? tag("已启用（Bearer）", "status-pr_created") : tag("未启用", "none")],
+      ["监听", esc(st.app.host) + ":" + esc(st.app.port)],
+      ["配置文件", st.app.config_path ? "<code>" + esc(st.app.config_path) + "</code>" : '<span class="muted">（不存在，用内置默认值）</span>'],
+      ["覆盖层", st.app.overlay_active
+        ? "<code>" + esc(st.app.overlay_path) + "</code>"
+        : '<span class="muted">尚未生成（WebUI 改配置时会创建 ' + esc(st.app.overlay_file) + "）</span>"],
+      ["环境文件", st.app.env_path ? "<code>" + esc(st.app.env_path) + "</code>" : '<span class="muted">（不存在）</span>'],
+    ]);
+
+    // 沙盒
+    var sb = st.sandbox;
+    pairs(document.getElementById("st-sandbox"), [
+      ["开关", sb.enabled ? tag("已启用", "status-pr_created") : tag("已关闭", "status-failed")],
+      ["后端", esc(sb.runtime) + (sb.runtime === "local" ? tag("隔离弱", "tier1") : "" )],
+      ["镜像", "<code>" + esc(sb.image) + "</code>"],
+      ["隔离", "网络=" + esc(sb.network) + " · 只读根=" + esc(sb.read_only_root) + " · 用户=" + esc(sb.user)],
+      ["限额", "CPU=" + esc(sb.limits.cpus) + " · 内存=" + esc(sb.limits.memory_mb) + "MB · 超时=" + esc(sb.limits.timeout_seconds) + "s"],
+      ["可用性", sb.ready === null
+        ? '<span class="muted">' + esc(sb.reason) + "</span>"
+        : (sb.ready ? tag("就绪", "status-pr_created") : tag("不可用", "status-failed")) + " " + esc(sb.reason)],
+    ]);
+
+    // 模型与数据库
+    pairs(document.getElementById("st-llm"), [
+      ["主模型", "<code>" + esc(st.llm.model) + "</code>" + (st.llm.fallback_model ? "（备用：" + esc(st.llm.fallback_model) + "）" : "")],
+      ["端点", "<code>" + esc(st.llm.base_url) + "</code>"],
+      ["API Key", st.llm.api_key_set ? tag("已配置", "status-pr_created") : tag("未配置", "status-failed")],
+      ["单次上限", num(st.llm.max_tokens) + ' <span class="muted small">tokens（推理模型需要足够余量）</span>'],
+      ["日预算", "$" + esc(st.llm.budget.daily_usd_per_repo) + " / 仓库 · " + esc(st.llm.budget.daily_tokens_per_repo) + " tokens"],
+      ["今日", num(st.llm.today.calls) + " 次调用 · " + num(st.llm.today.total_tokens) + " tokens · $" +
+        (st.llm.today.cost_usd || 0).toFixed(4)],
+      ["数据库", tag(st.database.backend, "") + " <code>" + esc(st.database.url) + "</code>"],
+      ["条目 / 仓库", num(st.database.items) + " / " + num(st.database.repos)],
+    ]);
+
+    // 队列
+    table(document.getElementById("st-queues"),
+      [["队列", ""], ["待处理", "num"], ["待定论", "num"], ["阈值", "num"], ["最久等待", ""], ["状态明细", ""]],
+      (st.queues || []).map(function (q) {
+        var counts = Object.keys(q.counts || {}).map(function (k) {
+          return esc(k) + " " + esc(q.counts[k]);
+        }).join(" · ") || "—";
+        return [
+          "<code>" + esc(q.name) + "</code>",
+          num(q.pending),
+          num(q.waiting) + (q.waiting >= q.flush_size ? " " + tag("已达阈值", "tier1") : ""),
+          '<span class="muted">' + esc(q.flush_size) + "</span>",
+          q.oldest_seconds === null ? "—" : esc(Math.round(q.oldest_seconds)) + "s",
+          '<span class="muted small">' + counts + "</span>",
+        ];
+      }), "没有队列记录。");
+
+    // 当前任务
+    var jobBox = document.getElementById("st-job");
+    var cur = st.jobs && st.jobs.current;
+    if (!cur) {
+      jobBox.innerHTML = '<div class="muted">没有正在跑的任务。</div>' +
+        ((st.jobs && st.jobs.jobs.length)
+          ? '<div class="mt"><a href="/jobs" class="small">查看最近 ' + st.jobs.jobs.length + " 条任务 →</a></div>"
+          : "");
+    } else {
+      jobBox.innerHTML =
+        '<div class="job"><div class="j-head"><span class="spinner"></span>' +
+        '<span class="j-kind">' + esc(Fissue.kindLabel(cur.kind)) + "</span>" +
+        tag(cur.status, "status-queued") + tag(cur.id, "") +
+        '<span class="muted small">' + esc(cur.duration_seconds) + "s</span></div>" +
+        '<div class="progress-line">' + esc(cur.progress || "") + "</div>" +
+        (cur.log && cur.log.length ? "<pre>" + esc(cur.log.join("\n")) + "</pre>" : "") +
+        "</div>";
+    }
+
+    // 监控仓库
+    table(document.getElementById("st-repos"),
+      [["仓库", ""], ["平台", ""], ["条目", "num"], ["最近抓取", ""], ["游标", ""]],
+      (st.repos || []).map(function (r) {
+        return [
+          "<code>" + esc(r.slug) + "</code>" +
+            (r.enabled ? "" : " " + tag("已停用", "none")) +
+            (r.orphan ? " " + tag("不在配置里", "tier1") : ""),
+          esc(r.platform),
+          num(r.items),
+          r.last_scanned_at
+            ? '<span class="muted small">' + esc(r.last_scanned_at.replace("T", " ").slice(0, 19)) + "</span>"
+            : '<span class="muted">从未抓取</span>',
+          '<span class="muted small">' + esc(JSON.stringify(r.cursor || {})) + "</span>",
+        ];
+      }), "还没有监控仓库。到「监控仓库」页添加一个。");
+
+    // 最近抓取
+    table(document.getElementById("st-scans"),
+      [["仓库", ""], ["开始", ""], ["耗时", ""], ["拉取", "num"], ["新增", "num"], ["更新", "num"], ["未变", "num"], ["结果", ""]],
+      (st.scans || []).map(function (s) {
+        var dur = s.finished_at ? Math.round((new Date(s.finished_at) - new Date(s.started_at)) / 1000) + "s" : "—";
+        return [
+          '<code class="small">' + esc(s.repo_key) + "</code>",
+          '<span class="muted small">' + esc((s.started_at || "").replace("T", " ").slice(0, 19)) + "</span>",
+          esc(dur),
+          num(s.fetched), num(s.created), num(s.updated), num(s.unchanged),
+          s.running ? '<span class="spinner"></span> 进行中'
+                    : (s.error ? '<span class="bad small">' + esc(s.error.slice(0, 160)) + "</span>"
+                               : '<span class="ok small">成功</span>'),
+        ];
+      }), "还没有抓取记录。");
+
+    document.getElementById("st-updated").textContent =
+      "更新于 " + (st.now || "").replace("T", " ").slice(11, 19) + " UTC";
+
+    if (first) {
+      first = false;
+      // 第一次渲染后再把原始 JSON 换成首屏那份，方便对照/复制
+      var raw = document.querySelector("details pre");
+      if (raw) raw.textContent = JSON.stringify(st, null, 2);
+    }
+    return st.writer.busy || !!(st.jobs && st.jobs.current);
+  }
+
+  function fmtDur(sec) {
+    sec = Math.round(sec);
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h) return h + " 小时 " + m + " 分";
+    if (m) return m + " 分 " + s + " 秒";
+    return s + " 秒";
+  }
+
+  async function tick(sandbox) {
+    try {
+      var st = await Fissue.api("/status", {query: sandbox ? {sandbox: "1"} : null});
+      var busy = renderStatus(st);
+      setTimeout(function () { tick(false); }, busy ? 2000 : 5000);
+    } catch (err) {
+      document.getElementById("st-updated").innerHTML =
+        '<span class="bad">读取失败：' + esc(err.message) + "</span>";
+      setTimeout(function () { tick(false); }, 5000);
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", function () {
+    // 首屏用服务端注入的那份快照，避免白屏等一下。挂到 window 上是为了排障时能在控制台里
+    // 直接查（`FISSUE_STATUS.alerts`），而不是只能盯着页面猜。
+    renderStatus(window.FISSUE_STATUS);
+    first = false;
+    setTimeout(function () { tick(false); }, 1500);
+
+    var btn = document.getElementById("probe-sandbox");
+    if (btn) {
+      btn.addEventListener("click", function () {
+        btn.disabled = true;
+        btn.textContent = "探测中…";
+        tick(true);
+        setTimeout(function () { btn.disabled = false; btn.textContent = "探测沙盒可用性"; }, 4000);
+      });
+    }
+  });
+</script>
+{% endblock %}

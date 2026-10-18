@@ -1,0 +1,349 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 初始化向导{% endblock %}
+{% block heading %}初始化向导{% endblock %}
+{% block subtitle %}五步配好：模型 → 数据库 → 平台凭据 → 监控仓库 → 抓第一轮{% endblock %}
+
+{% block content %}
+
+{% set by_key = {} %}
+{% for it in view.env_items %}{% set _ = by_key.update({it.key: it}) %}{% endfor %}
+
+{% if not view.writable %}
+<div class="alert error">
+  <span class="a-level">已锁</span>
+  <div>
+    <div>这台机器当前不允许从浏览器改写配置，向导无法写入。</div>
+    <div class="small muted">{{ view.blocked_reason }}</div>
+  </div>
+</div>
+{% endif %}
+
+{% if setup_done %}
+<div class="alert info">
+  <span class="a-level">已配好</span>
+  <div>
+    <div>看起来已经配置过了（有 LLM Key，也有监控仓库）。</div>
+    <div class="small muted">向导可以重复跑：已经配好的项会显示当前值，留空表示不改动。</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="steps" id="stepbar">
+  <span class="step-chip on" data-step="1">1 模型</span>
+  <span class="step-chip" data-step="2">2 数据库</span>
+  <span class="step-chip" data-step="3">3 平台凭据</span>
+  <span class="step-chip" data-step="4">4 监控仓库</span>
+  <span class="step-chip" data-step="5">5 完成</span>
+</div>
+
+{# ---------------------------------------------------------------- 步骤 1 #}
+<section class="panel step" data-step="1">
+  <h2>第 1 步 · AI 模型（OpenAI 兼容端点）</h2>
+  <div class="kv">
+    <div class="k">API Key</div>
+    <div class="v">
+      <input type="password" id="llm-key" style="width:340px"
+             placeholder="{{ by_key.get('FISSUE_LLM_API_KEY').value if by_key.get('FISSUE_LLM_API_KEY') and by_key.get('FISSUE_LLM_API_KEY').set else 'sk-...（必填）' }}">
+      {% if by_key.get('FISSUE_LLM_API_KEY') and by_key.get('FISSUE_LLM_API_KEY').set %}
+      <span class="tag status-pr_created">已配置</span>
+      {% endif %}
+    </div>
+    <div class="k">端点</div>
+    <div class="v"><input type="text" id="llm-base" style="width:420px"
+           value="{{ by_key.get('FISSUE_LLM_BASE_URL').value if by_key.get('FISSUE_LLM_BASE_URL') else '' }}"
+           placeholder="https://api.deepseek.com/v1"></div>
+    <div class="k">模型</div>
+    <div class="v"><input type="text" id="llm-model" style="width:260px"
+           value="{{ by_key.get('FISSUE_LLM_MODEL').value if by_key.get('FISSUE_LLM_MODEL') else '' }}"
+           placeholder="{{ view.effective.llm_model }}"></div>
+    <div class="k">备用模型</div>
+    <div class="v"><input type="text" id="llm-fallback" style="width:260px"
+           placeholder="可留空"></div>
+  </div>
+  <div class="muted small mt">
+    常见端点：DeepSeek <code>https://api.deepseek.com/v1</code> ·
+    通义 <code>https://dashscope.aliyuncs.com/compatible-mode/v1</code> ·
+    本地 Ollama <code>http://localhost:11434/v1</code>
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testLlm()">测试连通</button>
+    <span id="llm-result" class="small muted">这一步会真的发一次最小请求</span>
+    <span class="spacer"></span>
+    <button class="primary" onclick="next(2)">下一步</button>
+  </div>
+</section>
+
+{# ---------------------------------------------------------------- 步骤 2 #}
+<section class="panel step" data-step="2" hidden>
+  <h2>第 2 步 · 数据库</h2>
+  <div class="kv">
+    <div class="k">连接串</div>
+    <div class="v">
+      <input type="text" id="db-url" style="width:560px"
+             value="{{ by_key.get('FISSUE_DATABASE_URL').value if by_key.get('FISSUE_DATABASE_URL') else '' }}"
+             placeholder="sqlite:///E:/Fissue/fissue.db">
+      <div class="muted small">当前生效：<code>{{ view.effective.database }}</code></div>
+    </div>
+  </div>
+  <div class="muted small mt">
+    零依赖起步就用 SQLite（<code>sqlite:///&lt;路径&gt;</code>，文件不存在会自动创建）；
+    多机/大库再上 PostgreSQL（<code>postgresql+psycopg://用户:密码@主机:5432/库名</code>，需先建库）。
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testDb()">测试连接</button>
+    <span id="db-result" class="small muted">会真的连一次并建表</span>
+    <span class="spacer"></span>
+    <button class="ghost" onclick="next(1)">上一步</button>
+    <button class="primary" onclick="next(3)">下一步</button>
+  </div>
+</section>
+
+{# ---------------------------------------------------------------- 步骤 3 #}
+<section class="panel step" data-step="3" hidden>
+  <h2>第 3 步 · 平台凭据</h2>
+  <div class="muted small mb">可跳过（匿名也能读公开仓库，但限流紧、且无法提 PR）。</div>
+  <table>
+    <thead><tr><th>平台</th><th>Token</th><th></th></tr></thead>
+    <tbody>
+    {% for key, plat in [('FISSUE_GITHUB_TOKEN','github'), ('FISSUE_GITEE_TOKEN','gitee'), ('FISSUE_ATOMGIT_TOKEN','atomgit'), ('FISSUE_GITLAB_TOKEN','gitlab')] %}
+      {% set it = by_key.get(key) %}
+      <tr>
+        <td>{{ plat }}{% if it and it.set %} <span class="tag status-pr_created">已配</span>{% endif %}</td>
+        <td><input type="password" id="tok-{{ plat }}" style="width:320px"
+                   placeholder="{{ it.value if it and it.set else '未配置' }}"></td>
+        <td><button type="button" data-act="test-platform" data-platform="{{ plat }}">校验</button>
+            <span id="plat-{{ plat }}" class="small muted"></span></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="row mt">
+    <span class="spacer"></span>
+    <button class="ghost" onclick="next(2)">上一步</button>
+    <button class="primary" onclick="next(4)">下一步</button>
+  </div>
+</section>
+
+{# ---------------------------------------------------------------- 步骤 4 #}
+<section class="panel step" data-step="4" hidden>
+  <h2>第 4 步 · 监控仓库</h2>
+  <div class="row">
+    <label class="inline">平台
+      <select id="repo-platform">
+        {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="inline">owner <input type="text" id="repo-owner" placeholder="John-is-playing" style="width:160px"></label>
+    <label class="inline">name <input type="text" id="repo-name" placeholder="envkit" style="width:140px"></label>
+    <button type="button" onclick="probeRepo()">探测</button>
+    <span id="repo-probe" class="small muted"></span>
+  </div>
+  <div class="row mt">
+    <label class="inline">base 分支 <input type="text" id="repo-base" style="width:120px" placeholder="自动"></label>
+    <label class="inline">测试命令 <input type="text" id="repo-hint" value="{{ suggested_test_hint }}" style="width:210px"></label>
+    <label class="inline">时间窗（天） <input type="number" id="repo-since" value="30" min="0" style="width:80px"></label>
+    <label class="inline"><input type="checkbox" id="repo-issue" checked> 收 Issue</label>
+    <label class="inline"><input type="checkbox" id="repo-pr" checked> 收 PR</label>
+    <button class="primary" onclick="stageRepo()">加入清单</button>
+  </div>
+
+  <div class="mt">
+    <b>待写入的仓库</b>
+    <div id="repo-staged" class="muted small">（还没有加入任何仓库）</div>
+  </div>
+  <div class="muted small mt">
+    测试命令会原样在沙盒里执行（自动修复用它跑回归门）。默认值只是建议，请按仓库实际情况确认。
+  </div>
+  <div class="row mt">
+    <span class="spacer"></span>
+    <button class="ghost" onclick="next(3)">上一步</button>
+    <button class="primary" onclick="next(5)">下一步</button>
+  </div>
+</section>
+
+{# ---------------------------------------------------------------- 步骤 5 #}
+<section class="panel step" data-step="5" hidden>
+  <h2>第 5 步 · 写入并抓第一轮</h2>
+  <div class="kv" id="summary"></div>
+  <label class="inline mt"><input type="checkbox" id="first-scan" checked> 立刻抓第一轮（后台作业，可在「状态监测」看进度）</label>
+  <div class="row mt">
+    <button class="primary" onclick="applySetup()" {% if not view.writable %}disabled{% endif %}>写入配置并完成</button>
+    <span id="apply-result" class="small muted"></span>
+    <span class="spacer"></span>
+    <button class="ghost" onclick="next(4)">上一步</button>
+  </div>
+  <div class="muted small mt">
+    写入位置：密钥 → <code>{{ view.paths.env or '（.env 不存在，会创建）' }}</code>；
+    仓库列表 → 覆盖层 <code>{{ view.paths.overlay_expected }}</code>。
+    <b>你手写的 config.yaml 不会被改动。</b>
+  </div>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  var WRITABLE = {{ view.writable | tojson }};
+  var staged = [];      // 待写入的仓库（客户端暂存，最后一步一次性提交）
+
+  function val(id) { var el = document.getElementById(id); return el ? el.value.trim() : ""; }
+  function checked(id) { var el = document.getElementById(id); return !!(el && el.checked); }
+
+  function next(step) {
+    Array.prototype.forEach.call(document.querySelectorAll("section.step"), function (s) {
+      s.hidden = s.dataset.step !== String(step);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".step-chip"), function (c) {
+      var n = +c.dataset.step;
+      c.classList.toggle("on", n === step);
+      c.classList.toggle("done", n < step);
+    });
+    if (step === 5) renderSummary();
+    window.scrollTo({top: 0, behavior: "smooth"});
+  }
+
+  function fail(el, err) {
+    el.innerHTML = '<span class="bad">' + Fissue.escapeHtml(err.message) + "</span>";
+  }
+
+  function testLlm() {
+    var out = document.getElementById("llm-result");
+    out.innerHTML = '<span class="spinner"></span> 请求中…';
+    Fissue.api("/setup/test-llm", {
+      method: "POST",
+      body: {base_url: val("llm-base") || null, model: val("llm-model") || null,
+             api_key: val("llm-key") || null, fallback_model: val("llm-fallback") || null}
+    }).then(function (r) {
+      out.innerHTML = r.ok
+        ? '<span class="ok">连通</span>：' + Fissue.escapeHtml(r.model) + " · " + r.seconds + "s"
+        : '<span class="bad">失败：' + Fissue.escapeHtml(r.error) + "</span>";
+    }).catch(function (e) { fail(out, e); });
+  }
+
+  function testDb() {
+    var out = document.getElementById("db-result");
+    if (!val("db-url")) { out.innerHTML = '<span class="muted">没填就走当前生效的那个库。</span>'; return; }
+    out.innerHTML = '<span class="spinner"></span> 连接中…';
+    Fissue.api("/setup/test-db", {method: "POST", body: {url: val("db-url")}})
+      .then(function (r) {
+        out.innerHTML = r.ok ? '<span class="ok">连接正常</span>（' + Fissue.escapeHtml(r.backend) + "）"
+                             : '<span class="bad">失败：' + Fissue.escapeHtml(r.error || "未知") + "</span>";
+      }).catch(function (e) { fail(out, e); });
+  }
+
+  function testPlatform(plat) {
+    var out = document.getElementById("plat-" + plat);
+    out.innerHTML = '<span class="spinner"></span> 校验中…';
+    Fissue.api("/setup/test-platform", {method: "POST", body: {platform: plat, token: val("tok-" + plat)}})
+      .then(function (r) {
+        out.innerHTML = r.ok ? '<span class="ok">' + Fissue.escapeHtml(r.login) + "</span>"
+                             : '<span class="bad">' + Fissue.escapeHtml(r.error || "失败") + "</span>";
+      }).catch(function (e) { fail(out, e); });
+  }
+
+  // 按钮的值走 data-*，不写进 onclick：值一旦含引号，插值写法会把属性截断（按钮静默失效）。
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest("button[data-act=test-platform]") : null;
+    if (btn) testPlatform(btn.dataset.platform);
+  });
+
+  function probeRepo() {
+    var out = document.getElementById("repo-probe");
+    out.innerHTML = '<span class="spinner"></span> 探测中…';
+    Fissue.api("/repos/probe", {method: "POST", body: {
+      platform: val("repo-platform"), owner: val("repo-owner"), name: val("repo-name")
+    }}).then(function (r) {
+      if (r.ok) {
+        out.innerHTML = '<span class="ok">存在</span>，默认分支 <code>' + Fissue.escapeHtml(r.default_branch || "?") + "</code>";
+        if (r.default_branch && !val("repo-base")) document.getElementById("repo-base").value = r.default_branch;
+      } else {
+        out.innerHTML = '<span class="bad">' + Fissue.escapeHtml(r.error || "探测失败") + "</span>";
+      }
+    }).catch(function (e) { fail(out, e); });
+  }
+
+  function stageRepo() {
+    var owner = val("repo-owner"), name = val("repo-name");
+    if (!owner || !name) { Fissue.toast("owner 与 name 都要填。", "bad"); return; }
+    var collect = [];
+    if (checked("repo-issue")) collect.push("issue");
+    if (checked("repo-pr")) collect.push("pr");
+    staged.push({
+      platform: val("repo-platform"), owner: owner, name: name,
+      base_branch: val("repo-base") || null, test_hint: val("repo-hint") || null,
+      since_days: +val("repo-since") || 0, collect: collect, enabled: true
+    });
+    document.getElementById("repo-owner").value = "";
+    document.getElementById("repo-name").value = "";
+    document.getElementById("repo-base").value = "";
+    document.getElementById("repo-probe").textContent = "";
+    renderStaged();
+  }
+
+  function renderStaged() {
+    var box = document.getElementById("repo-staged");
+    if (!staged.length) { box.innerHTML = '<span class="muted small">（还没有加入任何仓库）</span>'; return; }
+    box.innerHTML = staged.map(function (r, i) {
+      return '<div class="row"><code>' + Fissue.escapeHtml(r.platform + ":" + r.owner + "/" + r.name) + "</code>" +
+        '<span class="muted small">测试命令 ' + Fissue.escapeHtml(r.test_hint || "（未填，自动修复会跳过回归门）") + "</span>" +
+        '<button type="button" class="ghost" onclick="unstage(' + i + ')">移除</button></div>';
+    }).join("");
+  }
+
+  function unstage(i) { staged.splice(i, 1); renderStaged(); }
+
+  /** 组装 .env 改动：密钥**留空 = 不改动**（否则一提交就把已有 key 抹了）。 */
+  function envPayload() {
+    var out = {};
+    var map = {
+      FISSUE_LLM_API_KEY: "llm-key", FISSUE_LLM_BASE_URL: "llm-base",
+      FISSUE_LLM_MODEL: "llm-model", FISSUE_LLM_FALLBACK_MODEL: "llm-fallback",
+      FISSUE_DATABASE_URL: "db-url",
+      FISSUE_GITHUB_TOKEN: "tok-github", FISSUE_GITEE_TOKEN: "tok-gitee",
+      FISSUE_ATOMGIT_TOKEN: "tok-atomgit", FISSUE_GITLAB_TOKEN: "tok-gitlab"
+    };
+    Object.keys(map).forEach(function (k) {
+      var v = val(map[k]);
+      if (v) out[k] = v;
+    });
+    return out;
+  }
+
+  function renderSummary() {
+    var env = envPayload();
+    var rows = Object.keys(env).map(function (k) {
+      var shown = k.indexOf("KEY") >= 0 || k.indexOf("TOKEN") >= 0 ? "（已填写）" : Fissue.escapeHtml(env[k]);
+      return '<div class="k">' + Fissue.escapeHtml(k) + '</div><div class="v">' + shown + "</div>";
+    }).join("");
+    rows += '<div class="k">监控仓库</div><div class="v">' +
+      (staged.length
+        ? staged.map(function (r) { return "<code>" + Fissue.escapeHtml(r.owner + "/" + r.name) + "</code>"; }).join("、")
+        : '<span class="warn">（未加入任何仓库——没有输入，流水线不会做任何事）</span>') + "</div>";
+    document.getElementById("summary").innerHTML = rows;
+  }
+
+  function applySetup() {
+    if (!WRITABLE) { Fissue.toast("本机当前不允许从浏览器改写配置。", "bad"); return; }
+    var out = document.getElementById("apply-result");
+    out.innerHTML = '<span class="spinner"></span> 写入中…';
+    Fissue.api("/setup/apply", {
+      method: "POST",
+      body: {env: envPayload(), repos: staged, first_scan: checked("first-scan")}
+    }).then(function (r) {
+      var bits = [];
+      if (r.written_env.length) bits.push("写入 " + r.written_env.length + " 个环境项");
+      if (r.added_repos.length) bits.push("新增仓库 " + r.added_repos.join("、"));
+      if (r.restart_required.length) bits.push("需重启才生效：" + r.restart_required.join("、"));
+      out.innerHTML = '<span class="ok">已保存</span>：' + Fissue.escapeHtml(bits.join("；") || "无改动");
+      if (r.first_scan_job) {
+        Fissue.toast("已开始抓第一轮（任务 " + r.first_scan_job.id + "），到「状态监测」看进度。", "ok", {timeout: 0});
+      } else if (r.first_scan_error) {
+        Fissue.toast("首次抓取没能启动", "bad", {detail: r.first_scan_error, timeout: 0});
+      }
+      setTimeout(function () { location.href = "/status"; }, 1800);
+    }).catch(function (e) { fail(out, e); });
+  }
+
+  renderStaged();
+</script>
+{% endblock %}

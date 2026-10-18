@@ -1,0 +1,343 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 设置{% endblock %}
+{% block heading %}设置{% endblock %}
+{% block subtitle %}密钥写 .env、业务配置写覆盖层；你手写的 config.yaml 永不改动{% endblock %}
+
+{% block content %}
+
+{% set by_key = {} %}
+{% for it in view.env_items %}{% set _ = by_key.update({it.key: it}) %}{% endfor %}
+
+{% if not view.writable %}
+<div class="alert error">
+  <span class="a-level">已锁</span>
+  <div>
+    <div>这台机器当前不允许从浏览器改写配置。</div>
+    <div class="small muted">{{ view.blocked_reason }}</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="alert info">
+  <span class="a-level">写在哪</span>
+  <div>
+    <div>优先级：<b>进程环境变量 &gt; .env &gt; 覆盖层 &gt; config.yaml &gt; 内置默认值</b>。</div>
+    <div class="small muted">
+      本页只写 .env 与覆盖层（<code>{{ view.paths.overlay_expected }}</code>）。
+      高优先级的层若也设了同一个键，会盖住这里的改动——下面的「来源」列会标出来。
+    </div>
+  </div>
+</div>
+
+<div class="save-bar" id="save-bar">
+  <button class="primary" onclick="saveSettings()" {% if not view.writable %}disabled{% endif %}>保存设置</button>
+  <span id="dirty-hint" class="small muted">改动后点这里保存。密钥留空 = 不改动；勾「清空」= 移除本层设置。</span>
+</div>
+
+<div class="panel">
+  <h2>AI 模型</h2>
+  {% set llm_key = by_key.get('FISSUE_LLM_API_KEY') %}
+  <div class="kv">
+    <div class="k">API Key</div>
+    <div class="v">
+      <input type="password" id="env-FISSUE_LLM_API_KEY" style="width:320px"
+             placeholder="{{ llm_key.value if llm_key and llm_key.set else '未配置（必填）' }}">
+      <label class="inline"><input type="checkbox" id="clear-FISSUE_LLM_API_KEY"> 清空</label>
+      {% if llm_key and llm_key.set %}<span class="tag status-pr_created">已配置</span>
+      {% else %}<span class="tag status-failed">未配置</span>{% endif %}
+    </div>
+
+    <div class="k">端点</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_BASE_URL" style="width:420px"
+             value="{{ by_key.get('FISSUE_LLM_BASE_URL').value if by_key.get('FISSUE_LLM_BASE_URL') else '' }}"
+             placeholder="https://api.deepseek.com/v1">
+      <span class="muted small">当前生效：<code>{{ view.effective.llm_base_url }}</code></span></div>
+
+    <div class="k">主模型</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_MODEL" style="width:240px"
+             value="{{ by_key.get('FISSUE_LLM_MODEL').value if by_key.get('FISSUE_LLM_MODEL') else '' }}"
+             placeholder="{{ view.effective.llm_model }}">
+      <span class="muted small">当前生效：<code>{{ view.effective.llm_model }}</code></span></div>
+
+    <div class="k">备用模型</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_FALLBACK_MODEL" style="width:240px"
+             value="{{ by_key.get('FISSUE_LLM_FALLBACK_MODEL').value if by_key.get('FISSUE_LLM_FALLBACK_MODEL') else '' }}"
+             placeholder="留空则不降级"></div>
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testLlm()">测试连通</button>
+    <span class="muted small">会真的发一次最小请求（花几个 token）。key 错、模型名错、端点错都会当场暴露。</span>
+    <span id="llm-result" class="small"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>代码托管平台 Token</h2>
+  <table>
+    <thead><tr><th>平台</th><th>Token</th><th>状态</th><th></th></tr></thead>
+    <tbody>
+    {% for key, plat in [('FISSUE_GITHUB_TOKEN','github'), ('FISSUE_GITEE_TOKEN','gitee'), ('FISSUE_ATOMGIT_TOKEN','atomgit'), ('FISSUE_GITLAB_TOKEN','gitlab')] %}
+      {% set it = by_key.get(key) %}
+      <tr>
+        <td>{{ plat }}</td>
+        <td>
+          <input type="password" id="env-{{ key }}" style="width:300px"
+                 placeholder="{{ it.value if it and it.set else '未配置' }}">
+          <label class="inline"><input type="checkbox" id="clear-{{ key }}"> 清空</label>
+        </td>
+        <td>{% if it and it.set %}<span class="tag status-pr_created">已配置</span>
+            {% else %}<span class="tag none">未配置</span>{% endif %}</td>
+        <td>
+          <button type="button" data-act="test-platform" data-platform="{{ plat }}">校验</button>
+          <span id="plat-{{ plat }}" class="small muted"></span>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="muted small mt">
+    留空 = 匿名访问（只能读公开仓库，限流很紧）；自动修复要提 PR，必须有写权限。
+    校验会问平台「我是谁」，能验出无效或越权的令牌。
+  </div>
+</div>
+
+<div class="panel">
+  <h2>数据库</h2>
+  <div class="kv">
+    <div class="k">连接串</div>
+    <div class="v">
+      <input type="text" id="env-FISSUE_DATABASE_URL" style="width:520px"
+             value="{{ by_key.get('FISSUE_DATABASE_URL').value if by_key.get('FISSUE_DATABASE_URL') else '' }}"
+             placeholder="sqlite:///E:/Fissue/fissue.db">
+      <div class="muted small">当前生效：<code>{{ view.effective.database }}</code></div>
+    </div>
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testDb()">测试连接</button>
+    <span class="muted small">会真的连一次并建表（表已存在是空操作）。</span>
+    <span id="db-result" class="small"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Web 与访问控制</h2>
+  <div class="kv">
+    <div class="k">监听地址</div>
+    <div class="v"><input type="text" id="env-FISSUE_WEB_HOST" style="width:200px"
+             value="{{ by_key.get('FISSUE_WEB_HOST').value if by_key.get('FISSUE_WEB_HOST') else '' }}"
+             placeholder="{{ view.effective.web_host }}"> <span class="warn small">改了要重启</span></div>
+
+    <div class="k">端口</div>
+    <div class="v"><input type="number" id="env-FISSUE_WEB_PORT" style="width:120px"
+             value="{{ by_key.get('FISSUE_WEB_PORT').value if by_key.get('FISSUE_WEB_PORT') else '' }}"
+             placeholder="{{ view.effective.web_port }}"> <span class="warn small">改了要重启</span></div>
+
+    <div class="k">访问口令</div>
+    <div class="v">
+      <input type="password" id="env-FISSUE_API_TOKEN" style="width:320px"
+             placeholder="{{ by_key.get('FISSUE_API_TOKEN').value if by_key.get('FISSUE_API_TOKEN') and by_key.get('FISSUE_API_TOKEN').set else '未设置' }}">
+      <label class="inline"><input type="checkbox" id="clear-FISSUE_API_TOKEN"> 清空</label>
+      {% if view.effective.auth_required %}<span class="tag status-pr_created">鉴权已开</span>
+      {% else %}<span class="tag none">未开鉴权</span>{% endif %}
+      <div class="muted small">
+        设了它，所有 <code>{{ api_prefix }}/*</code> 请求都要带 <code>Authorization: Bearer &lt;口令&gt;</code>。
+        <b>浏览器页面本身不带这个头</b>——所以给页面设口令后，请在反向代理层用 Basic Auth，
+        或继续只在本机使用。（本页的写操作依赖回环来源或这个 Bearer 口令。）
+      </div>
+    </div>
+
+    <div class="k">只读模式</div>
+    <div class="v">
+      {% if view.effective.read_only %}<span class="tag stale">已开启</span>{% else %}<span class="tag">关闭</span>{% endif %}
+      <span class="muted small">由 config.yaml 的 <code>web.read_only</code> 控制：管的是「要不要去平台上打标签/提 PR」，与下面这条互不影响。</span>
+    </div>
+
+    <div class="k">远程改配置</div>
+    <div class="v">
+      <label class="inline">
+        <input type="checkbox" id="overlay-allow-remote" {{ 'checked' if view.effective.allow_remote_config_write }}>
+        强制允许非本机来源改写配置（<code>web.allow_remote_config_write</code>）
+      </label>
+      <div class="muted small">
+        默认关闭：只有本机回环（或已开鉴权并带对口令）才能改配置。打开它 = 本机以外也能改密钥，
+        仅建议在完全可信的内网里自用。
+      </div>
+    </div>
+  </div>
+
+  <div class="row mt">
+    <span class="muted small">改完记得点上方的「保存设置」——这里不放第二个按钮，免得你以为
+      这一页有「各自保存」。</span>
+    <span class="muted small">密钥留空 = 不改动；勾「清空」= 移除**本层**的设置
+      （若 config.yaml 里也写同一个键，它会接着生效——「来源」列表里看得到谁在生效）。</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>配置来源</h2>
+  <div class="kv">
+    <div class="k">config.yaml</div>
+    <div class="v">{% if view.paths.config %}<code>{{ view.paths.config }}</code>{% else %}<span class="muted">（不存在，用内置默认值）</span>{% endif %}</div>
+    <div class="k">覆盖层</div>
+    <div class="v"><code>{{ view.paths.overlay_expected }}</code>
+      {% if not view.paths.overlay %}<span class="muted small">（还没生成）</span>{% endif %}</div>
+    <div class="k">.env</div>
+    <div class="v">{% if view.paths.env %}<code>{{ view.paths.env }}</code>{% else %}<span class="muted">（不存在）</span>{% endif %}</div>
+  </div>
+
+  {% if view.overlay_content %}
+  <div class="mt"><b>覆盖层里现在有什么</b><pre>{{ view.overlay_content | tojson(indent=2) }}</pre></div>
+  {% endif %}
+
+  <details class="mt">
+    <summary class="muted">每个配置项由哪一层提供（点开）</summary>
+    <div class="table-scroll mt">
+    <table>
+      <thead><tr><th>配置路径</th><th>来源</th></tr></thead>
+      <tbody>
+      {% for path, source in view.sources.items() %}
+      <tr><td><code>{{ path }}</code></td>
+        <td><span class="tag {{ 'tier1' if source == 'env' else '' }}">{{ source }}</span></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  var WRITABLE = {{ view.writable | tojson }};
+  var SECRETS = ['FISSUE_LLM_API_KEY', 'FISSUE_GITHUB_TOKEN', 'FISSUE_GITEE_TOKEN',
+                 'FISSUE_ATOMGIT_TOKEN', 'FISSUE_GITLAB_TOKEN', 'FISSUE_API_TOKEN'];
+  var PLAIN = ['FISSUE_LLM_BASE_URL', 'FISSUE_LLM_MODEL', 'FISSUE_LLM_FALLBACK_MODEL',
+               'FISSUE_DATABASE_URL', 'FISSUE_WEB_HOST', 'FISSUE_WEB_PORT'];
+
+  function val(id) {
+    var el = document.getElementById(id);
+    return el ? el.value.trim() : "";
+  }
+  function checked(id) {
+    var el = document.getElementById(id);
+    return !!(el && el.checked);
+  }
+
+  /** 组装 .env 的改动。
+   *
+   * 密钥的规则是**留空 = 不改动**：输入框里是空的（只显示掩码占位符），若把空串当值写下去，
+   * 用户点一次「保存设置」就会把已有的 key 抹掉。要清空必须显式勾「清空」。
+   */
+  function envPayload() {
+    var out = {};
+    SECRETS.forEach(function (k) {
+      var v = val("env-" + k);
+      if (v) out[k] = v;
+      else if (checked("clear-" + k)) out[k] = "";
+    });
+    PLAIN.forEach(function (k) {
+      var v = val("env-" + k);
+      if (v) out[k] = v;
+    });
+    return out;
+  }
+
+  function fail(err) {
+    Fissue.toast("操作失败", "bad", {detail: err.message, timeout: 0});
+  }
+
+  // ---------------------------------------------------------------------
+  // 未保存改动：提示 + 离页拦截
+  // ---------------------------------------------------------------------
+  //
+  // 为什么必须有：这一页是「填完要点保存」的模型，而我原先只在最下面一个无关面板里放了保存
+  // 按钮、也没有任何「还没保存」的提示。实测结果是用户改完模型直接离开，一次 PUT 都没发出去，
+  // 表现为「保存不了」——**这不是后端问题，是界面没告诉他还有一步**。
+  var dirty = false;
+
+  function markDirty() {
+    if (dirty) return;
+    dirty = true;
+    var bar = document.getElementById("save-bar");
+    if (bar) bar.classList.add("dirty");
+    var hint = document.getElementById("dirty-hint");
+    if (hint) {
+      hint.className = "small";
+      hint.innerHTML = "有未保存的改动 —— 点左边的「保存设置」才会写进文件（现在点「测试连通」只是试一下，不保存）。";
+    }
+  }
+
+  document.addEventListener("input", function (e) {
+    if (e.target && e.target.closest && e.target.closest("#save-bar")) return;  // 不把按钮本身当编辑
+    markDirty();
+  });
+  document.addEventListener("change", markDirty);
+
+  window.addEventListener("beforeunload", function (e) {
+    if (!dirty) return;
+    e.preventDefault();
+    e.returnValue = "";      // 现代浏览器据此弹「离开此页面？」确认框
+  });
+
+  function saveSettings() {
+    if (!WRITABLE) { Fissue.toast("本机当前不允许从浏览器改写配置。", "bad"); return; }
+    var overlay = {web: {allow_remote_config_write: checked("overlay-allow-remote")}};
+    Fissue.api("/settings", {method: "PUT", body: {env: envPayload(), overlay: overlay}})
+      .then(function (r) {
+        dirty = false;    // 先清脏标记，否则下面那句 reload 会被自己的离页拦截弹框挡住
+        var msg = "已保存并热重载：" + (r.written_env.length ? r.written_env.join("、") : "（无 .env 改动）");
+        if (r.restart_required && r.restart_required.length) msg += "；需重启才生效：" + r.restart_required.join("、");
+        Fissue.toast(msg, "ok", {timeout: 8000});
+        setTimeout(function () { location.reload(); }, 1200);
+      })
+      .catch(fail);
+  }
+
+  function testLlm() {
+    var out = document.getElementById("llm-result");
+    out.innerHTML = '<span class="spinner"></span> 请求中…';
+    Fissue.api("/setup/test-llm", {
+      method: "POST",
+      body: {base_url: val("env-FISSUE_LLM_BASE_URL") || null,
+             model: val("env-FISSUE_LLM_MODEL") || null,
+             api_key: val("env-FISSUE_LLM_API_KEY") || null}
+    }).then(function (r) {
+      out.innerHTML = r.ok
+        ? '<span class="ok">连通</span>：模型 ' + Fissue.escapeHtml(r.model) + " · " + r.seconds + "s · tokens " + r.tokens.completion
+        : '<span class="bad">失败：' + Fissue.escapeHtml(r.error) + "</span>";
+    }).catch(function (e) { out.innerHTML = '<span class="bad">' + Fissue.escapeHtml(e.message) + "</span>"; });
+  }
+
+  function testDb() {
+    var out = document.getElementById("db-result");
+    out.innerHTML = '<span class="spinner"></span> 连接中…';
+    Fissue.api("/setup/test-db", {method: "POST", body: {url: val("env-FISSUE_DATABASE_URL")}})
+      .then(function (r) {
+        out.innerHTML = r.ok
+          ? '<span class="ok">连接正常</span>（' + Fissue.escapeHtml(r.backend) + " · " + r.seconds + "s）"
+          : '<span class="bad">失败：' + Fissue.escapeHtml(r.error || "未知") + "</span>";
+      })
+      .catch(function (e) { out.innerHTML = '<span class="bad">' + Fissue.escapeHtml(e.message) + "</span>"; });
+  }
+
+  function testPlatform(plat) {
+    var key = "FISSUE_" + plat.toUpperCase() + "_TOKEN";
+    var out = document.getElementById("plat-" + plat);
+    out.innerHTML = '<span class="spinner"></span> 校验中…';
+    Fissue.api("/setup/test-platform", {method: "POST", body: {platform: plat, token: val("env-" + key)}})
+      .then(function (r) {
+        out.innerHTML = r.ok
+          ? '<span class="ok">' + Fissue.escapeHtml(r.login) + "</span>（" + r.seconds + "s）"
+          : '<span class="bad">' + Fissue.escapeHtml(r.error || "失败") + "</span>";
+      })
+      .catch(function (e) { out.innerHTML = '<span class="bad">' + Fissue.escapeHtml(e.message) + "</span>"; });
+  }
+
+  // 按钮的值走 data-*，不写进 onclick：值一旦含引号，插值写法会把属性截断（按钮静默失效）。
+  document.addEventListener("click", function (e) {
+    var btn = e.target && e.target.closest ? e.target.closest("button[data-act=test-platform]") : null;
+    if (btn) testPlatform(btn.dataset.platform);
+  });
+</script>
+{% endblock %}

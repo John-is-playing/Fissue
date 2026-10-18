@@ -1,0 +1,277 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 总览{% endblock %}
+{% block heading %}总览{% endblock %}
+{% block subtitle %}一眼看清：配置有没有问题、队列积压多少、钱花了多少{% endblock %}
+
+{% block header_extra %}
+  <span class="sub">{{ total }} 条条目</span>
+{% endblock %}
+
+{% block content %}
+
+{# 配置/环境告警：新手最常见的问题不是「功能坏了」，而是「少配了一样东西，
+   而没有任何地方告诉他」。这些条目由 /api/v1/status 的 alerts 提供。 #}
+{% for alert in alerts %}
+<div class="alert {{ alert.level }}">
+  <span class="a-level">{{ {'error': '错误', 'warn': '注意', 'info': '提示'}.get(alert.level, alert.level) }}</span>
+  <div>
+    <div>{{ alert.message }}</div>
+    {% if alert.hint %}<div class="small muted">{{ alert.hint }}</div>{% endif %}
+  </div>
+</div>
+{% endfor %}
+
+{% for problem in problems %}
+<div class="banner">⚠️ {{ problem }}</div>
+{% endfor %}
+
+<div class="cards">
+  <a class="card link" href="/items"
+     ><div class="k">全部条目</div><div class="v">{{ summary.total }}</div></a>
+  <a class="card link" href="/items?item_type=issue"><div class="k">Issue</div><div class="v">{{ summary.by_type.get('issue', 0) }}</div></a>
+  <a class="card link" href="/items?item_type=pr"><div class="k">PR</div><div class="v">{{ summary.by_type.get('pr', 0) }}</div></a>
+  <div class="card"><div class="k">BUG / FEATURE</div>
+    <div class="v">{{ summary.by_category.get('bug', 0) }} / {{ summary.by_category.get('feature', 0) }}</div></div>
+  <a class="card link" href="/items?priority=tier1"><div class="k">tier1（优先修）</div><div class="v">{{ summary.by_priority.get('tier1', 0) }}</div></a>
+  <a class="card link" href="/items?priority=tier2"><div class="k">tier2</div><div class="v">{{ summary.by_priority.get('tier2', 0) }}</div></a>
+  {% for dim, val in summary.avg_scores.items() %}
+  <div class="card"><div class="k">平均 {{ dim }}</div><div class="v">{{ val }}</div></div>
+  {% endfor %}
+</div>
+
+{# 流水线状态分布：状态取值来自后端 ItemStatus 枚举，点一下即按该状态筛选。 #}
+{% if summary.by_status %}
+<div class="panel">
+  <h2>流水线状态分布</h2>
+  <div class="dist">
+    {% set total_status = summary.by_status.values() | sum %}
+    {% for name, count in summary.by_status.items() %}
+      <span class="seg status-bar-{{ name }}" style="flex: {{ count }}"
+            title="{{ name }}：{{ count }} 条"></span>
+    {% endfor %}
+  </div>
+  <div class="dist-legend">
+    {% for name, count in summary.by_status.items() %}
+      <a href="/items?status={{ name }}"><span class="tag status-{{ name }}">{{ name }}</span></a>{{ count }}
+      {% if not loop.last %} · {% endif %}
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+<div class="grid-2">
+  <div class="panel">
+    <h2>队列积压</h2>
+    <table>
+      <thead><tr><th>队列</th><th class="num">待处理</th><th class="num">待定论</th>
+        <th class="num">阈值</th><th>最久等待</th></tr></thead>
+      <tbody>
+      {% for q in queues %}
+        <tr>
+          <td><a href="/queues"><code>{{ q.name }}</code></a></td>
+          <td class="num">{{ q.pending }}</td>
+          <td class="num">{{ q.waiting }}</td>
+          <td class="num muted">{{ q.flush_size }}</td>
+          <td class="muted">
+            {% if q.oldest_seconds is not none %}
+              {{ '%.0f' % q.oldest_seconds }}s
+              {% if q.idle_flush_seconds and q.oldest_seconds >= q.idle_flush_seconds %}
+                <span class="tag tier1">已过空闲阈值</span>
+              {% endif %}
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="muted small mt">
+      这里只展示计数与阈值；「该不该 flush」的判定只有服务端一份
+      （<code>QueueManager.should_flush</code>），页面不复制它。
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>模型用量（今日，UTC 自然日）</h2>
+    <div class="kv">
+      <div class="k">调用</div><div class="v mono">{{ usage.calls }} 次</div>
+      <div class="k">tokens</div>
+      <div class="v mono">{{ usage.total_tokens }}（入 {{ usage.prompt_tokens }} / 出 {{ usage.completion_tokens }}）</div>
+      <div class="k">花费</div><div class="v mono">${{ '%.4f' % usage.cost_usd }}</div>
+      <div class="k">日预算</div>
+      <div class="v mono">${{ budget.daily_usd_per_repo }} / 仓库 · {{ '{:,}'.format(budget.daily_tokens_per_repo) }} tokens</div>
+    </div>
+    <div class="row mt">
+      <a href="/status" class="small">状态监测 →</a>
+      <a href="{{ api_prefix }}/queues" target="_blank" rel="noopener" class="small">队列判定原始数据 ↗</a>
+    </div>
+  </div>
+</div>
+
+{# 控制面板：手动发起检索 / 评测 / 验证 / 修复 / flush。
+   走 /jobs/{kind}（不是同步 /actions/*），所以页面不会被长任务堵住，能实时看到进度与日志。 #}
+<span id="job-panel-anchor"></span>
+{% if not read_only %}
+<details class="panel collapsible" open>
+  <summary>控制面板 · 手动发起任务</summary>
+
+  <div class="row mb">
+    <label class="inline"><input type="checkbox" id="auto-refresh" checked> 完成后自动刷新页面</label>
+    <span class="muted small">任务在后台跑，进度逐秒刷新；同一时刻只允许一个写任务。</span>
+  </div>
+
+  <div class="grid-2">
+    <div>
+      <div class="row mb"><b class="small">检索新增</b></div>
+      <div class="row">
+        <select id="scan-repo">
+          <option value="">全部启用仓库</option>
+          {% for r in repos %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+        </select>
+        <input type="number" id="scan-limit" value="50" min="1" max="500" title="最多抓多少条" style="width:90px">
+        <label class="inline"><input type="checkbox" id="scan-full"> 全量（忽略游标）</label>
+        <button onclick="Fissue.runJob('scan', {repo: document.getElementById('scan-repo').value, limit: +document.getElementById('scan-limit').value, full: document.getElementById('scan-full').checked}, {autoReload: true})">开始检索</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="row mb"><b class="small">AI 评测</b></div>
+      <div class="row">
+        <input type="number" id="eval-limit" value="20" min="1" max="500" title="评测多少条" style="width:90px">
+        <label class="inline"><input type="checkbox" id="eval-deep"> 深度重评</label>
+        <button onclick="Fissue.runJob('evaluate', {limit: +document.getElementById('eval-limit').value, deep: document.getElementById('eval-deep').checked}, {autoReload: true})">评测未评测</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="row mb"><b class="small">沙盒验证</b></div>
+      <div class="row">
+        <input type="number" id="verify-limit" value="10" min="1" max="500" style="width:90px">
+        <button onclick="Fissue.runJob('verify', {limit: +document.getElementById('verify-limit').value}, {autoReload: true})">验证待验证条目</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="row mb"><b class="small">Flush 队列</b></div>
+      <div class="row">
+        <select id="flush-queue">
+          <option value="">全部队列</option>
+          {% for q in queues %}<option value="{{ q.name }}">{{ q.name }}</option>{% endfor %}
+        </select>
+        <label class="inline"><input type="checkbox" id="flush-force" checked> 忽略阈值强制刷</label>
+        <button onclick="Fissue.runJob('flush', {queue: document.getElementById('flush-queue').value, force: document.getElementById('flush-force').checked}, {autoReload: true})">Flush</button>
+      </div>
+    </div>
+
+    <div>
+      <div class="row mb"><b class="small">自动修复</b></div>
+      <div class="row">
+        <input type="number" id="fix-limit" value="5" min="1" max="500" style="width:90px">
+        <button onclick="Fissue.runJob('fix', {limit: +document.getElementById('fix-limit').value, dry_run: true}, {autoReload: true})">试跑（dry-run，只出补丁）</button>
+        <button class="danger" onclick="confirmFix()">真提 PR</button>
+      </div>
+    </div>
+  </div>
+</details>
+{% endif %}
+
+<div class="panel" id="job-panel">
+  <h2>任务</h2>
+  {% for j in jobs.jobs %}
+  {% set cls = 'ok' if j.status == 'done' else ('bad' if j.status == 'failed' else ('stale' if j.status == 'canceled' else 'unknown')) %}
+  <div class="job">
+    <div class="j-head">
+      <span class="j-kind">{{ j.kind }}</span>
+      <span class="tag {{ cls }}">{{ j.status }}</span>
+      <span class="tag">{{ j.id }}</span>
+      <span class="muted small">{{ j.duration_seconds }}s</span>
+      {% if j.live and not read_only %}
+      <span class="spacer"></span>
+      <button class="danger" data-act="cancel-job" data-job="{{ j.id }}">取消</button>
+      {% endif %}
+    </div>
+    {# 取消不是故障：它的说明不该是红色——那会让人以为出了错。 #}
+    {% if j.error %}<pre class="{{ 'bad' if j.status == 'failed' else 'muted' }}">{{ j.error }}</pre>{% endif %}
+    {% if j.log %}<pre>{{ j.log | join('\n') }}</pre>{% endif %}
+  </div>
+  {% else %}
+  <div class="muted">还没有任务记录。上面的控制面板可以手动发起一轮。</div>
+  {% endfor %}
+  <div class="mt"><a href="/jobs" class="small">全部任务 →</a></div>
+</div>
+
+<div class="panel">
+  <h2>最近抓取</h2>
+  {% if scans %}
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>仓库</th><th>开始</th><th class="num">拉取</th><th class="num">新增</th>
+      <th class="num">更新</th><th class="num">未变</th><th>结果</th></tr></thead>
+    <tbody>
+    {% for s in scans %}
+      <tr>
+        <td><code class="small">{{ s.repo_key }}</code></td>
+        <td class="muted small">{{ (s.started_at or '')[:19].replace('T', ' ') }}</td>
+        <td class="num">{{ s.fetched }}</td>
+        <td class="num">{{ s.created }}</td>
+        <td class="num">{{ s.updated }}</td>
+        <td class="num">{{ s.unchanged }}</td>
+        <td>
+          {% if s.running %}<span class="spinner"></span> <span class="muted small">进行中</span>
+          {% elif s.error %}<span class="bad small">{{ s.error[:120] }}</span>
+          {% else %}<span class="ok small">成功</span>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="muted">还没有抓取记录。到「初始化向导」或上面的控制面板跑一次。</div>
+  {% endif %}
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function confirmFix() {
+    var limit = +document.getElementById('fix-limit').value;
+    Fissue.confirm('真提 PR（最多 ' + limit + ' 条）？', '会真的 fork、改代码并在平台上开 PR，无法一键撤销。')
+      .then(function (ok) {
+        if (ok) Fissue.runJob('fix', {limit: limit, dry_run: false}, {autoReload: true});
+      });
+  }
+
+  // 页面刷新时如果还有任务在跑（比如用户手动刷新了），继续把它轮询完，
+  // 而不是让进度消失在刷新里。
+  document.addEventListener('DOMContentLoaded', function () {
+    var current = {{ (jobs.current.id if jobs.current else '') | tojson }};
+    if (!current) return;
+    (async function () {
+      var panel = document.getElementById('job-panel');
+      while (true) {
+        await new Promise(function (r) { setTimeout(r, 1500); });
+        var job;
+        try { job = await Fissue.api('/jobs/' + current); } catch (e) { return; }
+        var box = panel.querySelector('.job');
+        if (box) {
+          var badge = box.querySelector('.tag');
+          if (badge) badge.textContent = job.status;
+          var line = box.querySelector('.progress-line');
+          if (!line && job.progress) {
+            line = document.createElement('div');
+            line.className = 'progress-line';
+            box.appendChild(line);
+          }
+          if (line) line.textContent = job.progress;
+        }
+        if (!job.live) {
+          if (job.status === 'done') Fissue.toast('任务完成：' + job.kind, 'ok', {detail: job.result});
+          else Fissue.toast('任务失败：' + job.kind, 'bad', {detail: job.error, timeout: 0});
+          return;
+        }
+      }
+    })();
+  });
+</script>
+{% endblock %}

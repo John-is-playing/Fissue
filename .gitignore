@@ -1,6 +1,10 @@
 # 环境与密钥
 .env
 config.yaml
+# 覆盖层：WebUI / `fissue onboard` 改配置时写的那一份（仓库列表、回环写入开关等）。
+# 它与 config.yaml 一样是**本机产物**——不同机器该有不同的仓库列表与开关，
+# 提交它等于把你这台机器的运行配置推给别人。默认位置在 config.yaml 旁边。
+config.local.yaml
 
 # 数据与产物
 # 注意：这里用 ``data/*`` 而不是 ``data/``——被整目录排除时 git 根本不会
@@ -16,6 +20,10 @@ data/*
 # 本地数据库（SQLite 试用库，含抓取数据，不入版本库）
 *.db
 *.db-journal
+# WAL 模式的两份附属文件：库在 WAL 下运行时必然生成（见 store/db.py 的
+# `PRAGMA journal_mode=WAL`），服务只要跑着它们就在，不忽略会一直躺在 git status 里。
+*.db-wal
+*.db-shm
 *.db.bak-*
 *.sqlite
 *.sqlite3

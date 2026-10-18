@@ -822,6 +822,65 @@ async def test_chat_json_does_not_escalate_on_plain_parse_failure() -> None:
 
 
 # ---------------------------------------------------------------------------
+# max_retries 的语义：**总尝试次数**，不是「额外重试几次」
+# ---------------------------------------------------------------------------
+
+
+async def test_a_zero_retry_configuration_is_rejected_loudly() -> None:
+    """`max_retries=0` 会让一次请求都发不出去——必须明确报错。
+
+    回归一次真实事故：探活为了「快速失败」把它设成 0，于是 `range(1, 0+1)` 是空循环、
+    一个请求都没发出去，直接掉到函数末尾那句「LLM 请求重试耗尽」。表面现象是「测试连通
+    永远失败」，而真实原因（401 / 模型名不存在）根本问不出来。
+    """
+    from fissue.ai.client import LLMClient
+    from fissue.config import LLMConfig
+    from fissue.errors import LLMError
+
+    calls: list[str] = []
+
+    class _Recorder:
+        async def post(self, url, json=None):  # noqa: ANN001, ARG002
+            calls.append(str(url))
+            raise AssertionError("配置成 0 时不该发出任何请求")
+
+    client = LLMClient(LLMConfig(api_key="k", max_retries=0), client=_Recorder())  # type: ignore[arg-type]
+    with pytest.raises(LLMError) as exc:
+        await client._post_with_retry({"model": "m", "messages": []}, use_json=False)  # noqa: SLF001
+
+    assert "max_retries" in str(exc.value), f"报错要说清是配置问题：{exc.value}"
+    assert "1" in str(exc.value)
+    assert calls == [], "不该有任何请求发出去"
+
+
+async def test_one_attempt_reaches_the_endpoint_and_reports_the_real_error() -> None:
+    """`max_retries=1` = 尝试一次、不重试，并且**把真实错误报出来**。
+
+    这条守着探活的可诊断性：端点是 401 就该说 401（连响应体一起），而不是含糊地说
+    「重试耗尽」——用户需要据此判断是 key 错、模型名错还是地址错。
+    """
+    import httpx
+
+    from fissue.ai.client import LLMClient
+    from fissue.config import LLMConfig
+    from fissue.errors import LLMError
+
+    seen: list[str] = []
+
+    class _Unauthorized:
+        async def post(self, url, json=None):  # noqa: ANN001, ARG002
+            seen.append(str(url))
+            return httpx.Response(401, json={"error": {"message": "Authentication Fails"}})
+
+    client = LLMClient(LLMConfig(api_key="bad", max_retries=1), client=_Unauthorized())  # type: ignore[arg-type]
+    with pytest.raises(LLMError) as exc:
+        await client._post_with_retry({"model": "m", "messages": []}, use_json=False)  # noqa: SLF001
+
+    assert len(seen) == 1, "不重试时应当只打一次"
+    assert "401" in str(exc.value) and "Authentication Fails" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
 # 公开 API 契约进上下文：让模型不必猜方法名/返回类型
 # ---------------------------------------------------------------------------
 

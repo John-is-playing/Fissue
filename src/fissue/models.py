@@ -209,6 +209,13 @@ COMMENTS_SEEN_KEY = "_fissue_comments_seen"
 #: 标题/正文/标签/状态，也就通常不改变结论。
 MATERIAL_FIELDS: tuple[str, ...] = ("title", "body", "labels", "state", "merged")
 
+#: 表示「平台侧已不再可处理」的 ``state`` 取值（见 ``RawItem.is_closed``）。
+#:
+#: 写成**否定表**：只有这些值才判定为已关闭，其余一律当作「还开着」。
+#: 漏掉一个「进行中」的写法（比如 Gitee 的 ``progressing``）会把还开着的条目丢掉，
+#: 那等于永远不再处理它——比多抓一条已关闭的条目严重得多。
+_CLOSED_STATES = frozenset({"closed", "merged", "locked", "rejected"})
+
 #: 「评论没拉全」这类残缺原因的前缀（各适配器产出 ``comments_unavailable#N`` /
 #: ``comments_may_be_truncated#N``）。评论是评测最关键的上下文之一，残缺时既不能拿它
 #: 覆盖已入库的讨论（那是数据丢失），也不该据此下结论（结论会被回写到平台）。
@@ -349,6 +356,31 @@ class RawItem(BaseModel):
         ``DEGRADED_COMMENTS_PREFIX``。
         """
         return any(r.startswith(DEGRADED_COMMENTS_PREFIX) for r in self.degraded)
+
+    # -- 是否仍可处理 ------------------------------------------------------
+
+    @property
+    def is_closed(self) -> bool:
+        """这条条目在平台上是否**已经不再可处理**（关闭 / 合并 / 锁定 / 被拒）。
+
+        这是全项目判断「还要不要处理它」的唯一口径，放在模型上而不是各处比较字符串：
+        四个平台的取值并不一致，散落的 `state == "closed"` 迟早会漏掉某个平台的写法。
+
+        ==========  ==================================================================
+        平台         取值
+        ==========  ==================================================================
+        GitHub      ``open`` / ``closed``（**已合并的 PR 也是 closed**，另靠 ``merged`` 区分）
+        GitLab      ``open``（原样是 ``opened``，在适配器里已归一）/ ``closed`` / ``merged`` / ``locked``
+        Gitee       ``open`` / ``progressing`` / ``closed`` / ``rejected``
+        ==========  ==================================================================
+
+        **用「否定表」而不是「肯定表」**（只看 open/os 之类的白名单）：白名单漏掉某个平台的
+        「进行中」写法时，会把**还开着**的条目当成已关闭丢掉——那等于我们永远不再处理它，
+        比多抓一条已关闭的条目严重得多。所以只在我们确有把握时才说「它关了」。
+        """
+        if self.merged:
+            return True
+        return str(self.state or "").strip().lower() in _CLOSED_STATES
 
 
 # ---------------------------------------------------------------------------

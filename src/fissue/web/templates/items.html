@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 条目{% endblock %}
+{% block heading %}条目{% endblock %}
+{% block subtitle %}筛选、搜索、排序、勾选后批量操作{% endblock %}
+
+{% macro sort_link(key, label) -%}
+  <a href="?{{ base_qs }}&sort={{ key }}&order={{ 'asc' if (sort == key and order_desc) else 'desc' }}">{{ label }}
+    {%- if sort == key %} <span class="sort">{{ '▼' if order_desc else '▲' }}</span>{% endif -%}
+  </a>
+{%- endmacro %}
+
+{% block header_extra %}
+  <span class="sub">共 {{ total }} 条 · 第 {{ page }} / {{ pages }} 页</span>
+{% endblock %}
+
+{% block content %}
+
+{% for problem in problems %}
+<div class="banner">⚠️ {{ problem }}</div>
+{% endfor %}
+
+{# 筛选：仓库 / 类型 / 分类 / 优先级 / 状态 / 搜索 / 排序 / 每页条数。
+   取值一律来自后端枚举（原先模板里手写了一份 12 个状态的清单，漏掉了 classified / verifying）。 #}
+<form class="filters" method="get">
+  <label class="inline">仓库
+    <select name="repo_slug">
+      <option value="">全部</option>
+      {% for r in repos %}
+      <option value="{{ r }}" {% if filters.repo_slug == r %}selected{% endif %}>{{ r }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">类型
+    <select name="item_type">
+      <option value="">全部</option>
+      {% for t in types %}
+      <option value="{{ t }}" {% if filters.item_type == t %}selected{% endif %}>{{ t }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">分类
+    <select name="category">
+      <option value="">全部</option>
+      {% for c in categories %}
+      <option value="{{ c }}" {% if filters.category == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">优先级
+    <select name="priority">
+      <option value="">全部</option>
+      {% for p in priorities %}
+      <option value="{{ p }}" {% if filters.priority == p %}selected{% endif %}>{{ p }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">状态
+    <select name="status">
+      <option value="">全部</option>
+      {% for s in statuses %}
+      <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">搜索
+    <input type="search" name="q" value="{{ filters.q }}" placeholder="标题 / 正文 / 作者" style="width:180px">
+  </label>
+  <label class="inline">排序
+    <select name="sort">
+      {% for k in sort_keys %}
+      <option value="{{ k }}" {% if filters.sort == k %}selected{% endif %}>{{ k }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">方向
+    <select name="order">
+      <option value="desc" {% if filters.order == 'desc' %}selected{% endif %}>降序</option>
+      <option value="asc" {% if filters.order == 'asc' %}selected{% endif %}>升序</option>
+    </select>
+  </label>
+  <label class="inline">每页
+    <input type="number" name="limit" value="{{ filters.limit }}" min="1" max="500" style="width:80px">
+  </label>
+  <button type="submit" class="primary">筛选</button>
+  <a href="/items"><button type="button" class="ghost">重置</button></a>
+</form>
+
+{# 批量操作：勾选行之后只对**选中项**操作。API 的 keys 参数一直支持，旧页面却只有
+   「按 limit 取一批」的全量按钮，没法只修某几条。 #}
+<div class="row mb" id="bulk-bar">
+  <span class="muted">已选 <b id="pick-count">0</b> 条</span>
+  {% if not read_only %}
+  <button data-needs-pick disabled onclick="bulk('evaluate')">评测选中</button>
+  <button data-needs-pick disabled onclick="bulk('verify')">验证选中</button>
+  <button data-needs-pick disabled onclick="bulkFixDry()">试跑修复选中</button>
+  <button data-needs-pick disabled class="danger" onclick="bulkFixReal()">修复选中并提 PR</button>
+  <button data-needs-pick disabled class="danger" onclick="bulkDelete()">删除选中</button>
+  {% endif %}
+</div>
+
+{% if rows %}
+<div class="table-scroll">
+<table>
+  <thead>
+    <tr>
+      <th class="shrink"><input type="checkbox" id="pick-all" title="全选本页"></th>
+      <th class="shrink">{{ sort_link('number', '编号') }}</th>
+      <th>{{ sort_link('title', '标题') }}</th>
+      <th class="shrink">{{ sort_link('category', '分类') }}</th>
+      <th class="shrink" title="真实性 / 重要性 / 难度">真/重/难</th>
+      <th class="shrink">{{ sort_link('priority', '优先级') }}</th>
+      <th class="shrink">{{ sort_link('status', '状态') }}</th>
+      <th>结论</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td class="shrink"><input type="checkbox" name="keypick" value="{{ row.key }}" aria-label="选择 {{ row.title }}"></td>
+      <td class="shrink">
+        <span class="tag">{{ row.type }}</span><br>
+        <a href="{{ row.url }}" target="_blank" rel="noopener">#{{ row.number }}</a>
+      </td>
+      <td>
+        <a href="/item/{{ row.key | urlencode }}">{{ row.title }}</a><br>
+        <span class="muted small">{{ row.repo }} · {{ row.author }} · 💬 {{ row.comments }}</span>
+        {% for l in row.labels %}<span class="tag">{{ l }}</span>{% endfor %}
+        {% if row.conclusion_stale %}
+          <span class="tag stale" title="{{ row.conclusion_stale | join('；') }}">⚠️ 结论已过期</span>
+        {% endif %}
+        {% if row.degraded %}
+          <span class="tag stale" title="{{ row.degraded | join('；') }}">⚠️ 数据残缺</span>
+        {% endif %}
+      </td>
+      <td class="shrink">
+        {% set cat = row.evaluation.category if row.evaluation else 'unknown' %}
+        <span class="tag {{ cat }}">{{ cat }}</span>
+      </td>
+      <td class="shrink num">
+        {% if row.evaluation %}
+          {% set sc = row.evaluation.scores %}
+          {{ sc.get('authenticity', '-') }}/{{ sc.get('importance', '-') }}/{{ sc.get('difficulty', '-') }}
+        {% else %}<span class="muted">未评测</span>{% endif %}
+      </td>
+      <td class="shrink">
+        {% set pr = row.evaluation.priority if row.evaluation else 'none' %}
+        <span class="tag {{ pr }}">{{ pr }}</span>
+      </td>
+      {# 真实的流水线状态。旧版这里写的是 `row.evaluation and '已评测' or '待评测'`——
+         筛了 status、表格里却看不到 status，而且 payload 里当时根本没有它。 #}
+      <td class="shrink"><span class="tag status-{{ row.status }}" title="流水线状态">{{ row.status }}</span></td>
+      <td>
+        {% if row.evaluation %}
+          <span class="clamp">{{ row.evaluation.summary }}</span>
+          {% if row.evaluation.spam and (row.evaluation.spam.is_spam or row.evaluation.spam.is_duplicate) %}
+            <br><span class="tag bug">⚠️ 疑似{{ '刷量' if row.evaluation.spam.is_spam else '' }}{{ '重复' if row.evaluation.spam.is_duplicate else '' }}</span>
+          {% endif %}
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+{% set first = (page - 1) * filters.limit + 1 %}
+{% set last = (page - 1) * filters.limit + rows | length %}
+<div class="pager">
+  {% if page > 1 %}
+    <a href="?{{ page_qs }}&page={{ page - 1 }}"><button type="button">← 上一页</button></a>
+  {% else %}
+    <button type="button" disabled>← 上一页</button>
+  {% endif %}
+  <span class="page-info">第 {{ first }}–{{ last }} 条 / 共 {{ total }} 条 · 第 {{ page }} / {{ pages }} 页</span>
+  {% if page < pages %}
+    <a href="?{{ page_qs }}&page={{ page + 1 }}"><button type="button">下一页 →</button></a>
+  {% else %}
+    <button type="button" disabled>下一页 →</button>
+  {% endif %}
+</div>
+
+{% else %}
+<div class="empty">
+  {% if filters.q or filters.status or filters.category or filters.priority or filters.item_type or filters.repo_slug %}
+    当前筛选条件下没有条目。<a href="/items">清空筛选</a>
+  {% else %}
+    还没有数据。可以到「初始化向导」配好之后抓一轮，或先用命令行：
+    <pre>fissue db init
+fissue fetch --repo owner/name --platform github
+fissue eval --all</pre>
+  {% endif %}
+</div>
+{% endif %}
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  function bulk(kind) {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.runJob(kind, {keys: keys}, {autoReload: true});
+  }
+
+  function bulkFixDry() {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.runJob('fix', {keys: keys, dry_run: true}, {autoReload: true});
+  }
+
+  function bulkFixReal() {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.confirm('对选中的 ' + keys.length + ' 条真提 PR？', '会真的 fork、改代码并在平台上开 PR，无法一键撤销。')
+      .then(function (ok) {
+        if (ok) Fissue.runJob('fix', {keys: keys, dry_run: false}, {autoReload: true});
+      });
+  }
+
+  // 批量删除本地数据。走批量端点（而不是逐条 DELETE）：一次事务、一个写闸门，
+  // 不会删到一半被打断留下半批数据。
+  function bulkDelete() {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.confirm(
+      '删除选中的 ' + keys.length + ' 条本地数据？',
+      '会连同它们的评测、验证记录、修复记录与队列条目一起删除，**不可撤销**。' +
+        '平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。'
+    ).then(function (ok) {
+      if (!ok) return;
+      Fissue.api('/items/purge', {method: 'POST', body: {keys: keys}})
+        .then(function (r) {
+          var gone = (r.deleted || []).length;
+          var missed = (r.missing || []).length;
+          Fissue.toast(
+            '已删除 ' + gone + ' 条本地数据' + (missed ? '（另有 ' + missed + ' 条已不存在，跳过）' : ''),
+            'ok', {detail: r.counts, timeout: 8000}
+          );
+          setTimeout(function () { location.reload(); }, 1400);
+        })
+        .catch(function (err) {
+          Fissue.toast('删除失败', 'bad', {detail: err.message, timeout: 0});
+        });
+    });
+  }
+</script>
+{% endblock %}

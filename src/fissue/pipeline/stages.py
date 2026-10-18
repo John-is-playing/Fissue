@@ -393,7 +393,7 @@ class PRVerifyStage:
         if item.item_type is not ItemType.PR:
             result.skipped_reason = "非 PR"
             return result
-        if item.merged or item.state == "closed":
+        if item.is_closed:
             why = "PR 已合并，无需验证" if item.merged else "PR 已关闭"
             result.status = ItemStatus.SKIPPED
             result.skipped_reason = why

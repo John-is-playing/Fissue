@@ -306,6 +306,15 @@ class LLMClient:
         返回 ``None`` 表示「JSON mode 不被支持」，由调用方降级重试。
         """
         url = self.config.chat_completions_url
+        # `max_retries` 是**总尝试次数**（下面按 `attempt >= max_retries` 判最后一次），
+        # 所以 0 会让 `range(1, 1)` 全空：一次请求都不发出，然后直接掉到函数末尾那句
+        # 「LLM 请求重试耗尽」——报错里完全看不出「配置成了 0」，现象却是「所有调用都失败」。
+        # 实测踩过一次：探活为了快速失败设了 0，结果它永远失败，连 401 都问不出来。
+        if self.config.max_retries < 1:
+            raise LLMError(
+                f"llm.max_retries={self.config.max_retries} 不会发出任何请求（它表示总尝试次数，至少为 1）；"
+                "想「不重试」请填 1。"
+            )
         delay = 1.0
         for attempt in range(1, self.config.max_retries + 1):
             try:

@@ -1,86 +1,89 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{ data.key }} · Fissue</title>
-<style>
-  :root {
-    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a;
-    --fg:#e6e8ee; --muted:#98a0b3; --accent:#5b9dff;
-    --bug:#ff6b6b; --feature:#7dd3a0; --unknown:#98a0b3;
-    --t1:#ffb454; --t2:#7dd3a0; --none:#6b7280; --ok:#7dd3a0; --bad:#ff6b6b;
-  }
-  * { box-sizing: border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg);
-         font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
-  a { color:var(--accent); text-decoration:none; } a:hover{ text-decoration:underline; }
-  header { padding:16px 24px; border-bottom:1px solid var(--line);
-           display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
-  header h1 { margin:0; font-size:17px; }
-  .wrap { padding:20px 24px 70px; max-width:1100px; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
-           padding:16px 18px; margin-bottom:16px; }
-  .panel h2 { margin:0 0 12px; font-size:14px; color:var(--muted); font-weight:600;
-              text-transform:uppercase; letter-spacing:.6px; }
-  .kv { display:grid; grid-template-columns:120px 1fr; gap:6px 14px; }
-  .kv .k { color:var(--muted); }
-  .tag { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px;
-         border:1px solid var(--line); color:var(--muted); margin:0 4px 4px 0; }
-  .bug{color:var(--bug);border-color:#4b1f22;background:#2a1518}
-  .feature{color:var(--feature);border-color:#1f4b33;background:#14291f}
-  .tier1{color:var(--t1);border-color:#4b3a1f;background:#2a2216}
-  .tier2{color:var(--t2);border-color:#1f4b33;background:#14291f}
-  .ok{color:var(--ok)} .bad{color:var(--bad)} .muted{color:var(--muted)}
-  table { width:100%; border-collapse:collapse; }
-  th,td { padding:7px 10px; border-bottom:1px solid var(--line); text-align:left; font-size:13px; }
-  th { color:var(--muted); font-weight:500; font-size:12px; }
-  pre { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
-        padding:10px; overflow:auto; font-size:12px; max-height:420px; }
-  .score-row { margin:8px 0; }
-  .score-row .label { display:inline-block; width:120px; color:var(--muted); }
-  .bar { display:inline-block; height:8px; border-radius:4px; background:var(--accent);
-         vertical-align:middle; }
-  button { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
-           border-radius:7px; padding:7px 12px; cursor:pointer; font-size:13px; }
-  button:hover { border-color:var(--accent); }
-  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
-</style>
-</head>
-<body>
-<header>
-  <a href="/">← 返回</a>
-  <h1>{{ data.title }}</h1>
-  <span class="muted">{{ data.repo }} #{{ data.number }}</span>
-  <a href="{{ data.url }}" target="_blank" rel="noopener" style="margin-left:auto">在平台打开 ↗</a>
-</header>
+{% extends "base.html" %}
+{% block title %}{{ data.key }} · Fissue{% endblock %}
+{% block wrap_class %}narrow{% endblock %}
 
-<div class="wrap">
+{% block subtitle %}{{ data.repo }} #{{ data.number }}{% endblock %}
+
+{% block header_extra %}
+  <a href="{{ data.url }}" target="_blank" rel="noopener">在平台打开 ↗</a>
+{% endblock %}
+
+{% block content %}
 
 {% if not read_only %}
-<div class="actions">
-  <button onclick="act('approve-fix')">批准自动修复（提交 PR）</button>
-  <button onclick="act('approve-merge')">确认可合并（打标签）</button>
-  <button onclick="act('evaluate', {keys:[{{ data.key | tojson }}], deep:true})">重新深度评测</button>
-  <button onclick="act('verify', {keys:[{{ data.key | tojson }}]})">重新验证</button>
+{# 操作走 /jobs/{kind}：拿 job id 后轮询进度，不再是一个同步 fetch 干等 + alert 弹 JSON。 #}
+<div class="row mb">
+  <button class="danger" onclick="approveFix()">批准自动修复（提交 PR）</button>
+  <button onclick="approveMerge()">确认可合并（打标签）</button>
+  <button onclick="reEval()">重新深度评测</button>
+  <button onclick="reVerify()">重新验证</button>
+  {# 破坏性操作放在行尾、且措辞写明「本地数据 / 不可撤销」，别和上面那几个常用动作混在一起。 #}
+  <button class="danger" onclick="deleteItem()">删除本地数据</button>
 </div>
 {% endif %}
 
 <div class="panel">
   <h2>基本信息</h2>
   <div class="kv">
-    <div class="k">类型</div><div><span class="tag">{{ data.type }}</span> <span class="tag {{ data.evaluation.category if data.evaluation else 'unknown' }}">{{ data.evaluation.category if data.evaluation else '未分类' }}</span></div>
-    <div class="k">状态</div><div>{{ data.state }}{% if data.type == 'pr' %} · 已合并：{{ '是' if data.merge.merged else '否' }}{% if data.merge.draft %} · 草稿{% endif %}{% endif %}</div>
-    <div class="k">作者</div><div>{{ data.author }}（{{ data.author_kind }}）</div>
-    <div class="k">标签</div><div>{% for l in data.labels %}<span class="tag">{{ l }}</span>{% endfor %}{% if not data.labels %}<span class="muted">无</span>{% endif %}</div>
-    <div class="k">创建 / 更新</div><div>{{ data.created_at or '-' }} / {{ data.updated_at or '-' }}</div>
-    {% if data.linked_issues %}<div class="k">关联 Issue</div><div>{% for n in data.linked_issues %}<span class="tag">#{{ n }}</span>{% endfor %}</div>{% endif %}
+    <div class="k">类型</div>
+    <div class="v">
+      <span class="tag">{{ data.type }}</span>
+      <span class="tag {{ data.evaluation.category if data.evaluation else 'unknown' }}">{{ data.evaluation.category if data.evaluation else '未分类' }}</span>
+      <span class="tag status-{{ data.status }}">流水线：{{ data.status }}</span>
+      {% if data.conclusion_stale %}
+      <span class="tag stale" title="{{ data.conclusion_stale | join('；') }}">⚠️ 结论已过期</span>
+      {% endif %}
+      {% if data.degraded %}
+      <span class="tag stale" title="{{ data.degraded | join('；') }}">⚠️ 数据残缺</span>
+      {% endif %}
+    </div>
+    <div class="k">平台状态</div>
+    <div class="v">
+      {{ data.state }}{% if data.type == 'pr' %} · 已合并：{{ '是' if data.merge.merged else '否' }}{% if data.merge.draft %} · 草稿{% endif %}{% endif %}
+    </div>
+    <div class="k">作者</div><div class="v">{{ data.author }}（{{ data.author_kind }}）</div>
+    <div class="k">标签</div>
+    <div class="v">{% for l in data.labels %}<span class="tag">{{ l }}</span>{% endfor %}{% if not data.labels %}<span class="muted">无</span>{% endif %}</div>
+    <div class="k">创建 / 更新</div><div class="v mono">{{ data.created_at or '-' }} / {{ data.updated_at or '-' }}</div>
+    <div class="k">评论</div>
+    <div class="v mono">{{ data.comments }} 条{% if data.degraded and 'comments' in data.degraded | join(' ') %} <span class="warn">（评论没拉全，此数不准）</span>{% endif %}</div>
+    {% if data.linked_issues %}
+    <div class="k">关联 Issue</div><div class="v">{% for n in data.linked_issues %}<span class="tag">#{{ n }}</span>{% endfor %}</div>
+    {% endif %}
     {% if data.type == 'pr' %}
-    <div class="k">分支</div><div>{{ data.merge.head_branch }} → {{ data.merge.base_branch }}</div>
-    <div class="k">变更</div><div>+{{ data.merge.additions }}/-{{ data.merge.deletions }}（{{ data.merge.changed_files }} 个文件）</div>
+    <div class="k">分支</div><div class="v"><code>{{ data.merge.head_branch }}</code> → <code>{{ data.merge.base_branch }}</code></div>
+    <div class="k">变更</div><div class="v mono">+{{ data.merge.additions }}/-{{ data.merge.deletions }}（{{ data.merge.changed_files }} 个文件）</div>
     {% endif %}
   </div>
 </div>
+
+{# 正文与讨论：这是一个**分诊**工具，旧版却把正文与评论内容整块漏掉了——
+   想读 Issue 说了什么只能点「在平台打开」跳出去。数据一直在库里
+   （`get_item` 会 selectinload 评论），只是 payload 不发、页面不渲染。 #}
+<div class="panel">
+  <h2>正文</h2>
+  {% if data.body %}
+  <div class="body-text">{{ data.body }}</div>
+  {% else %}
+  <div class="muted">（正文为空）</div>
+  {% endif %}
+</div>
+
+{% if data.comment_thread %}
+<details class="panel collapsible" open>
+  <summary>讨论（{{ data.comment_thread | length }} 条）</summary>
+  {% for c in data.comment_thread %}
+  <div class="comment {% if c.author_kind in ['bot', 'ai_agent'] %}bot{% endif %}">
+    <div class="meta">
+      {{ c.author }}
+      <span class="tag">{{ c.author_kind }}</span>
+      {{ c.created_at or '' }}
+    </div>
+    <div class="body-text">{{ c.body }}</div>
+  </div>
+  {% endfor %}
+</details>
+{% endif %}
 
 {% if evaluation %}
 <div class="panel">
@@ -88,46 +91,58 @@
   {% for name, dim in evaluation.scores.as_dict().items() %}
   <div class="score-row">
     <span class="label">{{ name }}</span>
-    <b>{{ dim }}</b>
-    <span class="bar" style="width: {{ dim * 1.6 }}px"></span>
+    <span class="bar-track"><span class="bar-fill" style="width: {{ dim }}%"></span></span>
+    <b class="mono">{{ dim }}</b>
   </div>
   {% endfor %}
+
   {% for name in ['authenticity','importance','feasibility','difficulty','pr_quality'] %}
     {% set dim = evaluation.scores.get(name) %}
     {% if dim %}
-      <div style="margin:10px 0 6px"><b>{{ name }}</b> <span class="muted">{{ dim.score }} / 100（置信度 {{ '%.2f' % dim.confidence }}）</span></div>
+      <div class="mt"><b>{{ name }}</b>
+        <span class="muted mono">{{ dim.score }} / 100（置信度 {{ '%.2f' % dim.confidence }}）</span></div>
       <div class="muted">{{ dim.reason }}</div>
-      {% if dim.evidence %}<ul class="muted" style="margin:4px 0 0 18px">{% for e in dim.evidence %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+      {% if dim.evidence %}
+      <ul class="muted small">{% for e in dim.evidence %}<li>{{ e }}</li>{% endfor %}</ul>
+      {% endif %}
     {% endif %}
   {% endfor %}
-  <div style="margin-top:12px">
+
+  <div class="mt">
     <span class="tag">动作：{{ evaluation.action.value }}</span>
     <span class="tag {{ evaluation.priority.value }}">优先级：{{ evaluation.priority.value }}</span>
     {% for l in evaluation.labels_suggested %}<span class="tag">{{ l }}</span>{% endfor %}
   </div>
   {% if evaluation.spam.suspicious %}
-  <div style="margin-top:10px" class="bad">⚠️ 疑似
+  <div class="mt bad">⚠️ 疑似
     {{ '刷量' if evaluation.spam.is_spam else '' }}{{ '重复' if evaluation.spam.is_duplicate else '' }}{{ 'AI 生成' if evaluation.spam.is_ai_generated else '' }}
-    {% if evaluation.spam.reasons %}<div class="muted">{{ evaluation.spam.reasons | join('；') }}</div>{% endif %}
+    {% if evaluation.spam.reasons %}<div class="muted small">{{ evaluation.spam.reasons | join('；') }}</div>{% endif %}
   </div>
   {% endif %}
-  <div style="margin-top:12px"><b>结论：</b>{{ evaluation.summary }}</div>
-  <div class="muted" style="margin-top:6px">
-    模型 {{ evaluation.model }} · tokens {{ evaluation.prompt_tokens }}/{{ evaluation.completion_tokens }} ·
-    约 ${{ '%.5f' % evaluation.cost_usd }}
+  <div class="mt"><b>结论：</b>{{ evaluation.summary }}</div>
+  <div class="muted small mt">
+    模型 {{ evaluation.model }} · tokens 入 {{ evaluation.prompt_tokens }} / 出 {{ evaluation.completion_tokens }}
+    · 约 ${{ '%.5f' % evaluation.cost_usd }}
+    {% if evaluation.created_at %} · 评测于 {{ evaluation.created_at.strftime('%Y-%m-%d %H:%M') }}{% endif %}
   </div>
 </div>
 {% else %}
-<div class="panel"><h2>AI 评测</h2><div class="muted">尚未评测。执行 <code>fissue eval --repo {{ data.repo }} --all</code>。</div></div>
+<div class="panel"><h2>AI 评测</h2>
+  <div class="muted">尚未评测。可以点上面的「重新深度评测」，或执行
+    <code>fissue eval --repo {{ data.repo }} --all</code>。</div>
+</div>
 {% endif %}
 
 {% if conclusion %}
 <div class="panel">
   <h2>批量结论</h2>
-  <div><span class="tag">{{ conclusion.verdict }}</span> <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
-       {% for l in conclusion.labels %}<span class="tag">{{ l }}</span>{% endfor %}</div>
-  <div style="margin-top:8px">{{ conclusion.reason }}</div>
-  <div class="muted">置信度 {{ '%.2f' % conclusion.confidence }}</div>
+  <div>
+    <span class="tag">{{ conclusion.verdict }}</span>
+    <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
+    {% for l in conclusion.labels %}<span class="tag">{{ l }}</span>{% endfor %}
+  </div>
+  <div class="mt">{{ conclusion.reason }}</div>
+  <div class="muted small">置信度 {{ '%.2f' % conclusion.confidence }}</div>
 </div>
 {% endif %}
 
@@ -135,18 +150,19 @@
   <h2>验证器</h2>
   {% if verifier %}
   <div class="kv">
-    <div class="k">形态</div><div>{{ verifier.kind.value }}（{{ verifier.language }}）</div>
-    <div class="k">名称</div><div>{{ verifier.name }}</div>
-    <div class="k">运行命令</div><div><code>{{ verifier.command or '（清单型，无命令）' }}</code></div>
-    <div class="k">F2P 要求</div><div>base 必失败：{{ verifier.expect_fail_on_base }} · 修复后必通过：{{ verifier.expect_pass_on_fix }}</div>
+    <div class="k">形态</div><div class="v">{{ verifier.kind.value }}（{{ verifier.language }}）</div>
+    <div class="k">名称</div><div class="v">{{ verifier.name }}</div>
+    <div class="k">运行命令</div><div class="v"><code>{{ verifier.command or '（清单型，无命令）' }}</code></div>
+    <div class="k">F2P 要求</div>
+    <div class="v">base 必失败：{{ verifier.expect_fail_on_base }} · 修复后必通过：{{ verifier.expect_pass_on_fix }}</div>
   </div>
   {% if verifier.files %}
-  <div style="margin-top:10px"><b>验证器文件</b><ul class="muted">{% for p in verifier.files %}<li>{{ p }}</li>{% endfor %}</ul></div>
+  <div class="mt"><b>验证器文件</b><ul class="muted">{% for p in verifier.files %}<li><code>{{ p }}</code></li>{% endfor %}</ul></div>
   {% endif %}
   {% if verifier.checklist %}
-  <div style="margin-top:10px"><b>验证清单</b><ol class="muted">{% for c in verifier.checklist %}<li>{{ c }}</li>{% endfor %}</ol></div>
+  <div class="mt"><b>验证清单</b><ol class="muted">{% for c in verifier.checklist %}<li>{{ c }}</li>{% endfor %}</ol></div>
   {% endif %}
-  {% if verifier.notes %}<div style="margin-top:10px"><b>说明</b><div class="muted">{{ verifier.notes }}</div></div>{% endif %}
+  {% if verifier.notes %}<div class="mt"><b>说明</b><div class="muted">{{ verifier.notes }}</div></div>{% endif %}
   {% else %}
   <div class="muted">尚未生成验证器。</div>
   {% endif %}
@@ -155,32 +171,43 @@
 {% if runs %}
 <div class="panel">
   <h2>验证执行记录</h2>
+  <div class="table-scroll">
   <table>
-    <thead><tr><th>阶段</th><th>结果</th><th>退出码</th><th>耗时</th><th>时间</th></tr></thead>
+    <thead><tr><th>阶段</th><th>结果</th><th class="num">退出码</th><th class="num">耗时</th>
+      <th>F2P</th><th>时间</th></tr></thead>
     <tbody>
     {% for r in runs %}
       <tr>
         <td>{{ r.stage }}</td>
         <td class="{{ 'ok' if r.outcome.value == 'pass' else 'bad' }}">{{ r.outcome.value }}</td>
-        <td>{{ r.exit_code }}</td>
-        <td>{{ '%.1f' % r.duration_seconds }}s</td>
-        <td class="muted">{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        <td class="num">{{ r.exit_code }}</td>
+        <td class="num">{{ '%.1f' % r.duration_seconds }}s</td>
+        {# F2P 结果原先在页面上看不到，只能在报告里找——它恰恰是「这条到底验没验过」的关键。 #}
+        <td>
+          {% if r.f2p_ok is none %}<span class="muted">—</span>
+          {% elif r.f2p_ok %}<span class="ok">✓ 通过</span>
+          {% else %}<span class="bad">✗ 未通过</span>{% endif %}
+        </td>
+        <td class="muted mono">{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
+  </div>
 </div>
 {% endif %}
 
 {% if regression %}
 <div class="panel">
   <h2>既有测试回归门</h2>
-  <div>
-    <div class="k">模式</div><div><code>{{ regression.mode }}</code></div>
-    <div class="k">base</div><div>{{ regression.base.outcome if regression.base else '未运行' }}{% if regression.base and regression.base.exit_code is not none %}（exit={{ regression.base.exit_code }}）{% endif %}</div>
-    <div class="k">fix</div><div>{{ regression.fix.outcome if regression.fix else '未运行' }}{% if regression.fix and regression.fix.exit_code is not none %}（exit={{ regression.fix.exit_code }}）{% endif %}</div>
+  <div class="kv">
+    <div class="k">模式</div><div class="v"><code>{{ regression.mode }}</code></div>
+    <div class="k">base</div>
+    <div class="v">{{ regression.base.outcome if regression.base else '未运行' }}{% if regression.base and regression.base.exit_code is not none %}（exit={{ regression.base.exit_code }}）{% endif %}</div>
+    <div class="k">fix</div>
+    <div class="v">{{ regression.fix.outcome if regression.fix else '未运行' }}{% if regression.fix and regression.fix.exit_code is not none %}（exit={{ regression.fix.exit_code }}）{% endif %}</div>
     <div class="k">结论</div>
-    <div>
+    <div class="v">
       {% if regression.status == 'pass' %}<span class="ok">既有测试全绿</span>
       {% elif regression.status == 'fail' %}<span class="bad">⚠️ 修复破坏了既有测试{% if regression.blocking %}（strict：已阻断）{% else %}（未阻断）{% endif %}</span>
       {% elif regression.status == 'untrusted' %}<span class="muted">仓库本身不绿 / 跑不通 → 回归门不可信，未阻断</span>
@@ -188,7 +215,7 @@
     </div>
   </div>
   {% if regression.failed_tests %}
-  <div style="margin-top:10px"><b>失败用例</b><ul class="muted">{% for t in regression.failed_tests %}<li>{{ t }}</li>{% endfor %}</ul></div>
+  <div class="mt"><b>失败用例</b><ul class="muted">{% for t in regression.failed_tests %}<li><code>{{ t }}</code></li>{% endfor %}</ul></div>
   {% endif %}
 </div>
 {% endif %}
@@ -196,42 +223,101 @@
 {% if fixes %}
 <div class="panel">
   <h2>自动修复记录</h2>
+  <div class="table-scroll">
   <table>
-    <thead><tr><th>结果</th><th>轮次</th><th>分支</th><th>PR</th><th>说明</th></tr></thead>
+    <thead><tr><th>结果</th><th class="num">轮次</th><th>分支</th><th>PR</th><th>补丁 / 改动</th><th>说明</th></tr></thead>
     <tbody>
     {% for f in fixes %}
       <tr>
-        <td class="{{ 'ok' if f.outcome.value == 'success' else 'bad' }}">{{ f.outcome.value }}</td>
-        <td>{{ f.rounds }}</td>
-        <td>{{ f.branch or '-' }}</td>
+        <td class="{{ 'ok' if f.outcome.value == 'success' else 'bad' }}">
+          {{ f.outcome.value }}{% if f.dry_run %} <span class="tag">dry-run</span>{% endif %}
+        </td>
+        <td class="num">{{ f.rounds }}</td>
+        <td>{% if f.branch %}<code>{{ f.branch }}</code>{% else %}-{% endif %}</td>
         <td>{% if f.pr_url %}<a href="{{ f.pr_url }}" target="_blank" rel="noopener">#{{ f.pr_number }}</a>{% else %}-{% endif %}</td>
-        <td class="muted">{{ (f.error or f.report_path or '')[:100] }}</td>
+        {# 补丁落在哪、动了哪些文件：页面上要能看到，否则「修好了」只是一句话。 #}
+        <td class="small">
+          {% if f.patch_path %}<div><code>{{ f.patch_path }}</code></div>{% endif %}
+          {% if f.changed_files %}
+          <ul class="muted">{% for path in f.changed_files %}<li><code>{{ path }}</code></li>{% endfor %}</ul>
+          {% endif %}
+          {% if not f.patch_path and not f.changed_files %}<span class="muted">—</span>{% endif %}
+        </td>
+        <td class="muted small">
+          {% if f.error %}<span class="bad">{{ f.error }}</span>
+          {% elif f.report_path %}<code>{{ f.report_path }}</code>
+          {% else %}—{% endif %}
+        </td>
       </tr>
     {% endfor %}
     </tbody>
   </table>
+  </div>
 </div>
 {% endif %}
 
-</div>
+{% endblock %}
 
+{% block scripts %}
 <script>
-async function act(name, body) {
-  const prefix = {{ settings.api.prefix if settings else '/api/v1' | tojson }};
-  const url = prefix + '/actions/' + name + '?key=' + encodeURIComponent({{ data.key | tojson }});
-  if (!confirm('确认执行 ' + name + '？')) return;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(body || {})
+  var KEY = {{ data.key | tojson }};
+
+  // 这两个按钮原先直接把 KEY 插进 onclick：`onclick="Fissue.runJob('evaluate', {keys: [{{ data.key | tojson }}]})"`
+  // 会渲染成 `onclick="Fissue.runJob('evaluate', {keys: ["github:..."]})"`——里面的双引号
+  // 在第一个 `"` 处就把属性截断，点了没反应。KEY 已经在脚本作用域里，包成函数最省事。
+  function reEval() {
+    Fissue.runJob("evaluate", {keys: [KEY], deep: true}, {autoReload: true});
+  }
+
+  function reVerify() {
+    Fissue.runJob("verify", {keys: [KEY]}, {autoReload: true});
+  }
+
+  // 删除本地数据。两步确认，并把「连带删掉了什么」如实报出来——破坏性操作只回一句
+  // 「成功」没法让人核对，而后端是**知道**删掉了几条评测、几条验证记录的。
+  function deleteItem() {
+    Fissue.confirm(
+      "删除这条的本地数据？",
+      "会连同它的评测、验证记录、修复记录与队列条目一起删除，**不可撤销**。" +
+        "平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。"
+    ).then(function (ok) {
+      if (!ok) return;
+      Fissue.api("/items/" + encodeURIComponent(KEY), {method: "DELETE"})
+        .then(function (r) {
+          Fissue.toast("已删除：" + KEY, "ok", {detail: r.counts, timeout: 8000});
+          setTimeout(function () { location.href = "/items"; }, 1400);
+        })
+        .catch(function (err) {
+          Fissue.toast("删除失败", "bad", {detail: err.message, timeout: 0});
+        });
     });
-    const data = await res.json();
-    alert(res.ok ? (name + ' 完成：\n' + JSON.stringify(data, null, 2).slice(0, 1200))
-                 : ('失败：' + (data.detail || JSON.stringify(data))));
-    if (res.ok) location.reload();
-  } catch (e) { alert('请求失败：' + e); }
-}
+  }
+
+  // 批准修复 = 以「真提 PR」跑一次 fix 作业。走作业而不是同步端点：一次修复要来回好几轮、
+  // 动辄几分钟，同步请求会把页面挂住，也看不到进度。
+  function approveFix() {
+    if ({{ 'true' if data.type == 'pr' else 'false' }}) {
+      Fissue.toast('这一条是 PR：PR 侧走「合并验证」，没有 fork 提 PR 的修复流程。', 'info', {timeout: 0});
+      return;
+    }
+    Fissue.confirm('批准自动修复？', '会对 ' + KEY + ' 真提 PR（fork、改代码、开 PR），无法一键撤销。')
+      .then(function (ok) {
+        if (ok) Fissue.runJob('fix', {keys: [KEY], dry_run: false}, {autoReload: true});
+      });
+  }
+
+  function approveMerge() {
+    if ({{ 'false' if data.type == 'pr' else 'true' }}) {
+      Fissue.toast('只有 PR 可以批准合并。', 'bad');
+      return;
+    }
+    Fissue.confirm('确认可以合并？', '会在平台上打 merge-approved 标签并留一条评论；**不会自动合并**，仍需人工在平台点确认。')
+      .then(function (ok) {
+        if (!ok) return;
+        Fissue.api('/actions/approve-merge?key=' + encodeURIComponent(KEY), {method: 'POST', body: {note: ''}})
+          .then(function (data) { Fissue.toast('已打标签：' + (data.note || '完成'), 'ok'); setTimeout(function () { location.reload(); }, 900); })
+          .catch(function (err) { Fissue.toast('打标签失败', 'bad', {detail: err.message, timeout: 0}); });
+      });
+  }
 </script>
-</body>
-</html>
+{% endblock %}

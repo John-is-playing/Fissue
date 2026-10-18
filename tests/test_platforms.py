@@ -117,6 +117,34 @@ def gh(settings):
     yield adapter
 
 
+async def test_a_zero_retry_configuration_is_rejected_loudly() -> None:
+    """平台适配器同样：`max_retries=0` 一次请求都不发，必须明确报错。
+
+    回归一次真实事故：探活为了「快速失败」把它设成 0，于是「校验」按钮一直报
+    「GitHub 请求最终失败：GET https://api.github.com/user（None）」——`last_exc` 是空的，
+    真正的原因（连不上 / 401 / 404）全被丢掉；而**同一把 token 直连是 200**。
+    这个数是**总尝试次数**，至少为 1。
+    """
+    from fissue.errors import PlatformError
+    from fissue.platforms.github import GitHubAdapter
+
+    calls: list[tuple] = []
+
+    class _Recorder:
+        async def request(self, *args, **kwargs):  # noqa: ANN002, ANN003, ARG002
+            calls.append(args)
+            raise AssertionError("配置成 0 时不该发出任何请求")
+
+    adapter = GitHubAdapter(token="t", max_retries=0)
+    adapter._client = _Recorder()  # type: ignore[assignment]
+
+    with pytest.raises(PlatformError) as exc:
+        await adapter._request("GET", "https://api.github.com/user")
+
+    assert "max_retries" in str(exc.value), f"报错要说清是配置问题：{exc.value}"
+    assert calls == [], "不该有任何请求发出去"
+
+
 @respx.mock
 async def test_github_fetch_issue_and_pr(gh) -> None:
     respx.get(f"{GH}/repos/psf/requests/issues").mock(

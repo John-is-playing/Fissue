@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 任务{% endblock %}
+{% block heading %}任务{% endblock %}
+{% block subtitle %}作业历史与日志；提交入口在「总览」的控制面板{% endblock %}
+
+{% block header_extra %}
+  <span class="sub">{{ jobs.jobs | length }} 条</span>
+{% endblock %}
+
+{% block content %}
+
+{% if jobs.current %}
+<div class="panel">
+  <h2>正在运行</h2>
+  <div class="job">
+    <div class="j-head">
+      <span class="spinner"></span>
+      <span class="j-kind">{{ jobs.current.kind }}</span>
+      <span class="tag status-queued">{{ jobs.current.status }}</span>
+      <span class="tag">{{ jobs.current.id }}</span>
+      <span class="muted small">{{ jobs.current.duration_seconds }}s</span>
+      {% if not read_only %}
+      <span class="spacer"></span>
+      <button class="danger" data-act="cancel-job" data-job="{{ jobs.current.id }}">取消任务</button>
+      {% endif %}
+    </div>
+    <div class="progress-line" id="cur-progress">{{ jobs.current.progress }}</div>
+    {% if jobs.current.log %}<pre id="cur-log">{{ jobs.current.log | join('\n') }}</pre>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>历史</h2>
+  {% for j in jobs.jobs %}
+  {% set cls = 'ok' if j.status == 'done' else ('bad' if j.status == 'failed' else ('stale' if j.status == 'canceled' else 'unknown')) %}
+  <div class="job">
+    <div class="j-head">
+      <span class="j-kind">{{ j.kind }}</span>
+      <span class="tag {{ cls }}">{{ j.status }}</span>
+      <span class="tag">{{ j.id }}</span>
+      <span class="muted small">{{ j.duration_seconds }}s</span>
+      <span class="muted small">{{ (j.created_at or '')[:19].replace('T', ' ') }}</span>
+      <span class="spacer"></span>
+      {% if j.live and not read_only %}
+      <button class="danger" data-act="cancel-job" data-job="{{ j.id }}">取消</button>
+      {% endif %}
+      <span class="muted small">{{ j.params }}</span>
+    </div>
+    {% if j.error %}<pre class="{{ 'bad' if j.status == 'failed' else 'muted' }}">{{ j.error }}</pre>{% endif %}
+    {% if j.log %}<pre>{{ j.log | join('\n') }}</pre>{% endif %}
+    {% if j.result and j.status == 'done' %}<pre class="muted">{{ j.result | tojson(indent=2) }}</pre>{% endif %}
+  </div>
+  {% else %}
+  <div class="muted">
+    还没有任务记录。到<a href="/">总览</a>的控制面板可以发起：检索 / 评测 / 验证 / 修复 / flush。
+  </div>
+  {% endfor %}
+</div>
+
+<div class="muted small">
+  作业表是**进程内**的：重启服务后历史清空，且只在单个 uvicorn worker 下成立
+  （<code>fissue web</code> 与 <code>fissue serve --with-web</code> 都是单进程）。
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // 有任务在跑时把进度刷新出来；没有就不轮询。
+  var current = {{ (jobs.current.id if jobs.current else '') | tojson }};
+  if (current) {
+    (async function loop() {
+      var job;
+      try { job = await Fissue.api('/jobs/' + current); } catch (e) { return; }
+      var p = document.getElementById('cur-progress');
+      if (p) p.textContent = job.progress || '';
+      var log = document.getElementById('cur-log');
+      if (log) log.textContent = (job.log || []).join('\n');
+      if (job.live) {
+        setTimeout(loop, 1500);
+      } else {
+        Fissue.toast('任务已结束：' + job.status, job.status === 'done' ? 'ok' : 'bad',
+                     {detail: job.error || job.result, timeout: 0});
+        setTimeout(function () { location.reload(); }, 1200);
+      }
+    })();
+  }
+</script>
+{% endblock %}

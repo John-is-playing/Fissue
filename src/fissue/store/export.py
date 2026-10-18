@@ -18,6 +18,7 @@ from ..models import (
     Evaluation,
     ItemType,
     Platform,
+    Priority,
     RawItem,
     VerifierOutcome,
     VerifierRun,
@@ -103,18 +104,39 @@ def item_to_dict(
         "type": item.item_type.value,
         "url": item_url(item),
         "title": item.title,
+        "body": item.body,
         "state": item.state,
+        # 流水线状态（`new`→`pr_created`/`failed`）：筛选按它做，展示也必须能看到它。
+        # 原先这里没有，于是看板的「状态」列只能拿「有没有评测」凑数，页面上筛了
+        # status 却在表格里找不到状态。
+        "status": item.status.value,
         "labels": item.labels,
         "author": item.author,
         "author_kind": item.author_kind.value,
         "created_at": _iso(item.created_at),
         "updated_at": _iso(item.updated_at),
+        # `comments` 保持**计数**语义（导出/测试都在用）；评论正文另走 `comment_thread`。
         "comments": len(item.comments),
         "linked_issues": item.linked_issues,
         # 结论是否已过期（内容实质变化后、重新评测前）：让报告 / 看板 / API 都看得见。
         # 空列表 = 当前结论与内容一致。
         "conclusion_stale": item.stale_reasons,
+        # 数据残缺原因（评论没拉全等）。空列表才是完整——页面上要能看出来，
+        # 否则「0 条评论」既可能是真没人说话，也可能是我们没拉到。
+        "degraded": item.degraded,
     }
+    # 评论正文只在**调用方加载了**评论时才有：`list_items` 走 with_comments=False，
+    # 此时 comment_thread 是空表而不是「0 条评论」的假断言。
+    if item.comments:
+        data["comment_thread"] = [
+            {
+                "author": c.author,
+                "author_kind": c.author_kind.value,
+                "body": c.body,
+                "created_at": _iso(c.created_at),
+            }
+            for c in item.comments
+        ]
     if item.item_type is ItemType.PR:
         data["merge"] = {
             "merged": item.merged,
@@ -334,19 +356,32 @@ def summarize(
     repo: Repository,
     *,
     repo_slug: str | None = None,
+    item_type: ItemType | None = None,
     status: Any | None = None,
     category: Category | None = None,
+    priority: Priority | None = None,
+    query: str | None = None,
 ) -> dict[str, Any]:
     """概览统计。
 
     过滤条件必须与明细**一致**：原先只接 ``repo_slug``，于是 ``fissue export --status x``
     产出的那份 JSON 里，``count``（已过滤）与 ``summary.total`` / ``by_status``（全仓库）
     互相矛盾，Markdown 的「概览」与「明细」条数也对不上——外部读者据此会得出错误结论。
+    ``item_type`` / ``priority`` / ``query`` 同理：看板按它们筛了列表，概览卡片就必须跟着动，
+    否则顶上写着「共 300 条」、底下却是 12 条搜索结果。
     """
     # 计数走聚合查询，平均分只需要 key：原先 list_items(limit=100000) 会把十万条领域对象
     # （含标签、正文元数据）全加载进内存，只为数几个数。
-    stats = repo.item_stats(repo_slug=repo_slug, status=status, category=category)
-    keys = repo.item_keys(repo_slug=repo_slug, status=status, category=category)
+    filters = {
+        "repo_slug": repo_slug,
+        "item_type": item_type,
+        "status": status,
+        "category": category,
+        "priority": priority,
+        "query": query,
+    }
+    stats = repo.item_stats(**filters)
+    keys = repo.item_keys(**filters)
 
     evals = repo.evaluations_for(keys)
     dims: dict[str, list[int]] = {}

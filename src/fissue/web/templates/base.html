@@ -1,0 +1,87 @@
+{# 共用骨架：左侧导航 + 主区。
+ #
+ # 页面按**功能分类**分页（总览 / 条目 / 队列 / 任务 / 仓库 / 状态监测 / 初始化 / 设置），
+ # 每个页面只填 {% block content %}。原先只有一个页面、什么都堆在一起。
+ #
+ # `api_prefix` / `read_only` / `nav` 一律由 Python 侧传进来（见 web/app.py 的 _page_context），
+ # 不在模板里做条件表达式——`{{ a if b else c | tojson }}` 这种写法里 `tojson` 只作用于 else
+ # 分支，传了 a 就渲染出裸字符串，进 JS 就是正则字面量语法错误。这个坑踩过一次。
+ #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Fissue{% endblock %}</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔍</text></svg>">
+<link rel="stylesheet" href="{{ static_url }}">
+{% block head %}{% endblock %}
+</head>
+<body>
+
+<div class="shell">
+
+  <aside class="side">
+    <div class="brand">
+      <a href="/">Fissue</a>
+      <span class="ver">v{{ version }}</span>
+    </div>
+
+    <nav class="nav">
+      <a href="/" class="{{ 'on' if nav == 'overview' }}">总览</a>
+      <a href="/items" class="{{ 'on' if nav == 'items' }}">条目</a>
+      <a href="/queues" class="{{ 'on' if nav == 'queues' }}">队列</a>
+      <a href="/jobs" class="{{ 'on' if nav == 'jobs' }}">任务</a>
+      <a href="/repos" class="{{ 'on' if nav == 'repos' }}">监控仓库</a>
+      <a href="/status" class="{{ 'on' if nav == 'status' }}">状态监测</a>
+      <div class="nav-sep"></div>
+      <a href="/setup" class="{{ 'on' if nav == 'setup' }}">初始化向导</a>
+      <a href="/settings" class="{{ 'on' if nav == 'settings' }}">设置</a>
+    </nav>
+
+    {# 常驻的实时角标：每 5 秒拉一次 /api/v1/status，在**每个页面**上都显示
+       「有没有写操作在跑、有没有任务在跑」。没有它，用户在别的页面上看不到流水线是否活着。 #}
+    <div class="side-foot" id="live-box" data-state="unknown">
+      <div class="live-row">
+        <span class="dot" id="live-dot"></span>
+        <span id="live-text">正在读取状态…</span>
+      </div>
+      <div class="live-sub" id="live-sub"></div>
+      <div class="live-row" id="live-jobs-row" hidden>
+        <span class="spinner"></span><span id="live-jobs"></span>
+      </div>
+      <a class="small" href="/status">状态监测 →</a>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header>
+      <h1>{% block heading %}Fissue{% endblock %}</h1>
+      <span class="sub">{% block subtitle %}{% endblock %}</span>
+      <span class="spacer"></span>
+      {% block header_extra %}{% endblock %}
+      {% if read_only %}<span class="tag stale">只读模式</span>{% endif %}
+    </header>
+
+    <div class="wrap {% block wrap_class %}{% endblock %}">
+      {% if read_only %}
+      <div class="banner">当前为只读模式（web.read_only = true）——写操作按钮已禁用，仍可浏览与筛选。</div>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </div>
+  </main>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+  window.FISSUE = {
+    apiPrefix: {{ api_prefix | tojson }},
+    readOnly: {{ read_only | tojson }},
+    nav: {{ nav | tojson }}
+  };
+</script>
+<script src="{{ script_url }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

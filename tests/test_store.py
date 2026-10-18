@@ -1100,3 +1100,148 @@ def test_sqlite_concurrent_writers_do_not_lock_each_other_out(tmp_path) -> None:
 
     assert errors == [], f"并发写不该失败：{errors}"
     assert {str(i.number) for i in repo.list_items(limit=20)} == {str(n) for n in range(1, 9)}
+
+
+# ---------------------------------------------------------------------------
+# 列表查询：搜索 / 排序 / 总数口径
+# ---------------------------------------------------------------------------
+
+
+def _add_item(repo: Repository, number: int, title: str, *, body: str = "b", priority=None) -> None:
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=number,
+            item_type=ItemType.ISSUE, title=title, body=body,
+        ),
+    )
+
+
+def test_item_search_treats_underscore_as_a_literal(repo) -> None:
+    """搜索必须转义 LIKE 通配符。
+
+    ``_`` 在 LIKE 里是「任意单字符」，而 ``get_bool``、``snake_case`` 恰恰是最常见的搜索词：
+    不转义就会把 ``getXbool`` 一起搜出来，用户看到一堆无关条目还以为搜对了。
+    """
+    _add_item(repo, 1, "get_bool 大小写不敏感")
+    _add_item(repo, 2, "getXbool 不该被搜到")
+    _add_item(repo, 3, "get%bool 百分号也不该当通配符")
+
+    assert [i.number for i in repo.list_items(query="get_bool")] == ["1"]
+    assert [i.number for i in repo.list_items(query="get%bool")] == ["3"]
+    # 正文与作者同样在被搜的列里
+    _add_item(repo, 4, "无关标题", body="正文里提到 get_bool")
+    assert {i.number for i in repo.list_items(query="get_bool")} == {"1", "4"}
+
+
+def test_item_search_ignores_blank_query(repo) -> None:
+    """空串 / 纯空白不该退化成「匹配一切」之外的东西，也不该报错。"""
+    _add_item(repo, 1, "唯一的条目")
+    assert len(repo.list_items(query="")) == 1
+    assert len(repo.list_items(query="   ")) == 1
+
+
+def test_count_items_uses_the_same_filters_as_list_items(repo) -> None:
+    """总数与明细必须同口径（同一个 `_item_filtered`）。
+
+    ``summarize`` 的注释记着这条老账：概览与明细的条数曾经互相矛盾，外部读者据此得出
+    错误结论。分页也一样——``count`` 是这一页的条数，``total`` 才是筛选后的全部。
+    """
+    _add_item(repo, 1, "崩溃一点")
+    _add_item(repo, 2, "崩溃两点")
+    _add_item(repo, 3, "另一个问题")
+    repo.set_item_status("github:psf/requests#3", ItemStatus.EVALUATED)
+
+    for filters in (
+        {},
+        {"item_type": ItemType.ISSUE},
+        {"status": ItemStatus.EVALUATED},
+        {"query": "崩溃"},
+        {"status": ItemStatus.NEW, "query": "崩溃"},
+        {"category": Category.BUG},
+    ):
+        rows = repo.list_items(**filters, limit=100)
+        assert repo.count_items(**filters) == len(rows), f"口径不一致：{filters}"
+        # 概览的 total 用的是同一套过滤，也必须对得上
+        assert repo.item_stats(**filters)["total"] == len(rows), f"概览对不上：{filters}"
+
+
+def test_list_items_offset_pages_without_overlap(repo) -> None:
+    for n in range(1, 6):
+        _add_item(repo, n, f"条目 {n}")
+    first = repo.list_items(limit=2, offset=0, order_by="number", desc=False)
+    second = repo.list_items(limit=2, offset=2, order_by="number", desc=False)
+    assert [i.number for i in first] == ["1", "2"]
+    assert [i.number for i in second] == ["3", "4"]
+    assert {i.key for i in first}.isdisjoint({i.key for i in second})
+
+
+def test_list_items_ignores_an_unknown_sort_key(repo) -> None:
+    """排序键走白名单，非法键回落而不是炸。
+
+    原先的 ``getattr(ItemRow, order_by, ...)`` 拿到的不一定是列：``metadata`` 是 MetaData、
+    ``query`` 是描述符，它们都没有 ``.desc()``，于是 ``order_by=metadata`` 会炸成 500——
+    而这个参数现在直接来自 Web 查询串。
+    """
+    _add_item(repo, 1, "条目")
+    for bad in ("metadata", "query", "registry", ""):
+        assert len(repo.list_items(order_by=bad)) == 1, f"非法排序键 {bad!r} 不该炸"
+
+
+def test_item_to_dict_carries_the_new_display_fields(repo) -> None:
+    """payload 要带流水线状态、正文与评论正文。
+
+    回归：``item_to_dict`` 原先只发一个评论**计数**，正文与评论内容整颗丢掉——于是看板上
+    「状态」列只能拿「有没有评测」凑数（筛选按 status，表格里却看不到 status），详情页也读不到
+    Issue 到底说了什么，只能点「在平台打开」跳出去。
+    """
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=7,
+            item_type=ItemType.ISSUE, title="带评论的条目", body="正文第一行",
+            comments=[Comment(author="someone", body="我来看看")],
+        ),
+    )
+    item = repo.get_item("github:psf/requests#7")
+    assert item is not None
+    data = exp.item_to_dict(item)
+
+    assert data["status"] == ItemStatus.NEW.value
+    assert data["body"] == "正文第一行"
+    assert data["comments"] == 1, "`comments` 仍是计数语义（导出与测试都在用）"
+    assert data["comment_thread"][0]["author"] == "someone"
+    assert data["comment_thread"][0]["body"] == "我来看看"
+    assert data["degraded"] == []
+
+
+def test_item_to_dict_omits_comment_thread_when_comments_were_not_loaded(repo) -> None:
+    """列表路径不加载评论，此时**不能**输出一个空的评论表。
+
+    `list_items` 走 ``with_comments=False``，``item.comments`` 恒为空——如果照样发出
+    ``comment_thread: []``，读起来就成了「这条没有讨论」，而事实是我们没去读。
+    """
+    _add_item(repo, 8, "列表里的条目")
+    listed = repo.list_items(limit=10)[0]
+    assert "comment_thread" not in exp.item_to_dict(listed)
+
+
+def test_list_scan_runs_reads_back_what_scan_wrote(repo) -> None:
+    """`scan_runs` 此前**只有写入口没有读入口**，状态页的「最近抓取」就没有数据可展示。
+
+    只显示 `repos.last_scanned_at` 一个时间戳的话，看不出那次抓了多少条、有没有报错。
+    """
+    rid = repo.start_scan("github:psf/requests")
+    repo.finish_scan(rid, fetched=7, created=3, updated=2, unchanged=2, error=None)
+    rid2 = repo.start_scan("github:psf/requests")
+    repo.finish_scan(rid2, fetched=0, created=0, updated=0, unchanged=0, error="平台 500")
+
+    runs = repo.list_scan_runs(limit=10)
+    assert len(runs) == 2
+    assert runs[0].id == rid2, "应当按开始时间倒序（最近一次在前）"
+    assert runs[0].error == "平台 500"
+    assert runs[1].created == 3 and runs[1].error is None
+    # 只按仓库过滤
+    assert repo.list_scan_runs(repo_key="github:other/repo") == []

@@ -149,3 +149,43 @@ class WriteGate:
 
 #: 进程级单例（各进程一份；跨进程的互斥仍由 `single_flight` 的 flock 负责）。
 WRITE_GATE = WriteGate()
+
+
+def probe_write_lock(settings: Settings) -> tuple[bool, str]:
+    """当前有没有「写操作」在跑，是谁。**只读探测，不改动锁状态**。
+
+    给状态页用：页面得能显示「常驻服务正在跑」「另一次写操作正在进行」，否则用户只能从
+    「条目怎么不动了」倒推。
+
+    判断分两层，与 :func:`single_flight` 的两道闸门一一对应：
+
+    * **同进程**：看 ``WRITE_GATE`` 有没有 owner（``fissue serve --with-web`` 时 daemon 与
+      uvicorn 同进程，只看 flock 会漏掉）；
+    * **跨进程**：**非阻塞抢一次锁**，而不是看锁文件在不在——文件在进程退出后仍然留着
+      （flock 由内核释放，文件不删），拿「文件存在」当「有人跑」会一直误报。
+
+    没有 flock 的平台（Windows）返回「不知道」，而不是假装没人写。
+    """
+    if WRITE_GATE._owner is not None:      # noqa: SLF001 —— 同一模块内的自查
+        return True, f"本进程（pid={os.getpid()}）"
+    if fcntl is None:  # pragma: no cover - Windows
+        return False, ""
+    path = _lock_path(settings)
+    handle: int | None = None
+    try:
+        handle = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.lseek(handle, 0, os.SEEK_SET)
+            holder = os.read(handle, 200).decode("utf-8", "replace").strip()
+            return True, holder or f"{path.name} 被另一个进程持有"
+        else:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            return False, ""
+    except OSError as exc:  # pragma: no cover - 数据目录不可写等
+        log.debug("探测写锁失败（当作没人写）：%s", exc)
+        return False, ""
+    finally:
+        if handle is not None:
+            os.close(handle)

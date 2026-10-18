@@ -418,6 +418,16 @@ class PlatformAdapter(ABC):
         登录失效时可能回 200 + 一个 HTML 页，不校验就会被当成 diff 一路带到下游
         （`git apply` 阶段）才炸，错误现场离病根很远。
         """
+        # `max_retries` 是**总尝试次数**（下面按 `attempt >= max_retries` 判最后一次），
+        # 所以 0 会让 `range(1, 1)` 全空：一次请求都不发出，`last_exc` 保持 None，
+        # 最后抛出「请求最终失败：（None）」——真正的原因（连不上 / 401 / 404）全被丢掉。
+        # 实测踩过：GitHub 的「校验」按钮一直报 `GET https://api.github.com/user（None）`，
+        # 而同一把 token 直连是 200。想「不重试」请填 1。
+        if self.max_retries < 1:
+            raise PlatformError(
+                f"platforms.max_retries={self.max_retries} 不会发出任何请求"
+                "（它是总尝试次数，至少为 1）；想「不重试」请填 1。"
+            )
         last_exc: Exception | None = None
         idempotent = method.upper() in _IDEMPOTENT_METHODS
         for attempt in range(1, self.max_retries + 1):
@@ -505,7 +515,10 @@ class PlatformAdapter(ABC):
             return (payload, resp.headers) if return_headers else payload
 
         raise PlatformError(
-            self.sanitize(f"{self.platform.display} 请求最终失败：{method} {url}（{last_exc}）")
+            self.sanitize(
+                f"{self.platform.display} 请求最终失败：{method} {url}"
+                f"（{last_exc or '循环一次都没执行过——请检查 platforms.max_retries 是否 < 1'}）"
+            )
         )
 
     @staticmethod
