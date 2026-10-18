@@ -107,7 +107,9 @@ def test_report_on_empty_database(cli_env: dict[str, str]) -> None:
 
     assert result.exit_code == 0, result.output
     assert "条目总数" in result.output
-    assert "| 0 |" in result.output.replace(" ", " ")
+    # 报告是 Markdown 表格，同样会被 Rich 按控制台宽度折行；这里原先写的是
+    # ``replace(" ", " ")``（空格换空格，等于什么都没做），一旦折行断言即失效。
+    assert "| 0 |" in " ".join(result.output.split())
 
 
 def test_export_on_empty_database(cli_env: dict[str, str]) -> None:
