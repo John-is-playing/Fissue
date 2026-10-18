@@ -5,13 +5,13 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **关于版本**：项目尚未发布首个带标签的版本（`0.1.0` 见 `pyproject.toml`）。
-> 在 `1.0.0` 之前，`0.x` 的次版本号可能包含不向后兼容的变更。
-> 首个正式版本发布后，本节将替换为规范的版本记录。
+> **关于版本**：`v1.0.0` 是首个正式版本，`pyproject.toml` 同步为 `1.0.0`。
+> 在此之前 `main` 上沉淀过一批预发布快照（`rel/v1.0.0-b1…b10`、`rel/v1.0.1-a1`/`a2`），
+> 其中的 `b1` 与 `b9` 另出过 Release；本节即这批快照累积后的收口。
 
 ---
 
-## [未发布]
+## [1.0.0] - 2026-10-18
 
 ### 新增
 
@@ -36,6 +36,7 @@
 
 - **入站 webhook（事件驱动发现新条目）**：`webhooks.enabled: true` 时注册 `POST {api.prefix}/webhooks/<平台>`，平台一推就后台跑一轮（抓取 → 评测 → 验证 → flush → 修复），不必再等一个轮询间隔。GitHub 用 HMAC-SHA256（`X-Hub-Signature-256`），GitLab / Gitee / AtomGit 用共享密钥头，一律常数时间比对；只接受 `repos` 里登记且启用的仓库；**没配密钥时配置层拒绝启动、请求期再拦一道 403**（fail-closed）。该端点刻意不带 bearer 鉴权（平台不会带），所以它豁免 `FISSUE_API_TOKEN` 那套与两道写补刀——边界改为「签名 + 仓库白名单」，见 `SECURITY.md`
 - **自动修复新增「评审」环节**（`auto_fix.review_rounds`，默认 1，0 = 关闭）：F2P 与回归门挡得住「弄坏别处」，**挡不住「写得脏」**——真跑里那份三关全过的补丁把投递去重写成了模块级可变全局，靠调用顺序隐式传值。评审**只看改动快照**（因此能与回归门**并行**：回归门两分钟，评审不叠在上面），输出结构化发现（严重度 + 文件 + **原样引用** + 理由 + 建议），并做反幻觉过滤（引用不实/越界的条目直接丢弃）；只有 `critical`/`major` 触发返修（走与回归门同一套反馈通道），`nit` 只记录且落在 dry-run 的 `<patch>.review.txt`、人工报告与 PR 正文里。`auto_fix.review_model` 可给评审单独配模型（写与审不同模型，盲点不重合）
+- **systemd 服务单元**（`systemd/fissue.service`）：常驻服务可开机自启。单元里把几处「不能照抄」写进注释——服务账号须在 `docker` 组（沙盒 `runtime: docker`，且产品对「Docker 不可用」是 fail-closed）、`PATH` 要把 `.venv/bin` 放在最前（沙盒 local 通道用**裸** `python -m pytest` 起子进程）、`KillSignal=SIGTERM` + 足够的 `TimeoutStopSec`（daemon 收到信号要等各循环收尾）、`LANG`/`PYTHONIOENCODING` 固定 UTF-8（systemd 不带用户的 shell locale）
 
 ### 变更
 
@@ -65,6 +66,7 @@
 - **数据**：内容**实质变化**（标题/正文/标签/状态/merged）后重评。此前 `changed_keys` 没有任何消费者、`content_hash` 又在同一处被无条件覆写，结论永远停在旧内容上且事后无法判定过期；评论增长不算实质变化（否则每条评论烧一次 token）
 - **数据**：内容变更时若已有结论**已进入修复**（`fix_queued`/`fixing`/`pr_created`），不回落重评（免得重复修复 / 重复建 PR），只把「结论过期」如实留痕并在导出与 API 中可见
 - **数据**：打完标签把结果**并回本地快照**。`labels` 是实质字段，而打标签**只写平台、不回写本地**——于是下一次抓取必然读到「平台 ≠ 库里」的标签集，把我们**刚做出的结论**作废重评：每打一次标就白烧一轮 `classify + evaluate + verify`。真跑实测（树莓派常驻服务）：条目 #1 在 28 分钟内被作废两次，平台 `updated_at` 恰好是打标那一秒；LLM 调用 94 → 101、$0.4171 → $0.4528。修法是写入成功后按**并集**（与 GitHub `POST /issues/{n}/labels`、AtomGit 读改写取并集一致）并回本地
+- **数据**：回写标签时刷新的内容指纹**按「抓取时的评论条数」算**——评论**残缺**时库里存下的条数少于平台，按库里条数重算会与平台算出的对不上，于是下一次抓取仍报一次「更新」并重写字段与评论表。那个条数现在随条目落库（`raw` 的保留键，不改表结构），且与 `RawItem.content_hash()` 共用同一个函数，不会漂移
 - **数据**：评论抓取残缺时不再用空结果覆盖已入库讨论，评测阶段也跳过残缺条目（结论会被回写平台，据残缺数据下结论等于把错误固化）
 - **导出**：概览与明细统一过滤口径；计数改聚合查询、批量结论一次取回（原先逐条查询 + 十万级对象加载）
 - **抓取**：早停判定改用适配器**交出来的**条数——原先用过滤后的计数，配了标签过滤时游标会照推，`limit` 之后的旧条目永久落在增量窗口外
@@ -78,6 +80,8 @@
 - **数据库**：SQLite 开 WAL 并把 busy 超时提到 30s（驱动默认 5s，回滚日志模式下长读事务会挡住写者提交）
 - **CLI**：日志一律写 stderr——`RichHandler` 默认落在 stdout，一句 WARNING 就能把 `fissue status --json` 的输出打坏（实测 `JSONDecodeError`）
 - **常驻服务**：补齐**验证**这一步。`run_once` 原先只做抓取 → 评测 → flush → 修复，条目停在 `evaluated`，「部署成服务它自己转」这条链是断的；现按 CLI 口径接上（带镜像前置检查与预算门），Issue-FEATURE 不验证
+- **常驻服务**：三个写循环改为**排队**，而不是彼此撞闸门。它们本是三个独立 asyncio 任务，而 `RuntimeContext.open(exclusive=True)` 用的是「拿不到就立即报错」的 `WRITE_GATE`——scan 那一轮（分钟级）期间 flush 每个周期都撞上去：真跑实测每 60s 记一条 `flush 轮次异常` 外加约 40 行 Traceback，而整轮 scan 期间 flush **一次都没跑成**。现在三者共用一把「一轮」锁，轮到了再进闸门；对外部调用方（CLI、Web 写端点）仍是立即报错
+- **常驻服务**：退出时**请 uvicorn 自己停**（`should_exit`），而不是 cancel 它的任务——后者会让 uvicorn 的 lifespan 把 `CancelledError` 当异常上报，每次 stop/restart 都刷一条 ERROR + 整段 traceback（实测 5 次 `Stopped` ↔ 5 次 `CancelledError` 一一对应），看着像服务崩了
 - **推送**：强推改用**精确租约**。裸 `--force-with-lease` 在「推送目标是 URL、修复分支从未 fetch」时拿不到期望值，于是**远端已有同名分支就一律 `stale info`**，把正常重推也拒掉——真跑里 6 次推送全被拒、PR 一个也没建出来（修复分支是「条目+内容哈希」的确定性名字，远端早已存在，重推是常态）。现在先 `ls-remote` 问远端：有则用 `--force-with-lease=refs/heads/<branch>:<sha>`，确认没有则普通推送。**问不到远端状态时拒绝强推**并给出底层原因（此前会静默降级成普通推送，报出误导性的 `fetch first`）
 - **`.git` 加固的两处漏网**（全仓库 review 后补）：`harden_git` 会把容器可写的 `user.name` / `user.email`（以及 url 回退分支）**原样写回**重建后的配置，而 git 配置是**按行**解析的——一个带字面换行的值就能在「加固后」的配置里凭空造出执行入口；现在这些值当不可信输入处理，含换行/控制字符一律丢弃（丢弃不影响提交：`commit()` 自带 `-c user.name`）
 - **`pr_strategy.mode` 加白名单**：它原先没有校验，而代码只对**精确等于** `fork` 走 fork、其余一律 `head_repo = 上游仓库`——把 `fork` 拼成 `Fork`/`frok` 就等于**静默关掉 fork 安全阀**，把分支直推到别人的仓库

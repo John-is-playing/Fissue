@@ -4,6 +4,6 @@
 → 生成验证器并在 Docker 沙盒中 F2P 验证 → 对低难度高重要性 Issue 自动修复并提 PR。
 """
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = ["__version__"]
