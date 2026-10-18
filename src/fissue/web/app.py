@@ -38,6 +38,7 @@ from ..logging_setup import get_logger, setup_logging
 from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
 from .hooks import parse_event, signature_ok
 from .jobs import Job, JobRegistry
+from .setup import FORWARD_HEADERS as _FORWARD_HEADERS
 from .status import collect as collect_status
 from .status import queue_panel
 
@@ -76,13 +77,16 @@ class JobRequest(BaseModel):
 class EvalRequest(BaseModel):
     keys: list[str] = Field(default_factory=list, description="要重评的条目 key；留空则取未评测条目")
     deep: bool = False
-    limit: int = 20
+    # `ge=1`：`limit` 是「做多少条」，0 在语义上等于「一条都不做」。原先它是裸 int，
+    # 而处理函数写的是 `int(limit or 20)`——显式传 0 会被 `or` 当成「没传」而**反而**去评 20 条。
+    limit: int = Field(default=20, ge=1)
 
 
 class FixRequest(BaseModel):
     keys: list[str] = Field(default_factory=list)
     dry_run: bool = True
-    limit: int = 5
+    # 与 EvalRequest 同理：0 会被 `or 5` 当成没传，于是「我不想修」变成「去修 5 条并提 PR」。
+    limit: int = Field(default=5, ge=1)
 
 
 class ScanRequest(BaseModel):
@@ -202,7 +206,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 所以边界也分开（见 setup.py 的 setup_guard）。鉴权依赖两者共用一份。
     from .setup import register as register_setup
 
-    register_setup(application, st, auth=_auth_dependency(st))
+    register_setup(application, st, auth=_auth_dependency())
     _register_web(application, st, templates)
     return application
 
@@ -212,7 +216,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 # ---------------------------------------------------------------------------
 
 
-def _auth_dependency(settings: Settings):
+def _auth_dependency():
+    """鉴权依赖。
+
+    原先签名上带一个 `settings` 参数，但函数体里读的是**每次请求当下**的 settings
+    （见下方注释）——那个参数从来没被用过，留着只会让人以为「鉴权是注册时捕获的」。
+    """
     async def check(request: Request) -> None:
         # 读**当前**的 settings，而不是注册时捕获的那个对象：设置页改了口令会热重载
         # （web/setup.py::reload_state），这里若还盯着旧对象，新口令就得等重启才生效——
@@ -236,13 +245,8 @@ def _require_writable(settings: Settings) -> None:
 
 
 #: 反向代理常见的转发头。无鉴权时见到它们就拒绝写请求——见 :func:`_reject_proxied_write`。
-_FORWARD_HEADERS = (
-    "forwarded",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
-    "x-real-ip",
-)
+#: 判据的**唯一定义**在 setup.py（`FORWARD_HEADERS`）：两处各留一份迟早会分叉
+#: （原先这里多一个 `forwarded`，于是同一件事在两处得到相反结论）。
 
 
 def _reject_proxied_write(request: Request, settings: Settings) -> None:
@@ -459,6 +463,19 @@ def _quiet_report(message: str) -> None:
     log.debug("写操作进度：%s", message)
 
 
+def _limit_param(params: dict[str, Any], default: int) -> int:
+    """取「这一轮做多少条」。
+
+    **不能写成 `params.get("limit") or default`**：显式传 0 会被 `or` 当成「没传」，于是
+    「我一条都不想动」反而变成「去做 20 条」（对 fix 来说就是真去改代码并提 PR）。
+    0 的语义是「一条都不做」，必须原样保留。
+    """
+    raw = params.get("limit")
+    if raw is None:
+        return default
+    return max(0, int(raw))
+
+
 async def _work_scan(app: FastAPI, params: dict[str, Any], report: Report) -> dict[str, Any]:
     from ..pipeline.fetcher import Fetcher
     from ..platforms.registry import resolve_repos
@@ -491,7 +508,7 @@ async def _work_evaluate(app: FastAPI, params: dict[str, Any], report: Report) -
     ctx = _ctx_of(app)
     keys = list(params.get("keys") or [])
     items = ctx.repo.items_by_keys(keys) if keys else ctx.repo.items_needing_eval(
-        limit=int(params.get("limit") or 20)
+        limit=_limit_param(params, 20)
     )
     if not items:
         report("没有需要评测的条目")
@@ -522,7 +539,7 @@ async def _work_verify(app: FastAPI, params: dict[str, Any], report: Report) -> 
     items = (
         ctx.repo.items_by_keys(keys)
         if keys
-        else ctx.repo.list_items(status=ItemStatus.EVALUATED, limit=int(params.get("limit") or 10))
+        else ctx.repo.list_items(status=ItemStatus.EVALUATED, limit=_limit_param(params, 10))
     )
     if not items:
         report("没有待验证的条目")
@@ -581,7 +598,7 @@ async def _work_fix(app: FastAPI, params: dict[str, Any], report: Report) -> dic
             attempt = await fixer.fix_item(item, dry_run=dry_run)
             results.append(_attempt_payload(attempt))
     else:
-        limit = int(params.get("limit") or 5)
+        limit = _limit_param(params, 5)
         report(f"挑选候选并修复（最多 {limit} 条，{'dry-run' if dry_run else '真提 PR'}）")
         outcome = await fixer.fix_candidates(limit=limit, dry_run=dry_run)
         results = [_attempt_payload(a) for a in outcome.attempts]
@@ -663,7 +680,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         return
 
     prefix = settings.api.prefix
-    auth = _auth_dependency(settings)
+    auth = _auth_dependency()
 
     # -- 统计 -------------------------------------------------------------
 
@@ -1456,7 +1473,6 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                     runs, mode=_settings(request).verifier.regression_gate
                 ),
                 fixes=r.fix_attempts(key),
-                job=request.app.state.jobs.current(),
             ),
         )
 

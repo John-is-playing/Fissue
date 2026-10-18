@@ -106,10 +106,15 @@
   <div class="kv">
     <div class="k">连接串</div>
     <div class="v">
-      <input type="text" id="env-FISSUE_DATABASE_URL" style="width:520px"
-             value="{{ by_key.get('FISSUE_DATABASE_URL').value if by_key.get('FISSUE_DATABASE_URL') else '' }}"
-             placeholder="sqlite:///E:/Fissue/fissue.db">
-      <div class="muted small">当前生效：<code>{{ view.effective.database }}</code></div>
+      {# 连接串按**密钥**处理：它里面常带口令（`postgresql+psycopg://user:pw@host/db`）。
+         原先这里是 `type="text"` 且把值原样回填，等于把口令铺在页面上；现在与其它密钥一致：
+         框内为空、只显示掩码占位，留空 = 不改动、要清空请勾「清空」。 #}
+      {% set db_item = by_key.get('FISSUE_DATABASE_URL') %}
+      <input type="password" id="env-FISSUE_DATABASE_URL" style="width:460px"
+             placeholder="{{ db_item.value if db_item and db_item.set else 'sqlite:///E:/Fissue/fissue.db' }}">
+      <label class="inline"><input type="checkbox" id="clear-FISSUE_DATABASE_URL"> 清空</label>
+      {% if db_item and db_item.set %}<span class="tag status-pr_created">已配置</span>{% endif %}
+      <div class="muted small">当前生效：<code>{{ view.effective.database }}</code>（口令已遮）</div>
     </div>
   </div>
   <div class="row mt">
@@ -211,9 +216,10 @@
 <script>
   var WRITABLE = {{ view.writable | tojson }};
   var SECRETS = ['FISSUE_LLM_API_KEY', 'FISSUE_GITHUB_TOKEN', 'FISSUE_GITEE_TOKEN',
-                 'FISSUE_ATOMGIT_TOKEN', 'FISSUE_GITLAB_TOKEN', 'FISSUE_API_TOKEN'];
+                 'FISSUE_ATOMGIT_TOKEN', 'FISSUE_GITLAB_TOKEN', 'FISSUE_API_TOKEN',
+                 'FISSUE_DATABASE_URL'];     // 连接串内含口令，按密钥处理
   var PLAIN = ['FISSUE_LLM_BASE_URL', 'FISSUE_LLM_MODEL', 'FISSUE_LLM_FALLBACK_MODEL',
-               'FISSUE_DATABASE_URL', 'FISSUE_WEB_HOST', 'FISSUE_WEB_PORT'];
+               'FISSUE_WEB_HOST', 'FISSUE_WEB_PORT'];
 
   function val(id) {
     var el = document.getElementById(id);
@@ -312,7 +318,8 @@
   function testDb() {
     var out = document.getElementById("db-result");
     out.innerHTML = '<span class="spinner"></span> 连接中…';
-    Fissue.api("/setup/test-db", {method: "POST", body: {url: val("env-FISSUE_DATABASE_URL")}})
+    // 留空 = 测「当前生效的那个库」（后端会在 url 为空时回落），与其它密钥字段同语义。
+    Fissue.api("/setup/test-db", {method: "POST", body: {url: val("env-FISSUE_DATABASE_URL") || null}})
       .then(function (r) {
         out.innerHTML = r.ok
           ? '<span class="ok">连接正常</span>（' + Fissue.escapeHtml(r.backend) + " · " + r.seconds + "s）"

@@ -71,8 +71,26 @@
   var current = {{ (jobs.current.id if jobs.current else '') | tojson }};
   if (current) {
     (async function loop() {
-      var job;
-      try { job = await Fissue.api('/jobs/' + current); } catch (e) { return; }
+      // 读不到状态 **不等于** 任务跑完了：服务重启、任务被清理、网络抖动都会走到这里。
+      // 原先这里捕获后直接 return，于是页面永远停在「正在运行」——重启服务之后回来
+      // 看就是这样，像是在骗人。现在退避重试几次，仍然读不到就直说。
+      var job = null;
+      for (var attempt = 0; attempt < 4; attempt++) {
+        try {
+          job = await Fissue.api('/jobs/' + current, {silent: true});
+          break;
+        } catch (e) {
+          if (attempt === 3) {
+            var dead = document.getElementById('cur-progress');
+            if (dead) {
+              dead.innerHTML = '<span class="bad">读不到任务状态（服务可能重启过，或这条任务已被清理）：' +
+                Fissue.escapeHtml(e.message) + '</span>';
+            }
+            return;
+          }
+          await new Promise(function (r) { setTimeout(r, 1000 * (attempt + 1)); });
+        }
+      }
       var p = document.getElementById('cur-progress');
       if (p) p.textContent = job.progress || '';
       var log = document.getElementById('cur-log');

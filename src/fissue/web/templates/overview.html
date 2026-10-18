@@ -251,8 +251,25 @@
       var panel = document.getElementById('job-panel');
       while (true) {
         await new Promise(function (r) { setTimeout(r, 1500); });
-        var job;
-        try { job = await Fissue.api('/jobs/' + current); } catch (e) { return; }
+        // 与「任务」页同口径：读不到状态不等于任务结束，退避重试几次，仍不行就写在面板上，
+        // 而不是直接返回、让进度条永远停在那里。
+        var job = null;
+        for (var attempt = 0; attempt < 4 && !job; attempt++) {
+          try {
+            job = await Fissue.api('/jobs/' + current, {silent: true});
+          } catch (e) {
+            if (attempt === 3) {
+              var host = panel.querySelector('.job') || panel;
+              var bad = document.createElement('div');
+              bad.className = 'progress-line bad';
+              bad.textContent = '读不到任务状态（服务可能重启过，或这条任务已被清理）：' + e.message;
+              host.appendChild(bad);
+              return;
+            }
+            await new Promise(function (r) { setTimeout(r, 1000 * (attempt + 1)); });
+          }
+        }
+        if (!job) return;
         var box = panel.querySelector('.job');
         if (box) {
           var badge = box.querySelector('.tag');

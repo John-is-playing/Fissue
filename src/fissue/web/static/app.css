@@ -392,6 +392,9 @@ dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin
   font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 6px;
 }
 .live-row { display: flex; align-items: center; gap: 7px; }
+/* `display:flex` 会压过 UA 样式表里的 `[hidden]{display:none}`，于是 JS 里
+   `el.hidden = true` 完全不起作用——侧栏那行「任务进行中」就永久常显。这里显式压回去。 */
+.live-row[hidden] { display: none; }
 .live-sub { color: var(--muted); font-size: 11px; word-break: break-all; }
 .dot {
   width: 8px; height: 8px; border-radius: 50%; background: var(--none); flex: none;

@@ -25,6 +25,10 @@ log = get_logger(__name__)
 #: 会挡住写者的提交，一超过 5s 写者就失败。这里把超时明确调到 30s 并开 WAL。
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 
+#: PostgreSQL 的连接超时（秒）。psycopg 直接认 ``connect_timeout``。
+#: 见 `Database.__init__`：非 sqlite 才用得上。
+POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
+
 
 class Database:
     """封装 Engine 与 Session 生命周期。
@@ -40,6 +44,9 @@ class Database:
         kwargs: dict[str, Any] = {"echo": echo, "future": True, "pool_pre_ping": True}
         if not self.is_sqlite:
             kwargs.update(pool_size=pool_size, max_overflow=max_overflow, pool_recycle=1800)
+            # 连接超时：不给的话，一个不可路由的 PG 地址会一直等到操作系统的默认超时
+            # （几十秒到两分钟），而「测试连接」按钮与初始化向导都直接连它——用户是站在页面前等的。
+            kwargs["connect_args"] = {"connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS}
         else:
             kwargs["connect_args"] = {
                 "check_same_thread": False,

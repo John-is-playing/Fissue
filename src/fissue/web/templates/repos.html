@@ -213,17 +213,48 @@
       .catch(fail);
   }
 
+  // 回填用的原始值：用来判断「这个字段到底改没改」。
+  //
+  // 为什么必须有它：PATCH 的语义是「空串 = 清掉该字段」。若每次保存都把三个字段**全量**提交，
+  // 那么只要界面没能把某个值回填出来（例如接口忘了返回它），点一次「保存参数」就会把那个
+  // 已配好的值静默清成 null —— 实测正是这么把 base 分支清掉的，而自动修复提 PR 从此退化成
+  // 对着 main 改，页面上却一路显示「已保存」。
+  var ORIGINAL = {};
+
+  function snapshotOriginals() {
+    Array.prototype.forEach.call(
+      document.querySelectorAll("input[id^=base-], input[id^=hint-], input[id^=since-]"),
+      function (el) { ORIGINAL[el.id] = el.value; }
+    );
+  }
+
+  function pick(id) {
+    var el = document.getElementById(id);
+    return el ? el.value.trim() : "";
+  }
+
   function saveRepo(platform, owner, name, index) {
     if (!needWritable()) return;
-    var base = document.getElementById("base-" + index).value.trim();
-    var hint = document.getElementById("hint-" + index).value.trim();
-    var since = +document.getElementById("since-" + index).value;
-    // 空串 = 清掉该字段（后端把空串翻成 null），而不是「不改动」
-    Fissue.api("/repos/" + platform + "/" + owner + "/" + name, {
-      method: "PATCH",
-      body: {base_branch: base, test_hint: hint, since_days: since}
-    }).then(function (r) { after(r, "已保存 " + owner + "/" + name); }).catch(fail);
+    var body = {};
+    if (pick("base-" + index) !== (ORIGINAL["base-" + index] || "").trim()) {
+      body.base_branch = pick("base-" + index);       // 空串 = 清掉（后端把空串翻成 null）
+    }
+    if (pick("hint-" + index) !== (ORIGINAL["hint-" + index] || "").trim()) {
+      body.test_hint = pick("hint-" + index);
+    }
+    if (pick("since-" + index) !== (ORIGINAL["since-" + index] || "").trim()) {
+      body.since_days = +pick("since-" + index) || 0;
+    }
+    if (!Object.keys(body).length) {
+      Fissue.toast("这个仓库的参数没有改动。", "info", { timeout: 3000 });
+      return;
+    }
+    Fissue.api("/repos/" + platform + "/" + owner + "/" + name, { method: "PATCH", body: body })
+      .then(function (r) { after(r, "已保存 " + owner + "/" + name); })
+      .catch(fail);
   }
+
+  document.addEventListener("DOMContentLoaded", snapshotOriginals);
 
   function toggleRepo(platform, owner, name, enabled) {
     if (!needWritable()) return;

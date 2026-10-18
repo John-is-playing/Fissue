@@ -637,6 +637,236 @@ def test_settings_page_keeps_the_save_button_always_visible(settings: Settings, 
 
 
 # ---------------------------------------------------------------------------
+# 复审这一批的回归守卫
+#
+# 每条都对着一次具体的翻车方式（大多是「上线后才发现」），而不是对着实现细节。
+# ---------------------------------------------------------------------------
+
+
+def test_mask_url_keeps_the_rest_byte_for_byte() -> None:
+    """脱敏只动「口令」与「查询串的值」，其余**逐字节保留**。
+
+    原先走 urlsplit/urlunsplit 那条路，两个坑都实测过：查询串自带 `?` 会拼出 `??mode=`，
+    sqlite 的三斜杠会被吞成 `sqlite:/E:/…`——脱敏反而把库路径显示坏了。
+    """
+    from fissue.web.status import mask_url
+
+    assert mask_url("postgresql+psycopg://u:pw@h:5432/db?sslmode=require") == (
+        "postgresql+psycopg://u:***@h:5432/db?sslmode=***"
+    )
+    assert mask_url("sqlite:///E:/x.db?mode=rw") == "sqlite:///E:/x.db?mode=***"
+    assert mask_url("sqlite:///E:/Fissue/fissue.db") == "sqlite:///E:/Fissue/fissue.db"
+    assert mask_url("") == ""
+
+
+def test_settings_never_echo_the_dsn_password(settings: Settings, client: Any) -> None:
+    """连接串里常带口令：接口与页面都不能原样回显它。
+
+    同一批代码在 status.py 里专门写了脱敏去遮它，而设置页曾经把它原样铺给浏览器——
+    等于一边遮一边漏。
+    """
+    env_file(settings).write_text(
+        "FISSUE_DATABASE_URL=postgresql+psycopg://u:sekret@db.example/fissue\n", encoding="utf-8"
+    )
+
+    r = client.get("/api/v1/settings")
+    assert r.status_code == 200, r.text
+    assert "sekret" not in r.text, "口令被接口原样回显了"
+
+    page = client.get("/settings").text
+    assert "sekret" not in page, "口令出现在页面里"
+    # 按密钥渲染：空值 + 掩码占位（若把掩码回填进输入框，点保存就会把掩码写进配置）
+    assert 'type="password" id="env-FISSUE_DATABASE_URL"' in page
+    assert 'id="clear-FISSUE_DATABASE_URL"' in page
+
+
+def test_invalid_env_value_is_rejected_before_the_file_is_touched(
+    settings: Settings, client: Any
+) -> None:
+    """非法配置必须**在落盘之前**被挡住。
+
+    原先的顺序是「先写 .env → 再热重载」，于是 `FISSUE_WEB_PORT=8e3` 会被写进文件，
+    而重启直接起不来——服务起不来就没有界面，用户从界面上**无法自救**。
+    """
+    target = env_file(settings)
+    before = target.read_text(encoding="utf-8") if target.exists() else ""
+
+    r = client.put("/api/v1/settings", json={"env": {"FISSUE_WEB_PORT": "8e3"}})
+
+    assert r.status_code == 400, r.text
+    assert "未写入任何文件" in r.json()["detail"]
+    after = target.read_text(encoding="utf-8") if target.exists() else ""
+    assert after == before, "非法值仍然被写进了 .env"
+    assert "8e3" not in after
+
+
+def test_reload_state_refreshes_the_job_registry_settings(client: Any) -> None:
+    """热重载要把**作业表**里那份 settings 也换掉。
+
+    作业抢锁靠的就是它（`single_flight` 按 database.url 定位锁文件）。不同步的话，
+    在设置页改掉 DATABASE_URL 之后，新作业仍去抢旧库的 flock——两处写操作于是能同时进行：
+    重复调 LLM、重复往平台打标签。
+    """
+    r = client.put("/api/v1/settings", json={"env": {"FISSUE_LLM_MODEL": "another-model"}})
+    assert r.status_code == 200, r.text
+    assert client.app.state.jobs.settings is client.app.state.settings
+    assert client.app.state.settings.llm.model == "another-model"
+
+
+def test_limit_zero_is_not_treated_as_unset() -> None:
+    """显式 `limit=0` 的语义是「一条都不做」，不能被 `or` 吞成「没传」。"""
+    from fissue.web.app import _limit_param
+
+    assert _limit_param({"limit": 0}, 20) == 0
+    assert _limit_param({"limit": None}, 20) == 20
+    assert _limit_param({}, 20) == 20
+    assert _limit_param({"limit": 3}, 20) == 3
+
+
+def test_zero_limit_is_rejected_by_the_api(client: Any) -> None:
+    """接口层直接把 0 挡掉（422），而不是默默去做默认条数。
+
+    修复那一侧尤其要紧：`limit=0` 会被当成没传，于是「我不想修」变成「去修 5 条并提 PR」。
+    """
+    for path, body in (
+        ("/api/v1/jobs/evaluate", {"limit": 0}),
+        ("/api/v1/jobs/fix", {"limit": 0}),
+        ("/api/v1/actions/evaluate", {"limit": 0}),
+    ):
+        assert client.post(path, json=body).status_code == 422, path
+
+
+def test_patch_repo_keeps_the_fields_it_was_not_given(client: Any) -> None:
+    """只改一个字段，不该动到别的字段 —— 这是「点一下保存就把 base 分支清空」的根因。"""
+    assert (
+        client.patch("/api/v1/repos/github/psf/requests", json={"base_branch": "develop"}).status_code
+        == 200
+    )
+
+    r = client.patch("/api/v1/repos/github/psf/requests", json={"test_hint": "pytest -q"})
+    assert r.status_code == 200, r.text
+
+    rows = client.get("/api/v1/repos").json()["repos"]
+    row = next(x for x in rows if x["slug"] == "psf/requests")
+    assert row["base_branch"] == "develop", "没提交 base_branch，却被改掉了"
+    assert row["test_hint"] == "pytest -q"
+
+
+def test_repos_page_sends_only_the_changed_fields(client: Any) -> None:
+    """仓库页保存前先与原始值比对——不回填得出的字段绝不能顺手提交。
+
+    PATCH 的语义是「空串 = 清掉该字段」：全量提交三个字段，只要有一个没回填出来，
+    那一个就会被静默清空。
+    """
+    page = client.get("/repos").text
+    assert "var ORIGINAL = {}" in page
+    assert "function snapshotOriginals" in page
+    assert 'if (!Object.keys(body).length)' in page, "没有改动时不该发请求"
+    assert "body: {base_branch: base, test_hint: hint, since_days: since}" not in page, (
+        "又回到「三个字段全量提交」了"
+    )
+
+
+def test_test_db_falls_back_to_the_current_database(client: Any) -> None:
+    """连接串按密钥处理后输入框是空的，所以「测试连接」必须能不带 url 走通。"""
+    r = client.post("/api/v1/setup/test-db", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True, r.json()
+
+
+def test_forward_headers_are_a_single_source() -> None:
+    """「来自反向代理」的判据只能有一份。
+
+    原先 app.py 与 setup.py 各留一份，而 setup.py 那份漏了 `forwarded`（RFC 7239 的标准写法）
+    ——同一件事在两处得到相反结论：一边当它是代理来的、另一边不当。
+    """
+    from fissue.web import app as app_mod
+    from fissue.web import setup as setup_mod
+
+    assert app_mod._FORWARD_HEADERS is setup_mod.FORWARD_HEADERS
+    assert "forwarded" in setup_mod.FORWARD_HEADERS
+
+
+def test_frontend_sends_the_api_token_on_every_request(client: Any) -> None:
+    """前端必须带鉴权头，否则「按提示开了鉴权」的部署界面全瘫。
+
+    一旦设了 FISSUE_API_TOKEN，`/api/*` 全都要求 Bearer——而页面本身不带凭据。
+    原先前端一个 Authorization 头都不发：页面看着正常，点下去只弹「未授权」。
+    更讽刺的是设置页还在教用户配这个口令，等于那一页会把整个界面的写能力关掉。
+    """
+    js = client.get("/static/app.js").text
+    assert "Authorization" in js and "Bearer " in js
+    assert "fissue_api_token" in js, "口令要能被记住，否则每次刷新都要重输"
+    assert "if (res.status === 401" in js, "401 时要问一次口令并重试"
+    # 背景轮询必须静默，否则每 2 秒弹一个口令框
+    assert "silent: true" in js
+
+
+def test_frontend_guards_for_sidebar_and_polling(client: Any) -> None:
+    """三个「页面在撒谎」的守卫。
+
+    * `.live-row{display:flex}` 压过 `[hidden]{display:none}` → 侧栏「任务进行中」常显；
+    * status 页的 tick() 自我续期，点一次「探测沙盒」就永久多一条轮询链；
+    * 任务页/总览轮询读不到状态就 `return`，页面永远停在「正在运行」。
+    """
+    css = client.get("/static/app.css").text
+    assert ".live-row[hidden]" in css, "hidden 会被 display:flex 压掉，必须显式写回来"
+
+    status_page = client.get("/status").text
+    assert "function schedule(" in status_page, "轮询要有单链调度器"
+    assert "setTimeout(function () { tick(false); }" not in status_page, "又出现自我续期的链了"
+
+    for path in ("/jobs", "/"):
+        page = client.get(path).text
+        assert "读不到任务状态" in page, f"{path} 轮询失败时应当明说，而不是静默停住"
+        assert "catch (e) { return; }" not in page
+
+
+def test_repo_purge_is_scoped_by_slug_and_platform(client: Any) -> None:
+    """删仓库数据要按「仓库 + 平台」界定范围。
+
+    为什么这条不能像别的那样端到端演一遍「同 slug 跨平台共存」：**schema 上就到不了那个状态**
+    ——`repos.slug` 有唯一约束（两个平台不可能各有一行同名仓库），而 `items.repo_id` 非空并挂了
+    `ON DELETE CASCADE`，所以删仓库行时级联带走的是「挂在这行上的全部条目」，与条目自身的
+    platform 列无关。于是分两段守：
+    ① 行为：删除只清掉这个仓库的条目，别的仓库一条不动；
+    ② 源码：显式删条目的语句里必须带平台条件——若将来放开 slug 的唯一约束，它就是唯一
+       还站着的护栏（只按 slug 删会把同名仓库的条目一起带走，数据不可恢复）。
+    """
+    from fissue.models import ItemType, Platform, RawItem
+    from fissue.web import setup as setup_mod
+
+    repo = client.app.state.repo
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=1,
+            item_type=ItemType.ISSUE, title="本仓库的",
+        ),
+    )
+    other = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="urllib3"))
+    repo.upsert_item(
+        other,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/urllib3", number=2,
+            item_type=ItemType.ISSUE, title="别的仓库的",
+        ),
+    )
+
+    r = client.delete("/api/v1/repos/github/psf/requests", params={"purge_data": "true"})
+    assert r.status_code == 200, r.text
+
+    assert repo.items_by_keys(["github:psf/requests#1"]) == [], "要删的没删干净"
+    assert len(repo.items_by_keys(["github:psf/urllib3#2"])) == 1, "删到了别的仓库"
+
+    source = Path(setup_mod.__file__).read_text(encoding="utf-8")
+    assert source.count("ItemRow.platform == platform") == 2, (
+        "显式删条目的语句（select 与 delete 两处）都要带平台条件"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 探活（LLM）：一次真实请求 + 可诊断的报错
 # ---------------------------------------------------------------------------
 #

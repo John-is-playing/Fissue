@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}{{ data.key }} · Fissue{% endblock %}
+{% block heading %}{{ data.title }}{% endblock %}
 {% block wrap_class %}narrow{% endblock %}
 
 {% block subtitle %}{{ data.repo }} #{{ data.number }}{% endblock %}

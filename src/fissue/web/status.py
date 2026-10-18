@@ -12,7 +12,6 @@ import os
 import sys
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import FastAPI
 
@@ -29,35 +28,39 @@ def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
 
 
-def _mask_url(url: str) -> str:
-    """把 URL 里的用户口令与查询串遮掉。
+def mask_url(url: str) -> str:
+    """把 URL 里的用户口令与查询串值遮掉，**其余部分逐字节保留**。
 
-    ``postgresql+psycopg://user:pw@host/db`` 与 ``https://host/v1?key=xxx`` 都会被原样打出来
-    （后者只要有人把 key 写在 URL 里就会出现在页面上），所以统一在这里脱敏。
+    刻意不走 ``urlsplit``/``urlunsplit`` 那条路：它们会「规范化」，而规范化的代价在这里很具体，
+    两处都是实测出来的——
+
+    * ``sqlite:///E:/x.db?mode=rw`` → ``sqlite:/E:/x.db``（netloc 为空时前导双斜杠被吞掉），
+      脱敏反而把库路径显示坏了；
+    * 查询串自带 ``?`` 再交给 ``urlunsplit``，会拼出 ``??mode=``。
+
+    所以这里只做两件手术：查询串的**值**、权限段里的**口令**。
     """
     if not url:
         return ""
-    try:
-        parts = urlsplit(url)
-    except ValueError:  # pragma: no cover - 极其畸形才会走到
-        return "（无法解析）"
-    # 没有凭据、也没有查询串 → 原样返回。不能顺手走一遍 urlunsplit：`sqlite:///E:/x.db`
-    # 经它会变成 `sqlite:/E:/x.db`（netloc 为空时前导双斜杠被吞掉），看着像坏掉的路径。
-    if "@" not in parts.netloc and not parts.query:
+    base, qmark, query = url.partition("?")
+    if qmark:
+        # 查询串的值整体遮掉：`?key=xxx` 这类写法真的有人用（LLM 端点），
+        # 一旦被原样打出来就等于把密钥贴在页面上。
+        parts: list[str] = []
+        for pair in query.split("&"):
+            key, eq, _ = pair.partition("=")
+            parts.append(f"{key}=***" if eq else key)
+        url = f"{base}?{'&'.join(parts)}"
+
+    scheme, sep, rest = url.partition("://")
+    if not sep:
         return url
-    netloc = parts.netloc
-    if "@" in netloc:
-        userinfo, _, host = netloc.rpartition("@")
-        user = userinfo.split(":", 1)[0]
-        netloc = f"{user}:***@{host}"
-    # 查询串整体遮掉：`?key=xxx` 这类写法真的有人用（LLM 端点），而它一旦被原样打出来
-    # 就等于把密钥贴在页面上。
-    masked_pairs: list[str] = []
-    for pair in parts.query.split("&") if parts.query else []:
-        key, sep, _ = pair.partition("=")
-        masked_pairs.append(f"{key}=***" if sep else key)
-    query = "?" + "&".join(masked_pairs) if masked_pairs else ""
-    return urlunsplit((parts.scheme, netloc, parts.path, query, ""))
+    authority, slash, tail = rest.partition("/")
+    if "@" in authority:
+        # `user:pw@host` → `user:***@host`（只留用户名，便于确认「连的是哪个账号」）
+        userinfo, _, host = authority.rpartition("@")
+        authority = f"{userinfo.split(':', 1)[0]}:***@{host}"
+    return f"{scheme}{sep}{authority}{slash}{tail}"
 
 
 def _backend_of(url: str) -> str:
@@ -113,6 +116,10 @@ def repo_overview(app: FastAPI, settings: Settings, repo: Any) -> list[dict[str,
                 "platform": cfg.platform.value,
                 "enabled": cfg.enabled,
                 "collection": list(cfg.collect),
+                # `base_branch` 必须回传：仓库页的输入框用它回填。原先漏了这个字段，输入框
+                # 永远是空的，而「保存参数」会把空值按「清空」语义写下去——点一下就把已配的
+                # base 分支静默清成 null，自动修复提 PR 从此退化成对着 main 改。
+                "base_branch": cfg.base_branch,
                 "test_hint": cfg.test_hint,
                 "since_days": cfg.since_days,
                 # 库里那一份（抓取快照）：配置里登记了但还没抓过的仓库，这里是 None。
@@ -296,14 +303,14 @@ def collect(
         "writer": {"busy": busy, "who": who, "locks_supported": locks_ok},
         "database": {
             "backend": _backend_of(str(settings.database.url)),
-            "url": _mask_url(db_url or str(settings.database.url)),
+            "url": mask_url(db_url or str(settings.database.url)),
             "items": repo.count_items(),
             "repos": len(repo.list_repos()),
         },
         "llm": {
             "model": settings.llm.model,
             "fallback_model": settings.llm.fallback_model,
-            "base_url": _mask_url(settings.llm.base_url),
+            "base_url": mask_url(settings.llm.base_url),
             "api_key_set": bool(settings.llm.api_key),
             "max_tokens": settings.llm.max_tokens,
             "budget": settings.llm.budget.model_dump(),

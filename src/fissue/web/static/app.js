@@ -105,6 +105,58 @@
     return JSON.stringify(detail);
   }
 
+  // ---------------------------------------------------------------------
+  // 访问口令（FISSUE_API_TOKEN）
+  // ---------------------------------------------------------------------
+  //
+  // 后端一旦设了 `FISSUE_API_TOKEN`，鉴权就自动开启，`/api/*` 全都要求 Bearer 口令——而
+  // **页面本身不带凭据**（HTML 路由刻意不挂鉴权，否则浏览器打不开）。原先前端一个
+  // `Authorization` 头都不发，于是 UI 上**每一个写操作都会 401**：页面看着一切正常，
+  // 点下去只弹一句「未授权」。更讽刺的是「设置」页还在教用户去配这个口令——等于那一页
+  // 会把整个界面的写能力关掉。
+  //
+  // 现在的做法：口令存 localStorage（同源普通存储，本来就是给本机/内网自用的场景），
+  // 首次撞到 401 时弹一次输入框，存下后**原样重试**那次请求，用户不必再点一遍。
+  // 背景轮询（状态角标、任务进度）一律静默——否则每 2 秒弹一个框。
+  var TOKEN_KEY = "fissue_api_token";
+  var tokenAsked = false;      // 每次页面加载最多问一次，避免连续弹窗
+
+  function getToken() {
+    try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+
+  function setToken(value) {
+    try {
+      if (value) window.localStorage.setItem(TOKEN_KEY, value);
+      else window.localStorage.removeItem(TOKEN_KEY);
+    } catch (e) { /* 隐私模式下 localStorage 可能不可用：不致命，退化成不记住 */ }
+  }
+
+  /** 问一次口令。返回输入的值，取消则返回空。 */
+  function askToken(reason) {
+    return new Promise(function (resolve) {
+      var dlg = document.createElement("dialog");
+      dlg.innerHTML =
+        "<h3>这个接口需要访问口令</h3>" +
+        "<div class='muted small'></div>" +
+        "<input type='password' id='__tok' placeholder='FISSUE_API_TOKEN' style='width:100%;margin-top:10px'>" +
+        "<div class='dlg-actions'>" +
+        "<button class='ghost' value='no'>取消</button>" +
+        "<button class='primary' value='yes'>保存并重试</button></div>";
+      dlg.querySelector("div.muted").textContent = reason;
+      document.body.appendChild(dlg);
+      function finish(value) {
+        if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
+        resolve(value);
+      }
+      dlg.addEventListener("close", function () { finish(dlg.returnValue === "yes" ? dlg.querySelector("#__tok").value.trim() : ""); });
+      dlg.querySelector("button[value=no]").addEventListener("click", function () { dlg.close("no"); });
+      dlg.querySelector("button[value=yes]").addEventListener("click", function () { dlg.close("yes"); });
+      if (typeof dlg.showModal === "function") dlg.showModal();
+      else finish(window.prompt("FISSUE_API_TOKEN") || "");
+    });
+  }
+
   async function request(path, opts) {
     opts = opts || {};
     var url = API + path;
@@ -122,7 +174,28 @@
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(opts.body);
     }
+    var token = getToken();
+    if (token) init.headers["Authorization"] = "Bearer " + token;
+
     var res = await fetch(url, init);
+
+    // 401 = 服务端开了鉴权而我们没带（或带错了）口令。问一次、存下来、原样重试。
+    if (res.status === 401 && !opts._retried && !opts.silent && !tokenAsked) {
+      tokenAsked = true;
+      var entered = await askToken(
+        token
+          ? "当前保存的口令被服务端拒绝了（可能已改过）。请输入新的 FISSUE_API_TOKEN。"
+          : "这个服务开启了鉴权（api.auth_required=true），浏览器请求必须带上 FISSUE_API_TOKEN。" +
+            "口令只存在本浏览器里。"
+      );
+      if (entered) {
+        setToken(entered);
+        toast("口令已保存，正在重试刚才那一步。", "info", { timeout: 4000 });
+        return request(path, Object.assign({}, opts, { _retried: true }));
+      }
+      tokenAsked = false;      // 用户取消了：允许下次再问
+    }
+
     var payload = null;
     try {
       payload = await res.json();
@@ -171,7 +244,7 @@
     while (job && (job.status === "queued" || job.status === "running")) {
       await sleep(POLL_MS);
       try {
-        job = await request("/jobs/" + job.id);
+        job = await request("/jobs/" + job.id, {silent: true});
       } catch (err) {
         toast("轮询任务状态失败：" + err.message, "bad");
         break;
@@ -452,12 +525,14 @@
     var box = document.getElementById("live-box");
     if (!box) return null;
     try {
-      var st = await request("/status");
+      // silent：角标每几秒拉一次，不能弹口令框（否则设了口令的部署会一直被弹）。
+      // 401 时在角标上直说「需要口令」，由用户点任一操作时再问。
+      var st = await request("/status", {silent: true});
       return renderLive(box, st);
     } catch (err) {
       box.dataset.state = "error";
-      setText("live-text", "状态读取失败");
-      setText("live-sub", err.message);
+      setText("live-text", err.status === 401 ? "需要访问口令" : "状态读取失败");
+      setText("live-sub", err.status === 401 ? "点任一操作会提示输入 FISSUE_API_TOKEN" : err.message);
       return null;
     }
   }

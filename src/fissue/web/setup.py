@@ -60,6 +60,7 @@ from ..configio import (
 )
 from ..logging_setup import get_logger
 from ..models import Platform
+from .status import mask_url
 
 log = get_logger(__name__)
 
@@ -89,6 +90,10 @@ SECRET_KEYS: frozenset[str] = frozenset(
         "FISSUE_ATOMGIT_TOKEN",
         "FISSUE_GITLAB_TOKEN",
         "FISSUE_API_TOKEN",
+        # 连接串也算密钥：`postgresql+psycopg://user:pw@host/db` 的 pw 明文在里面。
+        # 同一批代码在 status.py 里专门写了 `mask_url` 去遮它，而设置页曾经把它**原样回显**
+        # 给浏览器（含口令）——等于一边遮一边漏。
+        "FISSUE_DATABASE_URL",
     }
 )
 
@@ -99,7 +104,11 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset({"repos", "web.allow_remote_config_
 #: 改了必须重启进程才生效的键（uvicorn 已经绑好 socket 了）。
 RESTART_REQUIRED: frozenset[str] = frozenset({"FISSUE_WEB_HOST", "FISSUE_WEB_PORT"})
 
-_FORWARD_HEADERS = (
+#: 「请求来自反向代理」的判据。**必须与 `app.py` 里那份一致**——两处判据不同，会出现
+#: 「一边认为是从代理来的、另一边不认为」，于是同一件事在两处得到相反结论。
+#: 原先这里漏了 `forwarded`（RFC 7239 的标准写法），而 app.py 有它。
+FORWARD_HEADERS = (
+    "forwarded",
     "x-forwarded-for",
     "x-forwarded-host",
     "x-forwarded-proto",
@@ -132,7 +141,7 @@ def setup_guard(request: Request, settings: Settings) -> None:
         # 鉴权已开：请求能走到这里，说明 Bearer 口令已经核对过了（见 app.py 的 auth 依赖）。
         # 经不经代理、是不是回环都无所谓了——口令就是身份。
         return
-    if any(request.headers.get(h) for h in _FORWARD_HEADERS):
+    if any(request.headers.get(h) for h in FORWARD_HEADERS):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -193,6 +202,12 @@ def reload_state(app: FastAPI) -> Settings:
     app.state.settings = settings
     app.state.db = database
     app.state.repo = Repository(database)
+    # 作业表里也留着一份 settings，而它正是作业抢锁的依据（`single_flight` 按 database.url
+    # 定位锁文件）。不同步的话，在设置页改掉 DATABASE_URL 之后，新提交的作业仍去抢**旧库**的
+    # flock——两处写操作于是能同时进行：重复调 LLM、重复往平台打标签。
+    jobs = getattr(app.state, "jobs", None)
+    if jobs is not None:
+        jobs.settings = settings
     if previous_db is not None and previous_db is not database:
         with contextlib.suppress(Exception):  # 旧引擎关不掉不该让保存失败
             previous_db.engine.dispose()
@@ -203,6 +218,42 @@ def reload_state(app: FastAPI) -> Settings:
 # ---------------------------------------------------------------------------
 # 写 .env / 覆盖层
 # ---------------------------------------------------------------------------
+
+
+def _validate_candidate(
+    settings: Settings, env_updates: dict[str, str], overlay_updates: dict[str, Any]
+) -> None:
+    """在落盘**之前**校验「改完之后的配置」能不能加载。
+
+    为什么必须前置：原先的顺序是「先写 .env / 覆盖层 → 再热重载」。于是把
+    `FISSUE_WEB_PORT=8e3`、或一个写错的 PG 地址写进 .env 时，**文件已经坏了**——而重启会
+    直接起不来，用户连界面都没有（服务起不来就没有界面），从界面上**无法自救**。
+    这里把「改完之后」的配置先在内存里构造一遍：不合法就 400，文件一字不动。
+    """
+    from ..config import _apply_env_overrides, _deep_merge
+
+    try:
+        merged: dict[str, Any] = {}
+        if settings.config_source:
+            merged = read_yaml_mapping(settings.config_source)
+        merged = _deep_merge(merged, read_yaml_mapping(overlay_file(settings)))
+        if overlay_updates:
+            merged = _deep_merge(merged, dict(overlay_updates))
+
+        target_env = env_file(settings)
+        env_values = _read_env_file(target_env) if target_env.exists() else {}
+        env_values.update({k: str(v) for k, v in env_updates.items()})
+        merged = _apply_env_overrides(merged, env_values)
+
+        Settings(**merged)
+    except Exception as exc:
+        # **整段都包进来**：非法值最早是在「环境变量覆盖」那一步被拒的（那里按字段类型解析，
+        # 例如 `FISSUE_WEB_PORT=8e3` 直接抛 ConfigError）。只包住 `Settings(...)` 的话，
+        # 它会以 500 冒出去——而用户要的是「这条值不合法、文件没动」。
+        raise HTTPException(
+            status_code=400,
+            detail=f"配置校验失败，未写入任何文件：{exc}",
+        ) from exc
 
 
 def apply_env(env_path: str | Path | None, values: dict[str, str]) -> list[str]:
@@ -354,7 +405,8 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "llm_model": settings.llm.model,
             "llm_base_url": settings.llm.base_url,
             "llm_api_key_set": bool(settings.llm.api_key),
-            "database": settings.database.url,
+            # 脱敏后再给页面：这一行（「当前生效」）原先直接把 DSN 原样铺出来，含口令。
+            "database": mask_url(str(settings.database.url)),
             "web_host": settings.web.host,
             "web_port": settings.web.port,
             "read_only": settings.web.read_only,
@@ -466,8 +518,18 @@ async def probe_llm(
             await client.aclose()
 
 
-def probe_database(url: str) -> dict[str, Any]:
-    """连一次库并建表。PostgreSQL 加连接超时，免得页面卡在一个不存在的库上。"""
+async def probe_database(url: str) -> dict[str, Any]:
+    """连一次库并建表。
+
+    **异步执行**：连接是一种不可控的等待（不可路由的地址会一直等到超时）。原先是同步实现、
+    却在 `async def` 端点里直接调用，于是「测试连接」会把整个事件循环按住——同一时刻的
+    状态轮询、别的请求全都停住。放到线程里跑就只是这一个请求在等。
+    """
+    return await asyncio.to_thread(_probe_database_sync, url)
+
+
+def _probe_database_sync(url: str) -> dict[str, Any]:
+    """`probe_database` 的同步实体（放在线程里跑）。"""
     from ..config import DatabaseConfig
     from ..store.db import build_database_from_config
 
@@ -611,7 +673,13 @@ class LlmTestIn(BaseModel):
 
 
 class DbTestIn(BaseModel):
-    url: str
+    """探活参数。
+
+    ``url`` 留空 = 测**当前生效的那个库**：连接串现在是按密钥处理的（输入框为空、只显示掩码），
+    所以「不填」是常态。要求必填会让「测试连接」按钮直接 422。
+    """
+
+    url: str | None = None
 
 
 class PlatformTestIn(BaseModel):
@@ -859,6 +927,8 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
     ) -> dict[str, Any]:
         settings = _current(request)
         setup_guard(request, settings)
+        # 先校验、后落盘：不合法就 400，绝不留下一个「重启起不来」的 .env / 覆盖层。
+        _validate_candidate(settings, body.env, body.overlay or {})
         written_env = apply_env(env_file(settings), body.env)
         written_overlay: list[str] = []
         if body.overlay:
@@ -902,7 +972,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
     ) -> dict[str, Any]:
         settings = _current(request)
         setup_guard(request, settings)
-        return probe_database(body.url)
+        return await probe_database(body.url or str(settings.database.url))
 
     @app.post(f"{prefix}/setup/test-platform")
     async def test_platform(
@@ -926,6 +996,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         """向导最后一步：写 .env + 覆盖层，热重载，可选立刻跑第一轮抓取。"""
         settings = _current(request)
         setup_guard(request, settings)
+        _validate_candidate(settings, body.env, {})
         written_env = apply_env(env_file(settings), body.env) if body.env else []
         added: list[str] = []
         if body.repos:
@@ -964,23 +1035,34 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         }
 
     def _purge_repo(request: Request, repo: RepoConfig) -> int:
-        """把某个仓库的条目连同库里的行一起删掉（显式要求时才走）。"""
+        """把某个仓库的条目连同库里的行一起删掉（显式要求时才走）。
+
+        **必须带上平台**：``slug`` 只是 ``owner/name``，不含平台——两个平台上可以有同名仓库，
+        项目自己的 ``Settings.repo()`` 也允许按平台消歧。只按 slug 删，会把另一个平台上
+        同名仓库的条目一并删掉（数据不可恢复）。
+        """
         from sqlalchemy import delete
 
         from ..store.tables import ItemRow, RepoRow
 
+        platform = repo.platform.value
         state = request.app.state
         with state.db.session() as session:
-            items = session.scalars(
-                select_ids(ItemRow).where(ItemRow.repo_slug == repo.slug)
-            ).all()
-            count = len(items)
+            count = len(
+                session.scalars(
+                    select_ids(ItemRow).where(
+                        ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
+                    )
+                ).all()
+            )
             if count:
                 session.execute(
-                    delete(ItemRow).where(ItemRow.repo_slug == repo.slug)
+                    delete(ItemRow).where(
+                        ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
+                    )
                 )
             session.execute(
-                delete(RepoRow).where(RepoRow.slug == repo.slug)
+                delete(RepoRow).where(RepoRow.slug == repo.slug, RepoRow.platform == platform)
             )
         return count
 

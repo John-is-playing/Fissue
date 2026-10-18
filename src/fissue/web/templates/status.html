@@ -261,15 +261,30 @@
     return s + " 秒";
   }
 
+  // **只允许一条轮询链**。原先 tick() 每次跑完就给自己排下一次，而「探测沙盒可用性」按钮
+  // 又直接调一次 tick(true)——于是每点一次就**永久多一条**链（N 次点击 = N+1 条 /status 轮询，
+  // 每 2 秒一起打服务端）。现在所有续期都走 schedule()，它先清掉上一张票。
+  var tickTimer = null;
+
+  function schedule(delay) {
+    if (tickTimer !== null) clearTimeout(tickTimer);
+    tickTimer = setTimeout(function () { tickTimer = null; tick(false); }, delay);
+  }
+
   async function tick(sandbox) {
     try {
-      var st = await Fissue.api("/status", {query: sandbox ? {sandbox: "1"} : null});
+      // silent：这一页每 2 秒轮询一次，不能每次都弹口令框；点了「探测沙盒」那次不静默，
+      // 于是首次需要口令时正好在那一下被问一次。
+      var st = await Fissue.api("/status", {
+        query: sandbox ? {sandbox: "1"} : null,
+        silent: !sandbox
+      });
       var busy = renderStatus(st);
-      setTimeout(function () { tick(false); }, busy ? 2000 : 5000);
+      schedule(busy ? 2000 : 5000);
     } catch (err) {
       document.getElementById("st-updated").innerHTML =
         '<span class="bad">读取失败：' + esc(err.message) + "</span>";
-      setTimeout(function () { tick(false); }, 5000);
+      schedule(5000);
     }
   }
 
@@ -278,7 +293,7 @@
     // 直接查（`FISSUE_STATUS.alerts`），而不是只能盯着页面猜。
     renderStatus(window.FISSUE_STATUS);
     first = false;
-    setTimeout(function () { tick(false); }, 1500);
+    schedule(1500);
 
     var btn = document.getElementById("probe-sandbox");
     if (btn) {

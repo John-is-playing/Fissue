@@ -969,6 +969,20 @@ def test_cancel_button_is_present_on_job_pages(client) -> None:
     assert 'data-act="cancel-job"' not in client.get("/jobs").text
 
 
+def test_item_page_renders_the_title_as_the_heading(client) -> None:
+    """详情页要把条目标题当标题渲染。
+
+    重做模板时漏了 `{% block heading %}`，h1 于是一直回落到 base.html 的「Fissue」——
+    只能从浏览器标签页里看出在看哪一条，页面正文里完全没有标题（相对旧模板的功能回归）。
+    """
+    import re
+
+    html = client.get(f"/item/{KEY_ENC}").text
+    match = re.search(r"<h1[^>]*>(.*?)</h1>", html, re.S)
+    assert match is not None, "详情页没有 h1"
+    assert "程序崩溃" in match.group(1), f"标题没进 h1：{match.group(1)[:60]!r}"
+
+
 def test_delete_entry_points_are_present(client) -> None:
     """两个删除入口：条目页的「删除选中」与详情页的「删除本地数据」，都要二次确认。"""
     items = client.get("/items").text

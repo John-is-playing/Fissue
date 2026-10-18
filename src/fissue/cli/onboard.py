@@ -138,7 +138,7 @@ def onboard(
     if chosen_db and chosen_db != settings.database.url:
         env_values["FISSUE_DATABASE_URL"] = chosen_db
     if check:
-        _report_probe(probe_database(chosen_db or settings.database.url))
+        _report_probe(run_async(probe_database(chosen_db or settings.database.url)))
 
     # -- 3. 平台凭据 -----------------------------------------------------
     emit("")
