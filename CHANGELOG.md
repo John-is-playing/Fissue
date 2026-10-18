@@ -28,7 +28,7 @@
 - **通知渠道**：console / webhook / 企业微信 / 钉钉 / 飞书，按 `dedup_key` 去重
 - **导出**：JSON / Markdown，支持按分类与状态过滤
 - **优先级分档策略可配置**：`importance`（默认）/ `dual`（取严）/ `custom`（用户函数）
-- **测试夹具体系**：textkit、ratekit、pipekit、envkit、lockkit 五套对抗夹具（60 Issue + 12 PR），覆盖单函数语义、数值边界、跨模块调用链、状态副作用、资源不变量
+- **测试夹具体系**：textkit、ratekit、pipekit、envkit、lockkit 五套对抗夹具（60 Issue + 20 PR），覆盖单函数语义、数值边界、跨模块调用链、状态副作用、资源不变量
 - **增量抓取**：靠 `items.content_hash`（标题/正文/标签数/评论数/状态任一变化才算变更）
 - **`fissue requeue`**：把「只能人工放行」的条目放回流水线——`--stale`（内容实质变化后结论已过期、但当时修复已开工的条目）与 `--failed`（失败条目按已有结论回退到该走的下一步），默认先列计划再确认
 - **常驻服务的验证开关**：`schedule.verify_enabled`（关掉即把验证交给人工 `fissue verify`）与 `schedule.verify_batch_limit`（每轮最多验多少条，默认 30；积压由后续轮次继续消化）
