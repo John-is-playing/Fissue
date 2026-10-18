@@ -753,15 +753,24 @@ class Repository:
                 )
 
             # 按 item_key 关联、**没有外键**的三张表：必须显式删。
-            for table in (VerifierRunRow, FixAttemptRow, BatchConclusionRow):
-                result = s.execute(delete(table).where(table.item_key.in_(wanted)))
-                counts[table.__tablename__] = int(result.rowcount or 0)
+            for orphan_table in (VerifierRunRow, FixAttemptRow, BatchConclusionRow):
+                result = cast(
+                    CursorResult[Any],
+                    s.execute(delete(orphan_table).where(orphan_table.item_key.in_(wanted))),
+                )
+                counts[orphan_table.__tablename__] = int(result.rowcount or 0)
 
-            result = s.execute(delete(QueueEntryRow).where(QueueEntryRow.item_key.in_(wanted)))
+            result = cast(
+                CursorResult[Any],
+                s.execute(delete(QueueEntryRow).where(QueueEntryRow.item_key.in_(wanted))),
+            )
             counts["queue_entries"] = int(result.rowcount or 0)
 
             # 剩下的子行交给数据库 CASCADE。
-            result = s.execute(delete(ItemRow).where(ItemRow.key.in_(wanted)))
+            result = cast(
+                CursorResult[Any],
+                s.execute(delete(ItemRow).where(ItemRow.key.in_(wanted))),
+            )
             counts["items"] = int(result.rowcount or 0)
         log.info("已删除条目 %d 条：%s", counts["items"], "、".join(f"{k} {v}" for k, v in counts.items()))
         return counts

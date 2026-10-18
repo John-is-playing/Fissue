@@ -372,7 +372,7 @@ def summarize(
     """
     # 计数走聚合查询，平均分只需要 key：原先 list_items(limit=100000) 会把十万条领域对象
     # （含标签、正文元数据）全加载进内存，只为数几个数。
-    filters = {
+    filters: dict[str, Any] = {
         "repo_slug": repo_slug,
         "item_type": item_type,
         "status": status,

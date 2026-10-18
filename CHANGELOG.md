@@ -11,6 +11,40 @@
 
 ---
 
+## [1.1.0-b3] - 2026-10-18
+
+> **预发布快照**：`rel/v1.1.0-b3`（做法同 b1/b2：不动版本号）。内容是修 CI——
+> `ruff + mypy` 这个 job 从 `v1.1.0-b1` 起一路红：同 job 里 `ruff` 过、`pytest`（3.10/3.12）
+> 也过，只有 `mypy` 挂，且错误随新提交累积到 **22 处 / 6 个文件**（`v1.1.0-b2` 的提交
+> `8638c96` 上已是 `Found 22 errors`）。根因不是依赖漂移——两次 CI 解析到的 `mypy` 都是
+> `2.4.0`——是新加的代码把类型问题带了进来，而本地漏跑 `mypy` 就推了。
+
+### 修复
+
+- **`mypy` 22 处清零**（`src/fissue` 15 处、`tests` 7 处），`ruff + mypy` job 转绿。全部只动
+  类型与标注，**不改运行时行为**：
+  - `config._deep_merge` 的 `override` 形参 `dict[str, Any]` → `Mapping[str, Any]`：该函数
+    只读它，而调用方 `configio.update_overlay` 传的本就是 `Mapping[str, Any]`
+  - 删条目时第二个循环变量 `table` 改名 `orphan_table`——它与上方循环同名，被 mypy 按前一个
+    元组的类型去核对（连带 union-attr）；取 `.rowcount` 改用项目既有的
+    `cast(CursorResult[Any], …)` 写法（`Result` 本身没有 `rowcount`）
+  - `store.export` 概览统计的 `filters` 显式标注 `dict[str, Any]`，`**filters` 展开不再触发
+    arg-type（`item_stats` / `item_keys` 各 4 条）
+  - `web.setup.apply_overlay` 的 `flat` 补 `set[str]` 标注
+  - 测试里两处可选值（`ItemRow | None`、`str | None`）改为带判空的 `_item_row` helper 与局部
+    `env_source`（`test_store`、`test_setup`）
+
+### 验证
+
+- CI 口径（Linux）下 `mypy`：**`Success: no issues found in 78 source files`**——本地以
+  `mypy --platform linux` 复现同一输出。本机（Windows）另报 16 处 `fcntl.flock` / `os.getgid` /
+  `AF_UNIX` 之类的 stdlib 平台差异，那些代码都有运行时守卫（`try/except ImportError`、
+  `hasattr`、`os.name == "nt"` 分支），Linux 上不存在此报错
+- 全量单测 **875 passed / 6 skipped**、`ruff` 全仓通过（CI 口径；本机 873 passed / 2 failed，
+  那 2 条是缺 `psycopg` 模块与 Windows 无 `sh` 的环境问题，CI 的 ubuntu 两者均具备）
+
+---
+
 ## [1.1.0-b2] - 2026-10-18
 
 > **预发布快照**：`rel/v1.1.0-b2`（做法同 b1：不动版本号）。内容是 `v1.1.0-b1` 之后一轮

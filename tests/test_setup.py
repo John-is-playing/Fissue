@@ -271,7 +271,9 @@ def test_writes_go_to_the_resolved_paths_never_to_cwd(
     before = _cwd_env_snapshot()
     before_overlay = _cwd_overlay_snapshot()
     assert settings.env_path is None, "夹具的前提：那份 .env 不存在（所以 env_path 是 None）"
-    assert env_file(settings) == Path(settings.env_source), "写入目标应当是解析出的路径"
+    env_source = settings.env_source
+    assert env_source is not None, "夹具的前提：那份 .env 解析出了路径"
+    assert env_file(settings) == Path(env_source), "写入目标应当是解析出的路径"
 
     from fissue.config import RepoConfig
 
@@ -282,8 +284,8 @@ def test_writes_go_to_the_resolved_paths_never_to_cwd(
         [RepoConfig(platform=Platform.GITHUB, owner="a", name="b")],
     )
 
-    assert Path(settings.env_source).exists(), "应当写进传入的那份 .env"
-    assert "sk-should-land-in-tmp" in Path(settings.env_source).read_text(encoding="utf-8")
+    assert Path(env_source).exists(), "应当写进传入的那份 .env"
+    assert "sk-should-land-in-tmp" in Path(env_source).read_text(encoding="utf-8")
     assert _cwd_env_snapshot() == before, "cwd 下的 .env 被改动了！"
     assert _cwd_overlay_snapshot() == before_overlay, "cwd 下的覆盖层被改动了！"
 
@@ -294,6 +296,8 @@ def test_apply_endpoint_writes_to_the_resolved_env_and_keeps_cwd_clean(
     """端到端版本：走 HTTP 的向导写入同样不能碰 cwd。"""
     before = _cwd_env_snapshot()
     before_overlay = _cwd_overlay_snapshot()
+    env_source = settings.env_source
+    assert env_source is not None, "夹具的前提：那份 .env 解析出了路径"
     r = client.post(
         "/api/v1/setup/apply",
         json={
@@ -303,7 +307,7 @@ def test_apply_endpoint_writes_to_the_resolved_env_and_keeps_cwd_clean(
         },
     )
     assert r.status_code == 200, r.text
-    assert "sk-e2e" in Path(settings.env_source).read_text(encoding="utf-8")
+    assert "sk-e2e" in Path(env_source).read_text(encoding="utf-8")
     assert _cwd_env_snapshot() == before, "cwd 下的 .env 被改动了！"
     assert _cwd_overlay_snapshot() == before_overlay, "cwd 下的覆盖层被改动了！"
 
@@ -372,13 +376,15 @@ def test_clearing_a_value_returns_to_the_lower_layer(settings: Settings, client:
     页面据实显示来源（「设置」页的 sources 表），所以这条不会让人困惑：
     想知道「清空之后到底谁在生效」，看那一列。
     """
+    env_source = settings.env_source
+    assert env_source is not None, "夹具的前提：那份 .env 解析出了路径"
     client.put("/api/v1/settings", json={"env": {"FISSUE_LLM_API_KEY": "sk-upper-layer"}})
     assert client.app.state.settings.llm.api_key == "sk-upper-layer"
 
     client.put("/api/v1/settings", json={"env": {"FISSUE_LLM_API_KEY": ""}})
     assert client.app.state.settings.llm.api_key == "test-key", "应当回落到 config.yaml 那一层"
     # 而这一层的设置确实被清掉了（.env 里那行变成空）
-    env_text = Path(settings.env_source).read_text(encoding="utf-8")
+    env_text = Path(env_source).read_text(encoding="utf-8")
     assert "FISSUE_LLM_API_KEY=\n" in env_text
     assert "sk-upper-layer" not in env_text
 

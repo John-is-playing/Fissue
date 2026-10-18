@@ -18,6 +18,7 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -843,7 +844,7 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
     return merged
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+def _deep_merge(base: dict[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):

@@ -828,14 +828,14 @@ def test_merge_labels_keeps_fingerprint_exact_under_degraded_comments(repo: Repo
     _, _, changed = repo.upsert_item(rid, fetch([]))
     assert changed is True
     assert len(_item(repo, item.key).comments) == 1, "前提：残缺结果不覆盖已入库讨论"
-    assert repo.get_item_row(item.key).raw[COMMENTS_SEEN_KEY] == 0, (
+    assert _item_row(repo, item.key).raw[COMMENTS_SEEN_KEY] == 0, (
         "前提：落库的指纹条数（0）与库里的评论条数（1）此刻确实不同"
     )
 
     repo.merge_item_labels(item.key, ["fissue"])
 
     # 平台侧现在也带着我们刚写上去的标签，再抓一次（同样残缺、同样 0 条）
-    item.labels = list(repo.get_item_row(item.key).labels or [])
+    item.labels = list(_item_row(repo, item.key).labels or [])
     _, _, again = repo.upsert_item(rid, fetch([]))
     assert again is False, "残缺态下重算的指纹必须与平台一致，否则每轮都白报一次「更新」"
 

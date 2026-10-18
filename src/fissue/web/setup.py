@@ -291,7 +291,7 @@ def apply_overlay(
     没有这一步，覆盖层里只写新加的那一条会把 config.yaml 里原有的整张列表替掉——静默丢失，
     详见 ``configio.seed_repos``。
     """
-    flat = set()
+    flat: set[str] = set()
     for key, value in updates.items():
         if isinstance(value, dict):
             flat.update(f"{key}.{sub}" for sub in value)
