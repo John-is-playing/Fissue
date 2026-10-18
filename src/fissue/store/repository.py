@@ -479,6 +479,31 @@ class Repository:
                 values["priority"] = priority.value
             s.execute(update(ItemRow).where(ItemRow.key == key).values(**values))
 
+    def merge_item_labels(self, key: str, labels: Sequence[str]) -> list[str]:
+        """把「刚写到平台上的标签」并进本地快照，返回合并后的标签集合。
+
+        为什么必须有它：``labels`` 是 :data:`MATERIAL_FIELDS` 之一，而打标签**只写平台、
+        不回写本地**。于是下一次抓取必然读到一个「平台 ≠ 库里」的标签集，判定为
+        「内容实质变化」，把我们**刚做出的结论**作废、置回 ``new`` 重评——每打一次标就
+        白烧一轮 classify + evaluate + verify。
+
+        实测（树莓派，2026-10-18）：条目 #1 在 28 分钟内被作废两次（平台 ``updated_at``
+        恰好是 flush 打标那一秒），两天里 LLM 调用 94 → 101、$0.4171 → $0.4528。
+
+        取**并集**是与平台语义对齐的：GitHub 的 ``POST /issues/{n}/labels`` 只增不替，
+        AtomGit 那侧同样是读改写取并集。所以「库里原有的标签（上次抓回来的那批）＋ 这次
+        写上去的」就是平台现在的集合。
+
+        只在平台写入**成功之后**调用——写入失败时本地不该假装已经有了。
+        """
+        with self.db.session() as s:
+            row = s.scalar(select(ItemRow).where(ItemRow.key == key))
+            if row is None:      # pragma: no cover - 打标载荷来自库里，正常取得到
+                return []
+            merged = list(dict.fromkeys([*(row.labels or []), *labels]))
+            row.labels = merged
+            return merged
+
     def reclaim_fixing_items(self, *, repo_slug: str | None = None) -> list[str]:
         """把「卡在 ``fixing``」的条目放回 ``fix_queued``，返回被恢复的 key。
 

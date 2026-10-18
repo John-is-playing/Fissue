@@ -2178,6 +2178,58 @@ async def test_safe_label_aligns_then_labels(ctx, repo) -> None:
     assert add.call_count == 2
 
 
+@respx.mock
+async def test_safe_label_keeps_local_snapshot_in_sync(ctx, repo) -> None:
+    """打标成功后必须把标签并回本地，否则下一次抓取会把自己刚做出的结论作废。
+
+    回归（树莓派实测，2026-10-18）：`labels` 是实质字段（MATERIAL_FIELDS），而打标签
+    只写平台、**不回写本地**。于是下一次抓取必然读到「平台 ≠ 库里」的标签集，判成内容
+    实质变化 → 结论作废、置回 `new` 重评。条目 #1 因此 28 分钟内被作废两次（平台
+    `updated_at` 恰好是 flush 打标那一秒），两天里 LLM 调用 94 → 101、$0.4171 → $0.4528。
+
+    这一条走**生产路径**（respx 打到 HTTP 层，不 stub `_safe_label`），否则测不到写回。
+    """
+    from fissue.platforms.registry import build_adapter
+
+    ctx.settings.platforms.label_cache_ttl_seconds = 600.0
+    adapter = build_adapter(ctx.settings, platform=Platform.GITHUB, token="t")
+    ctx._adapters["github:psf/requests"] = adapter
+
+    respx.get(f"{GH}/repos/psf/requests/labels").mock(
+        return_value=httpx.Response(
+            200, json=[{"name": "bug"}, {"name": "fissue"}, {"name": "reproduced"}]
+        )
+    )
+    added = respx.post(f"{GH}/repos/psf/requests/issues/7/labels").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    item = _seed_issue(repo, 7)          # 库里 labels=["bug"]，结论已落库（status=evaluated）
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    processor = FlushProcessor(ctx)
+    payload = {"key": item.key, "repo": item.repo, "number": item.number, "item_type": "issue"}
+
+    assert await processor._safe_label(payload, ["bug", "fissue", "reproduced"]) == (True, "")
+    assert added.call_count == 1
+    # 本地快照已经并上我们刚写下去的那两个标签
+    assert sorted(repo.get_item_row(item.key).labels) == ["bug", "fissue", "reproduced"]
+
+    # 下一次抓取：平台返回的正是「库里原有 + 我们写上去的」
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=7, item_type=ItemType.ISSUE,
+            title="崩溃 7", body="boom", labels=["bug", "fissue", "reproduced"],
+        ),
+    )
+
+    row = repo.get_item_row(item.key)
+    assert row.status != ItemStatus.NEW.value, (
+        "自己打标不该把结论作废——否则每打一次标就白烧一轮 classify + evaluate + verify"
+    )
+    assert repo.get_item(item.key).stale_reasons == [], "也不该留下「结论已过期」的痕迹"
+
+
 async def test_label_all_concurrency_follows_platform_setting(ctx, repo, monkeypatch) -> None:
     """打标签的并发上限跟随 platforms.label_concurrency（不再绑死 llm.concurrency）。"""
     processor = FlushProcessor(ctx)

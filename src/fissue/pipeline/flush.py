@@ -320,6 +320,10 @@ class FlushProcessor:
                 labels,
                 ItemType(payload.get("item_type") or "issue"),
             )
+            # 写成功之后把结果并回本地快照。少了这一步，下一次抓取必然读到「平台 ≠ 库里」
+            # 的标签集 → 判成内容实质变化 → 把我们**刚做出的结论**作废并重评，每打一次标
+            # 就白烧一轮 classify + evaluate + verify（详见 Repository.merge_item_labels）。
+            self.ctx.repo.merge_item_labels(str(payload.get("key") or ""), labels)
             return True, ""
         except Exception as exc:
             log.warning("打标签失败 %s：%s", payload.get("key"), exc)
