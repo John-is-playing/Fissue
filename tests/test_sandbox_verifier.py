@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from typing import Any, cast
 
@@ -32,6 +33,28 @@ from fissue.verifier.generator import (
     validate_spec,
 )
 from fissue.verifier.runner import classify_outcome, judge_f2p, verifier_self_error
+
+# ---------------------------------------------------------------------------
+# 平台能力标记：判据取产品自己的那个开关，而不是猜平台
+# ---------------------------------------------------------------------------
+
+#: Unix socket 转发是 POSIX 能力：`SandboxManager._decide_inline` 在 `os.name == "nt"` 时
+#: **直接 return True**（恒走 inline，转发组件永不启用），`ForwarderClient.submit` 也以同一
+#: 判据直接拒。所以「socket 在 → 必须走转发组件」这条断言在 Windows 上无从成立——跳过，
+#: 而不是把断言反过来写成「必须 inline」（那会把 SECURITY.md 的那条承诺测没了）。
+requires_unix_socket_forwarder = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows 恒走 inline：Unix socket 转发在该平台不存在（见 sandbox/forwarder.py）",
+)
+
+#: 「整棵进程组回收」也是 POSIX 语义：用例自己用 `sh -c "… & echo $!"` 起子孙进程、用
+#: `start_new_session` 建进程组，最后读 `/proc/<pid>/stat` 判它有没有被杀干净。Windows 上
+#: 这三样都不存在，跳过；同样不改成「查不到就算过」——那等于把这条用例废掉。
+requires_posix_process_group = pytest.mark.skipif(
+    os.name == "nt",
+    reason="依赖 sh / start_new_session 的进程组语义与 /proc（Windows 均无）",
+)
+
 
 # ---------------------------------------------------------------------------
 # 协议
@@ -196,6 +219,7 @@ def test_executor_timeout(settings) -> None:
     assert "超时" in (res.error or "")
 
 
+@requires_posix_process_group
 def test_local_timeout_kills_the_whole_process_group(tmp_path) -> None:
     """本地路径超时必须回收**整棵进程树**，否则子孙进程会一直持有管道写端。
 
@@ -1260,6 +1284,7 @@ def test_workspace_mounts_make_git_readonly_except_index(tmp_path) -> None:
     assert len(workspace_mounts(RepoWorkspace(root=bare, slug="a/b"))) == 1
 
 
+@requires_unix_socket_forwarder
 def test_forwarder_is_used_once_its_socket_exists(tmp_path) -> None:
     """转发组件「起了就该被用上」——SECURITY.md 那条承诺（调用方不持 Docker 句柄）的前提。
 
@@ -1282,6 +1307,7 @@ def test_forwarder_is_used_once_its_socket_exists(tmp_path) -> None:
     assert SandboxManager(off).inline is True, "显式关掉时才允许不用"
 
 
+@requires_unix_socket_forwarder
 def test_forwarder_client_uses_per_request_timeout(monkeypatch) -> None:
     """客户端超时按**本次请求**算，不被第一个请求固化。
 

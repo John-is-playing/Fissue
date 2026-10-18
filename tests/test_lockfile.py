@@ -12,8 +12,21 @@ import sys
 
 import pytest
 
+from fissue import lockfile as lockfile_mod
 from fissue.errors import FissueError
 from fissue.lockfile import _lock_path, single_flight
+
+#: 跨进程互斥建立在 `fcntl.flock` 上。没有它的平台（Windows）产品会**降级为不互斥**：
+#: 既不建锁文件、也不写持有者 pid（见 `lockfile.py` 的 `fcntl is None` 分支，以及
+#: `WriteGate` 那边仍在工作的事实）。下面几个用例守的是「真起一个子进程持锁 → 本进程
+#: **立刻**被拒」，那个平台上这个语义不存在——跳过，而不是把断言改成「什么都不该发生」。
+#:
+#: 判据直接取产品自己的那个能力开关，而不是 `sys.platform == "win32"`：跳过条件与
+#: 「产品能不能 flock」严格同源，不会在别的平台上误判。
+requires_flock = pytest.mark.skipif(
+    lockfile_mod.fcntl is None,
+    reason="本机无 fcntl：single_flight 降级为不互斥（不建锁文件、不记持有者 pid）",
+)
 
 
 def test_single_flight_is_reentrant_in_one_process(settings) -> None:
@@ -26,6 +39,7 @@ def test_single_flight_is_reentrant_in_one_process(settings) -> None:
         pass
 
 
+@requires_flock
 def test_lock_file_records_holder_pid(settings) -> None:
     """锁文件里写下持有者 pid：拿不到锁的人由此能看出「是谁在跑」。"""
     with single_flight(settings, action="测试"):
@@ -34,6 +48,7 @@ def test_lock_file_records_holder_pid(settings) -> None:
     assert f"pid={os.getpid()}" in content
 
 
+@requires_flock
 def test_failed_lock_file_write_does_not_leak_the_reentrancy_depth(settings, monkeypatch) -> None:
     """写锁文件那一步失败时**不能**把进程内深度留在 1——否则本进程此后再也不抢锁。
 
@@ -64,6 +79,7 @@ def test_failed_lock_file_write_does_not_leak_the_reentrancy_depth(settings, mon
         assert f"pid={os.getpid()}" in _lock_path(settings).read_text(encoding="utf-8")
 
 
+@requires_flock
 def test_lock_is_refused_when_another_process_holds_it(settings) -> None:
     """真·跨进程：别的进程持锁时，本进程**立即报错**（不排队、不静默等待）。
 

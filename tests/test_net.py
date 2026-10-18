@@ -237,7 +237,11 @@ def test_ca_bundle_expands_user_home(tmp_path, monkeypatch: pytest.MonkeyPatch) 
     存在」——配合上一条的静默回退，用户完全看不出自己钉的证书压根没生效。
     """
     _write_self_signed_pem(tmp_path / "ca.pem")
+    # `expanduser` 认的是**平台自己的**家目录变量：POSIX 看 HOME，Windows 看 USERPROFILE。
+    # 只设 HOME 的话，这条用例在 Windows 上测到的不是「`~` 被展开」，而是「压根没找到家」
+    # —— 于是它失败在自己搭的前提上，而不是失败在被测的行为上。两个都设，两边同样有意义。
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv(ENV_CA_BUNDLE, "~/ca.pem")
     net.reset_cache()
 

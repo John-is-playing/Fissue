@@ -184,6 +184,16 @@ def test_status_json_is_clean_in_a_real_process(cli_env: dict[str, str]) -> None
     cfg.write_text(yaml.safe_dump(data), encoding="utf-8")
 
     repo_src = Path(__file__).resolve().parents[1] / "src"
+    # 继承父进程环境，但**剔除 `FISSUE_*`**——这才是这里限制环境的本意：父进程若带着它们
+    # （CI 注入、或本机 .env 导出过），会把 CLI 的配置覆盖掉，这条用例就测不到真东西。
+    #
+    # 为什么不能只传 PATH/HOME/PYTHONPATH：Windows 上缺 `SYSTEMROOT` 时子进程连 Winsock 都
+    # 初始化不了（`OSError: [WinError 10106]`，报在 `import _overlapped` 上），用例于是死在
+    # 「子进程根本没起来」而不是它要守的断言上。这个坑原先被上一层解码错误挡着，修完才露出来。
+    child_env = {k: v for k, v in os.environ.items() if not k.upper().startswith("FISSUE_")}
+    child_env["PYTHONPATH"] = str(repo_src)
+    child_env["PYTHONIOENCODING"] = "utf-8"          # 与下面的 encoding 成对，见那里的说明
+
     proc = subprocess.run(
         [
             sys.executable,
@@ -192,13 +202,13 @@ def test_status_json_is_clean_in_a_real_process(cli_env: dict[str, str]) -> None
             "status", "--json", "--config", cli_env["config"], "--env", cli_env["env"],
         ],
         capture_output=True,
-        text=True,
+        # 子进程默认按**平台代码页**编码（中文 Windows 上是 GBK），而 `text=True` 又按 locale
+        # 猜解码方式——两边不约定，这条用例会死在 `UnicodeDecodeError` 上，而不是死在它真正
+        # 要守的断言上（stdout 必须只有 JSON、告警必须落在 stderr）。钉死 UTF-8 后，中文
+        # 告警的比对在哪个平台都成立。
+        encoding="utf-8",
         timeout=120,
-        env={
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": os.environ.get("HOME", ""),
-            "PYTHONPATH": str(repo_src),
-        },
+        env=child_env,
     )
 
     assert proc.returncode == 0, f"退出码 {proc.returncode}，stderr：{proc.stderr[-500:]}"
