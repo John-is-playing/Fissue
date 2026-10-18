@@ -54,6 +54,9 @@ class FissueService:
         #: 三个写循环共用的「一轮」锁。`run_forever` 每次启动都换新的一把，
         #: 原因（asyncio 原语会绑定事件循环）见 `_rounds`。
         self._round_lock: asyncio.Lock | None = None
+        #: 正在跑的 uvicorn 实例（`with_web` 时才有）。退出时要**请它自己停**
+        #: （`should_exit`），而不是 cancel 它的任务——原因见 `run_forever` 的收尾段。
+        self._web_server: Any | None = None
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -159,8 +162,18 @@ class FissueService:
             await self.stop_event.wait()
         finally:
             log.info("正在停止服务…")
+            # Web/API 先**请它自己停**，而不是直接 cancel：uvicorn 的 lifespan 会把
+            # `CancelledError` 当异常上报（ERROR + 整段 traceback），于是每次 stop/restart
+            # 都刷一条、看着像服务崩了——设备实测今天 5 次 `Stopped` ↔ 5 次 `CancelledError`
+            # 一一对应。`should_exit` 是 uvicorn 自己的优雅停止开关，置位后 `serve()` 正常返回。
+            if web_task is not None and self._web_server is not None:
+                self._web_server.should_exit = True
+                with contextlib.suppress(asyncio.TimeoutError):
+                    # 给连接收尾留点时间；真卡住了下面那圈 cancel 仍然兜底。
+                    await asyncio.wait_for(web_task, timeout=15)
             for t in tasks:
-                t.cancel()
+                if not t.done():
+                    t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             log.info("服务已停止")
 
@@ -273,6 +286,8 @@ class FissueService:
                 log_level=self.settings.app.log_level,
             )
             server = uvicorn.Server(config)
+            # 供 `run_forever` 收尾时置 `should_exit`（见那里的说明）。
+            self._web_server = server
             await server.serve()
         except Exception:
             log.exception("Web 服务异常退出")

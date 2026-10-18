@@ -114,6 +114,51 @@ async def test_write_loops_queue_instead_of_colliding(settings, monkeypatch, cap
     assert "Traceback" not in caplog.text, "让位是预期行为，不该打整段 Traceback"
 
 
+async def test_run_forever_stops_web_gracefully_instead_of_cancelling(settings, monkeypatch) -> None:
+    """退出时先请 uvicorn **自己停**（`should_exit`），而不是直接 cancel 它的任务。
+
+    回归（设备实测）：`run_forever` 收尾时一律 `t.cancel()`，而 uvicorn 的 lifespan 会把
+    `CancelledError` 当异常上报——于是每次 stop/restart 都刷一条 ERROR + 整段 traceback。
+    今天的日志里 5 次 `Stopped` ↔ 5 次 `CancelledError` 一一对应。置 `should_exit` 后
+    `serve()` 正常返回，这条 ERROR 就不该再出现。
+    """
+    import asyncio
+
+    settings.schedule.enabled = True
+    service = FissueService(settings, with_web=True)
+
+    class _FakeServer:
+        """替身 uvicorn：这里只关心 `should_exit` 这一个开关。"""
+
+        def __init__(self) -> None:
+            self.should_exit = False
+
+    server = _FakeServer()
+    seen: list[str] = []
+
+    async def fake_web() -> None:
+        service._web_server = server
+        while not server.should_exit:
+            await asyncio.sleep(0.01)      # 被 cancel 的话根本走不到下面那行
+        seen.append("graceful")
+
+    async def fake_scan() -> None:
+        service.request_stop()             # 立刻触发停机
+
+    async def noop() -> None:
+        return None
+
+    monkeypatch.setattr(service, "_web_loop", fake_web)
+    monkeypatch.setattr(service, "_scan_loop", fake_scan)
+    monkeypatch.setattr(service, "_flush_loop", noop)
+    monkeypatch.setattr(service, "_fix_loop", noop)
+
+    await service.run_forever()
+
+    assert server.should_exit is True, "必须先请 uvicorn 自己退出"
+    assert seen == ["graceful"], "web 任务应当是正常返回的，而不是被 cancel 掉"
+
+
 # ---------------------------------------------------------------------------
 # 验证步骤（常驻服务原先**没有**这一步）
 # ---------------------------------------------------------------------------
