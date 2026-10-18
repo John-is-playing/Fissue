@@ -36,6 +36,7 @@ from ..models import (
     VerifierKind,
     VerifierRun,
     VerifierSpec,
+    content_fingerprint,
 )
 from .db import Database
 from .tables import (
@@ -502,6 +503,23 @@ class Repository:
                 return []
             merged = list(dict.fromkeys([*(row.labels or []), *labels]))
             row.labels = merged
+            # 指纹也要跟上：`labels` 进指纹，只刷 labels 不刷指纹的话，下一次抓取仍会判
+            # 「平台 ≠ 库里」并重报一次「更新」（顺带把字段与评论表重写一遍）。
+            #
+            # 这么刷是安全的：指纹**不参与**「结论是否过期」的判定（那只认
+            # MATERIAL_FIELDS）。所以即使这里因为**评论残缺**而与平台算出的值不完全
+            # 一致（指纹含评论条数，而残缺时库里存下的评论条数可能少于平台），最坏也
+            # 只是多报一次「更新」——不会误作废结论、不会触发重评。
+            #
+            # 口径与 `RawItem.content_hash()` 共用 `content_fingerprint`，不会漂移。
+            row.content_hash = content_fingerprint(
+                title=row.title,
+                body=row.body,
+                labels=merged,
+                comments=len(row.comments),
+                merged=bool(row.merged),
+                state=row.state,
+            )
             return merged
 
     def reclaim_fixing_items(self, *, repo_slug: str | None = None) -> list[str]:

@@ -2215,12 +2215,16 @@ async def test_safe_label_keeps_local_snapshot_in_sync(ctx, repo) -> None:
     assert sorted(repo.get_item_row(item.key).labels) == ["bug", "fissue", "reproduced"]
 
     # 下一次抓取：平台返回的正是「库里原有 + 我们写上去的」
-    repo.upsert_item(
+    _, created, changed = repo.upsert_item(
         rid,
         RawItem(
             platform=Platform.GITHUB, repo="psf/requests", number=7, item_type=ItemType.ISSUE,
             title="崩溃 7", body="boom", labels=["bug", "fissue", "reproduced"],
         ),
+    )
+    assert created is False
+    assert changed is False, (
+        "指纹也要跟着回写，否则抓取仍会重报一次「更新」（并重写字段与评论表）"
     )
 
     row = repo.get_item_row(item.key)

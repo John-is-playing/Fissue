@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -206,6 +207,37 @@ MATERIAL_FIELDS: tuple[str, ...] = ("title", "body", "labels", "state", "merged"
 DEGRADED_COMMENTS_PREFIX = "comments_"
 
 
+def content_fingerprint(
+    *,
+    title: str | None,
+    body: str | None,
+    labels: Iterable[str],
+    comments: int,
+    merged: bool,
+    state: str | None,
+) -> str:
+    """内容指纹的**唯一**算法：增量判定与「写回后的本地快照」共用同一份口径。
+
+    为什么抽出来：``Repository.merge_item_labels`` 打完标签回写本地时也得把指纹刷新，
+    否则下一次抓取仍会判「平台 ≠ 库里」而重报一次「更新」。两处必须**逐字节一致**，
+    所以公式只留一份——在仓库层把公式抄一遍，抄的那份迟早跟这里漂移。
+
+    注意指纹**不参与**「结论是否过期」的判定（那只认 :data:`MATERIAL_FIELDS`），
+    它只决定「这条要不要重写字段与评论表」。
+    """
+    payload = "\x1f".join(
+        [
+            title or "",
+            body or "",
+            ",".join(sorted(labels)),
+            str(comments),
+            "1" if merged else "0",
+            state or "",
+        ]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
 class RawItem(BaseModel):
     """从平台抓取到的 Issue / PR 统一表示。"""
 
@@ -252,17 +284,14 @@ class RawItem(BaseModel):
 
     def content_hash(self) -> str:
         """内容指纹，用于增量判断与缓存（标题/正文/标签变了才算更新）。"""
-        payload = "\x1f".join(
-            [
-                self.title or "",
-                self.body or "",
-                ",".join(sorted(self.labels)),
-                str(len(self.comments)),
-                "1" if self.merged else "0",
-                self.state or "",
-            ]
+        return content_fingerprint(
+            title=self.title,
+            body=self.body,
+            labels=self.labels,
+            comments=len(self.comments),
+            merged=self.merged,
+            state=self.state,
         )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
     # -- 数据完整性 --------------------------------------------------------
 
