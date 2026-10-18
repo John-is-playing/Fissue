@@ -1,0 +1,63 @@
+# Fissue 常驻服务（systemd system unit）
+#
+# 安装（需 root）：
+#   sudo install -m 0644 systemd/fissue.service /etc/systemd/system/fissue.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now fissue.service
+#
+# 查看 / 运维：
+#   systemctl status fissue --no-pager
+#   journalctl -u fissue -f
+#   sudo systemctl restart fissue        # 改了 config.yaml / .env 之后
+#
+# 说明（几处「不照抄就会坏」的地方）
+# ----------------------------------
+# * User/Group 必须属于 docker 组。沙盒 `runtime: docker`，且产品对「Docker 不可用」
+#   是 **fail-closed**（拒绝执行、不会静默降级成本地执行），所以 docker 要先就绪。
+# * 用项目自己的 .venv，并把它的 bin 放在 PATH 最前：沙盒的 local 通道会用**裸**
+#   `python -m pytest` 起子进程，PATH 不对就会落到别的解释器上。
+# * 优雅退出：daemon 收到 SIGTERM 会置位 stop_event 并等各循环收尾
+#   （见 src/fissue/service/daemon.py::_install_signal_handlers），所以 TimeoutStopSec
+#   要给足——停的瞬间它可能正卡在一次 LLM 调用里。
+# * 单实例：daemon 会拿 flock（锁文件在数据目录下，文件名带库地址的哈希）。若已有 CLI
+#   在跑，它**立即报错退出**而不是排队；Restart 会等 RestartSec 再试，
+#   StartLimit* 防止在这种情况下无限打转。
+# * 若把数据库从 SQLite 换成 PostgreSQL，请自行加 `After=postgresql.service`。
+
+[Unit]
+Description=Fissue 常驻服务（增量扫描 + 队列调度 + 阈值通知 + Web/API）
+Documentation=file:/home/john/Fissue/BENCHMARK.md
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=john
+Group=john
+WorkingDirectory=/home/john/Fissue
+SyslogIdentifier=fissue
+
+# 日志即时进 journal（不带缓冲），并固定 UTF-8，免得中文日志在 C locale 下写坏
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+Environment=LANG=C.UTF-8
+Environment=PATH=/home/john/Fissue/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# --with-web 起的是 127.0.0.1:8000（本机 .env 里 FISSUE_WEB_HOST/PORT 定的），
+# 只监听回环、不对外；想要只跑扫描/调度/通知，把这个开关去掉即可。
+ExecStart=/home/john/Fissue/.venv/bin/fissue serve --with-web --config /home/john/Fissue/config.yaml --env /home/john/Fissue/.env
+
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# 够用的加固：不为权限提升留口子，并用私有 /tmp。
+# （不要开 ProtectHome/ProtectSystem——工作目录就在 /home 下。）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
