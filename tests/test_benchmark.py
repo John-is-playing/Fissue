@@ -442,4 +442,7 @@ def test_bench_list_on_missing_dir_is_friendly(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "bench capture" in result.output
+    # 输出由 Rich 按控制台宽度折行：临时路径一长，`fissue bench capture`
+    # 就会被拆到两行（``bench \ncapture``）。先归一化空白，避免断言绑死在
+    # 折行位置上——在长路径的 Windows 上会必然失败，而 Linux CI 看不出。
+    assert "bench capture" in " ".join(result.output.split())
