@@ -49,6 +49,71 @@ async def test_schedule_enabled_starts_scan_loop(settings, monkeypatch) -> None:
     assert started == ["scan"]
 
 
+async def test_write_loops_queue_instead_of_colliding(settings, monkeypatch, caplog) -> None:
+    """scan 与 flush 同时到期：后者**排队等**，不撞闸门、也不被整轮 scan 饿死。
+
+    回归（systemd 长跑实测，树莓派，scan 间隔 3600s / flush 间隔 60s）：scan 那一轮还在
+    跑（fetch → 评测 → 验证）时，flush 每个周期都撞 `RuntimeContext.open(exclusive=True)`
+    用的 `WRITE_GATE`——每 60s 记一条 `flush 轮次异常` 外加约 40 行 Traceback，而 flush
+    在整轮 scan 期间**一次都没跑成**。
+
+    所以这里同时守住两件事：两者不重叠（互斥还在），且 flush 不必等到下一个周期——
+    scan 一轮结束就立刻轮到它。
+    """
+    import asyncio
+    import contextlib
+    import logging
+    from types import SimpleNamespace
+
+    from fissue import lockfile
+    from fissue.pipeline.context import RuntimeContext
+
+    settings.schedule.enabled = True
+    service = FissueService(settings)
+
+    events: list[str] = []
+    flush_ran = asyncio.Event()
+
+    @contextlib.asynccontextmanager
+    async def fake_open(settings=None, *, exclusive=False, **kwargs):
+        # 故意走**真**闸门：不绕开它，才测得出「谁在挡谁」
+        async with lockfile.WRITE_GATE.hold_or_fail(action="抓取/评测/验证/修复"):
+            yield SimpleNamespace(repo=object())
+
+    async def slow_scan_round() -> dict:
+        events.append("scan:enter")
+        await asyncio.sleep(0.2)                    # 替代「分钟级的一轮」
+        events.append("scan:exit")
+        return {}
+
+    async def record_flush(ctx, notifier) -> dict:
+        events.append("flush")
+        flush_ran.set()
+        return {}
+
+    monkeypatch.setattr(RuntimeContext, "open", fake_open)
+    monkeypatch.setattr("fissue.service.daemon.Notifier", lambda *a, **kw: object())
+    monkeypatch.setattr(service, "run_once", slow_scan_round)
+    monkeypatch.setattr(service, "_flush_queues", record_flush)
+
+    with caplog.at_level(logging.INFO):
+        scan_task = asyncio.create_task(service._scan_loop())
+        await asyncio.sleep(0.05)                   # 让 scan 先持住这一轮
+        flush_task = asyncio.create_task(service._flush_loop())
+        try:
+            await asyncio.wait_for(flush_ran.wait(), timeout=2.0)
+        finally:
+            service.request_stop()
+            await asyncio.gather(scan_task, flush_task, return_exceptions=True)
+
+    assert "scan:exit" in events, f"scan 那轮没跑完：{events}"
+    assert events.index("flush") > events.index("scan:exit"), (
+        f"flush 必须等 scan 那轮结束才跑（互斥还在，且没有被饿死）：{events}"
+    )
+    assert "让位" in caplog.text, "排队时该留下一句说明——既不静默，也不打 Traceback"
+    assert "Traceback" not in caplog.text, "让位是预期行为，不该打整段 Traceback"
+
+
 # ---------------------------------------------------------------------------
 # 验证步骤（常驻服务原先**没有**这一步）
 # ---------------------------------------------------------------------------

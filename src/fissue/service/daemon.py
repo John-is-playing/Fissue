@@ -25,12 +25,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import signal
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from ..config import RepoConfig, Settings
-from ..errors import BudgetExceeded
+from ..errors import BudgetExceeded, WriterBusy
 from ..logging_setup import get_logger
 from ..models import Category, ItemStatus, ItemType, Priority, QueueName, RawItem
 from ..pipeline.context import RuntimeContext
@@ -51,6 +51,9 @@ class FissueService:
         self.with_web = with_web
         self.stop_event = asyncio.Event()
         self._last_scan: datetime | None = None
+        #: 三个写循环共用的「一轮」锁。`run_forever` 每次启动都换新的一把，
+        #: 原因（asyncio 原语会绑定事件循环）见 `_rounds`。
+        self._round_lock: asyncio.Lock | None = None
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -129,6 +132,10 @@ class FissueService:
             "（含 Web）" if self.with_web else "",
         )
 
+        # 每次启动都换一把新锁：asyncio.Lock 会把等待者记在创建它的事件循环上，
+        # 跨循环复用会抛「bound to a different event loop」（见 `_rounds`）。
+        self._round_lock = asyncio.Lock()
+
         tasks: list[asyncio.Task] = []
         if not self.settings.schedule.enabled:
             # 关掉调度：不自动扫描 / flush / 修复。想手动跑一轮用 `fissue serve --once`，
@@ -172,24 +179,67 @@ class FissueService:
 
     # -- 循环 -------------------------------------------------------------
 
+    def _rounds(self) -> asyncio.Lock:
+        """三个写循环共用的「一轮」互斥锁：**先排队，轮到了再进闸门**。
+
+        为什么需要它：``_scan_loop`` / ``_flush_loop`` / ``_fix_loop`` 是三个**独立的
+        asyncio 任务**，而 ``RuntimeContext.open(exclusive=True)`` 用的是「拿不到就
+        立即报错」的 ``WRITE_GATE``。于是只要 scan 那轮还在跑（fetch → 评测 → 验证，
+        分钟级），flush 每个周期都会撞上闸门。systemd 长跑实测（树莓派，scan 间隔
+        3600s、flush 间隔 60s）：日志里每 60s 一条 ``flush 轮次异常`` 外加约 40 行
+        Traceback，而 flush 在整轮 scan 期间**一次都没跑成**。
+
+        这里把「同一时刻只允许一处会写外部仓库的操作」在 daemon 内部**显式**表达成
+        排队，而不是让它退化成「每个周期撞一次、撞完就放弃」。对外部调用方（CLI、Web
+        写端点）保持立即报错——它们需要知道「有人在跑」，默默排队会让调用方无从判断
+        自己是不是被挂住了；``WRITE_GATE`` 的 fail-fast 语义原样不动。
+
+        **每次 ``run_forever`` 都换一把新锁**：``asyncio.Lock`` 会记住等待者所属的
+        事件循环，跨循环复用会抛「bound to a different event loop」——``WRITE_GATE``
+        刻意不用 asyncio 原语就是为了避开这点。而这里每个进程只起一次 ``run_forever``，
+        换新锁的代价为零。
+        """
+        if self._round_lock is None:
+            self._round_lock = asyncio.Lock()
+        return self._round_lock
+
+    @contextlib.asynccontextmanager
+    async def _round(self, what: str) -> AsyncIterator[None]:
+        """进入「一轮写操作」。
+
+        让位是**预期**行为而非异常，所以只在真的要等的时候记一条 INFO——不打
+        Traceback，也不每个周期重复刷屏（等锁时只记一次，等到就执行）。
+        """
+        lock = self._rounds()
+        if lock.locked():
+            log.info("%s 让位：另一轮写操作正在进行，等它结束后立即执行", what)
+        async with lock:
+            yield
+
     async def _scan_loop(self) -> None:
         interval = max(60, self.settings.schedule.scan_interval_seconds)
         while not self.stop_event.is_set():
-            try:
-                await self.run_once()
-            except Exception:
-                log.exception("扫描轮次异常（继续下一轮）")
+            async with self._round("扫描"):
+                try:
+                    await self.run_once()
+                except WriterBusy as exc:
+                    log.info("扫描让位：%s", exc)
+                except Exception:
+                    log.exception("扫描轮次异常（继续下一轮）")
             await self._sleep(interval)
 
     async def _flush_loop(self) -> None:
         interval = max(10, self.settings.schedule.queue_flush_interval_seconds)
         while not self.stop_event.is_set():
-            try:
-                async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
-                    notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
-                    await self._flush_queues(ctx, notifier)
-            except Exception:
-                log.exception("flush 轮次异常（继续）")
+            async with self._round("flush"):
+                try:
+                    async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
+                        notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
+                        await self._flush_queues(ctx, notifier)
+                except WriterBusy as exc:
+                    log.info("flush 让位：%s", exc)
+                except Exception:
+                    log.exception("flush 轮次异常（继续）")
             await self._sleep(interval)
 
     async def _fix_loop(self) -> None:
@@ -199,12 +249,15 @@ class FissueService:
             await self._sleep(interval)
             if self.stop_event.is_set():
                 return
-            try:
-                async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
-                    notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
-                    await self._run_fixes(ctx, notifier)
-            except Exception:
-                log.exception("修复轮次异常（继续）")
+            async with self._round("修复"):
+                try:
+                    async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
+                        notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
+                        await self._run_fixes(ctx, notifier)
+                except WriterBusy as exc:
+                    log.info("修复让位：%s", exc)
+                except Exception:
+                    log.exception("修复轮次异常（继续）")
 
     async def _web_loop(self) -> None:
         """把 Web/API 跑在同一个事件循环里。"""

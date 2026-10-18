@@ -21,7 +21,7 @@ from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 from .config import Settings
-from .errors import FissueError
+from .errors import WriterBusy
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -72,10 +72,10 @@ def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterat
             os.lseek(handle, 0, os.SEEK_SET)
             holder = os.read(handle, 200).decode("utf-8", "replace").strip()
             detail = f"（当前持有者：{holder}）" if holder else ""
-            raise FissueError(
+            raise WriterBusy(
                 f"{action}正在别处运行，本次不再并发执行{detail}。"
                 f"锁文件：{path}。同一时刻只允许一个会写仓库的进程——"
-                "请等它结束，或先停掉常驻服务（fissue daemon）。"
+                "请等它结束，或先停掉常驻服务（fissue serve）。"
             ) from exc
         # 把持有者写进锁文件：拿不到锁的人由此能看到「是谁在跑」，便于判断。
         os.lseek(handle, 0, os.SEEK_SET)
@@ -99,7 +99,7 @@ class WriteGate:
     """进程内的「写操作」串行闸门：同一任务可重入，不同任务互斥，拿不到立即报错。
 
     为什么 `flock` 之外还需要它：`flock` 解决的是**跨进程**互斥，而
-    ``fissue daemon --web`` 把 uvicorn 起在**同一个进程**里（见
+    ``fissue serve --with-web`` 把 uvicorn 起在**同一个进程**里（见
     ``service.daemon.FissueService._web_loop``）。此时 daemon 的
     ``_flush_loop`` 正持着 `flock`（并把它记在 `_hold_depth` 上），
     同进程的 ``/queues/flush``、``/actions/*`` 走的是重入旁路、直接放行——
@@ -134,7 +134,7 @@ class WriteGate:
                 self._depth -= 1
             return
         if self._owner is not None:
-            raise FissueError(
+            raise WriterBusy(
                 f"{action}正在本进程内进行中，本次不再并发执行。"
                 "同一时刻只允许一处会写外部仓库的操作——并发跑会重复调用 LLM 并重复写平台。"
             )
