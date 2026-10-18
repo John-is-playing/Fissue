@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from ..logging_setup import get_logger
 from ..models import (
+    COMMENTS_SEEN_KEY,
     MATERIAL_FIELDS,
     STALE_KEY,
     AuthorKind,
@@ -346,6 +347,10 @@ class Repository:
                 # 不会再重新检测出「变过」。若在这里被 item.raw 冲掉，过期就重新变成不可见了。
                 # 清零点只有一个：save_evaluation（重新出了结论）。
                 incoming_raw.setdefault(STALE_KEY, row.raw[STALE_KEY])
+            # 记下「这次指纹是按多少条评论算的」。`row.content_hash` 用的是 `item` 的条数
+            # （评论残缺时可能多于库里实际存下的），回写标签时要把指纹重算成同一个值，
+            # 就必须留下这个数（见 models.COMMENTS_SEEN_KEY）。
+            incoming_raw[COMMENTS_SEEN_KEY] = len(item.comments)
             row.raw = incoming_raw
             row.fetched_at = _now()
             if created:
@@ -506,17 +511,18 @@ class Repository:
             # 指纹也要跟上：`labels` 进指纹，只刷 labels 不刷指纹的话，下一次抓取仍会判
             # 「平台 ≠ 库里」并重报一次「更新」（顺带把字段与评论表重写一遍）。
             #
-            # 这么刷是安全的：指纹**不参与**「结论是否过期」的判定（那只认
-            # MATERIAL_FIELDS）。所以即使这里因为**评论残缺**而与平台算出的值不完全
-            # 一致（指纹含评论条数，而残缺时库里存下的评论条数可能少于平台），最坏也
-            # 只是多报一次「更新」——不会误作废结论、不会触发重评。
-            #
             # 口径与 `RawItem.content_hash()` 共用 `content_fingerprint`，不会漂移。
+            #
+            # 评论条数取 `upsert_item` 落库的那个「本次指纹是按多少条算的」，而不是
+            # `len(row.comments)`：评论**残缺**时库里存下的条数少于平台，用后者重算会与
+            # 平台算出的值不一致——那正是「更新」会反复出现的原因。老行没有这个键时退回
+            # 库里的条数（对评论完整的条目两者本就相等），最坏也只是多报一次「更新」。
+            seen = row.raw.get(COMMENTS_SEEN_KEY) if isinstance(row.raw, dict) else None
             row.content_hash = content_fingerprint(
                 title=row.title,
                 body=row.body,
                 labels=merged,
-                comments=len(row.comments),
+                comments=seen if isinstance(seen, int) else len(row.comments),
                 merged=bool(row.merged),
                 state=row.state,
             )

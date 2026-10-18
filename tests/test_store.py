@@ -800,6 +800,46 @@ def test_incomplete_but_not_smaller_comments_still_refresh(repo: Repository) -> 
     assert len(_item(repo, item.key).comments) == 2
 
 
+def test_merge_labels_keeps_fingerprint_exact_under_degraded_comments(repo: Repository) -> None:
+    """评论残缺时，回写标签重算的指纹必须与平台算出的**逐字节一致**。
+
+    回归：`merge_item_labels` 早先按 `len(row.comments)` 重算指纹，而评论残缺时库里存下的
+    条数**少于**平台（残缺结果不覆盖已入库讨论，见上一条用例），于是重算值与平台算出的
+    对不上——下一次抓取仍报一次「更新」，并把字段与评论表重写一遍。
+
+    现在按 `upsert_item` 落库的「本次指纹是按多少条算的」重算。用例里把**错配本身**也断言
+    出来（落库的条数 ≠ 库里的条数），所以它不是空转：没有这个键、退回库里条数时，最后那句
+    「不该再报更新」必然失败。
+    """
+    from fissue.models import COMMENTS_SEEN_KEY
+
+    item = _seed(repo, number=53)
+    rid = _repo_row(repo, "psf/requests").id
+
+    def fetch(comments: list) -> RawItem:
+        """模拟平台的一次返回：给定评论 + 打上「评论残缺」标记。"""
+        payload = item.model_dump()
+        payload["comments"] = comments
+        variant = RawItem(**payload)
+        variant.mark_degraded("comments_unavailable#53")
+        return variant
+
+    # 本轮平台评论没拉全（0 条）→ 库里仍留原有 1 条，但指纹是按 0 条算的
+    _, _, changed = repo.upsert_item(rid, fetch([]))
+    assert changed is True
+    assert len(_item(repo, item.key).comments) == 1, "前提：残缺结果不覆盖已入库讨论"
+    assert repo.get_item_row(item.key).raw[COMMENTS_SEEN_KEY] == 0, (
+        "前提：落库的指纹条数（0）与库里的评论条数（1）此刻确实不同"
+    )
+
+    repo.merge_item_labels(item.key, ["fissue"])
+
+    # 平台侧现在也带着我们刚写上去的标签，再抓一次（同样残缺、同样 0 条）
+    item.labels = list(repo.get_item_row(item.key).labels or [])
+    _, _, again = repo.upsert_item(rid, fetch([]))
+    assert again is False, "残缺态下重算的指纹必须与平台一致，否则每轮都白报一次「更新」"
+
+
 # ---------------------------------------------------------------------------
 # 队列中断残留
 # ---------------------------------------------------------------------------

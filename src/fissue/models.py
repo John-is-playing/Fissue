@@ -193,6 +193,14 @@ DEGRADED_KEY = "_fissue_degraded"
 #: ``RawItem.raw`` 里记录「已有结论已过期」的保留键。同样不改表结构。
 STALE_KEY = "_fissue_stale"
 
+#: ``RawItem.raw`` 里记录「这次内容指纹是按多少条评论算的」。
+#:
+#: 为什么必须落库：指纹含评论条数，而评论**残缺**时（见 :data:`DEGRADED_COMMENTS_PREFIX`，
+#: 库里为避免覆盖好数据会保留原有讨论）库里存下的条数会**少于**平台。此时若按「库里的
+#: 条数」重算指纹，就与平台算出的值对不上。``Repository.merge_item_labels`` 打完标签要
+#: 刷新指纹，只有按这个数算才能与平台逐字节对齐。
+COMMENTS_SEEN_KEY = "_fissue_comments_seen"
+
 #: 判定「结论是否过期」要看的内容字段。
 #:
 #: 为什么不复用 :meth:`RawItem.content_hash`：那个指纹里带着 ``len(comments)``。拿它判
