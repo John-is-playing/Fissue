@@ -253,7 +253,7 @@ def _exclusive_write(fn):
 
     为什么写端点必须加：``/queues/flush``、``/actions/*`` 会真去平台上打标签、把条目推进
     修复队列，而它们原先**完全不在互斥保护内**——独立 ``fissue web`` / ``serve`` 进程不持锁，
-    同进程（``fissue daemon --web`` 把 uvicorn 起在同一事件循环里）又走 `_hold_depth` 的重入旁路。
+    同进程（``fissue serve --with-web`` 把 uvicorn 起在同一事件循环里）又走 `_hold_depth` 的重入旁路。
 
     两道闸门缺一不可：
 

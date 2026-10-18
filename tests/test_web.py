@@ -503,7 +503,7 @@ def test_write_endpoint_rejects_proxied_unauthenticated_request(client) -> None:
 def test_write_endpoint_409_when_another_writer_holds_the_gate(client, monkeypatch) -> None:
     """同进程里已有写操作在跑时，写端点回 409（而不是并行再跑一遍）。
 
-    这一条守的是 `WRITE_GATE`：`fissue daemon --web` 把 uvicorn 与 daemon 的 flush/fix
+    这一条守的是 `WRITE_GATE`：`fissue serve --with-web` 把 uvicorn 与 daemon 的 flush/fix
     循环放在同一个事件循环里，`flock` 那侧走的是重入旁路，挡不住同进程的另一处写操作。
     """
     from fissue import lockfile

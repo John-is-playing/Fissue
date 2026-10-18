@@ -99,7 +99,7 @@ class RuntimeContext:
 
         # 两道闸门：
         # * `single_flight` 是 flock，管**跨进程**（CLI 撞 daemon / 撞 serve）；
-        # * `WRITE_GATE` 管**同进程**——`fissue daemon --web` 把 uvicorn 起在同一个
+        # * `WRITE_GATE` 管**同进程**——`fissue serve --with-web` 把 uvicorn 起在同一个
         #   进程里，`flock` 那边走的是重入旁路，挡不住同进程的另一处写操作。
         #   同一任务可重入，所以 daemon 的外层循环 + 内层 `open(exclusive=True)`
         #   不会把自己挡住。

@@ -504,7 +504,7 @@ async def test_flush_claims_the_batch_so_a_second_writer_gets_nothing(ctx, repo)
     """一批条目被 flush 抢走后，另一个写者只能拿到空批。
 
     回归：「挑（``flushed_at IS NULL``）→ 调 LLM → 标记已 flush」原先没有任何互斥，
-    于是 `fissue daemon --web` 里 daemon 的 flush 循环与同进程 uvicorn 的 `/queues/flush`
+    于是 `fissue serve --with-web` 里 daemon 的 flush 循环与同进程 uvicorn 的 `/queues/flush`
     会挑到**同一批**：同一批条目被送两次 LLM（重复计费）、平台标签被打两遍。
     这里在 handler 内部（也就是「已交出、结论还没落库」的窗口）再抢一次来复现它。
     """

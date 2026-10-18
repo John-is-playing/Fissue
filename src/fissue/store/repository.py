@@ -972,7 +972,7 @@ class Repository:
 
         为什么必须抢占：「挑（``flushed_at IS NULL``）→ 调 LLM → 标记已 flush」原先
         之间没有任何互斥，两个写者会挑到同一批——daemon 的 ``_flush_loop`` 与同一进程里
-        uvicorn 的 ``/queues/flush``（`fissue daemon --web`），或独立 serve 进程与 CLI。
+        uvicorn 的 ``/queues/flush``（`fissue serve --with-web`），或独立 serve 进程与 CLI。
         后果是同一批条目被送两次 LLM（重复计费）、平台标签被打两遍、``batch_conclusions``
         落两条。
 

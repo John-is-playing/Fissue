@@ -108,7 +108,7 @@ def test_lock_released_after_use(settings) -> None:
 async def test_write_gate_is_reentrant_for_the_same_task() -> None:
     """同一任务重入必须放行。
 
-    `fissue daemon --web` 是「外层循环持锁 → 内层 `open(exclusive=True)`」的嵌套结构，
+    `fissue serve --with-web` 是「外层循环持锁 → 内层 `open(exclusive=True)`」的嵌套结构，
     闸门若不可重入就会把自己锁死；而它同时又要挡住同进程里另一处（uvicorn 的请求任务）。
     """
     from fissue.lockfile import WriteGate
