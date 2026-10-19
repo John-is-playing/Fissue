@@ -46,9 +46,12 @@ app = typer.Typer(
 db_app = typer.Typer(help="数据库管理")
 sandbox_app = typer.Typer(help="沙盒与转发组件")
 bench_app = typer.Typer(help="跑分基线：冻结测量前提与结果，便于逐项对比")
+from .auth import auth_app  # noqa: E402  —— 放在这里：它只用 typer 与 config，不会与 main 成环
+
 app.add_typer(db_app, name="db")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(bench_app, name="bench")
+app.add_typer(auth_app, name="auth")
 
 # ---------------------------------------------------------------------------
 # 通用选项与输出

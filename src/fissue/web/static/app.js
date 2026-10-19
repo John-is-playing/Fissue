@@ -106,55 +106,29 @@
   }
 
   // ---------------------------------------------------------------------
-  // 访问口令（FISSUE_API_TOKEN）
+  // 鉴权：会话 cookie + CSRF（docs/AUTH.md §3.5 / §9）
   // ---------------------------------------------------------------------
   //
-  // 后端一旦设了 `FISSUE_API_TOKEN`，鉴权就自动开启，`/api/*` 全都要求 Bearer 口令——而
-  // **页面本身不带凭据**（HTML 路由刻意不挂鉴权，否则浏览器打不开）。原先前端一个
-  // `Authorization` 头都不发，于是 UI 上**每一个写操作都会 401**：页面看着一切正常，
-  // 点下去只弹一句「未授权」。更讽刺的是「设置」页还在教用户去配这个口令——等于那一页
-  // 会把整个界面的写能力关掉。
+  // 这里原先是一套「撞到 401 就弹框问口令、存 localStorage、原样重试」的逻辑——
+  // 那是单一全局口令时代的产物。换成 cookie 会话之后它整个不成立了：
   //
-  // 现在的做法：口令存 localStorage（同源普通存储，本来就是给本机/内网自用的场景），
-  // 首次撞到 401 时弹一次输入框，存下后**原样重试**那次请求，用户不必再点一遍。
-  // 背景轮询（状态角标、任务进度）一律静默——否则每 2 秒弹一个框。
-  var TOKEN_KEY = "fissue_api_token";
-  var tokenAsked = false;      // 每次页面加载最多问一次，避免连续弹窗
+  //   1. 身份是**浏览器自动带的 HttpOnly cookie**，前端拿不到、也不该拿到；
+  //   2. 浏览器拿不到 cookie 就意味着**页面本身没有凭据**，唯一的正确反应是
+  //      「去 /login 登录」，而不是在本页原地问一串谁也不认识的令牌；
+  //   3. cookie 会被浏览器自动附加到跨站请求上，所以写请求必须带 CSRF token
+  //      （服务端对会话认证的写请求强校验，Bearer/可信来源豁免）。
+  var AUTH_PREFIX = CFG.authPrefix || "/api/auth";
+  // 回环/可信网来源是空串（服务端也只对会话校验），所以这里「有没有值」不作判据。
+  var CSRF_TOKEN = CFG.csrfToken || "";
+  var redirecting = false;
 
-  function getToken() {
-    try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
-  }
-
-  function setToken(value) {
-    try {
-      if (value) window.localStorage.setItem(TOKEN_KEY, value);
-      else window.localStorage.removeItem(TOKEN_KEY);
-    } catch (e) { /* 隐私模式下 localStorage 可能不可用：不致命，退化成不记住 */ }
-  }
-
-  /** 问一次口令。返回输入的值，取消则返回空。 */
-  function askToken(reason) {
-    return new Promise(function (resolve) {
-      var dlg = document.createElement("dialog");
-      dlg.innerHTML =
-        "<h3>这个接口需要访问口令</h3>" +
-        "<div class='muted small'></div>" +
-        "<input type='password' id='__tok' placeholder='FISSUE_API_TOKEN' style='width:100%;margin-top:10px'>" +
-        "<div class='dlg-actions'>" +
-        "<button class='ghost' value='no'>取消</button>" +
-        "<button class='primary' value='yes'>保存并重试</button></div>";
-      dlg.querySelector("div.muted").textContent = reason;
-      document.body.appendChild(dlg);
-      function finish(value) {
-        if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
-        resolve(value);
-      }
-      dlg.addEventListener("close", function () { finish(dlg.returnValue === "yes" ? dlg.querySelector("#__tok").value.trim() : ""); });
-      dlg.querySelector("button[value=no]").addEventListener("click", function () { dlg.close("no"); });
-      dlg.querySelector("button[value=yes]").addEventListener("click", function () { dlg.close("yes"); });
-      if (typeof dlg.showModal === "function") dlg.showModal();
-      else finish(window.prompt("FISSUE_API_TOKEN") || "");
-    });
+  /** 未认证 → 去登录页，并记住回来的位置。 */
+  function gotoLogin() {
+    if (redirecting) return;
+    if (window.LOGIN || /^\/login\b/.test(window.location.pathname)) return;  // 已在登录页
+    redirecting = true;
+    var next = window.location.pathname + window.location.search;
+    window.location.replace(AUTH_PREFIX.replace(/\/api\/auth$/, "") + "/login?next=" + encodeURIComponent(next));
   }
 
   async function request(path, opts) {
@@ -169,31 +143,27 @@
       var s = qs.toString();
       if (s) url += (url.indexOf("?") >= 0 ? "&" : "?") + s;
     }
-    var init = { method: opts.method || "GET", headers: {} };
+    var method = (opts.method || "GET").toUpperCase();
+    // 同源 cookie 必须显式带上：fetch 默认就是 same-origin，这里写明是为了让
+    // 「靠 cookie 认证」这件事在代码里看得见，而不是一个隐含默认值。
+    var init = { method: method, headers: {}, credentials: "same-origin" };
     if (opts.body !== undefined && opts.body !== null) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(opts.body);
     }
-    var token = getToken();
-    if (token) init.headers["Authorization"] = "Bearer " + token;
+    // 非 GET 一律带 CSRF token（服务端只对会话身份校验；回环/自定义来源带着也无害）。
+    if (CSRF_TOKEN && method !== "GET" && method !== "HEAD" && method !== "OPTIONS") {
+      init.headers["X-CSRF-Token"] = CSRF_TOKEN;
+    }
 
     var res = await fetch(url, init);
 
-    // 401 = 服务端开了鉴权而我们没带（或带错了）口令。问一次、存下来、原样重试。
-    if (res.status === 401 && !opts._retried && !opts.silent && !tokenAsked) {
-      tokenAsked = true;
-      var entered = await askToken(
-        token
-          ? "当前保存的口令被服务端拒绝了（可能已改过）。请输入新的 FISSUE_API_TOKEN。"
-          : "这个服务开启了鉴权（api.auth_required=true），浏览器请求必须带上 FISSUE_API_TOKEN。" +
-            "口令只存在本浏览器里。"
-      );
-      if (entered) {
-        setToken(entered);
-        toast("口令已保存，正在重试刚才那一步。", "info", { timeout: 4000 });
-        return request(path, Object.assign({}, opts, { _retried: true }));
-      }
-      tokenAsked = false;      // 用户取消了：允许下次再问
+    // 401 = 没有有效会话（或 Key 失效）。浏览器唯一能做的是去登录——**不再弹框要口令**。
+    // 403 不跳：它可能是只读模式、CSRF 失败、或来源被拒，那些都该在原页面说清楚。
+    if (res.status === 401) {
+      if (opts.silent) throw new ApiError("未认证：需要登录。", 401, null);
+      gotoLogin();
+      throw new ApiError("未认证：正在跳转到登录页…", 401, null);
     }
 
     var payload = null;
@@ -204,6 +174,14 @@
     }
     if (!res.ok) throw new ApiError(errorText(res.status, payload), res.status, payload);
     return payload;
+  }
+
+  /** 登出：清会话 cookie 后回登录页。 */
+  async function logout() {
+    try {
+      await fetch(AUTH_PREFIX + "/logout", { method: "POST", credentials: "same-origin" });
+    } catch (e) { /* 网络失败也照样跳：本地的会话状态已经不该继续用了 */ }
+    window.location.replace("/login");
   }
 
   // ---------------------------------------------------------------------
@@ -525,14 +503,14 @@
     var box = document.getElementById("live-box");
     if (!box) return null;
     try {
-      // silent：角标每几秒拉一次，不能弹口令框（否则设了口令的部署会一直被弹）。
-      // 401 时在角标上直说「需要口令」，由用户点任一操作时再问。
+      // silent：角标每几秒拉一次，401 时不能触发跳转（否则页面会在用户打字时被抢走）。
+      // 未登录时的正常路径是「页面守卫直接 303 到 /login」，走到这里说明会话刚过期。
       var st = await request("/status", {silent: true});
       return renderLive(box, st);
     } catch (err) {
       box.dataset.state = "error";
-      setText("live-text", err.status === 401 ? "需要访问口令" : "状态读取失败");
-      setText("live-sub", err.status === 401 ? "点任一操作会提示输入 FISSUE_API_TOKEN" : err.message);
+      setText("live-text", err.status === 401 ? "会话已过期" : "状态读取失败");
+      setText("live-sub", err.status === 401 ? "刷新页面会重新登录" : err.message);
       return null;
     }
   }
@@ -559,12 +537,16 @@
     kindLabel: kindLabel,
     statusClass: statusClass,
     pollStatus: pollStatus,
+    logout: logout,
     readOnly: READ_ONLY,
   };
 
   document.addEventListener("DOMContentLoaded", function () {
     startLiveBadge();
     wireSelectAll();
+    // 登出按钮只在 base.html 判断「当前是会话身份」时才渲染出来；这里无脑接一下。
+    var logoutBtn = document.getElementById("logout-btn");
+    if (logoutBtn) logoutBtn.addEventListener("click", logout);
     // 取消按钮在所有页面上共用这一处接线（总览的任务面板与「任务」页都用 data-act=cancel-job）。
     document.addEventListener("click", function (e) {
       var btn = e.target && e.target.closest ? e.target.closest("button[data-act=cancel-job]") : null;

@@ -8,8 +8,12 @@
   ``web.allow_repo_management``」，但那个开关背后没有任何路由——属于「配置写了却
   不生效」，已随 P2 清理一并删除（要做得另开一个特性，而不是留个空开关）。
 
-鉴权：``api.auth_required=true`` 时所有 ``/api`` 请求必须带
-``Authorization: Bearer <FISSUE_API_TOKEN>``。
+鉴权（docs/AUTH.md）
+--------------------
+三种来源互为「或」：**回环**、**可信网段**（``web.trusted_networks``）免登录；
+其余来源必须持有会话 cookie 或 ``Authorization: Bearer <API Key>``。
+判定与路由都在 :mod:`fissue.web.auth`，本模块只负责把它接到应用上，
+并把「写操作的两道补刀」更新成按身份判定。
 """
 
 from __future__ import annotations
@@ -36,9 +40,10 @@ from ..errors import FissueError
 from ..lockfile import WRITE_GATE, single_flight
 from ..logging_setup import get_logger, setup_logging
 from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueName
+from .auth import AUTH_PREFIX, page_guard_middleware
+from .auth import register as register_auth
 from .hooks import parse_event, signature_ok
 from .jobs import Job, JobRegistry
-from .setup import FORWARD_HEADERS as _FORWARD_HEADERS
 from .status import collect as collect_status
 from .status import queue_panel
 
@@ -149,33 +154,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """构造 FastAPI 应用。"""
     st = settings or load_settings()
     setup_logging(st.app.log_level)
-    if st.api.enabled and not st.api.auth_required:
-        # 为什么告警在这里发：这里才是「即将对外提供 API」的那一刻，而 `Settings._validate`
-        # 是每条命令都会走的构造期路径。（这条告警曾经打坏过 `fissue status --json` 的输出，
-        # 根因是日志写到了 stdout；已在 `logging_setup` 修正为一律 stderr。）
-        #
-        # 为什么必须提醒：启动检查只能看**绑定地址**，看不见反向代理——`web.host=127.0.0.1`
-        # + 同机 nginx 转到本端口时，无鉴权的写控制面（打平台标签、推进修复队列）照样对外。
-        # 拦不了（拦了「绑本机、不开 token」这个默认用法就没了），但必须说清。
-        log.warning(
-            "未启用 API 鉴权（未设 FISSUE_API_TOKEN）：写操作入口（%s/queues/flush、"
-            "%s/actions/*）对本机任何进程开放；若在本端口前挂了反向代理，等于把它一并"
-            "开放出去。要对外提供服务请务必设置 FISSUE_API_TOKEN。",
-            st.api.prefix,
-            st.api.prefix,
-        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 启动时确保表存在，并持有数据库连接
         from ..store.db import build_database
         from ..store.repository import Repository
+        from .auth import AuthStore, migrate_legacy_token, warn_if_unprovisioned
 
         database = build_database(st)
         database.create_all()
         app.state.settings = st
         app.state.db = database
         app.state.repo = Repository(database)
+        # 鉴权是**启动期**就要就位的：旧口令一次性迁移（docs/AUTH.md §7），
+        # 以及「还没有管理员账号」时生成引导口令并打印（§3.4）。
+        # 两件都放在这里而不是请求期：它们每次进程启动只该发生一次。
+        store = AuthStore(database)
+        migrate_legacy_token(st, store)
+        warn_if_unprovisioned(st, store)
         log.info("Web/API 已就绪（只读=%s，API 前缀=%s）", st.web.read_only, st.api.prefix)
         yield
         # 先把在跑的作业收掉，再关日志：作业里可能正握着 flock 或占着沙盒目录，
@@ -200,6 +197,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 静态资源：样式与脚本从两个页面里抽出来放这里（原先各内联一份，改一处漏一处）。
     application.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    # 页面守卫放最外层（中间件先于路由）：未认证的页面加载直接 303 到 /login，
+    # 而不是渲染一个处处报错的看板。`/api/*` 不受它影响（必须能返回结构化的 401/403，
+    # 前端要靠状态码决定行为），`/static/*` 也必须放行——登录页的样式就在这里。
+    @application.middleware("http")
+    async def _guard_pages(request: Request, call_next: Any) -> Any:
+        return await page_guard_middleware(request, call_next)
+
     _register_api(application, st)
     # 配置写入类端点（仓库管理 / 设置 / 初始化向导）住在 web/setup.py：
     # 它们与 /actions/* 是**两类不同的写**（后者写外部平台，前者写本机配置），
@@ -207,6 +211,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .setup import register as register_setup
 
     register_setup(application, st, auth=_auth_dependency())
+    # 会话/API Key 的端点与 /login 页：挂在固定的 `/api/auth` 下，**不随 api.prefix**，
+    # 也不受 api.enabled 影响——登录不该因为「业务 API 关了」而一起消失。
+    register_auth(application, st)
     _register_web(application, st, templates)
     return application
 
@@ -219,24 +226,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def _auth_dependency():
     """鉴权依赖。
 
-    原先签名上带一个 `settings` 参数，但函数体里读的是**每次请求当下**的 settings
-    （见下方注释）——那个参数从来没被用过，留着只会让人以为「鉴权是注册时捕获的」。
-    """
-    async def check(request: Request) -> None:
-        # 读**当前**的 settings，而不是注册时捕获的那个对象：设置页改了口令会热重载
-        # （web/setup.py::reload_state），这里若还盯着旧对象，新口令就得等重启才生效——
-        # 而「改完口令立刻要能登进去」正是用户唯一的预期。
-        st = _settings(request)
-        if not st.api.auth_required:
-            return
-        header = request.headers.get("authorization", "")
-        token = st.api.token
-        if not token:
-            raise HTTPException(status_code=500, detail="服务端未配置 FISSUE_API_TOKEN")
-        if not header.lower().startswith("bearer ") or header[7:].strip() != token:
-            raise HTTPException(status_code=401, detail="未授权")
+    实现整体搬到 :mod:`fissue.web.auth`（它同时服务 ``/api/v1/*`` 与配置写入端点），
+    这里只保留这个入口名——`_register_api` 与 `register_setup` 都在用它，
+    而「鉴权只有一处实现」这个约束比少一个转发函数重要。
 
-    return check
+    依赖内部**每次请求现取 settings 与数据库**，不缓存：设置页改完会热重载
+    （web/setup.py::reload_state），闭包里那份是启动时的旧对象。
+    """
+    from .auth import require_auth_dependency
+
+    return require_auth_dependency()
 
 
 def _require_writable(settings: Settings) -> None:
@@ -244,40 +243,44 @@ def _require_writable(settings: Settings) -> None:
         raise HTTPException(status_code=403, detail="当前为只读模式（web.read_only=true）")
 
 
-#: 反向代理常见的转发头。无鉴权时见到它们就拒绝写请求——见 :func:`_reject_proxied_write`。
+#: 反向代理常见的转发头。见到它们就拒绝**未认证**的写请求——见 :func:`_reject_proxied_write`。
 #: 判据的**唯一定义**在 setup.py（`FORWARD_HEADERS`）：两处各留一份迟早会分叉
 #: （原先这里多一个 `forwarded`，于是同一件事在两处得到相反结论）。
 
 
 def _reject_proxied_write(request: Request, settings: Settings) -> None:
-    """未启用鉴权时，拒绝「看起来经过了反向代理」的写请求。
+    """拒绝「经过反向代理且未认证」的写请求。
 
     ``Settings._validate`` 只能看**绑定地址**，因此 ``web.host=127.0.0.1`` + 同机 nginx
-    反代到本端口时，无鉴权的写操作控制面（去平台打标签、把条目推进修复队列）其实已经
-    对外开放，而启动检查看不见这一半。这里见到转发头就拒。
+    反代到本端口时，写操作控制面（去平台打标签、把条目推进修复队列）在 HTTP 层与
+    「本机用户直接访问」无法区分。见到转发头就拒，把常见配置（nginx 的
+    ``proxy_set_header``）从「静默开放」变成「响亮拒绝」。
 
-    必须说清楚边界：**这是补刀，不是安全边界**。边界是 ``FISSUE_API_TOKEN``——同机代理
-    若一个转发头都不设，请求与「本机用户直接访问」在 HTTP 层无法区分，只有令牌能真正
-    兜住。转发头命中只是让常见配置（nginx 的 ``proxy_set_header``）从「静默开放」变成
-    「响亮拒绝」。对端来源见 :func:`_reject_remote_write`，那是另一道。
+    必须说清楚边界：**这是补刀，不是安全边界**。边界是**身份**——同机代理若一个转发头
+    都不设，只有会话/API Key 能真正兜住。判据本身在 :func:`web.auth.forwarded_without_declaration`：
+    已认证、或已声明可信网段时放行（反代正是「对外入口」的常态，要求它不能带转发头是荒谬的），
+    其余情况见到转发头就拒。
     """
-    if settings.api.auth_required:
-        return          # 有鉴权，经不经过代理都无所谓
-    hit = [h for h in _FORWARD_HEADERS if request.headers.get(h)]
+    from .auth import forwarded_without_declaration, resolve_identity
+
+    identity = resolve_identity(request)
+    hit = forwarded_without_declaration(request, settings, identity)
     if hit:
         raise HTTPException(
             status_code=403,
             detail=(
                 f"拒绝写操作：请求带有反向代理转发头（{'、'.join(hit)}），"
-                "而当前未启用 API 鉴权。请设置 FISSUE_API_TOKEN 后再经代理访问。"
+                "但既没有通过认证，也没有声明可信网段。"
+                "请在 /login 登录（或用 API Key），"
+                "若这个控制面确实挂在反向代理后面，请把代理/内网网段写进 web.trusted_networks。"
             ),
         )
 
 
 def _reject_remote_write(request: Request, settings: Settings) -> None:
-    """未启用鉴权时，**来源不是回环**的写请求一律拒绝。
+    """**来源不是回环/可信网段且未认证**的写请求一律拒绝。
 
-    为什么还需要这一道：「对外可达却没鉴权」本来在启动时就会被拒（见 ``Settings._validate``），
+    为什么还需要这一道：「对外可达却没身份机制」本来在启动时就会被拒（见 ``Settings._validate``），
     但那个检查读的是 ``web.host``——**把 ``create_app()`` 嵌进别人的服务器**（或换个
     绑定地址、或经 `docker -p` 之类暴露出去）时，配置里写的仍是 `127.0.0.1`，检查就看不见了。
     这一道直接看**对端地址**，把那种情况兜住。
@@ -285,7 +288,10 @@ def _reject_remote_write(request: Request, settings: Settings) -> None:
     拿不到可解析的对端地址时（测试客户端 ``testclient``、Unix socket 等）不在这里判——
     「不知道」不等于「可疑」，不能因此把本机正常用法也拦掉。
     """
-    if settings.api.auth_required:
+    from .auth import resolve_identity
+
+    identity = resolve_identity(request)
+    if identity.allowed:
         return
     client = request.client
     host = (client.host if client else "") or ""
@@ -297,8 +303,9 @@ def _reject_remote_write(request: Request, settings: Settings) -> None:
         raise HTTPException(
             status_code=403,
             detail=(
-                f"拒绝写操作：请求来自 {host}，不是本机回环地址，而当前未启用 API 鉴权。"
-                "要对外开放请设置 FISSUE_API_TOKEN。"
+                f"拒绝写操作：请求来自 {host}，既不是本机回环/可信网段，也没有通过认证。"
+                "请在该机器上访问 /login 登录（或带上 API Key）；"
+                "若这台机器只有可信网络可达，可把网段写进 web.trusted_networks。"
             ),
         )
 
@@ -427,8 +434,15 @@ def _page_context(request: Request, *, nav: str = "", **extra: Any) -> dict[str,
     ``nav`` **必须给默认值**：base.html 里是 ``{{ nav | tojson }}``，而 Jinja 的 ``tojson``
     序列化一个 ``Undefined`` 会直接抛 ``TypeError``——某个路由忘了传 nav，整个页面就 500。
     默认空串 = 「没有高亮项」，比崩了强。
+
+    ``csrf_token`` / ``identity`` 是 cookie 化鉴权之后新增的：前端要对所有非 GET 请求带上
+    ``X-CSRF-Token``，而它对每个会话都不同（见 docs/AUTH.md §3.5）。**在 Python 侧算好再交给
+    模板**，模板里只做 ``| tojson``——理由同上（``|`` 的优先级坑踩过一次）。
     """
+    from .auth import resolve_identity
+
     settings = _settings(request)
+    identity = resolve_identity(request)
     context: dict[str, Any] = {
         "settings": settings,
         "nav": nav,
@@ -438,6 +452,9 @@ def _page_context(request: Request, *, nav: str = "", **extra: Any) -> dict[str,
         "version": FISSUE_VERSION,
         "static_url": request.url_for("static", path="app.css"),
         "script_url": request.url_for("static", path="app.js"),
+        "identity": identity,
+        "csrf_token": identity.csrf_token,
+        "auth_prefix": AUTH_PREFIX,
     }
     context.update(extra)
     return context

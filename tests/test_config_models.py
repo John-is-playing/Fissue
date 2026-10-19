@@ -85,18 +85,21 @@ def test_repo_name_with_slash_rejected(tmp_path: Path) -> None:
         load_settings(cfg)
 
 
-def test_exposed_api_without_auth_is_refused(tmp_path: Path) -> None:
-    """对外可达 + 启用 API + 无鉴权 → **拒绝启动**（fail-safe）。
+def test_exposed_api_without_any_mechanism_is_refused(tmp_path: Path) -> None:
+    """对外可达 + 启用 API + 既没会话鉴权也没可信网段 → **拒绝启动**（fail-safe）。
 
-    回归：这三者原先能同时成立，而 `/api/*` 里带着**会写外部仓库**的路由（`/api/flush`
-    会真的去平台上打标签、把条目推进修复队列）。`api.auth_required` 默认 false，
-    唯一的保险是「设了 `FISSUE_API_TOKEN` 才自动翻成 true」——于是把 `WEB_HOST` 指向
-    外部（或放到反向代理后面）就等于**把写操作入口对所有人开放**。
+    回归：这几种组合原先能同时成立，而 `/api/*` 里带着**会写外部仓库**的路由
+    （`/api/flush` 会真的去平台上打标签、把条目推进修复队列）。旧版唯一的保险是
+    「设了 `FISSUE_API_TOKEN` 才自动翻成 true」——于是把 `WEB_HOST` 指向外部就等于
+    **把写操作入口对所有人开放**。
+
+    新判据（docs/AUTH.md §3.3）：`web.auth.enabled`（默认 true）**或**
+    `web.trusted_networks` 非空。所以这里必须**显式**关掉鉴权，才谈得上「没机制」。
     """
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
-        yaml.safe_dump({"web": {"host": "0.0.0.0"},
-                        "api": {"enabled": True, "auth_required": False}}),
+        yaml.safe_dump({"web": {"host": "0.0.0.0", "auth": {"enabled": False}},
+                        "api": {"enabled": True}}),
         encoding="utf-8",
     )
     # **必须传一个显式的空 env 文件**：`load_settings(cfg)` 默认会去读仓库的 `.env`，
@@ -105,16 +108,24 @@ def test_exposed_api_without_auth_is_refused(tmp_path: Path) -> None:
     env = tmp_path / "empty.env"
     env.write_text("", encoding="utf-8")
 
-    with pytest.raises(ConfigError, match="FISSUE_API_TOKEN"):
+    with pytest.raises(ConfigError, match="web.auth.enabled"):
         load_settings(cfg, env)
 
 
-def test_loopback_api_without_auth_is_still_allowed(tmp_path: Path) -> None:
-    """只绑本机时不拦——本地开发不该被迫配令牌（别把安全规则做成拦路虎）。"""
+def test_declaring_a_trusted_network_alone_satisfies_the_gate(tmp_path: Path) -> None:
+    """没有会话鉴权，但声明了可信网段 → 放行（内网直连就是这个用法）。"""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
-        yaml.safe_dump({"web": {"host": "127.0.0.1"},
-                        "api": {"enabled": True, "auth_required": False}}),
+        yaml.safe_dump(
+            {
+                "web": {
+                    "host": "0.0.0.0",
+                    "auth": {"enabled": False},
+                    "trusted_networks": ["192.168.1.0/24"],
+                },
+                "api": {"enabled": True},
+            }
+        ),
         encoding="utf-8",
     )
     env = tmp_path / "empty.env"
@@ -122,7 +133,23 @@ def test_loopback_api_without_auth_is_still_allowed(tmp_path: Path) -> None:
 
     s = load_settings(cfg, env)
 
-    assert s.api.enabled and not s.api.auth_required
+    assert s.web.trusted_networks == ["192.168.1.0/24"]
+
+
+def test_loopback_binding_needs_no_mechanism(tmp_path: Path) -> None:
+    """只绑本机时不拦——本地开发不该被迫配任何凭据（别把安全规则做成拦路虎）。"""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump({"web": {"host": "127.0.0.1", "auth": {"enabled": False}},
+                        "api": {"enabled": True}}),
+        encoding="utf-8",
+    )
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+
+    s = load_settings(cfg, env)
+
+    assert s.api.enabled and s.web.auth.enabled is False
 
 
 def test_repo_lookup_helpers(settings: Settings) -> None:
@@ -275,20 +302,30 @@ def test_unknown_config_keys_are_reported_with_a_hint(tmp_path: Path) -> None:
     """拼错的配置键必须能被**指出来**：老键仍不报错，但不能一声不响地忽略。
 
     回归：`load_settings` 把 YAML 直接交给 pydantic，而 pydantic 默认忽略多余键——把
-    `api.auth_required` 写成 `api.auth_requird`、`web.read_only` 写成 `web.readonly`，既不报错
+    `web.auth.enabled` 写成 `web.auth.enabeld`、`web.read_only` 写成 `web.readonly`，既不报错
     也不提示，而这两个都是**安全开关**：用户以为开了，实际按默认跑。
+
+    （这条原先拿 `api.auth_required` 当例子。那个键已被 `web.auth.enabled` 取代——
+    鉴权总开关从「API 的布尔量」搬到了「Web 的会话鉴权」名下，见 docs/AUTH.md §3.3。）
     """
     from fissue.config import _unknown_config_keys, load_settings
 
     found = dict(
-        _unknown_config_keys({"api": {"auth_requird": True}, "web": {"readonly": True}, "nope": 1})
+        _unknown_config_keys(
+            {"web": {"readonly": True, "auth": {"enabeld": True}}, "nope": 1}
+        )
     )
-    assert set(found) == {"api.auth_requird", "web.readonly", "nope"}
-    assert "auth_required" in found["api.auth_requird"], "要给「你是不是想写…」的候选"
+    assert set(found) == {"web.readonly", "nope", "web.auth.enabeld"}
+    assert "enabled" in found["web.auth.enabeld"], "要给「你是不是想写…」的候选"
     assert "read_only" in found["web.readonly"]
 
     # 既有契约：老配置里的残留键（已删除的字段）仍**不报错**，只是会被忽略
     assert _unknown_config_keys({"auto_fix": {"pr_strategy": {"mode": "fork"}}, "repos": []}) == []
+    # 旧版的 `api.auth_required` / `api.token` 就这么个「被删掉的键」：留着它不该让加载失败，
+    # 但要被**指出来**（它在 load_settings 里走一条专门的迁移提示，见 `_legacy_auth_keys`）
+    legacy = dict(_unknown_config_keys({"api": {"auth_required": True, "token": "x"}}))
+    assert set(legacy) == {"api.auth_required", "api.token"}
+    assert "enabled" in legacy["api.auth_required"]
 
     # 端到端：带未知键的配置照旧能加载（不报错），未知键按默认值走
     cfg = tmp_path / "c.yaml"

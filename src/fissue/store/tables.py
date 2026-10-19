@@ -317,3 +317,82 @@ class NotificationRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("dedup_key", name="uq_notification_dedup"),)
+
+
+# ---------------------------------------------------------------------------
+# 鉴权（见 docs/AUTH.md §4）
+# ---------------------------------------------------------------------------
+#
+# 三张都是**新表**，`create_all` 直接建，不需要迁移脚本。
+#
+# 为什么不与业务表建外键：`sessions.user_id` 只指向 `auth_users`（同一套鉴权内部），
+# 而鉴权数据与「条目/评测」那条流水线**没有任何主外键关系**——这样 `fissue auth reset`
+# 能在业务表都还不存在的新库上工作。
+
+
+class AuthUserRow(Base):
+    """登录账号。
+
+    先支持**单管理员**（docs/AUTH.md §12 决策 3），但字段按多用户设计：用户名唯一、
+    每行独立的 TOTP 密钥与恢复码。将来要加 RBAC，是加一列而不是换表。
+    """
+
+    __tablename__ = "auth_users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    #: `pbkdf2_sha256$<iters>$<salt>$<hash>`（格式见 `fissue.auth.crypto`）。
+    password_hash: Mapped[str] = mapped_column(Text, default="")
+    #: TOTP 密钥（base32）。`totp_enabled=false` 时这里可以是「待激活」的密钥。
+    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: 恢复码**只存哈希**，用掉一个就从列表里删一个。
+    recovery_code_hashes: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class SessionRow(Base):
+    """浏览器会话。
+
+    ``id`` 即 cookie 里那串（另加 HMAC 签名，见 `fissue.auth.crypto.sign_value`）——
+    库里存**原始 id**，签名只用于在本地快速打回伪造 cookie，不参与身份判定。
+    """
+
+    __tablename__ = "sessions"
+
+    #: 32 字节随机（`token_urlsafe`），不是自增整数：主键本身不该可猜。
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("auth_users.id", ondelete="CASCADE"), index=True
+    )
+    #: 双提交 CSRF：写请求必须带上它（见 docs/AUTH.md §3.5）。
+    csrf_token: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: 审计用：谁在用、从哪来。两列都截断存（User-Agent 可以任意长）。
+    user_agent: Mapped[str] = mapped_column(String(255), default="")
+    peer_ip: Mapped[str] = mapped_column(String(64), default="")
+
+
+class ApiKeyRow(Base):
+    """对外接口用的长期凭据。
+
+    ``prefix`` 是**公开**标识（列表里显示、按它查表），``key_hash`` 是 ``sha256(完整明文)``。
+    明文只在创建那一刻回一次，之后库里再也拿不到它——所以「忘记 Key」只能吊销重建，
+    这是有意的，不是缺陷。
+    """
+
+    __tablename__ = "api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), default="")
+    prefix: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    key_hash: Mapped[str] = mapped_column(String(128), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: 非空 = 已吊销。**软删**而不是删行：审计要看得见「这把曾经存在、何时失效」。
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

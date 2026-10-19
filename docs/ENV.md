@@ -233,36 +233,49 @@ FISSUE_GITLAB_TOKEN=
 
 ### 3.5 Web / API
 
-#### `FISSUE_API_TOKEN` —— 访问令牌
+#### Web / API 鉴权（**不是一个环境变量**）
 
-**填了 = 自动开启鉴权**（无需再改 `config.yaml`）：所有 `/api/*` 请求必须带
+> 旧版的 `FISSUE_API_TOKEN`（单一全局口令）已被**会话登录 + 多 API Key** 整体替换，
+> 完整设计见 [AUTH.md](./AUTH.md)。口令、TOTP 密钥、API Key 哈希都存在**数据库**里，
+> 配置项在 `config.yaml` 的 `web.auth` 段（可在「设置」页改）。
 
-```
-Authorization: Bearer <你的token>
-```
+三种身份来源互为「或」：
 
-**留空 = 不鉴权**，仅适合本机。
+| 来源 | 适用 | 怎么用 |
+|---|---|---|
+| **回环** | 本机 | 永远免登录——本机打开 `http://127.0.0.1:8000/` 即可 |
+| **可信网段** | 内网 | 把内网写进 `web.trusted_networks`（如 `["192.168.1.0/24"]`），视同回环：免登录、可写配置 |
+| **会话 / API Key** | 其余（含对外） | 浏览器在 `/login` 登录；脚本用 `Authorization: Bearer fissue_<prefix>_<secret>` |
+
+首次启动且**没有管理员账号**时，控制台会打印一条一次性引导口令（同时写在
+`data/auth-bootstrap-token`，0600）：本机访问 `/login` 可直接初始化；从别的机器访问则要带上它，
+**用后即焚**。
 
 ```bash
-# 生成一个强随机串
-python -c "import secrets; print(secrets.token_urlsafe(32))"
+# 本机初始化（无需引导口令）
+# 浏览器打开 http://127.0.0.1:8000/login
+
+# 从别的机器初始化 / 或口令忘了，在服务器上自救
+fissue auth status                  # 看有没有账号、引导口令是什么
+fissue auth set-password            # 设/改口令（会注销该账号全部会话）
+fissue auth reset                   # 清 2FA 与恢复码（手机丢了用这个）
+fissue auth key create --name ci    # 建一把 API Key（明文只显示这一次）
 ```
 
-```bash
-FISSUE_API_TOKEN=Kx7vQ2mN8pL4wR9tY6uZ3sD5fG1hJ0aB
-```
-
-> 对外暴露（`--host 0.0.0.0`）时**务必**填上，否则任何人都能触发修复与提 PR。
+> 对外暴露（`--host 0.0.0.0`）时，**`web.auth.enabled` 保持默认的 `true`** 即可，
+> 不会再看到旧版那条「没有鉴权」的启动报错。真正危险的是**显式关掉它、又不声明可信网段**——
+> 那种组合配置层会直接拒绝启动（fail-closed）。
 >
-> 注意：`/api/v1/health` 与网页本身不需要鉴权；网页上的操作按钮走 API，
-> 浏览器不会自动带 Token，所以对外开启鉴权后请用 API 而非网页按钮。
+> 反向代理：CIDR 判定**只看真实对端地址**，默认**不信任** `X-Forwarded-For`。所以
+> 「绑 127.0.0.1 + 同机 nginx 转出去」时，请把代理/内网网段写进 `web.trusted_networks`
+> 显式声明，否则带转发头的写请求会被 403 拦下（那是补刀，不是边界）。
 
 #### `FISSUE_WEB_HOST` / `FISSUE_WEB_PORT`
 
 | 值 | 含义 |
 |---|---|
 | `127.0.0.1`（默认） | 仅本机可访问，最安全 |
-| `0.0.0.0` | 所有网卡可访问，**需配 `FISSUE_API_TOKEN`** |
+| `0.0.0.0` | 所有网卡可访问，**需有身份机制**：默认的 `web.auth.enabled=true` 已满足（内网可再声明 `web.trusted_networks` 免登录） |
 
 ```bash
 FISSUE_WEB_HOST=127.0.0.1
@@ -421,7 +434,7 @@ fissue fetch --repo psf/requests --limit 1
 | `FISSUE_GITEE_TOKEN` | | 空 | Gitee 访问 |
 | `FISSUE_ATOMGIT_TOKEN` | | 空 | AtomGit 访问 |
 | `FISSUE_GITLAB_TOKEN` | | 空 | GitLab 访问 |
-| `FISSUE_API_TOKEN` | | 空（不鉴权） | Web/API 访问令牌 |
+| ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：单一访问口令被会话 + API Key 替换（见 [AUTH.md](./AUTH.md)）。留着旧值不会报错，启动时会自动导入成一条 API Key（prefix=`legacy`） |
 | `FISSUE_WEB_HOST` | | `127.0.0.1` | 监听地址 |
 | `FISSUE_WEB_PORT` | | `8000` | 监听端口 |
 | `FISSUE_SANDBOX_RUNNER_SOCKET` | | 空（inline） | 沙盒转发组件 socket |

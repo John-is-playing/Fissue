@@ -242,20 +242,50 @@ def test_webhook_rejects_unknown_platform_and_bad_json(hook_client) -> None:
     assert r.status_code == 400
 
 
-def test_webhook_works_behind_api_auth_without_a_bearer_token(hook_client, settings) -> None:
-    """**这是这个端点的设计要点**：平台不会带 bearer 令牌，所以它在鉴权开启时也要照常工作。
+def _seed_admin(settings) -> None:
+    """给这个库造一个管理员账号。
 
-    而普通 API 路由在同样设置下必须要求令牌——两条一起断言，免得将来有人「顺手」给 webhook
-    挂上 `Depends(auth)`，把真实部署（尤其挂了反代）变成永远收不到推送。
+    为什么这几条用例非造不可：「还没初始化（没有管理员）」与「你有身份但没带」是**两种**
+    状态——前者回 403 + 引导口令指引（登录也不可能成功），后者回 401（去登录就行）。
+    不造账号时测到的是前者，断言 401 会失败，而那个失败看着像鉴权坏了。
     """
-    settings.api.auth_required = True
-    settings.api.token = "api-token"
+    from fissue.auth import AuthStore, hash_password
+    from fissue.store.db import build_database
 
+    database = build_database(settings)
+    database.create_all()
+    AuthStore(database).create_user("admin", hash_password("s3cret-pass"))
+
+
+def test_webhook_works_without_an_identity_on_a_remote_peer(settings, repo, monkeypatch) -> None:
+    """**这是这个端点的设计要点**：平台推送时既没有会话、也不会带 Bearer 令牌，
+    所以它在鉴权开启、且来源是外网时也必须照常工作。
+
+    这里必须用**非回环**来源来断言：回环本来就免登录，拿它测不出「webhook 有没有被例外放行」。
+    而普通 API 路由在同样条件下必须要求身份——两条一起断言，免得将来有人「顺手」给
+    webhook 挂上 `Depends(REQUIRE_AUTH)`，把真实部署（尤其挂了反代）变成永远收不到推送。
+    """
+    from fastapi.testclient import TestClient
+
+    from fissue.service.daemon import FissueService
+    from fissue.web.app import create_app
+
+    _seed_admin(settings)
+    settings.webhooks.enabled = True
+    settings.webhooks.secrets.github = "hook-secret"
+
+    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+        return {}
+
+    monkeypatch.setattr(FissueService, "run_once", fake_round)
     body = _github_payload()
-    r = hook_client.post("/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body))
-    assert r.status_code == 202, r.text
+    with TestClient(create_app(settings), client=("203.0.113.9", 4321)) as remote:
+        r = remote.post(
+            "/api/v1/webhooks/github", content=body, headers=_github_headers("hook-secret", body)
+        )
+        assert r.status_code == 202, r.text
 
-    assert hook_client.get("/api/v1/items").status_code == 401, "普通 API 路由仍必须要求令牌"
+        assert remote.get("/api/v1/items").status_code == 401, "普通 API 路由仍必须要求身份"
 
 
 def test_webhook_accepts_a_gitlab_token_header(hook_client, settings) -> None:
@@ -391,16 +421,35 @@ def test_item_page_404(client) -> None:
 
 
 def test_auth_required(settings) -> None:
+    """授权矩阵：回环免登录；非回环必须有会话或 API Key（docs/AUTH.md §3.1）。"""
     from fastapi.testclient import TestClient
 
+    from fissue.auth import AuthStore, generate_api_key, hash_token
+    from fissue.store.db import build_database
+
     s = settings.model_copy(deep=True)
-    s.api.auth_required = True
-    s.api.token = "s3cret"
-    with TestClient(create_app(s)) as c:
-        assert c.get("/api/v1/health").status_code == 200        # health 不需要鉴权
-        assert c.get("/api/v1/stats").status_code == 401
-        assert c.get("/api/v1/stats", headers={"Authorization": "Bearer wrong"}).status_code == 401
-        assert c.get("/api/v1/stats", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    _seed_admin(s)
+    database = build_database(s)
+    database.create_all()
+    store = AuthStore(database)
+    prefix, secret, plaintext = generate_api_key()
+    store.create_key(name="ci", prefix=prefix, key_hash=hash_token(secret))
+
+    with TestClient(create_app(s)) as local:
+        # health 无副作用，任何来源都免鉴权（探活要用它）
+        assert local.get("/api/v1/health").status_code == 200
+        # 回环：三种来源里最省事的那个，免登录
+        assert local.get("/api/v1/stats").status_code == 200
+
+    with TestClient(create_app(s), client=("203.0.113.9", 4321)) as remote:
+        assert remote.get("/api/v1/health").status_code == 200
+        assert remote.get("/api/v1/stats").status_code == 401, "没有身份的对外请求一律拒绝"
+        assert remote.get(
+            "/api/v1/stats", headers={"Authorization": "Bearer wrong"}
+        ).status_code == 401
+        assert remote.get(
+            "/api/v1/stats", headers={"Authorization": f"Bearer {plaintext}"}
+        ).status_code == 200
 
 
 def test_read_only_blocks_actions(settings, repo, sample_issue) -> None:
@@ -488,13 +537,14 @@ def test_api_disabled_registers_no_rest_routes(settings) -> None:
 
 
 def test_write_endpoint_rejects_proxied_unauthenticated_request(client) -> None:
-    """未开鉴权时，带反向代理转发头的写请求必须被拒。
+    """带反向代理转发头、又没有声明可信网段的写请求必须被拒。
 
     回归：`Settings._validate` 只能看**绑定地址**，所以 `web.host=127.0.0.1` + 同机 nginx
-    反代到本端口时，无鉴权的写控制面（打平台标签、推进修复队列）其实已经对外开放。
-    见到转发头就 403，把「静默开放」变成「响亮拒绝」。
+    反代到本端口时，写控制面（打平台标签、推进修复队列）其实已经对外开放。见到转发头就 403，
+    把「静默开放」变成「响亮拒绝」。
 
-    注意这是补刀、不是边界：真正的边界是 `FISSUE_API_TOKEN`。
+    注意这是补刀、不是边界：真正的边界是**身份**（会话或 API Key）。这条对**回环来源**
+    同样生效，而且正是它的主场——反代后面时，对端地址就是 127.0.0.1。
     """
     r = client.post(
         "/api/v1/queues/flush",
@@ -502,7 +552,7 @@ def test_write_endpoint_rejects_proxied_unauthenticated_request(client) -> None:
         headers={"X-Forwarded-For": "203.0.113.7"},
     )
     assert r.status_code == 403, r.text
-    assert "FISSUE_API_TOKEN" in r.text
+    assert "反向代理" in r.text
 
     # 读接口不受影响（只读，没有副作用）
     assert client.get("/api/v1/stats", headers={"X-Forwarded-For": "203.0.113.7"}).status_code == 200
@@ -525,20 +575,23 @@ def test_write_endpoint_409_when_another_writer_holds_the_gate(client, monkeypat
 
 
 def test_write_endpoint_rejects_a_remote_peer_when_unauthenticated(settings, repo) -> None:
-    """未开鉴权时，**来源不是回环**的写请求一律 403。
+    """**来源不是回环/可信网段**且没有身份的写请求一律 403。
 
     启动检查读的是 `web.host`，把 `create_app()` 嵌进别人的服务器（或换绑定地址、经
-    `docker -p` 暴露）时它看不见；这一道直接看对端地址，把那种情况兜住。读接口不受影响。
+    `docker -p` 暴露）时它看不见；这一道直接看对端地址，把那种情况兜住。读接口同样要求身份
+    （`/api/*` 一律过鉴权依赖），而 `/health` 免鉴权。
     """
     from fastapi.testclient import TestClient
 
     from fissue.web.app import create_app
 
+    _seed_admin(settings)
     with TestClient(create_app(settings), client=("203.0.113.9", 4321)) as c:
         r = c.post("/api/v1/queues/flush", json={"queue": "verify", "force": True})
-        assert r.status_code == 403, r.text
-        assert "FISSUE_API_TOKEN" in r.text
-        assert c.get("/api/v1/stats").status_code == 200, "只读接口不受影响"
+        assert r.status_code == 401, r.text
+        assert "/login" in r.text, "要把「怎么才能进」说清楚"
+        assert c.get("/api/v1/stats").status_code == 401
+        assert c.get("/api/v1/health").status_code == 200
 
 
 def test_write_endpoint_allows_an_unparseable_peer(client) -> None:

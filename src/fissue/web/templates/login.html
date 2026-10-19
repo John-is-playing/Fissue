@@ -1,0 +1,264 @@
+{# 登录页（独立渲染，**不**套 base.html）。
+ #
+ # 为什么独立：左侧导航的每一条链接在登录前都是 401——套上去等于把用户引到死路。
+ # 这一页只需要「一个卡片 + 两步表单」。
+ #
+ # 两步（口令 → 2FA）在**同一页**里切换：#login-step / #twofa-step / #bootstrap-step
+ # 三个块显隐。不做三个路由，是因为「输到一半刷新回到第一步」比多写几行 JS 更烦人。
+ #
+ # 所有变量由 web/auth.py::login_page 传进来，模板里只做 `| tojson`——
+ # 不做 `a if b else c | tojson` 这种条件表达式（`|` 只作用于 else 分支，踩过）。
+ #}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · Fissue</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔍</text></svg>">
+<link rel="stylesheet" href="{{ static_url }}">
+<style>
+  /* 登录页是独立布局：不套 .shell 的左右两栏，居中一张卡片即可。 */
+  body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .login-card { width: 380px; max-width: 92vw; }
+  .login-card h1 { margin: 0 0 4px; font-size: 22px; }
+  .login-card .ver { color: var(--muted); font-size: 12px; }
+  .login-card .panel { margin-top: 18px; }
+  .login-card input { width: 100%; }
+  .login-card .field { margin-bottom: 12px; }
+  .login-card .field label { display: block; margin-bottom: 4px; font-size: 13px; color: var(--muted); }
+  .login-actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+  .login-err { color: var(--danger, #d64545); font-size: 13px; margin-top: 8px; min-height: 18px; }
+  .login-hint { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.6; }
+  .secret {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    background: rgba(127,127,127,.14);
+    padding: 2px 6px; border-radius: 4px; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+<div class="login-card">
+  <h1>Fissue</h1>
+  <div class="ver">v{{ version }} · Web 控制台</div>
+
+  {# ---- 第一步：用户名 + 口令 ---- #}
+  <div class="panel" id="login-step" hidden>
+    <h2>登录</h2>
+    <form id="login-form" autocomplete="on">
+      <div class="field">
+        <label for="username">用户名</label>
+        <input type="text" id="username" name="username" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="password">口令</label>
+        <input type="password" id="password" name="password" autocomplete="current-password" required>
+      </div>
+      <div class="login-actions">
+        <button class="primary" type="submit" id="login-btn">登录</button>
+        <span class="muted small" id="login-wait"></span>
+      </div>
+      <div class="login-err" id="login-err"></div>
+    </form>
+  </div>
+
+  {# ---- 第二步：TOTP / 恢复码 ---- #}
+  <div class="panel" id="twofa-step" hidden>
+    <h2>两步验证</h2>
+    <div class="muted small">输入认证器 App 里的 6 位验证码；也可以直接填一个恢复码。</div>
+    <form id="twofa-form" style="margin-top:12px">
+      <div class="field">
+        <label for="code">验证码 / 恢复码</label>
+        <input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
+      </div>
+      <div class="login-actions">
+        <button class="primary" type="submit" id="twofa-btn">验证并登录</button>
+        <button type="button" class="ghost" id="twofa-back">返回</button>
+      </div>
+      <div class="login-err" id="twofa-err"></div>
+    </form>
+  </div>
+
+  {# ---- 首次引导：还没有管理员账号 ---- #}
+  <div class="panel" id="bootstrap-step" hidden>
+    <h2>初始化管理员</h2>
+    <div class="muted small">
+      这台服务还没有管理员账号。创建后即可用它登录——引导口令**用后即焚**。
+    </div>
+    <form id="bootstrap-form" style="margin-top:12px">
+      <div class="field" id="bootstrap-token-field" hidden>
+        <label for="bootstrap-token">引导口令</label>
+        <input type="password" id="bootstrap-token" autocomplete="off" placeholder="控制台打印的那串">
+        <div class="login-hint">
+          它写在服务器的 <code class="secret">data/auth-bootstrap-token</code>，
+          启动日志里也打印过一次。
+        </div>
+      </div>
+      <div class="field">
+        <label for="new-username">管理员用户名</label>
+        <input type="text" id="new-username" value="admin" autocomplete="username" required>
+      </div>
+      <div class="field">
+        <label for="new-password">设置口令（至少 8 位）</label>
+        <input type="password" id="new-password" autocomplete="new-password" required>
+      </div>
+      <div class="login-actions">
+        <button class="primary" type="submit" id="bootstrap-btn">创建并登录</button>
+      </div>
+      <div class="login-err" id="bootstrap-err"></div>
+    </form>
+  </div>
+
+  <div class="login-hint" id="trusted-hint" hidden></div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+  window.FISSUE = {
+    apiPrefix: {{ api_prefix | tojson }},
+    authPrefix: {{ auth_prefix | tojson }},
+    csrfToken: ""
+  };
+  window.LOGIN = {
+    noAdmin: {{ no_admin | tojson }},
+    tokenRequired: {{ bootstrap_token_required | tojson }},
+    trusted: {{ trusted_source | tojson }},
+    next: {{ next | tojson }}
+  };
+</script>
+<script>
+(function () {
+  "use strict";
+  var AUTH = window.FISSUE.authPrefix;
+  var NEXT = window.LOGIN.next || "/";
+  var challenge = "";
+
+  function $(id) { return document.getElementById(id); }
+  function show(step) {
+    ["login-step", "twofa-step", "bootstrap-step"].forEach(function (id) {
+      $(id).hidden = (id !== step);
+    });
+    var focus = step === "login-step" ? "username"
+      : step === "twofa-step" ? "code" : "new-username";
+    var el = $(focus);
+    if (el) el.focus();
+  }
+  function err(id, text) {
+    $(id).textContent = text || "";
+  }
+  function busy(btn, id, on, text) {
+    btn.disabled = on;
+    $(id).textContent = on ? (text || "处理中…") : "";
+  }
+
+  /** 统一发请求：把 FastAPI 的 detail 抽出来，前端只显示一句人话。 */
+  function post(path, body) {
+    return fetch(AUTH + path, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(body || {})
+    }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (!res.ok) {
+          var detail = data && data.detail;
+          if (detail && typeof detail !== "string") detail = JSON.stringify(detail);
+          throw new Error(detail || ("HTTP " + res.status));
+        }
+        return data || {};
+      });
+    });
+  }
+
+  function afterLogin(data) {
+    // 登录成功后立刻跳回原页面（`?next=` 带的那个）。
+    if (data && data.note) { /* 目前没有需要展示的附加信息 */ }
+    window.location.replace(NEXT || "/");
+  }
+
+  $("login-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var btn = $("login-btn");
+    err("login-err", "");
+    busy(btn, "login-wait", true, "校验中…（PBKDF2 需要一点时间）");
+    post("/login", {username: $("username").value, password: $("password").value})
+      .then(function (data) {
+        busy(btn, "login-wait", false);
+        if (data.requires_2fa) {
+          challenge = data.challenge;
+          show("twofa-step");
+          return;
+        }
+        afterLogin(data);
+      })
+      .catch(function (ex) {
+        busy(btn, "login-wait", false);
+        err("login-err", ex.message);
+      });
+  });
+
+  $("twofa-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var btn = $("twofa-btn");
+    err("twofa-err", "");
+    busy(btn, "login-wait", true);
+    post("/2fa", {challenge: challenge, code: $("code").value})
+      .then(afterLogin)
+      .catch(function (ex) {
+        busy(btn, "login-wait", false);
+        err("twofa-err", ex.message);
+      });
+  });
+  $("twofa-back").addEventListener("click", function () {
+    challenge = "";
+    err("twofa-err", "");
+    show("login-step");
+  });
+
+  $("bootstrap-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var btn = $("bootstrap-btn");
+    err("bootstrap-err", "");
+    busy(btn, "login-wait", true, "创建中…");
+    post("/bootstrap", {
+      bootstrap_token: $("bootstrap-token").value,
+      username: $("new-username").value,
+      password: $("new-password").value
+    })
+      .then(afterLogin)
+      .catch(function (ex) {
+        busy(btn, "login-wait", false);
+        err("bootstrap-err", ex.message);
+      });
+  });
+
+  // 首屏：问一次服务端「现在该显示哪一步」。
+  // 为什么还要问：`no_admin` 是服务端渲染时读的，而**用户可能在其他标签页里刚建完账号**，
+  // 或者进程刚被重启过。一次 /me 把这个判断收在唯一一处（服务端）。
+  fetch(AUTH + "/me", {headers: {"Accept": "application/json"}})
+    .then(function (r) { return r.json(); })
+    .catch(function () { return null; })
+    .then(function (data) {
+      if (data && data.allowed) { window.location.replace(NEXT || "/"); return; }
+      if (data && data.no_admin) {
+        $("bootstrap-token-field").hidden = !window.LOGIN.tokenRequired;
+        show("bootstrap-step");
+        if (!window.LOGIN.tokenRequired) {
+          $("trusted-hint").hidden = false;
+          $("trusted-hint").textContent =
+            "当前是从本机/可信网访问，初始化不需要引导口令。";
+        }
+        return;
+      }
+      show("login-step");
+      if (window.LOGIN.trusted) {
+        $("trusted-hint").hidden = false;
+        $("trusted-hint").textContent =
+          "注意：当前来源被判为可信，通常应当免登录直接进入。看到这一页说明会话鉴权" +
+          "与来源判定不一致，请检查 web.auth.enabled 与 web.trusted_networks。";
+      }
+    });
+})();
+</script>
+</body>
+</html>

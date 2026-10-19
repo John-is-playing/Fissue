@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -55,9 +56,20 @@ def client(settings: Settings):
         yield c
 
 
-def _req(host: str = "127.0.0.1", headers: dict[str, str] | None = None) -> Request:
-    """只带 client 与 headers 的最小请求对象——`setup_guard` 只读这两样。"""
+def _req(
+    host: str = "127.0.0.1",
+    headers: dict[str, str] | None = None,
+    *,
+    settings: Settings | None = None,
+    db: Any = None,
+) -> Request:
+    """最小请求对象：``client`` + ``headers`` + 一个带 ``state`` 的 app。
+
+    之所以还要 ``state``：``setup_guard`` 现在按**身份**判定（``resolve_identity``），
+    而身份要读「当前生效的配置」与（认证时）数据库——不再是只看 client 与 headers。
+    """
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    app = SimpleNamespace(state=SimpleNamespace(settings=settings, db=db, repo=None))
     return Request(
         {
             "type": "http",
@@ -68,6 +80,7 @@ def _req(host: str = "127.0.0.1", headers: dict[str, str] | None = None) -> Requ
             "client": (host, 12345),
             "headers": raw,
             "query_string": b"",
+            "app": app,
         }
     )
 
@@ -216,41 +229,69 @@ def test_overlay_whitelist_rejects_unknown_paths(tmp_path: Path, settings: Setti
 # ---------------------------------------------------------------------------
 
 
-def test_guard_allows_loopback(settings: Settings) -> None:
-    setup_guard(_req("127.0.0.1"), settings)          # 不该抛
-    setup_guard(_req("::1"), settings)
+def test_guard_allows_loopback(settings: Settings, db: Any) -> None:
+    setup_guard(_req("127.0.0.1", settings=settings, db=db), settings)     # 不该抛
+    setup_guard(_req("::1", settings=settings, db=db), settings)
 
 
-def test_guard_allows_unparseable_peer(settings: Settings) -> None:
+def test_guard_allows_unparseable_peer(settings: Settings, db: Any) -> None:
     """测试客户端 / UDS 拿不到可解析地址。「不知道对端是谁」不等于「可疑」。"""
-    setup_guard(_req("testclient"), settings)
+    setup_guard(_req("testclient", settings=settings, db=db), settings)
 
 
-def test_guard_rejects_remote_when_unauthenticated(settings: Settings) -> None:
+def test_guard_allows_a_declared_trusted_network(settings: Settings, db: Any) -> None:
+    """声明了可信网段 → 等同回环（docs/AUTH.md §3.1）。"""
+    s = settings.model_copy(deep=True)
+    s.web.trusted_networks = ["192.168.1.0/24"]
+    setup_guard(_req("192.168.1.50", settings=s, db=db), s)
+
+
+def test_guard_rejects_remote_when_unauthenticated(settings: Settings, db: Any) -> None:
     with pytest.raises(HTTPException) as exc:
-        setup_guard(_req("192.168.1.50"), settings)
+        setup_guard(_req("192.168.1.50", settings=settings, db=db), settings)
     assert exc.value.status_code == 403
-    assert "FISSUE_API_TOKEN" in str(exc.value.detail)
+    assert "/login" in str(exc.value.detail)
 
 
-def test_guard_rejects_proxied_requests(settings: Settings) -> None:
-    """带反代转发头 = 这个控制面可能已经对外了，即使来源看着是回环。"""
+def test_guard_rejects_proxied_requests(settings: Settings, db: Any) -> None:
+    """带反代转发头、又没有声明 → 这个控制面可能已经对外了，即使来源看着是回环。
+
+    这一条对**回环来源**同样生效，而且正是它的主场：`web.host=127.0.0.1` + 同机 nginx
+    把公网接进来时，对端地址就是 127.0.0.1，与用户自己点页面在协议层无法区分。
+    """
     with pytest.raises(HTTPException) as exc:
-        setup_guard(_req("127.0.0.1", {"x-forwarded-for": "203.0.113.7"}), settings)
+        setup_guard(
+            _req(
+                "127.0.0.1",
+                {"x-forwarded-for": "203.0.113.7"},
+                settings=settings,
+                db=db,
+            ),
+            settings,
+        )
     assert exc.value.status_code == 403
     assert "反向代理" in str(exc.value.detail)
 
 
-def test_guard_allows_remote_when_authenticated(settings: Settings) -> None:
-    s = settings.model_copy(deep=True)
-    s.api.auth_required = True
-    setup_guard(_req("203.0.113.9"), s)               # 口令已经核对过（auth 依赖）
+def test_guard_allows_remote_when_authenticated(settings: Settings, db: Any) -> None:
+    """已认证来源直接放行——经不经代理、是不是回环都无所谓（身份已经核对过）。"""
+    from fissue.auth import AuthStore, generate_api_key, hash_token
+
+    prefix, secret, plaintext = generate_api_key()
+    AuthStore(db).create_key(name="ci", prefix=prefix, key_hash=hash_token(secret))
+    req = _req(
+        "203.0.113.9",
+        {"authorization": f"Bearer {plaintext}", "x-forwarded-for": "203.0.113.7"},
+        settings=settings,
+        db=db,
+    )
+    setup_guard(req, settings)          # 不该抛
 
 
-def test_guard_allows_remote_when_force_switch_is_on(settings: Settings) -> None:
+def test_guard_allows_remote_when_force_switch_is_on(settings: Settings, db: Any) -> None:
     s = settings.model_copy(deep=True)
     s.web.allow_remote_config_write = True
-    setup_guard(_req("192.168.1.50"), s)
+    setup_guard(_req("192.168.1.50", settings=s, db=db), s)
 
 
 # ---------------------------------------------------------------------------
@@ -609,17 +650,26 @@ def test_status_can_probe_the_sandbox_on_demand(settings: Settings, client: Any)
 def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
     data = client.get("/api/v1/settings").json()
     assert set(data["writable_keys"]) == set(ENV_WRITABLE)
-    # 覆盖层能改的是**路径**（不是文件名）：仓库列表与那个强制跳过开关
-    assert set(data["overlay_writable"]) == {"repos", "web.allow_remote_config_write"}
+    # 覆盖层能改的是**路径**（不是文件名）：仓库列表、那条强制跳过开关，
+    # 以及这次新增的一组鉴权项（docs/AUTH.md §6）。
+    assert set(data["overlay_writable"]) == {
+        "repos",
+        "web.allow_remote_config_write",
+        "web.auth.enabled",
+        "web.auth.session_ttl_minutes",
+        "web.auth.secure_cookie",
+        "web.auth.login_max_failures",
+        "web.trusted_networks",
+    }
     assert "FISSUE_WEB_PORT" in data["restart_keys"]
     assert data["paths"]["overlay_expected"].endswith("config.local.yaml")
 
 
-def test_settings_view_reports_blocked_reason(settings: Settings) -> None:
+def test_settings_view_reports_blocked_reason(settings: Settings, db: Any) -> None:
     """被锁时页面要能说清「为什么不让改」，而不是只给一个禁用的按钮。"""
-    view = settings_view(_req("192.168.1.50"), settings)
+    view = settings_view(_req("192.168.1.50", settings=settings, db=db), settings)
     assert view["writable"] is False
-    assert "回环" in view["blocked_reason"] or "鉴权" in view["blocked_reason"]
+    assert "/login" in view["blocked_reason"] or "可信网" in view["blocked_reason"]
 
 
 def test_settings_page_keeps_the_save_button_always_visible(settings: Settings, client: Any) -> None:
@@ -785,26 +835,34 @@ def test_forward_headers_are_a_single_source() -> None:
 
     原先 app.py 与 setup.py 各留一份，而 setup.py 那份漏了 `forwarded`（RFC 7239 的标准写法）
     ——同一件事在两处得到相反结论：一边当它是代理来的、另一边不当。
+
+    现在两份**判断逻辑**也都收在一处（`web.auth.forwarded_without_declaration`），
+    两个写入口（`app._reject_proxied_write` 与 `setup.setup_guard`）都调它，
+    所以这里连带把「常量只有一份」也钉住。
     """
-    from fissue.web import app as app_mod
+    from fissue.web import auth as auth_mod
     from fissue.web import setup as setup_mod
 
-    assert app_mod._FORWARD_HEADERS is setup_mod.FORWARD_HEADERS
+    assert auth_mod.FORWARD_HEADERS is setup_mod.FORWARD_HEADERS
     assert "forwarded" in setup_mod.FORWARD_HEADERS
+    assert callable(auth_mod.forwarded_without_declaration)
 
 
-def test_frontend_sends_the_api_token_on_every_request(client: Any) -> None:
-    """前端必须带鉴权头，否则「按提示开了鉴权」的部署界面全瘫。
+def test_frontend_sends_csrf_and_redirects_to_login(client: Any) -> None:
+    """前端必须带 CSRF token、未认证时跳登录页，且**不再**弹口令框。
 
-    一旦设了 FISSUE_API_TOKEN，`/api/*` 全都要求 Bearer——而页面本身不带凭据。
-    原先前端一个 Authorization 头都不发：页面看着正常，点下去只弹「未授权」。
-    更讽刺的是设置页还在教用户配这个口令，等于那一页会把整个界面的写能力关掉。
+    换成会话 cookie 之后，「撞到 401 就问口令」那套整个不成立了：身份是浏览器自动带的
+    HttpOnly cookie，前端拿不到也不该拿到；正确反应是去 /login。这条钉住三件事：
+    写请求带 `X-CSRF-Token`、401 跳登录、以及那套 localStorage 口令逻辑**真的没了**
+    （留着它等于给「口令存在浏览器里」这个已废弃的模型续命）。
     """
     js = client.get("/static/app.js").text
-    assert "Authorization" in js and "Bearer " in js
-    assert "fissue_api_token" in js, "口令要能被记住，否则每次刷新都要重输"
-    assert "if (res.status === 401" in js, "401 时要问一次口令并重试"
-    # 背景轮询必须静默，否则每 2 秒弹一个口令框
+    assert "X-CSRF-Token" in js, "cookie 化之后，写请求必须带 CSRF token"
+    assert "credentials" in js, "同源 cookie 要显式带上"
+    assert "/login?next=" in js, "401 时应当跳登录页并把回来的位置带上"
+    assert "fissue_api_token" not in js, "旧的口令弹框/localStorage 逻辑必须彻底移除"
+    assert "askToken" not in js
+    # 背景轮询必须静默，否则会话过期时会在用户打字中途把页面抢走
     assert "silent: true" in js
 
 

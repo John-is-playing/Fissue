@@ -292,14 +292,25 @@ web:
   port: 8000
   read_only: false                    # false = 允许重评 / flush / 批准提 PR / 批准合并
                                       # （仓库与密钥管理界面尚未实现，故此处无对应开关）
+  # 会话鉴权（详见 docs/AUTH.md）。口令、TOTP 密钥、API Key 哈希都在**数据库**里，
+  # 不是这里的配置项——这里只放策略。
+  auth:
+    enabled: true                     # 唯一的总开关。关掉 = 只靠回环/可信网放行
+    session_ttl_minutes: 480          # 会话有效期（分钟）
+    secure_cookie: false              # 反向代理已提供 HTTPS 时置 true
+    login_max_failures: 5             # 连续失败多少次后指数退避锁定
+  # 可信内网网段：落在这些 CIDR 里的来源**视为等同回环**（免登录、可写配置）。
+  # 判定只看真实对端地址，不信任 X-Forwarded-For。
+  trusted_networks: []                # 例如 ["192.168.1.0/24", "10.0.0.0/8"]
 
 api:
   enabled: true
   prefix: /api/v1
-  auth_required: false                # 设为 true 需在 .env 配置 FISSUE_API_TOKEN
-  # 注意：`api.enabled: true` 且 `web.host` 对外可达时，**没开鉴权会被拒绝启动**——
-  # `/api/flush` 这类路由会真的去平台上打标签、把条目推进修复队列，不能对外裸奔。
-  # 在 .env 里设 FISSUE_API_TOKEN 即自动开鉴权（也可以显式写 auth_required: true）。
+  # 注意：`api.enabled: true` 且 `web.host` 对外可达时，**既没有会话鉴权、也没有可信网段
+  # 会被拒绝启动**——`/api/flush` 这类路由会真的去平台上打标签、把条目推进修复队列。
+  # 默认的 web.auth.enabled=true 已经满足这条要求，所以升级后不会再看到那条报错。
+  # 旧版那个单一访问口令（FISSUE_API_TOKEN / api.auth_required）已被会话 + API Key 替换；
+  # 若环境里还留着旧口令，启动时会自动导入成一条 API Key（prefix=legacy）。
   #
   # ⚠️ **反向代理**：上面那道检查只能看**绑定地址**，看不见代理。所以「host 绑 127.0.0.1 +
   #    同机 nginx 转到本端口」依然等于把无鉴权的写控制面开放出去——这种情况必须设

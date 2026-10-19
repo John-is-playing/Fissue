@@ -226,12 +226,22 @@ def _alerts(
             "沙盒已关闭：验证器不跑，F2P 与回归门都失效（自动修复会失去证据）。",
             "把 config.yaml 的 sandbox.enabled 打开。",
         )
-    if not settings.api.auth_required:
+    if not settings.web.auth.enabled and not settings.web.trusted_networks:
         add(
-            "info",
-            "API 未启用鉴权：本机自用没问题，对外暴露前必须设 FISSUE_API_TOKEN。",
-            "若要把界面暴露到局域网/公网，先在「设置」里设访问口令。",
+            "warn",
+            "会话鉴权已关闭（web.auth.enabled=false）且没有声明可信网段："
+            "只有本机回环能访问，其它来源一律被拒。",
+            "要开放给内网，请把网段写进 web.trusted_networks；要对外开放，打开 web.auth.enabled。",
         )
+    elif not settings.web.trusted_networks:
+        host = str(settings.web.host or "").strip().lower()
+        loopback = host in {"127.0.0.1", "localhost", "::1"} or host.startswith("127.")
+        if not loopback:
+            add(
+                "info",
+                f"已绑定 {settings.web.host} 但未声明可信网段：内网浏览器需要先登录。",
+                "想免登录直连，可在设置页把内网网段写进 web.trusted_networks（例如 192.168.1.0/24）。",
+            )
     if not locks_ok:
         add(
             "info",
@@ -291,7 +301,10 @@ def collect(
             "uptime_seconds": round((now - started).total_seconds(), 1) if started else None,
             "read_only": settings.web.read_only,
             "api_prefix": settings.api.prefix,
-            "auth_required": settings.api.auth_required,
+            "auth_enabled": settings.web.auth.enabled,
+            "trusted_networks": list(settings.web.trusted_networks),
+            "session_ttl_minutes": settings.web.auth.session_ttl_minutes,
+            "secure_cookie": settings.web.auth.secure_cookie,
             "host": settings.web.host,
             "port": settings.web.port,
             "config_path": settings.config_path,

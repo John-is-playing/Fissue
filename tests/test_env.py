@@ -171,31 +171,28 @@ def test_sandbox_socket_does_not_clobber_other_forwarder_fields(tmp_path: Path) 
 
 
 def test_web_host_and_port(tmp_path: Path) -> None:
-    # 非本机绑定必须同时开鉴权（fail-safe：`api.enabled` 默认就是 true，而 `/api/*`
-    # 里带着会写外部仓库的路由）。这里测的是「环境变量能不能覆盖 host/port」，
-    # 所以把令牌一并给上——只管绑定的那条断言不变。
-    env = _write(
-        tmp_path / ".env",
-        "FISSUE_WEB_HOST=0.0.0.0\nFISSUE_WEB_PORT=9001\nFISSUE_API_TOKEN=s3cret\n",
-    )
+    # 环境变量覆盖 host/port。注意这里**不再需要**配任何口令：`web.auth.enabled`
+    # 默认就是 true，fail-closed 那条判据天然满足。
+    env = _write(tmp_path / ".env", "FISSUE_WEB_HOST=0.0.0.0\nFISSUE_WEB_PORT=9001\n")
     s = load_settings(None, env, overrides=BASE_OVERRIDES)
     assert s.web.host == "0.0.0.0"
     assert s.web.port == 9001
 
 
-def test_api_token_enables_auth_automatically(tmp_path: Path) -> None:
-    """填了 API_TOKEN 就自动开启鉴权（防呆：不用再记住改 auth_required）。"""
+def test_legacy_api_token_is_no_longer_a_config_item(tmp_path: Path) -> None:
+    """旧口令（`FISSUE_API_TOKEN`）**不再是配置项**。
+
+    它已被会话 + API Key 整体替换（docs/AUTH.md §2 决策 3）。这里钉住两件事：
+
+    * 留着旧口令不会让加载失败（老部署升级上来时 .env 里还有它——这是常态）；
+    * 但它也**不会**再被读成配置——`APIConfig` 里既没有 `token` 也没有 `auth_required`，
+      唯一的去处是启动时那条一次性迁移垫片（`web.auth.migrate_legacy_token`）。
+    """
     env = _write(tmp_path / ".env", "FISSUE_API_TOKEN=s3cret\n")
     s = load_settings(None, env, overrides=BASE_OVERRIDES)
-    assert s.api.token == "s3cret"
-    assert s.api.auth_required is True
-
-
-def test_api_token_absent_keeps_auth_off(tmp_path: Path) -> None:
-    env = _write(tmp_path / ".env", "FISSUE_API_TOKEN=\n")
-    s = load_settings(None, env, overrides=BASE_OVERRIDES)
-    assert s.api.token == ""
-    assert s.api.auth_required is False
+    assert not hasattr(s.api, "token")
+    assert not hasattr(s.api, "auth_required")
+    assert s.web.auth.enabled is True, "默认就开着会话鉴权，不依赖任何口令"
 
 
 # ---------------------------------------------------------------------------

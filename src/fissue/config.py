@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import difflib
+import ipaddress
 import logging
 import os
 from collections.abc import Mapping
@@ -511,15 +512,45 @@ class NotifyConfig(BaseModel):
     events: list[str] = Field(default_factory=list)
 
 
+class WebAuthConfig(BaseModel):
+    """会话鉴权开关（docs/AUTH.md §6）。
+
+    这是**唯一**的鉴权开关。此前有一个 `api.auth_required` 布尔量，它与
+    `FISSUE_API_TOKEN` 是否设置隐式联动，结果同一件事有两个真相来源
+    （设了口令却把 auth_required 写成 false、或反过来）。现在只有一个：
+    要么开着会话鉴权，要么声明可信网段，要么绑回环。
+    """
+
+    #: 是否启用会话鉴权。关掉 = 只靠「回环 / 可信网段」放行。
+    #:
+    #: 默认 **true**：升级后你原来那条「对外可达却没鉴权」的启动报错不会再出现，
+    #: 因为默认就已经声明了机制。
+    enabled: bool = True
+    #: 会话有效期（分钟）。
+    session_ttl_minutes: int = Field(default=480, ge=1)
+    #: 反向代理已提供 TLS 时置 true —— 给会话 cookie 加 `Secure`。
+    secure_cookie: bool = False
+    #: 触发退避锁定前允许的密码失败次数。
+    login_max_failures: int = Field(default=5, ge=1)
+
+
 class WebConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8000
     read_only: bool = False
+    #: 会话鉴权（登录 / 2FA / API Key）。
+    auth: WebAuthConfig = Field(default_factory=WebAuthConfig)
+    #: **可信网段**：落在这些 CIDR 里的来源视为等同回环——免登录、可写配置。
+    #:
+    #: 满足「内网直接用浏览器访问」这个诉求，且不用把口令写进浏览器。
+    #: 判定只看**真实对端地址**（`request.client.host`），**不信任** `X-Forwarded-For`：
+    #: 转发头本身可以被伪造，而「相信转发头」等于把判定权交给任何能构造请求的人。
+    trusted_networks: list[str] = Field(default_factory=list)
     #: 「配置写入」类操作（初始化向导 / 仓库管理 / 设置页）的额外边界。
     #:
-    #: 默认 False = **本机回环**才允许写配置；来源不是回环时，必须开鉴权（FISSUE_API_TOKEN）。
-    #: 打开它 = 「我明白风险，强制允许非本机来源改写配置」——给「内网无口令自用」这种部署留的
-    #: 出口，页面上会以显式开关呈现并带警告，而不是悄悄放行。
+    #: 正常路径是：来源在回环/可信网内，或请求已通过会话/API Key 认证。
+    #: 打开它 = 「我明白风险，强制允许**未经认证**的非本机来源改写配置」——给
+    #: 「内网无口令自用」这种部署留的出口，页面上以显式开关呈现并带警告，而不是悄悄放行。
     #:
     #: 与 `read_only` 的分工：`read_only` 管的是「要不要去平台上打标签/提 PR」，
     #: 这个开关管的是「能不能改本机的配置文件」。两件不同的事，别互相借用语义。
@@ -528,12 +559,64 @@ class WebConfig(BaseModel):
     # 但那个界面从未实现、背后没有任何路由，属于「配置写了不生效」，已删除。
     # 真正的写操作闸门是上面的 `read_only`（见 web/app.py 的 _require_writable）。
 
+    @field_validator("trusted_networks")
+    @classmethod
+    def _check_trusted_networks(cls, value: list[str]) -> list[str]:
+        """网段必须是**带前缀长度**的合法 CIDR，并在加载期就报错。
+
+        这条校验放在这里而不是请求期：写错一个网段如果被静默忽略，用户会在
+        「我以为配了可信网」的错觉里把控制面暴露出去。宁可启动就失败，并说清哪一条不对。
+
+        为什么裸地址（``192.168.1.0``）也要拒：``ip_network`` 会把它当成 ``/32``——
+        用户想圈一个网段，实际只放行了一台机器，而**任何地方都不会提示他**。
+        要单机就写 ``192.168.1.5/32``，要把意图写出来。
+        """
+        cleaned: list[str] = []
+        for raw in value:
+            text = str(raw).strip()
+            if not text:
+                continue
+            if "/" not in text:
+                raise ConfigError(
+                    f"web.trusted_networks 里的条目缺少前缀长度：{text!r}。"
+                    "请写 CIDR 形式——网段用 192.168.1.0/24，单机用 192.168.1.5/32。"
+                )
+            try:
+                ipaddress.ip_network(text, strict=False)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"web.trusted_networks 里的网段不合法：{text!r}（{exc}）。"
+                    "请写 CIDR 形式，例如 192.168.1.0/24 或 10.0.0.0/8。"
+                ) from exc
+            cleaned.append(text)
+        return cleaned
+
+    def network_of(self, host: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+        """``host`` 落在哪个可信网段里（不在任何网段则 None）。"""
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        for item in self.trusted_networks:
+            try:
+                net = ipaddress.ip_network(item, strict=False)
+            except ValueError:  # pragma: no cover - 构造期已校验过
+                continue
+            if addr.version == net.version and addr in net:
+                return net
+        return None
+
 
 class APIConfig(BaseModel):
+    """REST 前缀与开关。
+
+    这里**曾有** ``auth_required`` 与 ``token``（单一全局 Bearer 口令）。它们已被
+    `web.auth` + 会话/API Key 整体替换（docs/AUTH.md §2 决策 3）——不再是两套机制并存。
+    旧口令可被一次性导入为一条 API Key，见 `fissue.web.auth.migrate_legacy_token`。
+    """
+
     enabled: bool = True
     prefix: str = "/api/v1"
-    auth_required: bool = False
-    token: str = Field(default="", repr=False)
 
 
 class ExportConfig(BaseModel):
@@ -682,31 +765,40 @@ class Settings(BaseModel):
                 "sandbox.runtime=local：隔离性弱，仅建议本机开发使用"
             )
 
-        # 安全默认：把「远程可达」与「无鉴权」这两件事**互斥**掉。
+        # 安全默认：把「远程可达」与「无身份」这两件事**互斥**掉。
         #
-        # `api.enabled=true` 时才会注册 `/api/*`，其中包含**会写外部仓库**的路由——
-        # `/api/flush` 会真的去平台上打标签、把条目推进修复队列。而 `api.auth_required`
-        # 默认 **false**，唯一的保险是「设了 `FISSUE_API_TOKEN` 就自动翻成 true」。
-        # 也就是说：只要把 `WEB_HOST` 指向 0.0.0.0（或按常见做法放到反向代理后面）
-        # 而没设令牌，**任何人**都能触发对真实仓库的写操作——默认是 fail-open。
+        # （这一段替换了旧版的 `api.auth_required` 判据。旧版唯一的保险是「设了
+        # `FISSUE_API_TOKEN` 就自动把它翻成 true」，于是把 `WEB_HOST` 指向 0.0.0.0
+        # 就等于把会写外部仓库的路由暴露给所有人——fail-open。）
         #
-        # 这里改成 fail-safe：宁可拒绝启动，也不默默开着一个能被外部写入的控制面。
+        # 现在的判据只看**配置**（此刻数据库还没连上，拿不到「有没有管理员」）：
+        #
+        #     条件：web.host 非回环 且 api.enabled
+        #     放行当且仅当：web.auth.enabled 或 web.trusted_networks 非空
+        #
+        # 因为 `web.auth.enabled` 默认 true，唯一还会触发这条报错的情况是：用户**显式**
+        # 关掉了会话鉴权、又没声明可信网、却把页面绑到非回环地址——也就是「既不要身份、
+        # 又不要可信网、又要对外」，这正是应当拦下的组合。
+        #
+        # 「尚无管理员账号」这件事启动期看不见，改由**请求期**兜（web/auth.py 的
+        # bootstrap 流程）。启动期放行但会打一条警告。
         host = str(self.web.host or "").strip().lower()
         loopback = host in {"127.0.0.1", "localhost", "::1"} or host.startswith("127.")
-        if not loopback and self.api.enabled and not self.api.auth_required:
+        has_mechanism = self.web.auth.enabled or bool(self.web.trusted_networks)
+        if not loopback and self.api.enabled and not has_mechanism:
             raise ConfigError(
-                f"api.enabled=true 且 web.host={self.web.host} 对外可达，但没有鉴权："
-                "请在 .env 里设置 FISSUE_API_TOKEN（会自动开启鉴权），"
-                "或在 config.yaml 写 api.auth_required: true 并同时提供该令牌"
+                f"api.enabled=true 且 web.host={self.web.host} 对外可达，但没有身份机制："
+                "请在 config.yaml 打开 web.auth.enabled（默认就是 true，你应当是被显式关掉过），"
+                "或声明可信内网网段 web.trusted_networks（例如 [\"192.168.1.0/24\"]）。"
             )
-        if not loopback and not self.api.auth_required:
+        if not loopback and not has_mechanism:
             # 页面本身只有 GET（只读），所以这里只提醒不拦——但提前告知，
             # 免得之后一开 api.enabled 就被上面那条拒绝启动。
             import logging
 
             logging.getLogger(__name__).warning(
-                "web.host=%s 对外可达且未开鉴权：页面只读无碍，但一旦启用 api.enabled 会被拒绝启动；"
-                "建议现在就设置 FISSUE_API_TOKEN",
+                "web.host=%s 对外可达且未声明任何身份机制：页面只读无碍，但一旦启用 api.enabled "
+                "会被拒绝启动；建议现在就打开 web.auth.enabled 或声明 trusted_networks",
                 self.web.host,
             )
         # 入站 webhook：开了却没有密钥 = 那个端点对外裸奔，**直接拒绝启动**（fail-closed）。
@@ -836,10 +928,10 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
         web["host"] = v
     if (port := port_of("WEB_PORT")) is not None:
         web["port"] = port
-    api = merged.setdefault("api", {})
-    if v := env_of("API_TOKEN"):
-        api["token"] = v
-        api["auth_required"] = True
+    # 这里曾有 `FISSUE_API_TOKEN` → `api.token` + 自动翻 `auth_required`。
+    # 单一口令的机制已被会话 + API Key 整体替换（docs/AUTH.md §2 决策 3、§6）。
+    # 旧口令**仍可**被一次性导入为一条 API Key，但那条路径在 `fissue.web.auth` 里
+    # 显式读环境变量，不再把它接进通用配置模型——口令不该是一个「配置项」。
 
     return merged
 
@@ -862,6 +954,19 @@ def _sub_model(annotation: Any) -> type[BaseModel] | None:
         if isinstance(arg, type) and issubclass(arg, BaseModel):
             return arg
     return None
+
+
+def _legacy_auth_keys(raw: dict[str, Any]) -> list[str]:
+    """配置里残留的**旧版单一口令**键（`api.token` / `api.auth_required`）。
+
+    它们已被会话 + API Key 整体替换（docs/AUTH.md §2 决策 3），但老部署的 config.yaml 里
+    多半还留着。识别出来是为了给一条**说人话**的迁移提示，而不是拿通用那句
+    「未知键 `api.auth_required`，你是不是想写 enabled？」去打发刚升级上来的用户。
+    """
+    api = raw.get("api")
+    if not isinstance(api, dict):
+        return []
+    return [f"api.{key}" for key in ("token", "auth_required") if key in api]
 
 
 def _unknown_config_keys(
@@ -953,13 +1058,28 @@ def load_settings(
 
     # 未知键**不报错**（项目允许老配置里的残留键），但必须**响亮**：安全开关被拼错时，
     # 静默忽略等于让用户以为它生效了。见 _unknown_config_keys 的说明。
+    #
+    # 例外：旧版单一口令机制那两个键（`api.token` / `api.auth_required`）走下面那条**专门**的
+    # 提示。它们不是拼错，是被整体替换掉了（docs/AUTH.md §2 决策 3）——拿「你是不是想写
+    # enabled？」去提示一个刚升级上来的用户，只会把人带偏。
+    legacy_keys = set(_legacy_auth_keys(raw))
     for path, candidates in _unknown_config_keys(raw):
+        if path in legacy_keys:
+            continue
         leaf = path.rsplit(".", 1)[-1]
         near = difflib.get_close_matches(leaf, candidates, n=2, cutoff=0.6)
         logging.getLogger(__name__).warning(
             "配置里有未知键 `%s`，会被忽略%s",
             path,
             f"；你是不是想写 {'、'.join(near)}？" if near else "",
+        )
+    if legacy_keys:
+        logging.getLogger(__name__).warning(
+            "配置里的 %s 已不再是配置项：单一访问口令机制已被**会话 + API Key** 整体替换"
+            "（见 docs/AUTH.md），它们会被忽略。若 .env 里还留着 FISSUE_API_TOKEN，"
+            "启动时会自动把它导入成一条 API Key（prefix=legacy）——到「API Key」页新建一把"
+            "正式 Key 并吊销它即可。",
+            "、".join(sorted(legacy_keys)),
         )
 
     try:

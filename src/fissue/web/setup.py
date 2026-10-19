@@ -65,6 +65,11 @@ from .status import mask_url
 log = get_logger(__name__)
 
 #: 允许通过界面写进 ``.env`` 的键 → 界面上的说明文字。**白名单**，不是「什么都能写」。
+#:
+#: 这里曾有 ``FISSUE_API_TOKEN``（单一访问口令）。它已被会话 + API Key 整体替换，
+#: 所以从这个白名单里去掉了：登录口令**不经通用配置写入器**，它只以 PBKDF2 哈希
+#: 存在 ``auth_users`` 表里。留一个「往 .env 写访问口令」的入口，等于给「口令是配置项」
+#: 这个错觉续命。
 ENV_WRITABLE: dict[str, str] = {
     "FISSUE_LLM_API_KEY": "LLM API Key",
     "FISSUE_LLM_BASE_URL": "LLM 端点（OpenAI 兼容）",
@@ -75,7 +80,6 @@ ENV_WRITABLE: dict[str, str] = {
     "FISSUE_ATOMGIT_TOKEN": "AtomGit Token",
     "FISSUE_GITLAB_TOKEN": "GitLab Token",
     "FISSUE_DATABASE_URL": "数据库连接串",
-    "FISSUE_API_TOKEN": "访问口令（设置后 /api 全部要求 Bearer 鉴权）",
     "FISSUE_WEB_HOST": "监听地址",
     "FISSUE_WEB_PORT": "监听端口",
 }
@@ -89,7 +93,6 @@ SECRET_KEYS: frozenset[str] = frozenset(
         "FISSUE_GITEE_TOKEN",
         "FISSUE_ATOMGIT_TOKEN",
         "FISSUE_GITLAB_TOKEN",
-        "FISSUE_API_TOKEN",
         # 连接串也算密钥：`postgresql+psycopg://user:pw@host/db` 的 pw 明文在里面。
         # 同一批代码在 status.py 里专门写了 `mask_url` 去遮它，而设置页曾经把它**原样回显**
         # 给浏览器（含口令）——等于一边遮一边漏。
@@ -99,7 +102,21 @@ SECRET_KEYS: frozenset[str] = frozenset(
 
 #: 覆盖层里允许写的顶层路径（点分）。``repos`` 由 :func:`save_repos` 专门负责，
 #: 它带种子导入，不能走通用的深合并。
-OVERLAY_WRITABLE: frozenset[str] = frozenset({"repos", "web.allow_remote_config_write"})
+#:
+#: ``web.auth.*`` 与 ``web.trusted_networks`` 是这次新增的（docs/AUTH.md §6）：
+#: 鉴权开关、会话时长、安全 cookie、失败次数与可信网段**都要能在界面上改**，
+#: 否则「配置不生效」的错觉会比不提供更糟。
+OVERLAY_WRITABLE: frozenset[str] = frozenset(
+    {
+        "repos",
+        "web.allow_remote_config_write",
+        "web.auth.enabled",
+        "web.auth.session_ttl_minutes",
+        "web.auth.secure_cookie",
+        "web.auth.login_max_failures",
+        "web.trusted_networks",
+    }
+)
 
 #: 改了必须重启进程才生效的键（uvicorn 已经绑好 socket 了）。
 RESTART_REQUIRED: frozenset[str] = frozenset({"FISSUE_WEB_HOST", "FISSUE_WEB_PORT"})
@@ -136,35 +153,52 @@ def _peer_is_loopback(request: Request) -> bool:
 
 
 def setup_guard(request: Request, settings: Settings) -> None:
-    """配置写入的边界。不通过就 403（并把「怎么才能通过」写清楚）。"""
-    if settings.api.auth_required:
-        # 鉴权已开：请求能走到这里，说明 Bearer 口令已经核对过了（见 app.py 的 auth 依赖）。
-        # 经不经代理、是不是回环都无所谓了——口令就是身份。
-        return
-    if any(request.headers.get(h) for h in FORWARD_HEADERS):
+    """配置写入的边界。不通过就 403（并把「怎么才能通过」写清楚）。
+
+    判据按 docs/AUTH.md §9 更新为「身份」而不是「有没有设过口令」：
+
+    * 来源在回环/可信网段内 → 放行（本机与内网自用，这是主要用法）；
+    * 已通过会话或 API Key 认证 → 放行（`Depends(auth)` 已核对过，这里不重复）；
+    * 其余 → 拒绝，除非显式打开 ``web.allow_remote_config_write`` 那个逃生开关。
+
+    转发头的补刀保留：挂了反向代理时，请求在 HTTP 层与「本机直连」无法区分，
+    见到转发头就拒，把「静默开放」变成「响亮拒绝」。**这是补刀，不是安全边界**——
+    真正的边界是身份本身。
+    """
+    from .auth import forwarded_without_declaration, resolve_identity
+
+    identity = resolve_identity(request)
+    hit = forwarded_without_declaration(request, settings, identity)
+    if hit:
         raise HTTPException(
             status_code=403,
             detail=(
-                "拒绝改写配置：请求带有反向代理转发头，而当前未启用 API 鉴权。"
+                f"拒绝改写配置：请求带有反向代理转发头（{'、'.join(hit)}），"
+                "但既没有通过认证，也没有声明可信网段。"
                 "在反向代理后面暴露这个控制面等于把「改密钥」的权限一并开放——"
-                "请设置 FISSUE_API_TOKEN（或在设置页里设访问口令）。"
+                "请在 /login 登录（或用 API Key），"
+                "若确实挂在反向代理后面，请把代理/内网网段写进 web.trusted_networks。"
             ),
         )
-    if _peer_is_loopback(request):
+    if identity.trusted_source or identity.authenticated:
         return
     if settings.web.allow_remote_config_write:
         log.warning(
-            "允许非本机来源改写配置（web.allow_remote_config_write=true），来源：%s",
+            "允许未认证的非本机来源改写配置（web.allow_remote_config_write=true），来源：%s",
             request.client.host if request.client else "未知",
         )
         return
     peer = request.client.host if request.client else "未知"
+    hint = (
+        "请在该机器上访问 /login 完成初始化（尚无管理员账号）。"
+        if settings.web.auth.enabled
+        else "当前 web.auth.enabled=false：请改为 true，或把来源网段写进 web.trusted_networks。"
+    )
     raise HTTPException(
         status_code=403,
         detail=(
-            f"拒绝改写配置：请求来自 {peer}，既不是本机回环，也没有开启 API 鉴权。"
-            "要对外开放这个控制面，请设置 FISSUE_API_TOKEN；"
-            "若确定这台机器只有可信网络可达，可在设置页打开"
+            f"拒绝改写配置：请求来自 {peer}，既不是本机回环/可信网段，也没有通过认证。"
+            f"{hint} 若确定这台机器只有可信网络可达，也可在设置页打开"
             "「强制允许非本机来源改写配置」（web.allow_remote_config_write）。"
         ),
     )
@@ -278,6 +312,23 @@ def apply_env(env_path: str | Path | None, values: dict[str, str]) -> list[str]:
     return sorted(values)
 
 
+def _flatten_paths(updates: dict[str, Any], prefix: str = "") -> set[str]:
+    """把待写字典摊成**叶子路径**的集合，用于和 :data:`OVERLAY_WRITABLE` 比对。
+
+    必须**递归**：``{"web": {"auth": {"enabled": true}}}`` 的叶子是 ``web.auth.enabled``。
+    原先只摊一层，于是 `web.auth` 这个中间节点被当成待写路径去比对白名单，直接 400
+    「不允许改写这些配置项：web.auth」——而白名单里写的明明是那四个叶子。
+    """
+    flat: set[str] = set()
+    for key, value in updates.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            flat.update(_flatten_paths(value, path))
+        else:
+            flat.add(path)
+    return flat
+
+
 def apply_overlay(
     overlay_path: str | Path,
     settings: Settings,
@@ -291,13 +342,7 @@ def apply_overlay(
     没有这一步，覆盖层里只写新加的那一条会把 config.yaml 里原有的整张列表替掉——静默丢失，
     详见 ``configio.seed_repos``。
     """
-    flat: set[str] = set()
-    for key, value in updates.items():
-        if isinstance(value, dict):
-            flat.update(f"{key}.{sub}" for sub in value)
-        else:
-            flat.add(key)
-    unknown = sorted(p for p in flat if p not in OVERLAY_WRITABLE)
+    unknown = sorted(p for p in _flatten_paths(updates) if p not in OVERLAY_WRITABLE)
     if unknown:
         raise HTTPException(
             status_code=400,
@@ -308,7 +353,7 @@ def apply_overlay(
         )
     seed = seed_repos(settings.repos) if (seed_repo_list and "repos" in updates) else None
     update_overlay(overlay_path, updates, seed=seed)
-    return sorted(flat)
+    return sorted(_flatten_paths(updates))
 
 
 def save_repos(overlay_path: str | Path, settings: Settings, repos: list[RepoConfig]) -> None:
@@ -411,7 +456,15 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "web_port": settings.web.port,
             "read_only": settings.web.read_only,
             "allow_remote_config_write": settings.web.allow_remote_config_write,
-            "auth_required": settings.api.auth_required,
+            # 鉴权（docs/AUTH.md §6）：全部经覆盖层可写。
+            "auth_enabled": settings.web.auth.enabled,
+            "session_ttl_minutes": settings.web.auth.session_ttl_minutes,
+            "secure_cookie": settings.web.auth.secure_cookie,
+            "login_max_failures": settings.web.auth.login_max_failures,
+            # 覆盖层里没写就显示空列表（回落到 config.yaml / 默认值的那份仍由
+            # settings.web.trusted_networks 给出，页面上的输入框回填的是**生效值**）。
+            "trusted_networks": list(settings.web.trusted_networks),
+            "trusted_networks_text": "\n".join(settings.web.trusted_networks),
             "repos": [r.slug for r in settings.repos],
         },
         "sources": sources,
@@ -772,6 +825,47 @@ def build_repo(body: RepoIn) -> RepoConfig:
     )
 
 
+def auth_view(request: Request, settings: Settings) -> dict[str, Any]:
+    """设置页「管理员账号」区要的数据（口令/2FA 状态、会话与 Key 计数）。
+
+    为什么单独一块：这些值住在**数据库**（auth_users / sessions / api_keys），
+    与 ``describe_settings`` 那套「配置文件里的值」是两种东西。混在一起会让
+    「保存设置」看起来能改口令——它不能，也绝不该能（口令只存哈希，不经配置写入器）。
+
+    取不到数据库时**不抛**：设置页在「数据库连不上」时仍然要能渲染出来，
+    否则用户连改数据库地址的界面都打不开（而那正是他此刻需要的东西）。
+    """
+    from .auth import resolve_identity, store_of
+
+    identity = resolve_identity(request)
+    info: dict[str, Any] = {
+        "username": identity.username,
+        "source": identity.label,
+        "authenticated": identity.authenticated,
+        "provisioned": False,
+        "admin_name": "",
+        "two_factor": False,
+        "sessions": 0,
+        "api_keys": 0,
+    }
+    try:
+        store = store_of(request)
+        admin = store.admin()
+        info.update(
+            {
+                "provisioned": admin is not None,
+                "admin_name": admin.username if admin else "",
+                "two_factor": bool(admin and admin.totp_enabled),
+                "sessions": len(store.list_sessions(limit=100)),
+                "api_keys": store.key_count(active_only=True),
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 - 状态读不到不该让设置页 500
+        log.debug("读取鉴权状态失败（设置页将显示为空）：%s", exc)
+        info["error"] = f"{type(exc).__name__}: {exc}"
+    return info
+
+
 def settings_view(request: Request, settings: Settings) -> dict[str, Any]:
     """设置页的数据：每个可写项的值（密钥掩码）、来源、是否需重启，以及当前边界状态。"""
     ok, reason = guard_state(request, settings)
@@ -782,6 +876,7 @@ def settings_view(request: Request, settings: Settings) -> dict[str, Any]:
         "writable_keys": sorted(ENV_WRITABLE),
         "overlay_writable": sorted(OVERLAY_WRITABLE),
         "restart_keys": sorted(RESTART_REQUIRED),
+        "auth": auth_view(request, settings),
     }
 
 

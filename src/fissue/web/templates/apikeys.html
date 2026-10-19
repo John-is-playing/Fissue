@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{# API Key 页：列表 + 创建（明文只显示一次）+ 吊销。
+ #
+ # 为什么要独立一页而不是塞进「设置」：这里是**凭据面**（能签发对外的钥匙），
+ # 设置页是**配置面**。混在一页时，「我要撤销一把泄露的 Key」得在一屏参数里找。
+ #
+ # 明文只在这一页的对话框里出现一次——库里只有 `sha256(secret)`，找不回来。
+ #}
+{% block title %}API Key · Fissue{% endblock %}
+{% block heading %}API Key{% endblock %}
+{% block subtitle %}给脚本 / CI / 第三方用的长期凭据。明文只在创建时显示一次。{% endblock %}
+{% block header_extra %}<button class="primary" id="new-key">新建 Key</button>{% endblock %}
+
+{% block content %}
+<div class="alert info">
+  <span class="a-level">怎么用</span>
+  <div>
+    <div>请求头带上：<code>Authorization: Bearer fissue_&lt;prefix&gt;_&lt;secret&gt;</code>。</div>
+    <div class="small muted">
+      鉴别方式：回环与可信网段（<code>web.trusted_networks</code>）免身份，其余来源必须有会话或 Key。
+      当前身份：<b>{{ identity.label }}</b>{% if identity.username %}（{{ identity.username }}）{% endif %}。
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>现有 Key（{{ keys | selectattr('revoked', 'equalto', false) | list | length }} 把有效 / 共 {{ keys | length }} 把）</h2>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>名称</th><th>Prefix</th><th>创建</th><th>最近使用</th><th>状态</th><th></th></tr></thead>
+    <tbody id="key-rows">
+      {% for k in keys %}
+      <tr data-key-id="{{ k.id }}">
+        <td>{{ k.name }}{% if k.legacy %} <span class="tag stale">旧口令迁移</span>{% endif %}</td>
+        <td><code>{{ k.prefix }}</code></td>
+        <td class="muted small">{{ (k.created_at or '')[:19].replace('T', ' ') }}</td>
+        <td class="muted small">{{ (k.last_used_at or '')[:19].replace('T', ' ') or '从未使用' }}</td>
+        <td>
+          {% if k.revoked %}<span class="tag failed">已吊销</span>
+          {% else %}<span class="tag status-pr_created">有效</span>{% endif %}
+        </td>
+        <td>
+          {% if not k.revoked %}
+          <button type="button" class="danger" data-revoke="{{ k.id }}" data-name="{{ k.name }}">吊销</button>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">还没有任何 Key。点右上角「新建 Key」。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="muted small mt">
+    库里只存哈希与 prefix，**拿不回明文**——忘了就吊销重建。已吊销的行会保留下来，
+    因为「这把曾经存在、何时失效」本身就是审计信息。
+  </div>
+</div>
+
+{# 明文只显示一次的对话框。放在页面里而不是每次动态造，是为了让「一次性」这件事可见。 #}
+<dialog id="key-dialog">
+  <h3>Key 已创建</h3>
+  <div class="muted small">
+    这是**唯一一次**看到明文。关掉这个框之后就再也拿不回来了，请现在复制走。
+  </div>
+  <div class="mt"><code class="secret" id="key-plain"></code></div>
+  <div class="dlg-actions">
+    <button type="button" class="ghost" id="key-copy">复制</button>
+    <button type="button" class="primary" id="key-done">我已保存</button>
+  </div>
+</dialog>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  "use strict";
+  var AUTH = {{ auth_prefix | tojson }};
+
+  async function call(path, opts) {
+    opts = opts || {};
+    var res = await fetch(AUTH + path, {
+      method: opts.method || "GET",
+      headers: { "Content-Type": "application/json" },
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    });
+    var data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    if (!res.ok) {
+      var detail = data && data.detail;
+      if (detail && typeof detail !== "string") detail = JSON.stringify(detail);
+      throw new Error(detail || ("HTTP " + res.status));
+    }
+    return data || {};
+  }
+
+  var dialog = document.getElementById("key-dialog");
+
+  document.getElementById("new-key").addEventListener("click", async function () {
+    var name = await promptDialog();
+    if (name === null) return;
+    try {
+      var created = await call("/api-keys", { method: "POST", body: { name: name } });
+      document.getElementById("key-plain").textContent = created.key;
+      if (typeof dialog.showModal === "function") dialog.showModal();
+      else window.alert("请复制这把 Key（只显示一次）：\n\n" + created.key);
+      Fissue.toast("已创建：" + created.name + "。请立刻复制明文。", "info", { timeout: 6000 });
+    } catch (ex) {
+      Fissue.toast("创建失败：" + ex.message, "error");
+    }
+  });
+
+  /** 问一个名字（默认「默认」）。取消返回 null。 */
+  function promptDialog() {
+    return new Promise(function (resolve) {
+      var dlg = document.createElement("dialog");
+      dlg.innerHTML =
+        "<h3>新建 API Key</h3>" +
+        "<div class='muted small'>给个能认出来的名字（例如 ci-runner、homepage）。</div>" +
+        "<input type='text' id='__keyname' value='默认' style='width:100%;margin-top:10px'>" +
+        "<div class='dlg-actions'>" +
+        "<button class='ghost' value='no'>取消</button>" +
+        "<button class='primary' value='yes'>创建</button></div>";
+      document.body.appendChild(dlg);
+      function finish(value) {
+        if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
+        resolve(value);
+      }
+      dlg.addEventListener("close", function () {
+        finish(dlg.returnValue === "yes" ? (dlg.querySelector("#__keyname").value.trim() || "默认") : null);
+      });
+      dlg.querySelector("button[value=no]").addEventListener("click", function () { dlg.close("no"); });
+      dlg.querySelector("button[value=yes]").addEventListener("click", function () { dlg.close("yes"); });
+      if (typeof dlg.showModal === "function") dlg.showModal();
+      else finish(window.prompt("Key 名称", "默认"));
+    });
+  }
+
+  document.getElementById("key-copy").addEventListener("click", function () {
+    var text = document.getElementById("key-plain").textContent;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(
+        function () { Fissue.toast("已复制到剪贴板。", "info"); },
+        function () { Fissue.toast("复制失败：请手动选中复制。", "error"); }
+      );
+    } else {
+      Fissue.toast("这个浏览器不支持自动复制，请手动选中复制。", "info");
+    }
+  });
+  document.getElementById("key-done").addEventListener("click", function () { dialog.close(); });
+
+  document.getElementById("key-rows").addEventListener("click", async function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-revoke]") : null;
+    if (!btn) return;
+    var name = btn.dataset.name;
+    var ok = await Fissue.confirm(
+      "吊销 Key",
+      "吊销后，任何用这把 Key（" + name + "）的脚本立刻失效，且**不可恢复**。确认？"
+    );
+    if (!ok) return;
+    try {
+      await call("/api-keys/" + btn.dataset.revoke + "/revoke", { method: "POST" });
+      Fissue.toast("已吊销：" + name, "info");
+      setTimeout(function () { window.location.reload(); }, 600);
+    } catch (ex) {
+      Fissue.toast("吊销失败：" + ex.message, "error");
+    }
+  });
+})();
+</script>
+{% endblock %}

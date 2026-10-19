@@ -35,6 +35,7 @@
       <a href="/repos" class="{{ 'on' if nav == 'repos' }}">监控仓库</a>
       <a href="/status" class="{{ 'on' if nav == 'status' }}">状态监测</a>
       <div class="nav-sep"></div>
+      <a href="/api-keys" class="{{ 'on' if nav == 'apikeys' }}">API Key</a>
       <a href="/setup" class="{{ 'on' if nav == 'setup' }}">初始化向导</a>
       <a href="/settings" class="{{ 'on' if nav == 'settings' }}">设置</a>
     </nav>
@@ -60,6 +61,11 @@
       <span class="sub">{% block subtitle %}{% endblock %}</span>
       <span class="spacer"></span>
       {% block header_extra %}{% endblock %}
+      {# 当前身份：三种来源（回环 / 可信网段 / 会话）在权限上很不一样，页面上必须看得见，
+         否则出了「为什么这台机器不用登录」这类问题，用户没有任何线索。 #}
+      <span class="tag" title="本次请求的身份判定结果">{{ identity.label }}</span>
+      {% if identity.username %}<span class="muted small">{{ identity.username }}</span>{% endif %}
+      {% if identity.authenticated %}<button type="button" class="ghost small" id="logout-btn">登出</button>{% endif %}
       {% if read_only %}<span class="tag stale">只读模式</span>{% endif %}
     </header>
 
@@ -77,8 +83,15 @@
 <script>
   window.FISSUE = {
     apiPrefix: {{ api_prefix | tojson }},
+    authPrefix: {{ auth_prefix | tojson }},
     readOnly: {{ read_only | tojson }},
-    nav: {{ nav | tojson }}
+    nav: {{ nav | tojson }},
+    {# cookie 化鉴权之后，所有写请求必须带上它（docs/AUTH.md §3.5）。
+       会话身份才有值；回环/可信网来源是空串——服务端也只对会话校验。 #}
+    csrfToken: {{ csrf_token | tojson }},
+    {# 身份在 Python 侧算好再交过来：模板里只做 tojson，不做条件表达式
+       （`{{ a if b else c | tojson }}` 的 `|` 只作用于 else 分支，踩过一次）。 #}
+    identity: {{ identity.to_dict() | tojson }}
   };
 </script>
 <script src="{{ script_url }}"></script>
