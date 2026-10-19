@@ -536,6 +536,34 @@
     })();
   }
 
+  /** 停止**当前这一轮**（常驻服务的定时轮次）。
+   *
+   * 为什么单独有它：轮次在整轮期间持有写闸门、又不在作业表里，所以「取消任务」够不着它——
+   * 原先只能去跑 `fissue serve` 的终端按 Ctrl-C，等于把整台服务停掉。这里让它可以在页面上停。
+   * 代价必须当面说清：取消是打断式的，正在进行的**单条**操作可能只完成一半。
+   */
+  async function stopRound(btn) {
+    var ok = await confirmDialog(
+      "停止当前轮次",
+      "这一轮会在最近的等待点中断；正在进行的单条操作（例如正在建 PR）可能只完成一半。" +
+      "停的只是这一轮，服务与之后按间隔的轮次照常。确认停止？"
+    );
+    if (!ok) return;
+    btn.disabled = true;
+    try {
+      var res = await request("/round/stop", {method: "POST"});
+      toast(
+        "已请求停止：" + (res.stopped || "当前轮次") + "（已跑 " + Math.round(res.seconds || 0) + "s）",
+        "info",
+        {timeout: 6000}
+      );
+      setTimeout(function () { window.location.reload(); }, 1500);
+    } catch (err) {
+      toast("没能停止", "bad", {detail: err.message, timeout: 0});
+      btn.disabled = false;
+    }
+  }
+
   window.Fissue = {
     api: request,
     toast: toast,
@@ -563,6 +591,11 @@
     document.addEventListener("click", function (e) {
       var btn = e.target && e.target.closest ? e.target.closest("button[data-act=cancel-job]") : null;
       if (btn) cancelJob(btn.dataset.job);
+    });
+    // 「停止这一轮」只在「任务」页那条「不在本表」提示里出现（常驻轮次才给）。
+    document.addEventListener("click", function (e) {
+      var btn = e.target && e.target.closest ? e.target.closest("button[data-act=stop-round]") : null;
+      if (btn) stopRound(btn);
     });
     // 「全选」表头的 indeterminate 态：勾了一部分时给个可见的中间态。
     var all = document.getElementById("pick-all");

@@ -1191,6 +1191,39 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             media = "application/json; charset=utf-8"
         return PlainTextResponse(content, media_type=media)
 
+    @app.post(f"{prefix}/round/stop")
+    async def stop_round(request: Request, _: None = Depends(auth)) -> dict[str, Any]:
+        """停止**当前这一轮**（常驻服务的定时轮次）。
+
+        为什么**不能**套 `_exclusive_write`：那一层会先去抢写闸门——而轮次正握着它，
+        等于「想停它就得先等它结束」，正是这次要解决的死结。所以这里只要求身份
+        （``Depends(auth)``，非回环来源仍需会话/Key），**完全不碰**写闸门。
+
+        停不掉的情形如实回答（409）：本进程没有在跑的轮次——可能刚结束，也可能跑在另一个
+        进程里（跨进程那份 task 在别人的内存里，谁都停不了它）。
+        """
+        from ..service.control import ROUNDS
+
+        stopped = ROUNDS.request_stop()
+        if stopped is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "本进程当前没有在跑的轮次：它可能已经结束，或跑在另一个进程里"
+                    "（那种情况下谁都停不了它，只能去那个进程停服务）。"
+                ),
+            )
+        log.warning("已请求停止当前轮次：%s（已跑 %.0f 秒）", stopped.name, stopped.seconds)
+        return {
+            "ok": True,
+            "stopped": stopped.name,
+            "seconds": stopped.seconds,
+            "note": (
+                "已请求停止：它会在最近的等待点退出。正在进行的单条操作"
+                "（例如正在建 PR）可能只完成一半。"
+            ),
+        }
+
     @app.get(f"{prefix}/health")
     async def health() -> dict[str, Any]:
         return {"status": "ok", "version": __import__("fissue").__version__}

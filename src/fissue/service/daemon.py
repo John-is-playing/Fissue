@@ -38,6 +38,7 @@ from ..pipeline.fetcher import Fetcher
 from ..pipeline.flush import FlushProcessor
 from ..pipeline.queue import QueueManager
 from ..pipeline.stages import EvalStage
+from .control import ROUNDS
 from .notify import Notifier
 
 log = get_logger(__name__)
@@ -236,35 +237,54 @@ class FissueService:
         async with lock:
             yield
 
+    @staticmethod
+    def _round_cancelled(what: str) -> None:
+        """轮次被取消：界面点了「停止这一轮」，或服务正在关闭。
+
+        **必须吞掉** `CancelledError`：不吞的话这个循环任务会被判「已取消」而结束——扫描器
+        从此再也不回来，而界面上什么都不会说。吞掉是安全的：紧接着的 `_sleep()` 会先看
+        `stop_event`（服务关闭时它已被置位），于是 `while` 条件立刻为假、循环正常退出。
+
+        也正因为要单独接它：`CancelledError` 自 Python 3.8 起是 `BaseException`，下面那些
+        `except Exception` **吃不到**它。
+        """
+        log.warning("%s轮次被中止（界面请求停止当前轮次，或服务正在关闭）", what)
+
     async def _scan_loop(self) -> None:
         interval = max(60, self.settings.schedule.scan_interval_seconds)
         while not self.stop_event.is_set():
             async with self._round("扫描"):
-                try:
-                    await self.run_once(round_name="扫描轮次")
-                except WriterBusy as exc:
-                    log.info("扫描让位：%s", exc)
-                except Exception:
-                    log.exception("扫描轮次异常（继续下一轮）")
+                with ROUNDS.register("扫描轮次"):
+                    try:
+                        await self.run_once(round_name="扫描轮次")
+                    except asyncio.CancelledError:
+                        self._round_cancelled("扫描")
+                    except WriterBusy as exc:
+                        log.info("扫描让位：%s", exc)
+                    except Exception:
+                        log.exception("扫描轮次异常（继续下一轮）")
             await self._sleep(interval)
 
     async def _flush_loop(self) -> None:
         interval = max(10, self.settings.schedule.queue_flush_interval_seconds)
         while not self.stop_event.is_set():
             async with self._round("flush"):
-                try:
-                    async with RuntimeContext.open(
-                        self.settings,
-                        exclusive=True,
-                        action="常驻服务：flush 轮次",
-                        kind="round",
-                    ) as ctx:
-                        notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
-                        await self._flush_queues(ctx, notifier)
-                except WriterBusy as exc:
-                    log.info("flush 让位：%s", exc)
-                except Exception:
-                    log.exception("flush 轮次异常（继续）")
+                with ROUNDS.register("flush 轮次"):
+                    try:
+                        async with RuntimeContext.open(
+                            self.settings,
+                            exclusive=True,
+                            action="常驻服务：flush 轮次",
+                            kind="round",
+                        ) as ctx:
+                            notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
+                            await self._flush_queues(ctx, notifier)
+                    except asyncio.CancelledError:
+                        self._round_cancelled("flush")
+                    except WriterBusy as exc:
+                        log.info("flush 让位：%s", exc)
+                    except Exception:
+                        log.exception("flush 轮次异常（继续）")
             await self._sleep(interval)
 
     async def _fix_loop(self) -> None:
@@ -275,19 +295,22 @@ class FissueService:
             if self.stop_event.is_set():
                 return
             async with self._round("修复"):
-                try:
-                    async with RuntimeContext.open(
-                        self.settings,
-                        exclusive=True,
-                        action="常驻服务：修复轮次",
-                        kind="round",
-                    ) as ctx:
-                        notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
-                        await self._run_fixes(ctx, notifier)
-                except WriterBusy as exc:
-                    log.info("修复让位：%s", exc)
-                except Exception:
-                    log.exception("修复轮次异常（继续）")
+                with ROUNDS.register("修复轮次"):
+                    try:
+                        async with RuntimeContext.open(
+                            self.settings,
+                            exclusive=True,
+                            action="常驻服务：修复轮次",
+                            kind="round",
+                        ) as ctx:
+                            notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
+                            await self._run_fixes(ctx, notifier)
+                    except asyncio.CancelledError:
+                        self._round_cancelled("修复")
+                    except WriterBusy as exc:
+                        log.info("修复让位：%s", exc)
+                    except Exception:
+                        log.exception("修复轮次异常（继续）")
 
     async def _web_loop(self) -> None:
         """把 Web/API 跑在同一个事件循环里。"""

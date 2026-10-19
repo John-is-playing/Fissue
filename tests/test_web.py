@@ -1092,7 +1092,7 @@ def test_status_reports_who_holds_the_write_gate(client, monkeypatch) -> None:
 
 
 def test_jobs_page_explains_a_writer_that_is_not_a_job(client, monkeypatch) -> None:
-    """轮次在写时，任务页要明说「它不在这张表里、也不能从这里取消」。"""
+    """轮次在写时，任务页要明说「它不在这张表里」，并指出可以**就地**停掉它。"""
     _fake_writer(monkeypatch, who="常驻服务：扫描轮次", kind="round", seconds=252.4)
 
     html = client.get("/jobs").text
@@ -1100,7 +1100,7 @@ def test_jobs_page_explains_a_writer_that_is_not_a_job(client, monkeypatch) -> N
     assert "不在本表" in html
     assert "常驻服务轮次" in html and "常驻服务：扫描轮次" in html
     assert "252" in html, "已跑时长要显示出来"
-    assert "Ctrl-C" in html, "还要告诉用户怎么才能停掉它"
+    assert 'data-act="stop-round"' in html, "要给出停它的入口（原先只能停掉整个服务）"
 
 
 def test_jobs_page_keeps_quiet_when_the_writer_is_a_job(client, monkeypatch) -> None:
@@ -1123,3 +1123,70 @@ def test_frontend_shows_who_is_writing_and_for_how_long(client) -> None:
 
     app_js = client.get("/static/app.js").text
     assert "writerDur" in app_js and "kind_label" in app_js
+
+
+# ---------------------------------------------------------------------------
+# 停止当前轮次：常驻轮次停得掉，跨进程的停不了（不许给一个按下去必然失败的按钮）
+# ---------------------------------------------------------------------------
+
+
+def test_stop_round_reports_nothing_to_stop(client) -> None:
+    """没有在跑的轮次 → 409，并说清「可能刚结束，或在另一个进程里」。"""
+    res = client.post("/api/v1/round/stop")
+
+    assert res.status_code == 409
+    assert "没有在跑的轮次" in res.text
+
+
+def test_stop_round_stops_the_current_round(client, monkeypatch) -> None:
+    """有轮次在跑 → 200 + 告知停的是哪一轮、跑了多久、以及打断的代价。"""
+    from datetime import datetime, timezone
+
+    from fissue.service import control
+
+    stopped = control.RoundInfo("扫描轮次", datetime.now(timezone.utc), 252.4)
+    monkeypatch.setattr(control.ROUNDS, "request_stop", lambda: stopped)
+
+    res = client.post("/api/v1/round/stop")
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["stopped"] == "扫描轮次"
+    assert body["seconds"] == 252.4
+    assert "只完成一半" in body["note"], "打断的代价必须如实告知"
+
+
+def test_stop_round_requires_an_identity(settings) -> None:
+    """非回环来源没有身份就停不了——停轮次也是控制面操作。"""
+    from fastapi.testclient import TestClient
+
+    from fissue.web.app import create_app
+
+    _seed_admin(settings)
+    with TestClient(create_app(settings), client=("203.0.113.9", 4321)) as remote:
+        assert remote.post("/api/v1/round/stop").status_code == 401
+
+
+def test_jobs_page_offers_stopping_a_round(client, monkeypatch) -> None:
+    """轮次在写时给出「停止这一轮」按钮（原先只能去终端 Ctrl-C 停掉整个服务）。"""
+    _fake_writer(monkeypatch, who="常驻服务：扫描轮次", kind="round", seconds=252.4)
+
+    html = client.get("/jobs").text
+
+    assert 'data-act="stop-round"' in html
+    assert "只完成一半" in html, "打断的代价要写在按钮旁边"
+
+
+def test_jobs_page_has_no_stop_button_for_another_process(client, monkeypatch) -> None:
+    """跨进程的写操作**不给**按钮：那份任务在别的进程的内存里，按下去只会 409。"""
+    _fake_writer(
+        monkeypatch,
+        who="pid=123 开始于 20:47:41：抓取/评测/验证/修复",
+        kind="cli",
+        seconds=None,
+    )
+
+    html = client.get("/jobs").text
+
+    assert "不在本表" in html, "仍要解释它是谁"
+    assert 'data-act="stop-round"' not in html
