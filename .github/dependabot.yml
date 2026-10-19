@@ -1,0 +1,30 @@
+# 依赖自动更新。
+#
+# 两条生态：pip（`pyproject.toml` 里的 `>=` 松约束）与 github-actions（workflow 里的
+# action 版本）。此前两者都靠人盯——而松约束 + 无提醒的组合，正是「供应链面积悄悄变大」
+# 的典型温床。这里的策略是**每周一次、小批量**：更新以 PR 形式进入，仍需过 CI。
+
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # dev 依赖（pytest/ruff/mypy 等）打包成一个 PR，减少噪音；
+      # 运行依赖单独走，因为它们直接影响打包产物，值得逐个看。
+      dev-dependencies:
+        dependency-type: development
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "chore(ci)"

@@ -305,5 +305,5 @@ def test_env_example_can_load_as_valid_settings(tmp_path: Path) -> None:
         overrides={"repos": [{"platform": "github", "owner": "a", "name": "b"}]},
     )
     assert s.llm.api_key.startswith("sk-your-key")
-    assert s.database.url.startswith("postgresql")
+    assert s.database.url.startswith("sqlite")
     assert s.web.port == 8000

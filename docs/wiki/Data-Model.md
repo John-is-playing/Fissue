@@ -1,6 +1,6 @@
 # 数据模型
 
-> 存储层：**PostgreSQL 为主库**（SQLite 亦可运行），支持导出 JSON / Markdown。
+> 存储层：默认 **SQLite**（零依赖），生产 / 多机可换 PostgreSQL；支持导出 JSON / Markdown。
 > 完整细节见 [docs/DESIGN.md §7](../DESIGN.md#7-存储)。
 
 ---
@@ -68,16 +68,18 @@
 
 ## 4. SQLite 兼容
 
-局部开发与测试用 SQLite（零依赖）即可运行：
+**SQLite 是默认后端**（零依赖、开箱即用，也是开发与测试全程在用的那条路）：
 
 - 已对 `with_for_update` 等**方言差异**做处理。
 - 开启 **WAL** + **30s busy 超时**（驱动默认只有 5s；回滚日志模式下长**读**事务会把写者的提交挡住）。
 
 ```bash
-FISSUE_DATABASE_URL=sqlite:///E:/Fissue/data/fissue.db
+# 默认即此值，通常什么都不用写
+FISSUE_DATABASE_URL=sqlite:///./data/fissue.db
 ```
 
-> ⚠️ **PostgreSQL 后端未在真跑里用过**——开发期全程 SQLite。生产建议用 PG，但请把它当作**尚未测量**的部分（见[基准与可信度](Benchmark.md#5-尚未测量)）。
+> ⚠️ **PostgreSQL 后端未在真跑里用过**——开发期全程 SQLite。生产 / 多机建议用 PG，
+> 但请把它当作**尚未测量**的部分（见[基准与可信度](Benchmark.md#5-尚未测量)）。
 
 ---
 

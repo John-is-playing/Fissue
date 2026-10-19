@@ -28,7 +28,7 @@
 | Python | ≥ 3.10 | `python --version` | 装 Python 3.11+ |
 | LLM API Key | **必需** | — | 见第 3 节 |
 | Docker | 建议（沙盒验证需要隔离） | `docker info` | 可降级本地执行，但**无隔离** |
-| PostgreSQL | 可选 | `psql --version` | 本地试跑可用 SQLite |
+| PostgreSQL | 可选（生产 / 多机推荐；默认用 SQLite） | `psql --version` | 不装也能跑——默认走 SQLite |
 
 ```bash
 python --version     # 期望 Python 3.10+
@@ -93,14 +93,14 @@ Fissue 只说 OpenAI 兼容协议（`/chat/completions`），换供应商只改�
 ### 3.2 数据库
 
 ```bash
-# 用 PostgreSQL（生产推荐）
-FISSUE_DATABASE_URL=postgresql+psycopg://fissue:fissue@localhost:5432/fissue
+# 默认就是 SQLite（零依赖，文件落在 ./data/fissue.db），通常什么都不用配
+FISSUE_DATABASE_URL=sqlite:///./data/fissue.db
 
-# 或本地试跑用 SQLite（零依赖）
-FISSUE_DATABASE_URL=sqlite:///E:/Fissue/data/fissue.db
+# 生产 / 多机换 PostgreSQL（SQLite 并发写会锁表）
+FISSUE_DATABASE_URL=postgresql+psycopg://fissue:fissue@localhost:5432/fissue
 ```
 
-> PostgreSQL 需先建库：`createdb -U fissue fissue`
+> 换 PostgreSQL 时需先建库：`createdb -U fissue fissue`
 
 ### 3.3 平台 Token
 
@@ -316,7 +316,7 @@ fissue db check       # 检查连通性
 期望：
 
 ```
-✅ 数据库已就绪：postgresql+psycopg://fissue:***@localhost:5432/fissue
+✅ 数据库已就绪：sqlite:///./data/fissue.db
 ```
 
 重置（危险，清空所有数据）：

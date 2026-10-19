@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import create_engine, text
@@ -30,6 +31,26 @@ SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
 
 
+def ensure_sqlite_parent_dir(url: str) -> None:
+    """SQLite 文件库：把父目录建出来。
+
+    默认连接串指向 ``./data/fissue.db``——那是一个**目录里的文件**，而 SQLite 只会建文件、
+    **不会建目录**。此前默认是 PostgreSQL（要用户自己建库），现在默认 SQLite，若不建目录，
+    ``fissue db init`` 在全新机器上会直接 ``unable to open database file``，
+    而报错离原因很远。
+
+    只在「有文件路径」时动手：``:memory:`` 与空库名（``sqlite://``）跳过。
+    """
+    from sqlalchemy.engine import make_url
+
+    database = make_url(url).database
+    if not database or database == ":memory:":
+        return
+    parent = Path(database).expanduser().parent
+    if str(parent):
+        parent.mkdir(parents=True, exist_ok=True)
+
+
 class Database:
     """封装 Engine 与 Session 生命周期。
 
@@ -39,6 +60,8 @@ class Database:
     def __init__(self, url: str, *, echo: bool = False, pool_size: int = 5, max_overflow: int = 10) -> None:
         self.url = url
         self.is_sqlite = url.startswith("sqlite")
+        if self.is_sqlite:
+            ensure_sqlite_parent_dir(url)
         # 「本进程内表已确保存在」的标记，供 ensure_schema() 做零开销短路
         self._schema_ready = False
         kwargs: dict[str, Any] = {"echo": echo, "future": True, "pool_pre_ping": True}

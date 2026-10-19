@@ -51,8 +51,10 @@ _EXEMPT = {
     ),
     "jinja2": "由 fastapi.templating.Jinja2Templates 使用，代码里不直接 import",
     "pytest-asyncio": "pytest 插件：靠 entry point 加载（asyncio_mode=auto），代码里不 import",
+    "pytest-cov": "pytest 插件：靠 entry point 加载（--cov 参数），代码里不 import",
     "ruff": "命令行 linter，只运行不 import",
     "mypy": "命令行类型检查器，只运行不 import",
+    "pre-commit": "命令行工具，只在本地提交前钩子里运行，代码里不 import",
 }
 
 
@@ -259,3 +261,19 @@ def _stdlib_names() -> frozenset[str]:
     import sys
 
     return frozenset(sys.stdlib_module_names)
+
+
+# ---------------------------------------------------------------------------
+# 类型标记
+# ---------------------------------------------------------------------------
+
+
+def test_the_package_ships_a_py_typed_marker() -> None:
+    """``src/fissue/py.typed`` 必须存在（否则下游用户拿不到类型信息）。
+
+    本项目对 ``src/fissue`` 强制 mypy 且 CI 阻断，但**下游**用户能不能用上这些类型，
+    取决于这个空标记文件；没有它，mypy 会把 fissue 当成无类型包，用户侧检查直接失效。
+    它又极容易在重构目录时被顺手删掉——而删掉之后**本仓库自己的 CI 完全无感**，
+    所以钉一条在这里。
+    """
+    assert (SRC / "py.typed").is_file(), "缺少 src/fissue/py.typed——下游用户将拿不到类型信息"

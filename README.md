@@ -81,7 +81,7 @@ Fissue 把这一整套「分诊（triage）→ 验证 → 修复」流程自动�
 | 交付形态 | CLI + Web 仪表盘 + REST API + 常驻服务 |
 | 抓取平台 | GitHub · Gitee · AtomGit · GitLab（含自建实例） |
 | AI | 任意 OpenAI 兼容端点（DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM…） |
-| 存储 | PostgreSQL（可导出 JSON / Markdown） |
+| 存储 | SQLite（默认，零依赖）· PostgreSQL（生产 / 多机，需显式配置）；可导出 JSON / Markdown |
 | 沙盒 | Docker：禁网、限 CPU/内存/PID/时长、非 root、只读根、只挂隔离工作区、转发组件通道 |
 | 配置 | `.env`（密钥）+ `config.yaml`（业务配置） |
 
@@ -91,14 +91,16 @@ Fissue 把这一整套「分诊（triage）→ 验证 → 修复」流程自动�
 
 ```bash
 # 1. 安装
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python -m venv .venv
+source .venv/bin/activate          # Linux / macOS / Git Bash
+# .venv\Scripts\Activate.ps1       # Windows PowerShell
 pip install -e ".[dev]"
 
 # 2. 准备配置
-cp .env.example .env            # 填入 LLM key、数据库连接、平台 token
+cp .env.example .env            # 填入 LLM key 与平台 token（数据库默认 SQLite，可不动）
 cp config.example.yaml config.yaml
 
-# 3. 初始化数据库
+# 3. 初始化数据库（默认 SQLite，文件落在 ./data/fissue.db，无需另起数据库）
 fissue db init
 
 # 4. 抓取仓库（先单仓库）

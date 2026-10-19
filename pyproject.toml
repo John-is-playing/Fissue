@@ -46,6 +46,12 @@ dev = [
     "respx>=0.21",
     "ruff>=0.4",
     "mypy>=1.10",
+    # 覆盖率：CI 用它出报告并卡一条**软门**（见 [tool.coverage.report].fail_under）。
+    "pytest-cov>=5.0",
+    # 本地提交前钩子（.pre-commit-config.yaml 走 language: system，用的是本环境里的
+    # ruff / mypy，因此这套钩子与 CI 跑的是同一版本——见 CONTRIBUTING.md 的教训：
+    # 「没在本地跑 mypy 就会在 CI 上红」）。
+    "pre-commit>=3.7",
 ]
 
 [project.scripts]
@@ -73,3 +79,10 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
+
+[tool.coverage.report]
+# 覆盖率**软门**：略低于当前实测值，只为拦住「覆盖率倒退」，不追求一步到位的高门槛。
+# 只有真去收集覆盖率时才生效（CI 的 test job 用 `--cov=fissue` 触发）；
+# 本地 `pytest -q` 不带 --cov，因此这条不会影响日常跑测。
+fail_under = 79       # 当前全量测试实测 82%，预留 3 个百分点的波动空间
+show_missing = true

@@ -8,10 +8,10 @@ app:
   data_dir: ./data           # 本地数据目录（克隆缓存、报告、patch 产物）
 
 # ---------------------------------------------------------------------------
-# 数据库：主存储 PostgreSQL，支持导出 JSON / Markdown
+# 数据库：默认 SQLite（零依赖，文件落在 ./data/），支持导出 JSON / Markdown
 # ---------------------------------------------------------------------------
 database:
-  url: postgresql+psycopg://fissue:fissue@localhost:5432/fissue   # 可被 FISSUE_DATABASE_URL 覆盖
+  url: sqlite:///./data/fissue.db   # 可被 FISSUE_DATABASE_URL 覆盖；生产/多机换 PostgreSQL（先 createdb）
   echo: false
   pool_size: 5
 

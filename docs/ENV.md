@@ -81,28 +81,29 @@ FISSUE_ENV=/etc/fissue/.env.prod
 
 ---
 
-### 3.2 `FISSUE_DATABASE_URL` —— 数据库（**必填**）
+### 3.2 `FISSUE_DATABASE_URL` —— 数据库（可选，默认 SQLite）
 
 **格式**：SQLAlchemy 连接串。
 
 | 场景 | 值 |
 |---|---|
-| PostgreSQL（推荐） | `postgresql+psycopg://用户:密码@主机:5432/库名` |
-| 本地试跑（零依赖） | `sqlite:///E:/Fissue/data/fissue.db`（Windows） |
-| 本地试跑（Linux/Mac） | `sqlite:////home/me/fissue.db`（注意 4 个斜杠 = 绝对路径） |
+| 默认（零依赖） | `sqlite:///./data/fissue.db`（文件落在 `./data/`，父目录会自动创建） |
+| SQLite 绝对路径 | `sqlite:////home/me/fissue.db`（注意 4 个斜杠 = 绝对路径） |
+| PostgreSQL（生产 / 多机，推荐但需自建） | `postgresql+psycopg://用户:密码@主机:5432/库名` |
 | 密码含特殊字符 | 需 URL 编码，如 `@` → `%40`，`:` → `%3A` |
 
 ```bash
-# PostgreSQL 示例
+# PostgreSQL 示例（换成 PG 时才需要）
 FISSUE_DATABASE_URL=postgresql+psycopg://fissue:my%40pass@localhost:5432/fissue
 ```
 
-**不填会怎样**：用内置默认 `postgresql+psycopg://fissue:fissue@localhost:5432/fissue`。
+**不填会怎样**：用内置默认 `sqlite:///./data/fissue.db`——零依赖、开箱即用，
+`fissue db init` 之后就能跑（这也是本项目开发期与单测真正验证过的那条路）。
 
-**PostgreSQL 首次准备**：
+**换成 PostgreSQL 时首次准备**：
 
 ```bash
-createdb -U fissue fissue          # 建库
+createdb -U fissue fissue          # 先建库（PG 不会自己建）
 fissue db init                     # 建表
 fissue db check                    # 验证连通
 ```
@@ -112,12 +113,14 @@ fissue db check                    # 验证连通
 | 现象 | 原因 | 解决 |
 |---|---|---|
 | `无法连接数据库：...` | 服务没起 / 连接串错 | `pg_isready`；`fissue db check` |
-| `database "fissue" does not exist` | 没建库 | `createdb -U fissue fissue` |
+| `database "fissue" does not exist` | 没建库（PG） | `createdb -U fissue fissue` |
 | `password authentication failed` | 密码错或含特殊字符未编码 | 编码特殊字符 |
-| SQLite `unable to open database file` | 目录不存在 / 路径格式错 | 先 `mkdir -p data`；Windows 用 `sqlite:///E:/...` |
+| SQLite `unable to open database file` | 目录不存在 / 路径格式错 | 默认路径会自动建目录；自定义路径请确认父目录存在 |
 
-> **SQLite vs PostgreSQL**：SQLite 适合单机试用（零运维）；
-> 常驻服务 + Web 并发建议 PostgreSQL（SQLite 并发写会锁表）。
+> **SQLite vs PostgreSQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
+> 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表）。
+> 注意 PG 后端**未在真跑里被测量过**（见 [BENCHMARK.md §5 尚未测量](../BENCHMARK.md#5-尚未测量)），
+> 生产使用前请把它当作「尚未测量」的部分。
 
 ---
 
@@ -425,7 +428,7 @@ fissue fetch --repo psf/requests --limit 1
 
 | 变量 | 必需 | 默认 | 作用 |
 |---|---|---|---|
-| `FISSUE_DATABASE_URL` | ✅ | PostgreSQL 本地串 | 存储连接串 |
+| `FISSUE_DATABASE_URL` | | `sqlite:///./data/fissue.db` | 存储连接串（生产/多机换 PostgreSQL） |
 | `FISSUE_LLM_API_KEY` | ✅ | 无 | 大模型密钥 |
 | `FISSUE_LLM_BASE_URL` | | `config.yaml` 值 | 模型端点 |
 | `FISSUE_LLM_MODEL` | | `config.yaml` 值 | 模型名 |

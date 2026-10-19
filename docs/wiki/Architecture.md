@@ -25,7 +25,7 @@
 │  workspace  本地 git 工作副本                                     │
 ├──────────────────────────────────────────────────────────────────┤
 │ 基础层                                                            │
-│  config · models · store（PostgreSQL + JSON/MD 导出）· errors · 日志 │
+│  config · models · store（SQLite / PostgreSQL + JSON/MD 导出）· errors · 日志 │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -42,7 +42,7 @@ src/fissue/
   lockfile.py     跨进程写锁（flock）
   net.py          HTTP 客户端与 TLS / 限流处理
   workspace.py    本地 git 工作副本
-  store/          PostgreSQL 持久化 + JSON/MD 导出
+  store/          SQLite / PostgreSQL 持久化 + JSON/MD 导出
   platforms/      GitHub / Gitee / AtomGit / GitLab 适配器
   ai/             OpenAI 兼容客户端、预算、提示词、评估器
   verifier/       验证器生成与 F2P / 回归门执行
@@ -151,7 +151,7 @@ Docker 不可用时**默认拒绝执行**（不再静默降级）。
 
 ## 6. 存储
 
-PostgreSQL 为主库（SQLite 亦可运行）。表的清单与增量口径见[数据模型](Data-Model.md)。
+存储默认 SQLite（零依赖），生产 / 多机可换 PostgreSQL。表的清单与增量口径见[数据模型](Data-Model.md)。
 
 ---
 

@@ -48,8 +48,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
-      - name: 跑离线单测
-        run: python -m pytest -q -p no:cacheprovider
+      - name: 跑离线单测与覆盖率
+        run: python -m pytest -q -p no:cacheprovider --cov=fissue --cov-report=term
 
   lint:
     name: ruff + mypy

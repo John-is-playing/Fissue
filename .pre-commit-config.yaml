@@ -1,0 +1,30 @@
+# 本地提交前钩子（`pip install -e ".[dev]"` 后 `pre-commit install` 启用）。
+#
+# 为什么用 `language: system` 而不是官方镜像仓库
+# ------------------------------------------------
+# 官方镜像（`astral-sh/ruff-pre-commit`、`mirrors-mypy`）各自钉一个 rev，而那个 rev
+# 未必等于本环境 / CI 装的版本——于是又会犯 `CONTRIBUTING.md` 里记过的那条教训：
+# 「没在本地按 CI 的版本跑 mypy，推上去才发现类型错误」。改用 system：钩子直接调用
+# 本环境里那份 ruff / mypy（来自 `pip install -e ".[dev]"`），与 CI 同源、同版本。
+#
+# 为什么**没有** ruff-format
+# --------------------------
+# 本仓库没做 `ruff format`（那会要求重排 70+ 个文件，是与本项目无关的大 diff），
+# CI 的 lint job 也只跑 `ruff check`——这里保持一致，不引入 CI 不检查的规矩。
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check（与 CI 同参数）
+        entry: python -m ruff check
+        language: system
+        types: [python]
+        files: ^(src/|tests/|scripts/)
+      - id: mypy
+        name: mypy src/fissue tests scripts（与 CI 同参数）
+        entry: python -m mypy src/fissue tests scripts
+        language: system
+        pass_filenames: false
+        types: [python]
+        files: ^(src/|tests/|scripts/)

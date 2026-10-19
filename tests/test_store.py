@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import select
@@ -952,6 +953,38 @@ def test_export_shows_real_comment_counts(repo: Repository) -> None:
     assert str(rows[0]["number"]) == "95", f"应当是 #95，实际：{rows[0]}"
 
     assert rows[0]["comments"] >= 1, f"导出里的评论数应当是真数，实际：{rows[0]['comments']}"
+
+
+# ---------------------------------------------------------------------------
+# SQLite 文件库：父目录要自动建出来
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_database_creates_its_parent_directory(tmp_path: Path) -> None:
+    """默认连接串指向 ``./data/fissue.db``，而 SQLite **只建文件、不建目录**。
+
+    回归场景：把默认后端从 PostgreSQL 换成 SQLite 之后，全新机器上第一次
+    ``fissue db init`` 会因为 ``data/`` 不存在而 ``unable to open database file``——
+    这里钉住「连之前先把父目录建好」，正是 :func:`ensure_sqlite_parent_dir` 的职责。
+    """
+    from fissue.store.db import Database
+
+    db_file = tmp_path / "nested" / "deep" / "fissue.db"
+    assert not db_file.parent.exists()
+
+    database = Database(f"sqlite:///{db_file.as_posix()}")
+    database.create_all()
+
+    assert db_file.is_file(), "父目录没被建出来，SQLite 建不了文件"
+
+
+def test_memory_sqlite_does_not_touch_the_filesystem() -> None:
+    """``:memory:`` 不该去建任何目录（它没有文件路径）。"""
+    from fissue.store.db import Database, ensure_sqlite_parent_dir
+
+    ensure_sqlite_parent_dir("sqlite:///:memory:")   # 不抛异常即通过
+    database = Database("sqlite:///:memory:")
+    database.create_all()
 
 
 def test_save_verifier_run_requires_a_verifier_id(repo: Repository) -> None:
