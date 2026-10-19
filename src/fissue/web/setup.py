@@ -103,9 +103,13 @@ SECRET_KEYS: frozenset[str] = frozenset(
 #: 覆盖层里允许写的顶层路径（点分）。``repos`` 由 :func:`save_repos` 专门负责，
 #: 它带种子导入，不能走通用的深合并。
 #:
-#: ``web.auth.*`` 与 ``web.trusted_networks`` 是这次新增的（docs/AUTH.md §6）：
-#: 鉴权开关、会话时长、安全 cookie、失败次数与可信网段**都要能在界面上改**，
-#: 否则「配置不生效」的错觉会比不提供更糟。
+#: ``web.auth.*`` 与 ``web.trusted_networks`` 是鉴权那次新增的（docs/AUTH.md §6）：
+#: 鉴权开关、会话时长、安全 cookie、失败次数与可信网段**都要能在界面上改**。
+#:
+#: ``llm.*`` 这一组是**计费与预算**（以及影响花费的生成参数）：价格填错会让
+#: ``hard_stop`` 提前掐断或形同虚设，而这些数只有用户知道（跟着模型/渠道走），原先却只能
+#: 改 config.yaml。它们的边界由 pydantic 的约束兜（见 ``BudgetConfig`` / ``PricingConfig``），
+#: 写盘前的 ``_validate_candidate`` 会先跑一遍。
 OVERLAY_WRITABLE: frozenset[str] = frozenset(
     {
         "repos",
@@ -115,6 +119,19 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset(
         "web.auth.secure_cookie",
         "web.auth.login_max_failures",
         "web.trusted_networks",
+        # -- LLM 计费与预算 --
+        "llm.pricing.input_per_1k",
+        "llm.pricing.output_per_1k",
+        "llm.budget.daily_tokens_per_repo",
+        "llm.budget.daily_usd_per_repo",
+        "llm.budget.hard_stop",
+        # -- 影响花费的生成参数 --
+        "llm.temperature",
+        "llm.max_tokens",
+        "llm.max_tokens_ceiling",
+        "llm.timeout_seconds",
+        "llm.max_retries",
+        "llm.concurrency",
     }
 )
 
@@ -489,6 +506,22 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "trusted_networks": list(settings.web.trusted_networks),
             "trusted_networks_text": "\n".join(settings.web.trusted_networks),
             "repos": [r.slug for r in settings.repos],
+            # LLM 计费 / 预算 / 生成参数的**生效值**：页面上的输入框按它回填。
+            # 为什么必须回填生效值而不是覆盖层里的值：这三处可能来自 config.yaml 或默认值，
+            # 只显示覆盖层那份会让用户以为「我填的数没生效」——真正生效的是合并后的这一份。
+            "llm_tunables": {
+                "pricing_input_per_1k": settings.llm.pricing.input_per_1k,
+                "pricing_output_per_1k": settings.llm.pricing.output_per_1k,
+                "budget_tokens": settings.llm.budget.daily_tokens_per_repo,
+                "budget_usd": settings.llm.budget.daily_usd_per_repo,
+                "budget_hard_stop": settings.llm.budget.hard_stop,
+                "temperature": settings.llm.temperature,
+                "max_tokens": settings.llm.max_tokens,
+                "max_tokens_ceiling": settings.llm.max_tokens_ceiling,
+                "timeout_seconds": settings.llm.timeout_seconds,
+                "max_retries": settings.llm.max_retries,
+                "concurrency": settings.llm.concurrency,
+            },
         },
         "sources": sources,
         "overlay_content": read_yaml_mapping(settings.overlay_path) if settings.overlay_path else {},

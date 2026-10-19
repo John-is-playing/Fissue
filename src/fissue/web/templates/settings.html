@@ -80,6 +80,91 @@
   </div>
 </div>
 
+{# 计费与预算 / 生成参数：这一组走**覆盖层**（config.local.yaml），与上面那块走 .env 的
+   模型名/端点/Key 分开——项目一贯的分工是「密钥与部署项写 .env，业务配置写覆盖层」。
+   单价填错会直接让花费统计与 hard_stop 失真，所以它必须能在这里改。 #}
+<div class="panel">
+  <h2>模型参数与计费</h2>
+  <div class="muted small">
+    这一组写覆盖层 <code>{{ view.paths.overlay_expected }}</code>，保存后热重载、立即生效。
+    回填的是**当前生效值**（可能来自 config.yaml 或内置默认值）。
+  </div>
+
+  <h3 class="mt">计费与预算</h3>
+  <div class="kv">
+    <div class="k">输入单价</div>
+    <div class="v">
+      <input type="number" step="0.00001" min="0" style="width:150px" id="overlay-llm-price-in"
+             value="{{ view.effective.llm_tunables.pricing_input_per_1k }}">
+      <span class="muted small">美元 / 1K 输入 token（<code>llm.pricing.input_per_1k</code>）</span>
+    </div>
+    <div class="k">输出单价</div>
+    <div class="v">
+      <input type="number" step="0.00001" min="0" style="width:150px" id="overlay-llm-price-out"
+             value="{{ view.effective.llm_tunables.pricing_output_per_1k }}">
+      <span class="muted small">美元 / 1K 输出 token（<code>llm.pricing.output_per_1k</code>）</span>
+    </div>
+    <div class="k">日 token 上限</div>
+    <div class="v">
+      <input type="number" min="0" style="width:170px" id="overlay-llm-budget-tokens"
+             value="{{ view.effective.llm_tunables.budget_tokens }}">
+      <span class="muted small">每仓库每日累计（<code>llm.budget.daily_tokens_per_repo</code>）；<b>0 = 不限</b></span>
+    </div>
+    <div class="k">日花费上限</div>
+    <div class="v">
+      <input type="number" step="0.01" min="0" style="width:150px" id="overlay-llm-budget-usd"
+             value="{{ view.effective.llm_tunables.budget_usd }}">
+      <span class="muted small">美元 / 仓库 / 日（<code>llm.budget.daily_usd_per_repo</code>）；<b>0 = 不限</b></span>
+    </div>
+    <div class="k">超限即停</div>
+    <div class="v">
+      <label class="inline"><input type="checkbox" id="overlay-llm-hard-stop"
+        {{ 'checked' if view.effective.llm_tunables.budget_hard_stop }}> <code>llm.budget.hard_stop</code></label>
+      <div class="muted small">关掉 = 超预算只告警、不中断调用（告警会出现在「状态监测」页）。</div>
+    </div>
+  </div>
+
+  <h3 class="mt">生成参数</h3>
+  <div class="kv">
+    <div class="k">temperature</div>
+    <div class="v">
+      <input type="number" step="0.05" min="0" max="2" style="width:120px" id="overlay-llm-temperature"
+             value="{{ view.effective.llm_tunables.temperature }}">
+      <span class="muted small">0~2（<code>llm.temperature</code>）</span>
+    </div>
+    <div class="k">单次上限</div>
+    <div class="v">
+      <input type="number" min="1" style="width:140px" id="overlay-llm-max-tokens"
+             value="{{ view.effective.llm_tunables.max_tokens }}">
+      <span class="muted small"><code>max_tokens</code>；推理模型的 reasoning 会吃掉大半预算，别调太小</span>
+    </div>
+    <div class="k">截断加码上限</div>
+    <div class="v">
+      <input type="number" min="1" style="width:140px" id="overlay-llm-ceiling"
+             value="{{ view.effective.llm_tunables.max_tokens_ceiling }}">
+      <span class="muted small"><code>max_tokens_ceiling</code>（被长度截断时翻倍重试，但不越过它）</span>
+    </div>
+    <div class="k">并发</div>
+    <div class="v">
+      <input type="number" min="1" style="width:120px" id="overlay-llm-concurrency"
+             value="{{ view.effective.llm_tunables.concurrency }}">
+      <span class="muted small">同时在跑的 LLM 请求数（<code>llm.concurrency</code>）</span>
+    </div>
+    <div class="k">大模型超时</div>
+    <div class="v">
+      <input type="number" min="1" style="width:120px" id="overlay-llm-timeout"
+             value="{{ view.effective.llm_tunables.timeout_seconds }}">
+      <span class="muted small">秒（<code>llm.timeout_seconds</code>）</span>
+    </div>
+    <div class="k">重试次数</div>
+    <div class="v">
+      <input type="number" min="0" style="width:120px" id="overlay-llm-retries"
+             value="{{ view.effective.llm_tunables.max_retries }}">
+      <span class="muted small">次（<code>llm.max_retries</code>）</span>
+    </div>
+  </div>
+</div>
+
 <div class="panel">
   <h2>代码托管平台 Token</h2>
   <table>
@@ -404,6 +489,14 @@
     return isNaN(n) ? fallback : n;
   }
 
+  /** 浮点版（单价这类值用）：解析不出来就回落到当前生效值，绝不把 NaN 写进配置。 */
+  function numOr(id, fallback) {
+    var raw = val(id);
+    if (!raw) return fallback;
+    var n = parseFloat(raw);
+    return isNaN(n) ? fallback : n;
+  }
+
   /** 组装 .env 的改动。
    *
    * 密钥的规则是**留空 = 不改动**：输入框里是空的（只显示掩码占位符），若把空串当值写下去，
@@ -444,6 +537,30 @@
           login_max_failures: intOr("overlay-max-failures", 5)
         },
         trusted_networks: nets
+      },
+      // 计费 / 预算 / 生成参数：整组一起交（页面上的值是**生效值**回填，所见即所写）。
+      // 边界由服务端的 pydantic 约束兜底，这里不做格式判断——写不合法就 400、文件一字不动。
+      llm: llmPayload()
+    };
+  }
+
+  /** 模型参数与计费那一组。 */
+  function llmPayload() {
+    return {
+      temperature: numOr("overlay-llm-temperature", 0.2),
+      max_tokens: intOr("overlay-llm-max-tokens", 16384),
+      max_tokens_ceiling: intOr("overlay-llm-ceiling", 32768),
+      timeout_seconds: intOr("overlay-llm-timeout", 120),
+      max_retries: intOr("overlay-llm-retries", 4),
+      concurrency: intOr("overlay-llm-concurrency", 4),
+      pricing: {
+        input_per_1k: numOr("overlay-llm-price-in", 0.00014),
+        output_per_1k: numOr("overlay-llm-price-out", 0.00028)
+      },
+      budget: {
+        daily_tokens_per_repo: intOr("overlay-llm-budget-tokens", 2000000),
+        daily_usd_per_repo: numOr("overlay-llm-budget-usd", 5),
+        hard_stop: checked("overlay-llm-hard-stop")
       }
     };
   }

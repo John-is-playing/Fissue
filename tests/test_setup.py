@@ -650,8 +650,9 @@ def test_status_can_probe_the_sandbox_on_demand(settings: Settings, client: Any)
 def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
     data = client.get("/api/v1/settings").json()
     assert set(data["writable_keys"]) == set(ENV_WRITABLE)
-    # 覆盖层能改的是**路径**（不是文件名）：仓库列表、那条强制跳过开关，
-    # 以及这次新增的一组鉴权项（docs/AUTH.md §6）。
+    # 覆盖层能改的是**路径**（不是文件名）：仓库列表、那条强制跳过开关、
+    # 一组鉴权项（docs/AUTH.md §6），以及一组 LLM 计费/预算/生成参数
+    # （单价填错会让 hard_stop 失真，所以它必须能在界面上改）。
     assert set(data["overlay_writable"]) == {
         "repos",
         "web.allow_remote_config_write",
@@ -660,6 +661,17 @@ def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
         "web.auth.secure_cookie",
         "web.auth.login_max_failures",
         "web.trusted_networks",
+        "llm.pricing.input_per_1k",
+        "llm.pricing.output_per_1k",
+        "llm.budget.daily_tokens_per_repo",
+        "llm.budget.daily_usd_per_repo",
+        "llm.budget.hard_stop",
+        "llm.temperature",
+        "llm.max_tokens",
+        "llm.max_tokens_ceiling",
+        "llm.timeout_seconds",
+        "llm.max_retries",
+        "llm.concurrency",
     }
     assert "FISSUE_WEB_PORT" in data["restart_keys"]
     assert data["paths"]["overlay_expected"].endswith("config.local.yaml")
@@ -1203,3 +1215,91 @@ def test_reload_failure_says_the_file_was_already_written(
     detail = res.json()["detail"]
     assert "已写盘" in detail
     assert "db check" in detail
+
+
+# ---------------------------------------------------------------------------
+# LLM 计费 / 预算 / 生成参数：经覆盖层可写
+# ---------------------------------------------------------------------------
+#
+# 单价填错不会报错，只会让花费统计与 hard_stop 悄悄失真（提前掐断或形同虚设），
+# 所以它必须能在界面上改，也必须**在写盘前**被约束挡住。
+
+
+def test_llm_billing_and_params_are_writable_through_the_overlay(
+    settings: Settings, client: Any
+) -> None:
+    res = client.put(
+        "/api/v1/settings",
+        json={
+            "env": {},
+            "overlay": {
+                "llm": {
+                    "pricing": {"input_per_1k": 0.001, "output_per_1k": 0.002},
+                    "budget": {"daily_usd_per_repo": 3.5, "hard_stop": False},
+                    "temperature": 0.7,
+                    "max_tokens": 20000,
+                    "concurrency": 8,
+                }
+            },
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    eff = body["effective"]["llm_tunables"]
+    assert eff["pricing_input_per_1k"] == 0.001
+    assert eff["pricing_output_per_1k"] == 0.002
+    assert eff["budget_usd"] == 3.5
+    assert eff["budget_hard_stop"] is False
+    assert eff["temperature"] == 0.7
+    assert eff["max_tokens"] == 20000
+    assert eff["concurrency"] == 8
+    assert "llm.pricing.input_per_1k" in body["written_overlay"]
+    assert "llm.budget.hard_stop" in body["written_overlay"]
+
+
+@pytest.mark.parametrize(
+    "bad_llm",
+    [
+        {"pricing": {"input_per_1k": -1}},          # 负单价：花费统计会变成负数
+        {"pricing": {"output_per_1k": -0.001}},
+        {"budget": {"daily_usd_per_repo": -0.5}},   # 负预算：判定永远成立，每轮都被掐断
+        {"budget": {"daily_tokens_per_repo": -1}},
+        {"temperature": 5},                          # 超出 0~2
+        {"max_tokens": 0},                           # 0 上限没有任何意义
+        {"concurrency": 0},
+    ],
+)
+def test_bad_llm_values_are_rejected_and_nothing_is_written(
+    settings: Settings, client: Any, bad_llm: dict
+) -> None:
+    target = overlay_file(settings)
+    before = target.read_text(encoding="utf-8") if target.exists() else None
+
+    res = client.put("/api/v1/settings", json={"env": {}, "overlay": {"llm": bad_llm}})
+
+    assert res.status_code == 400, res.text
+    after = target.read_text(encoding="utf-8") if target.exists() else None
+    assert after == before, "校验没过却动了覆盖层"
+
+
+def test_settings_page_renders_the_billing_panel(client: Any) -> None:
+    """设置页要有这一组输入框，而且**回填的是生效值**（不是空框）。"""
+    html = client.get("/settings").text
+
+    for fid in (
+        "overlay-llm-price-in",
+        "overlay-llm-price-out",
+        "overlay-llm-budget-tokens",
+        "overlay-llm-budget-usd",
+        "overlay-llm-hard-stop",
+        "overlay-llm-temperature",
+        "overlay-llm-max-tokens",
+        "overlay-llm-ceiling",
+        "overlay-llm-concurrency",
+        "overlay-llm-timeout",
+        "overlay-llm-retries",
+    ):
+        assert fid in html, f"设置页缺 {fid}"
+
+    assert 'value="0.00014"' in html, "单价要按生效值回填，而不是留空"

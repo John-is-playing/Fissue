@@ -121,16 +121,27 @@ class DatabaseConfig(BaseModel):
 
 
 class BudgetConfig(BaseModel):
-    daily_tokens_per_repo: int = 2_000_000
-    daily_usd_per_repo: float = 5.0
+    """按**单仓库**每日累计的预算闸门，全部可在 WebUI 改。
+
+    ``0`` = **关掉那一维度的限制**（代码里是 `budget.daily_usd_per_repo and …` 的写法）——
+    这是有意的出口，所以约束是「非负」而不是「正」：负预算只会让判定永远成立、把每一轮
+    都掐断，属于纯粹的误填。
+    """
+
+    daily_tokens_per_repo: int = Field(default=2_000_000, ge=0)
+    daily_usd_per_repo: float = Field(default=5.0, ge=0)
     hard_stop: bool = True
 
 
 class PricingConfig(BaseModel):
-    """单位：美元 / 1K token。"""
+    """单位：美元 / 1K token。
 
-    input_per_1k: float = 0.00014
-    output_per_1k: float = 0.00028
+    这两个数**直接决定** ``cost_usd`` 与预算判定：填错（或与实际单价不符）会让 ``hard_stop``
+    要么提前掐断、要么形同虚设。所以它必须能在 WebUI 里改——原先只能改 config.yaml。
+    """
+
+    input_per_1k: float = Field(default=0.00014, ge=0)
+    output_per_1k: float = Field(default=0.00028, ge=0)
 
     def cost(self, prompt_tokens: int, completion_tokens: int) -> float:
         return (
@@ -144,17 +155,17 @@ class LLMConfig(BaseModel):
     model: str = "deepseek-chat"
     fallback_model: str | None = None
     api_key: str = Field(default="", repr=False)
-    temperature: float = 0.2
+    temperature: float = Field(default=0.2, ge=0, le=2)
     #: 单次补全的 token 上限。这只是**上限**，不是预留——实际计费按真实用量，
     #: 调高不会产生闲置成本。推理模型的 reasoning_content 会吃掉大量预算
     #: （实测同一提示的推理长度在 14207~17264 字符间波动），8192 余量偏紧。
-    max_tokens: int = 16384
+    max_tokens: int = Field(default=16384, ge=1)
     #: 被长度截断后自动加码的上限（见 LLMClient.chat_json）。
     #: 截断时翻倍重试，但不超过此上限，避免单次调用失控。
-    max_tokens_ceiling: int = 32768
-    timeout_seconds: int = 120
-    max_retries: int = 4
-    concurrency: int = 4
+    max_tokens_ceiling: int = Field(default=32768, ge=1)
+    timeout_seconds: int = Field(default=120, ge=1)
+    max_retries: int = Field(default=4, ge=0)
+    concurrency: int = Field(default=4, ge=1)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)
 
