@@ -249,6 +249,29 @@ def reload_state(app: FastAPI) -> Settings:
     return settings
 
 
+def _reload_or_report(app: FastAPI) -> Settings:
+    """热重载；失败时给一条**可照做**的报错，而不是把裸异常丢出去变成 500。
+
+    为什么单独包一层：走到这一步时**文件已经写下去了**——校验只能保证「这个值解析得通」，
+    保证不了「那台数据库此刻连得上」。报错必须让用户知道两件事：已经写盘了、下一步敲什么。
+    只丢一个 500 的话，他既不知道写没写、也不知道怎么复核；而**重载不出来就没有界面**，
+    等于把人直接逼回命令行（真机实测踩到过，见 `DatabaseConfig._check_url` 的说明）。
+    """
+    try:
+        return reload_state(app)
+    except Exception as exc:
+        log.exception("配置已写盘，但热重载失败")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"配置已写盘，但热重载失败：{type(exc).__name__}: {exc}\n"
+                "请用 `fissue db check --config <config.yaml> --env <.env>` 复核数据库连接串；"
+                "若连接串写错了，直接编辑 .env 里的 FISSUE_DATABASE_URL"
+                "（此刻界面可能已经打不开——重载不出来就没有界面，只能从命令行自救）。"
+            ),
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 写 .env / 覆盖层
 # ---------------------------------------------------------------------------
@@ -927,7 +950,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
                     detail=f"这个仓库已经在监控里：{new.platform.value}:{new.slug}",
                 )
         save_repos(overlay_file(settings), settings, [*settings.repos, new])
-        fresh = reload_state(app)
+        fresh = _reload_or_report(app)
         log.info("已加入监控：%s（%s）", new.slug, new.platform.value)
         return repos_view(request, fresh)
 
@@ -955,7 +978,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         repos = list(settings.repos)
         repos[index] = updated
         save_repos(overlay_file(settings), settings, repos)
-        fresh = reload_state(app)
+        fresh = _reload_or_report(app)
         log.info("已更新仓库配置：%s（%s）", updated.slug, "、".join(sorted(changes)))
         return repos_view(request, fresh)
 
@@ -984,7 +1007,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         purged = 0
         if purge_data:
             purged = _purge_repo(request, removed)
-        fresh = reload_state(app)
+        fresh = _reload_or_report(app)
         kept = _repo_of(request).count_items(repo_slug=removed.slug)
         log.info("已移出监控：%s（purge_data=%s）", removed.slug, purge_data)
         return {
@@ -1028,7 +1051,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         written_overlay: list[str] = []
         if body.overlay:
             written_overlay = apply_overlay(overlay_file(settings), settings, body.overlay)
-        fresh = reload_state(app)
+        fresh = _reload_or_report(app)
         needs_restart = sorted(k for k in written_env if k in RESTART_REQUIRED)
         return {
             **settings_view(request, fresh),
@@ -1104,7 +1127,7 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
                     repos.append(candidate)
                     added.append(f"{candidate.platform.value}:{candidate.slug}")
             save_repos(overlay_file(settings), settings, repos)
-        fresh = reload_state(app)
+        fresh = _reload_or_report(app)
 
         job: dict[str, Any] | None = None
         error = ""

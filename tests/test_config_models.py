@@ -428,3 +428,62 @@ def test_on_failure_rejects_undocumented_values(tmp_path: Path, value: str) -> N
     with pytest.raises(ConfigError) as exc:
         load_settings(cfg)
     assert "on_failure" in str(exc.value), str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# 数据库连接串：写错的写法必须在**加载期**被挡住
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "sqlite:/home/john/Fissue/data/fissue.db",   # 冒号后只有一个斜杠
+        "/home/john/Fissue/data/fissue.db",          # 忘了 scheme，直接写了个路径
+        "sqli••••••e.db",                            # 页面上的**脱敏值**被当成真实值填了回来
+        "",
+        "   ",
+        "not a url",
+    ],
+)
+def test_malformed_database_url_is_rejected_at_load_time(tmp_path: Path, bad: str) -> None:
+    """连接串写坏要在**加载期**报错，而不是等到建引擎、更不是等到写盘之后。
+
+    真机实测踩到过：设置页 / 初始化向导是「先写盘、后热重载」，而写盘前的校验只构造
+    `Settings`——那时**不碰数据库**。于是把页面上显示的脱敏值（`sqli••••••e.db`）当成真实
+    连接串填回去时：校验放行 → 写进 .env → 重载 500；此后每次保存配置都 500、重启也起不来，
+    而**服务起不来就没有界面**，只能到机器上改文件自救。
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump({"database": {"url": bad}}), encoding="utf-8")
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match="database.url"):
+        load_settings(cfg, env)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("sqlite:////home/john/Fissue/data/fissue.db", "sqlite:////home/john/Fissue/data/fissue.db"),
+        (
+            "postgresql+psycopg://fissue:pw@localhost:5432/fissue",
+            "postgresql+psycopg://fissue:pw@localhost:5432/fissue",
+        ),
+        ("sqlite:////home/john/my db.db", "sqlite:////home/john/my db.db"),   # 路径里的空格要留着
+        ("sqlite:////home/john/x.db   ", "sqlite:////home/john/x.db"),        # 尾随空白要去掉
+    ],
+)
+def test_valid_database_urls_load_and_are_trimmed(tmp_path: Path, raw: str, expected: str) -> None:
+    """合法的写法要放行；**只去掉首尾空白**（手抄进 .env 时很常见），路径内部的空格要保留。
+
+    为什么去空白不是多余的洁癖：`sqlite:////home/john/x.db\\n` 这种值 SQLAlchemy **能解析**，
+    于是它一路通过校验，直到运行时才发现「文件不在那儿」——报错离原因十万八千里。
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(yaml.safe_dump({"database": {"url": raw}}), encoding="utf-8")
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+
+    assert load_settings(cfg, env).database.url == expected

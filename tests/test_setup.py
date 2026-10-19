@@ -1148,3 +1148,58 @@ def test_onboard_cli_refuses_to_prompt_without_a_tty(tmp_path: Path, monkeypatch
     result = CliRunner().invoke(cli_app, ["onboard", "--config", str(cfg), "--env", str(tmp_path / "m.env")])
     assert result.exit_code != 0
     assert "yes" in result.output.lower() or "--yes" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 数据库连接串：写盘前就要挡住（真机踩过：页面上的脱敏值被当成真实值填回去）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "sqli••••••e.db",                              # 页面显示的脱敏值
+        "sqlite:/home/john/Fissue/data/fissue.db",     # 冒号后只一个斜杠
+        "/home/john/Fissue/data/fissue.db",            # 忘了 scheme
+    ],
+)
+def test_bad_database_url_is_rejected_and_nothing_is_written(
+    settings: Settings, client: Any, bad: str
+) -> None:
+    """错填连接串必须 400 + **一个字都不落盘**。
+
+    这条守的是「先写盘、后热重载」的顺序：坏值真写下去了，重启就起不来，而**服务起不来就没有
+    界面**——用户从界面上无法自救，只能回到机器上改文件。`_validate_candidate` 的 docstring 里
+    写的正是这件事。
+    """
+    target = env_file(settings)
+    before = target.read_text(encoding="utf-8") if target.exists() else None
+
+    res = client.put("/api/v1/settings", json={"env": {"FISSUE_DATABASE_URL": bad}})
+
+    assert res.status_code == 400, res.text
+    assert "database.url" in res.text
+    after = target.read_text(encoding="utf-8") if target.exists() else None
+    assert after == before, "校验没过却动了 .env"
+
+
+def test_reload_failure_says_the_file_was_already_written(
+    settings: Settings, client: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """热重载失败不能只丢一个裸 500：要说清「已写盘」以及怎么复核。
+
+    校验再严也只能保证「这个值解析得通」，保证不了「那台数据库此刻连得上」。那种情况下
+    文件已经写下去了，报错必须让用户知道这一点，否则他既不知道写没写、也不知道下一步。
+    """
+
+    def boom(app: Any) -> Settings:
+        raise RuntimeError("模拟重载失败")
+
+    monkeypatch.setattr(setup_mod, "reload_state", boom)
+
+    res = client.put("/api/v1/settings", json={"env": {"FISSUE_LLM_MODEL": "some-model"}})
+
+    assert res.status_code == 500
+    detail = res.json()["detail"]
+    assert "已写盘" in detail
+    assert "db check" in detail

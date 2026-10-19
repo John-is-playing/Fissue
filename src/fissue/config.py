@@ -73,6 +73,52 @@ class DatabaseConfig(BaseModel):
     pool_size: int = 5
     max_overflow: int = 10
 
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        """连接串必须真的能用来建引擎——在**加载期**就挡住，而不是等到写盘之后。
+
+        为什么落在这一层（而不是等 `create_engine`）：设置页 / 初始化向导是「**先写盘、后热重载**」，
+        而写盘前那道校验只构造 `Settings`——那时不碰数据库。于是写坏一个连接串会一路过关：
+        写进 .env → 重载时 500 → 此后每次保存配置都 500、重启也起不来；而**服务起不来就没有界面**，
+        用户只能回到机器上改文件。`web/setup.py::_validate_candidate` 的 docstring 里写的正是
+        「别留下一个重启起不来的 .env」。
+
+        放在这里，三条入口（config.yaml / .env / 向导）一律在加载期被同一条规则挡住。
+        """
+        text = (value or "").strip()
+        if not text:
+            raise ConfigError("database.url 不能为空")
+        if "•" in text:
+            # 实测踩到过：用户把页面上显示的**脱敏值**（`sqli••••••e.db`）当成真实连接串填了回去。
+            # 单靠「解析失败」提示他，他很可能再看一眼页面、又把脱敏值抄回来一次。
+            raise ConfigError(
+                "database.url 看起来是**页面上显示的脱敏值**（含 •）——那是用来确认「填的是哪一条」的，"
+                "不是真实连接串。请填真实值，例如 "
+                "sqlite:////绝对路径/xxx.db 或 postgresql+psycopg://user:pw@host:5432/dbname"
+            )
+        # 延迟导入：config 是热点路径（每条命令都走），没必要在模块级拉起 sqlalchemy。
+        from sqlalchemy.engine import make_url
+
+        try:
+            parsed = make_url(text)
+        except Exception as exc:
+            raise ConfigError(
+                f"database.url 不是合法的连接串：{exc}。"
+                "常用两种写法：SQLite 用 sqlite:////绝对路径/文件.db（注意**四个斜杠**，"
+                "写成 sqlite:///home/... 会把 /home/... 当成相对路径）；"
+                "PostgreSQL 用 postgresql+psycopg://user:password@host:5432/dbname"
+            ) from exc
+        try:
+            parsed.get_dialect()
+        except Exception as exc:
+            # 驱动名写错（`postgresql+psycopgg`）或该驱动没装，同样是「一路写到 .env、重启才炸」。
+            raise ConfigError(
+                f"database.url 的驱动不可用：{parsed.drivername!r}（{exc}）。"
+                "本项目随包提供 PostgreSQL（postgresql+psycopg）与 SQLite（sqlite）两种。"
+            ) from exc
+        return text
+
 
 class BudgetConfig(BaseModel):
     daily_tokens_per_repo: int = 2_000_000
