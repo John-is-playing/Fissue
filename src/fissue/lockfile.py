@@ -17,7 +17,10 @@ import contextlib
 import errno
 import hashlib
 import os
+import time
 from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import Settings
@@ -78,9 +81,12 @@ def single_flight(settings: Settings, *, action: str = "本次操作") -> Iterat
                 "请等它结束，或先停掉常驻服务（fissue serve）。"
             ) from exc
         # 把持有者写进锁文件：拿不到锁的人由此能看到「是谁在跑」，便于判断。
+        # 除 pid 外还记上**开始时间**与**在做什么**——实测里只看到 `pid=140896` 时，
+        # 用户既不知道那是谁、也判断不出它跑了多久、是不是卡住了。
+        started = datetime.now(timezone.utc).astimezone().strftime("%H:%M:%S")
         os.lseek(handle, 0, os.SEEK_SET)
         os.ftruncate(handle, 0)
-        os.write(handle, f"pid={os.getpid()}\n".encode())
+        os.write(handle, f"pid={os.getpid()} 开始于 {started}：{action}\n".encode())
         # `_hold_depth` 必须在**可能抛异常的那几步之后**才置 1，归零仍放在 yield 之后。
         # 否则 `lseek/ftruncate/write` 任一步抛错（磁盘满、只读数据目录、EBADF）时：flock 被
         # 外层 `finally: os.close` 释放，而进程内深度留在 1 → 此后本进程**所有** `single_flight`
@@ -121,9 +127,17 @@ class WriteGate:
     def __init__(self) -> None:
         self._owner: asyncio.Task | None = None
         self._depth = 0
+        # 持有者信息（给状态页看）。只在**最外层**那次获取时写、重入不改：一个任务的可读名字
+        # 该由最外层那句 action 决定（daemon 的「扫描轮次」而不是内层的「抓取/评测/…」）。
+        self._label = ""
+        self._kind = ""
+        self._since_mono: float | None = None
+        self._since_wall: datetime | None = None
 
     @contextlib.asynccontextmanager
-    async def hold_or_fail(self, *, action: str = "本次写操作") -> AsyncIterator[None]:
+    async def hold_or_fail(
+        self, *, action: str = "本次写操作", kind: str = "write"
+    ) -> AsyncIterator[None]:
         task = asyncio.current_task()
         if task is not None and task is self._owner:
             # 同一任务重入：daemon 的外层循环 + 内层 open，直接放行
@@ -134,28 +148,86 @@ class WriteGate:
                 self._depth -= 1
             return
         if self._owner is not None:
+            holder = self.describe()
             raise WriterBusy(
-                f"{action}正在本进程内进行中，本次不再并发执行。"
+                f"{holder.who or '另一个写操作'}正在本进程内进行中，本次不再并发执行。"
                 "同一时刻只允许一处会写外部仓库的操作——并发跑会重复调用 LLM 并重复写平台。"
             )
         self._owner = task
         self._depth = 1
+        self._label, self._kind = action, kind
+        self._since_mono = time.monotonic()
+        self._since_wall = datetime.now(timezone.utc)
         try:
             yield
         finally:
             self._owner = None
             self._depth = 0
+            self._label, self._kind = "", ""
+            self._since_mono = None
+            self._since_wall = None
+
+    def describe(self) -> WriterStatus:
+        """当前持有者的可读描述。**只读**，不改动任何锁状态。
+
+        没有 owner 时返回「不忙」。有 owner 但没登记标签（测试里直接塞 ``_owner``、
+        或调用方没传 action）时退回旧文案，别因为拿不到标签就崩。
+        """
+        if self._owner is None:
+            return WriterStatus(busy=False)
+        seconds = (
+            None if self._since_mono is None else round(time.monotonic() - self._since_mono, 1)
+        )
+        return WriterStatus(
+            busy=True,
+            who=self._label or f"本进程（pid={os.getpid()}）",
+            kind=self._kind or "write",
+            since=self._since_wall,
+            seconds=seconds,
+        )
+
+
+#: 持有者种类 → 界面上的说法。让前端不必去猜 `who` 字符串的含义。
+#: 这让「任务页列出的是网页作业，而正在写的是常驻服务轮次」这类区分变得**显式**，
+#: 而不是让用户对着一张空表和一个「写操作进行中」的角标发懵。
+GATE_KINDS: dict[str, str] = {
+    "round": "常驻服务轮次",
+    "job": "网页作业",
+    "request": "网页写操作",
+    "cli": "命令行 / 其它进程",
+    "write": "写操作",
+}
+
+
+@dataclass(frozen=True)
+class WriterStatus:
+    """「现在有没有写操作、是谁、在做什么、跑了多久」。
+
+    以前这里只回 ``(busy, who)``，而 ``who`` 是 ``本进程（pid=…）`` 这种没法用的字符串：
+    实测里用户看到「写操作进行中」，却既不知道是谁在写、也判断不出它是在干活还是卡住了。
+    """
+
+    busy: bool
+    who: str = ""
+    #: 见 :data:`GATE_KINDS`。
+    kind: str = ""
+    #: 开始时刻（拿得到时）。
+    since: datetime | None = None
+    #: 已经跑了多少秒（拿得到时；跨进程时拿不到，就如实给 None）。
+    seconds: float | None = None
 
 
 #: 进程级单例（各进程一份；跨进程的互斥仍由 `single_flight` 的 flock 负责）。
 WRITE_GATE = WriteGate()
 
 
-def probe_write_lock(settings: Settings) -> tuple[bool, str]:
-    """当前有没有「写操作」在跑，是谁。**只读探测，不改动锁状态**。
+def probe_write_lock(settings: Settings) -> WriterStatus:
+    """当前有没有「写操作」在跑、是谁、在做什么、多久了。**只读探测，不改动锁状态**。
 
     给状态页用：页面得能显示「常驻服务正在跑」「另一次写操作正在进行」，否则用户只能从
-    「条目怎么不动了」倒推。
+    「条目怎么不动了」倒推。**而只说一句「写操作进行中」是不够的**——实测里用户对着这句话
+    既不知道是谁在写、也无法判断它是不是卡住了（真机那次其实是常驻服务的定时轮次在正常
+    推进，Token 一直在涨，但界面上除了这一句话什么都没有）。
 
     判断分两层，与 :func:`single_flight` 的两道闸门一一对应：
 
@@ -166,10 +238,11 @@ def probe_write_lock(settings: Settings) -> tuple[bool, str]:
 
     没有 flock 的平台（Windows）返回「不知道」，而不是假装没人写。
     """
-    if WRITE_GATE._owner is not None:      # noqa: SLF001 —— 同一模块内的自查
-        return True, f"本进程（pid={os.getpid()}）"
+    in_process = WRITE_GATE.describe()
+    if in_process.busy:
+        return in_process
     if fcntl is None:  # pragma: no cover - Windows
-        return False, ""
+        return WriterStatus(busy=False)
     path = _lock_path(settings)
     handle: int | None = None
     try:
@@ -179,13 +252,18 @@ def probe_write_lock(settings: Settings) -> tuple[bool, str]:
         except OSError:
             os.lseek(handle, 0, os.SEEK_SET)
             holder = os.read(handle, 200).decode("utf-8", "replace").strip()
-            return True, holder or f"{path.name} 被另一个进程持有"
+            # 锁文件里没写「在做什么」时（老进程留下的、或写失败的），退回旧文案。
+            return WriterStatus(
+                busy=True,
+                who=holder or f"{path.name} 被另一个进程持有",
+                kind="cli",
+            )
         else:
             fcntl.flock(handle, fcntl.LOCK_UN)
-            return False, ""
+            return WriterStatus(busy=False)
     except OSError as exc:  # pragma: no cover - 数据目录不可写等
         log.debug("探测写锁失败（当作没人写）：%s", exc)
-        return False, ""
+        return WriterStatus(busy=False)
     finally:
         if handle is not None:
             os.close(handle)

@@ -468,14 +468,26 @@
     if (el) el.textContent = text || "";
   }
 
+  /** 已跑时长的短文本。拿不到就返回空串——跨进程时确实拿不到，别编一个数字出来。 */
+  function writerDur(seconds) {
+    if (seconds === null || seconds === undefined) return "";
+    var total = Math.round(seconds);
+    if (total < 60) return "（已跑 " + total + "s）";
+    var minutes = Math.floor(total / 60);
+    if (minutes < 60) return "（已跑 " + minutes + "m" + (total % 60) + "s）";
+    return "（已跑 " + Math.floor(minutes / 60) + "h" + (minutes % 60) + "m）";
+  }
+
   function renderLive(box, st) {
     var job = st.jobs && st.jobs.current;
     var busy = (st.writer && st.writer.busy) || !!job;
     box.dataset.state = busy ? "busy" : "idle";
 
     if (st.writer && st.writer.busy) {
-      setText("live-text", "写操作进行中");
-      setText("live-sub", st.writer.who || "");
+      // 说清「是谁在写、跑了多久」。角标是**全站可见**的，原先这里只有一个 pid：用户既看不出
+      // 那是常驻服务的轮次还是自己刚点的操作，也判断不出它是在干活还是卡住了。
+      setText("live-text", st.writer.kind_label ? "写操作进行中：" + st.writer.kind_label : "写操作进行中");
+      setText("live-sub", (st.writer.who || "") + writerDur(st.writer.seconds));
     } else if (job) {
       setText("live-text", "任务进行中：" + kindLabel(job.kind));
       setText("live-sub", job.progress || job.status);

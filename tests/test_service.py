@@ -80,7 +80,7 @@ async def test_write_loops_queue_instead_of_colliding(settings, monkeypatch, cap
         async with lockfile.WRITE_GATE.hold_or_fail(action="抓取/评测/验证/修复"):
             yield SimpleNamespace(repo=object())
 
-    async def slow_scan_round() -> dict:
+    async def slow_scan_round(**_kwargs: object) -> dict:
         events.append("scan:enter")
         await asyncio.sleep(0.2)                    # 替代「分钟级的一轮」
         events.append("scan:exit")

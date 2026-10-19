@@ -176,8 +176,8 @@ class JobRegistry:
         job.report("开始")
         try:
             # 两道闸门都在**作业自己的任务里**握：见模块开头「与写闸门的关系」。
-            async with WRITE_GATE.hold_or_fail(action=f"{job.kind} 任务"):
-                with single_flight(self.settings, action=f"{job.kind} 任务"):
+            async with WRITE_GATE.hold_or_fail(action=f"作业 {job.kind} {job.id}", kind="job"):
+                with single_flight(self.settings, action=f"作业 {job.kind} {job.id}"):
                     result = await work(job)
             job.result = result or {}
             job.status = DONE

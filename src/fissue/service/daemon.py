@@ -60,11 +60,18 @@ class FissueService:
 
     # -- 生命周期 ---------------------------------------------------------
 
-    async def run_once(self) -> dict[str, Any]:
-        """跑完整的一轮：扫描 → 评测 → flush → 修复。"""
+    async def run_once(self, *, round_name: str = "服务轮次") -> dict[str, Any]:
+        """跑完整的一轮：扫描 → 评测 → flush → 修复。
+
+        ``round_name`` 会作为写闸门的名字出现在状态页上（「常驻服务：扫描轮次」）。
+        为什么值得传：轮次在整轮期间持锁，而界面上原先只能说「写操作进行中」＋一个 pid——
+        用户看不出是谁在写、也判断不出它是不是卡住了。
+        """
         from ..pipeline.context import RuntimeContext
 
-        async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
+        async with RuntimeContext.open(
+            self.settings, exclusive=True, action=f"常驻服务：{round_name}", kind="round"
+        ) as ctx:
             ctx.init_db()
             notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
             result: dict[str, Any] = {}
@@ -234,7 +241,7 @@ class FissueService:
         while not self.stop_event.is_set():
             async with self._round("扫描"):
                 try:
-                    await self.run_once()
+                    await self.run_once(round_name="扫描轮次")
                 except WriterBusy as exc:
                     log.info("扫描让位：%s", exc)
                 except Exception:
@@ -246,7 +253,12 @@ class FissueService:
         while not self.stop_event.is_set():
             async with self._round("flush"):
                 try:
-                    async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
+                    async with RuntimeContext.open(
+                        self.settings,
+                        exclusive=True,
+                        action="常驻服务：flush 轮次",
+                        kind="round",
+                    ) as ctx:
                         notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
                         await self._flush_queues(ctx, notifier)
                 except WriterBusy as exc:
@@ -264,7 +276,12 @@ class FissueService:
                 return
             async with self._round("修复"):
                 try:
-                    async with RuntimeContext.open(self.settings, exclusive=True) as ctx:
+                    async with RuntimeContext.open(
+                        self.settings,
+                        exclusive=True,
+                        action="常驻服务：修复轮次",
+                        kind="round",
+                    ) as ctx:
                         notifier = Notifier(self.settings.notify, self.settings, ctx.repo)
                         await self._run_fixes(ctx, notifier)
                 except WriterBusy as exc:

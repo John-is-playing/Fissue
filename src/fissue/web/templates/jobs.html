@@ -9,6 +9,32 @@
 
 {% block content %}
 
+{# 「写操作进行中」但本表看不到对应的作业——这是真机踩到的困惑点：角标说有活在干，这一页
+   却空空如也，用户既不知道是谁在写、也取消不了。原因很明确：**本表只列从网页提交的作业**，
+   而常驻服务自己的定时轮次不在其中。这里把它点明，并按种类给出不同的话。 #}
+{% if writer and writer.busy and writer.kind != 'job' %}
+<div class="alert info">
+  <span class="a-level">不在本表</span>
+  <div>
+    <div>
+      正在写的是 <b>{{ writer.kind_label }}</b>：<code>{{ writer.who }}</code>{% if writer.seconds is not none %}（已跑 {{ writer.seconds | round | int }} 秒）{% endif %}
+    </div>
+    <div class="small muted">
+      {% if writer.kind == 'round' %}
+      本页只列**从网页提交的作业**；上面这条是常驻服务自己调度的轮次，因此不在这里，
+      也**不能从本页取消**。要停它请停掉常驻服务（在跑 <code>fissue serve</code> 的那个终端按 Ctrl-C）；
+      想看它跑到哪一步，去「状态监测」页。
+      {% elif writer.kind == 'cli' %}
+      它是**另一个进程**在写（命令行或另一个服务）。本进程看不到它的进度，也无法从页面取消——
+      要等它结束，或先停掉那个进程。
+      {% else %}
+      它是网页上刚发起的一次写操作（例如 flush、批准提 PR）。等它跑完即可；只有长任务才会登记成上面的作业。
+      {% endif %}
+    </div>
+  </div>
+</div>
+{% endif %}
+
 {% if jobs.current %}
 <div class="panel">
   <h2>正在运行</h2>

@@ -156,3 +156,87 @@ async def test_write_gate_blocks_a_different_task() -> None:
     async with gate.hold_or_fail(action="daemon 的 flush 循环"):
         await asyncio.create_task(web_request())
         assert seen == ["blocked"], f"不同任务必须被挡住：{seen}"
+
+
+# ---------------------------------------------------------------------------
+# 写闸门要说清「是谁在写、在做什么、写了多久」
+# ---------------------------------------------------------------------------
+#
+# 真机踩到的困惑：界面上只说一句「写操作进行中」＋一个 pid。用户既不知道是谁在写、也判断
+# 不出它是在正常干活还是卡住了（那次其实是常驻服务的定时轮次在正常推进，Token 一直在涨）。
+
+
+async def test_gate_reports_who_is_writing_and_for_how_long() -> None:
+    from fissue.lockfile import WriteGate
+
+    gate = WriteGate()
+    assert gate.describe().busy is False
+
+    async with gate.hold_or_fail(action="常驻服务：扫描轮次", kind="round"):
+        holder = gate.describe()
+        assert holder.busy is True
+        assert holder.who == "常驻服务：扫描轮次"
+        assert holder.kind == "round"
+        assert holder.since is not None
+        assert holder.seconds is not None and holder.seconds >= 0
+
+    assert gate.describe().busy is False, "退出后必须清干净，否则状态页会一直说有人在写"
+
+
+async def test_gate_keeps_the_outer_label_on_reentry() -> None:
+    """重入不换名字：可读名字该由**最外层**那句 action 决定。
+
+    daemon 是「外层循环持锁 → 内层 open」的嵌套结构。若内层把名字覆盖成「抓取/评测/验证/修复」，
+    状态页就会丢掉「常驻服务的扫描轮次」这条真正有用的信息。
+    """
+    from fissue.lockfile import WriteGate
+
+    gate = WriteGate()
+    # 一道 `async with` 里同时握住两层（内层是重入）——这正是 daemon 那套「外层循环持锁 →
+    # 内层 open」的结构。
+    async with (
+        gate.hold_or_fail(action="常驻服务：扫描轮次", kind="round"),
+        gate.hold_or_fail(action="抓取/评测/验证/修复"),
+    ):
+        holder = gate.describe()
+        assert holder.who == "常驻服务：扫描轮次"
+        assert holder.kind == "round"
+
+
+def test_gate_describes_a_foreign_owner_without_crashing() -> None:
+    """有人直接塞 `_owner`（测试替身 / 老路径）时要退回旧文案，而不是崩。"""
+    from fissue.lockfile import WriteGate
+
+    gate = WriteGate()
+    gate._owner = object()          # type: ignore[assignment]  # noqa: SLF001 —— 故意的：模拟「有 owner 但没登记标签」
+    holder = gate.describe()
+    assert holder.busy is True
+    assert "pid=" in holder.who
+    assert holder.kind == "write"
+
+
+async def test_probe_write_lock_returns_label_and_kind(settings) -> None:
+    """探测函数要连着种类一起回——页面靠它区分「网页作业」与「常驻轮次」。"""
+    from fissue.lockfile import WRITE_GATE, probe_write_lock
+
+    assert probe_write_lock(settings).busy is False
+
+    async with WRITE_GATE.hold_or_fail(action="作业 flush job-1", kind="job"):
+        holder = probe_write_lock(settings)
+        assert holder.busy is True
+        assert holder.who == "作业 flush job-1"
+        assert holder.kind == "job"
+        assert holder.seconds is not None
+
+    assert probe_write_lock(settings).busy is False
+
+
+@requires_flock
+def test_lock_file_records_who_and_since(settings) -> None:
+    """拿不到锁的人从锁文件里要能读到「谁在跑、什么时候开始的」，而不是只有一个 pid。"""
+    with single_flight(settings, action="抓取/评测/验证/修复"):
+        text = _lock_path(settings).read_text(encoding="utf-8")
+
+    assert f"pid={os.getpid()}" in text
+    assert "开始于" in text
+    assert "抓取/评测/验证/修复" in text, "锁文件里要能看出对方在做什么"

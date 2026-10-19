@@ -527,7 +527,7 @@ def serve(
 
     service = FissueService(settings, with_web=with_web)
     if once:
-        run_async(service.run_once())
+        run_async(service.run_once(round_name="命令行单轮扫描"))
         emit("✅ 单轮扫描完成", style="green")
         return
     try:

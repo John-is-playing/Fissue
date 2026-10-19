@@ -79,7 +79,13 @@ class RuntimeContext:
     @classmethod
     @asynccontextmanager
     async def open(
-        cls, settings: Settings | None = None, *, exclusive: bool = False, **kwargs: Any
+        cls,
+        settings: Settings | None = None,
+        *,
+        exclusive: bool = False,
+        action: str | None = None,
+        kind: str = "cli",
+        **kwargs: Any,
     ) -> AsyncIterator[RuntimeContext]:
         """异步上下文：自动关闭 LLM 客户端与适配器。
 
@@ -87,8 +93,15 @@ class RuntimeContext:
         的入口用（fetch / eval / verify / flush / fix / daemon 的一轮）——daemon 与 CLI
         同跑会重复评测（白烧 token）并在同一个 SQLite 上互相写冲突，这两样唯一键和
         「只认 open 的复用」都挡不住。**读命令不要加**：看板/`status` 不该被常驻服务挡住。
+
+        ``action`` / ``kind``：这一轮**是谁在写**，会出现在状态页与锁文件里
+        （``kind`` 取 ``fissue.lockfile.GATE_KINDS`` 的键）。默认适合命令行；常驻服务的
+        定时轮次会传「常驻服务：扫描轮次」并把 ``kind`` 设为 ``round``——不传的话，
+        用户在界面上只会看到一句「写操作进行中」＋一个 pid，既看不出是谁、也判断不出
+        是不是卡住了（真机实测就卡在这个信息缺口上）。
         """
         ctx = cls.create(settings, **kwargs)
+        label = action or "抓取/评测/验证/修复"
         if not exclusive:
             try:
                 yield ctx
@@ -103,8 +116,8 @@ class RuntimeContext:
         #   进程里，`flock` 那边走的是重入旁路，挡不住同进程的另一处写操作。
         #   同一任务可重入，所以 daemon 的外层循环 + 内层 `open(exclusive=True)`
         #   不会把自己挡住。
-        async with WRITE_GATE.hold_or_fail(action="抓取/评测/验证/修复"):
-            with single_flight(ctx.settings, action="抓取/评测/修复"):
+        async with WRITE_GATE.hold_or_fail(action=label, kind=kind):
+            with single_flight(ctx.settings, action=label):
                 try:
                     yield ctx
                 finally:

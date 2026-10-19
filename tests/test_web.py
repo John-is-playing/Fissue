@@ -136,7 +136,7 @@ def hook_client(settings, repo, monkeypatch):
 
     rounds: list[str] = []
 
-    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+    async def fake_round(self, **_kwargs: Any) -> dict[str, Any]:      # noqa: ANN001
         rounds.append("round")
         return {}
 
@@ -157,7 +157,7 @@ def test_webhook_endpoint_is_404_until_enabled(settings, repo, monkeypatch) -> N
     from fissue.service.daemon import FissueService
     from fissue.web.app import create_app
 
-    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+    async def fake_round(self, **_kwargs: Any) -> dict[str, Any]:      # noqa: ANN001
         return {}
 
     monkeypatch.setattr(FissueService, "run_once", fake_round)
@@ -274,7 +274,7 @@ def test_webhook_works_without_an_identity_on_a_remote_peer(settings, repo, monk
     settings.webhooks.enabled = True
     settings.webhooks.secrets.github = "hook-secret"
 
-    async def fake_round(self) -> dict[str, Any]:      # noqa: ANN001
+    async def fake_round(self, **_kwargs: Any) -> dict[str, Any]:      # noqa: ANN001
         return {}
 
     monkeypatch.setattr(FissueService, "run_once", fake_round)
@@ -1049,3 +1049,77 @@ def test_delete_entry_points_are_present(client) -> None:
     assert "Fissue.confirm(" in detail
     # 措辞必须点明「只删本地」——否则用户会以为平台上的 Issue 也被删了
     assert "本地数据" in detail
+
+
+# ---------------------------------------------------------------------------
+# 「谁在写」要说清楚：角标不能只说一句「写操作进行中」
+# ---------------------------------------------------------------------------
+#
+# 真机报告：角标显示「后台有写操作进行中」，但任务页看不到任何任务、也无法取消，而 token
+# 一直在走。查下来是**常驻服务的定时轮次**在整轮持锁——它不在 JobRegistry 里，所以那张表是
+# 空的，取消按钮也够不着它。下面这几条守的是「界面必须把这件事说明白」。
+
+
+def _fake_writer(monkeypatch, **fields):
+    """把写闸门的持有者换成一个受控替身（不必真的去抢锁）。"""
+    from fissue import lockfile
+
+    status = lockfile.WriterStatus(**{"busy": True, **fields})
+    monkeypatch.setattr(lockfile.WRITE_GATE, "describe", lambda: status)
+    return status
+
+
+def test_status_reports_who_holds_the_write_gate(client, monkeypatch) -> None:
+    """`/status` 要给出「谁在写、哪一类、跑了多久」，而不是只报一个 pid。"""
+    from datetime import datetime, timezone
+
+    _fake_writer(
+        monkeypatch,
+        who="常驻服务：扫描轮次",
+        kind="round",
+        since=datetime(2026, 10, 19, 12, 47, 41, tzinfo=timezone.utc),
+        seconds=252.4,
+    )
+
+    writer = client.get("/api/v1/status").json()["writer"]
+
+    assert writer["busy"] is True
+    assert writer["who"] == "常驻服务：扫描轮次"
+    assert writer["kind"] == "round"
+    assert writer["kind_label"] == "常驻服务轮次", "页面直接用这个中文，别让它自己猜 kind"
+    assert writer["seconds"] == 252.4
+    assert writer["since"].startswith("2026-10-19T12:47:41")
+
+
+def test_jobs_page_explains_a_writer_that_is_not_a_job(client, monkeypatch) -> None:
+    """轮次在写时，任务页要明说「它不在这张表里、也不能从这里取消」。"""
+    _fake_writer(monkeypatch, who="常驻服务：扫描轮次", kind="round", seconds=252.4)
+
+    html = client.get("/jobs").text
+
+    assert "不在本表" in html
+    assert "常驻服务轮次" in html and "常驻服务：扫描轮次" in html
+    assert "252" in html, "已跑时长要显示出来"
+    assert "Ctrl-C" in html, "还要告诉用户怎么才能停掉它"
+
+
+def test_jobs_page_keeps_quiet_when_the_writer_is_a_job(client, monkeypatch) -> None:
+    """作业在写时**不要**弹那条提示——那时表格里就是它自己。"""
+    _fake_writer(monkeypatch, who="作业 scan job-1", kind="job", seconds=3.0)
+
+    html = client.get("/jobs").text
+
+    assert "不在本表" not in html
+
+
+def test_frontend_shows_who_is_writing_and_for_how_long(client) -> None:
+    """前端两处（状态页写闸门、全站角标）都要把种类与时长显示出来。
+
+    它们是前端渲染的，所以只能守到「脚本里有这段接线」——真机那次的病根正是这段接线缺失：
+    `who` 只有一个 pid、也没有时长，用户看不出是谁在写、更判断不出卡没卡。
+    """
+    status_html = client.get("/status").text
+    assert "writerText" in status_html and "kind_label" in status_html
+
+    app_js = client.get("/static/app.js").text
+    assert "writerDur" in app_js and "kind_label" in app_js

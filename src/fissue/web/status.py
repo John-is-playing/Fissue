@@ -17,7 +17,7 @@ from fastapi import FastAPI
 
 from .. import __version__
 from ..config import DEFAULT_OVERLAY_FILE, Settings
-from ..lockfile import fcntl, probe_write_lock
+from ..lockfile import GATE_KINDS, fcntl, probe_write_lock
 from ..logging_setup import get_logger
 from ..models import QueueName
 
@@ -266,6 +266,26 @@ def _alerts(
     return alerts
 
 
+def writer_panel(settings: Settings) -> dict[str, Any]:
+    """「谁在写、在做什么、写了多久」——状态页与任务页共用这一份口径。
+
+    为什么抽出来：**两个页面都要用它**。状态页显示写闸门；任务页则要能说明「正在写的东西
+    不在这张表里」（常驻服务的定时轮次不是网页作业——真机实测里用户就是对着空表 +
+    「写操作进行中」发懵的）。各拼一遍迟早对不上。
+    """
+    writer = probe_write_lock(settings)
+    return {
+        "busy": writer.busy,
+        "who": writer.who,
+        # `kind` 是给页面用的稳定取值（见 lockfile.GATE_KINDS），`kind_label` 是给人看的中文。
+        "kind": writer.kind,
+        "kind_label": GATE_KINDS.get(writer.kind, writer.kind or "写操作"),
+        "since": _iso(writer.since) if writer.since else None,
+        "seconds": writer.seconds,
+        "locks_supported": fcntl is not None,
+    }
+
+
 def collect(
     app: FastAPI,
     settings: Settings,
@@ -279,7 +299,6 @@ def collect(
     轮询一次，每次都敲 Docker 既慢又吵。
     """
     now = datetime.now(timezone.utc)
-    busy, who = probe_write_lock(settings)
     # 平台没有 flock（Windows）时跨进程互斥不生效——这条要作为告警出现在页面上，
     # 而不是等用户发现「同一条被评测了两遍、钱花了两份」。
     locks_ok = fcntl is not None
@@ -313,7 +332,7 @@ def collect(
             "overlay_file": DEFAULT_OVERLAY_FILE,
             "overlay_active": settings.overlay_path is not None,
         },
-        "writer": {"busy": busy, "who": who, "locks_supported": locks_ok},
+        "writer": writer_panel(settings),
         "database": {
             "backend": _backend_of(str(settings.database.url)),
             "url": mask_url(db_url or str(settings.database.url)),

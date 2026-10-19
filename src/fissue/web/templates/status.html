@@ -100,6 +100,18 @@
 
   function num(n) { return '<span class="mono">' + esc(n) + "</span>"; }
 
+  /** 「是谁在写、写了多久」。
+   *
+   * 原先这里只显示一个 pid（`本进程（pid=140896）`）——用户看不出那是常驻服务的定时轮次、
+   * 是网页上刚点的一次操作，还是另一个进程；更判断不出它是**在干活**还是**卡住了**。
+   * 现在 `who` 自带名字（如「常驻服务：扫描轮次」），这里再补上已跑时长。
+   */
+  function writerText(w) {
+    var text = w.who || "未知";
+    if (w.seconds !== null && w.seconds !== undefined) text += "（已跑 " + fmtDur(w.seconds) + "）";
+    return text;
+  }
+
   function renderStatus(st) {
     // 告警
     var alerts = document.getElementById("st-alerts");
@@ -131,7 +143,7 @@
       ["版本", esc(st.app.version) + " · pid " + esc(st.app.pid)],
       ["已运行", st.app.uptime_seconds === null ? "—" : fmtDur(st.app.uptime_seconds)],
       ["写闸门", st.writer.busy
-        ? tag("进行中：" + (st.writer.who || "未知"), "tier1")
+        ? tag("进行中：" + writerText(st.writer), "tier1")
         : tag("空闲", "status-pr_created")],
       ["跨进程互斥", st.writer.locks_supported
         ? tag("可用（flock）", "status-pr_created")

@@ -45,7 +45,7 @@ from .auth import register as register_auth
 from .hooks import parse_event, signature_ok
 from .jobs import Job, JobRegistry
 from .status import collect as collect_status
-from .status import queue_panel
+from .status import queue_panel, writer_panel
 
 log = get_logger(__name__)
 
@@ -142,7 +142,7 @@ async def _run_round_after_hook(settings: Settings) -> None:
     from ..service.daemon import FissueService
 
     try:
-        out = await FissueService(settings).run_once()
+        out = await FissueService(settings).run_once(round_name="webhook 触发的轮次")
         log.info("webhook 触发的一轮完成：%s", out)
     except FissueError as exc:
         log.info("webhook 触发的一轮跳过（已有写进程在跑）：%s", exc)
@@ -334,7 +334,11 @@ def _exclusive_write(fn):
         _reject_proxied_write(request, settings)
         _reject_remote_write(request, settings)
         try:
-            async with _write_guard(settings, action="Web/API 写操作"):
+            # 名字带上方法 + 路径：状态页上显示「网页写操作 POST /api/v1/queues/flush」
+            # 比一句「Web/API 写操作」有用得多——用户能立刻对上自己刚才点了什么。
+            async with _write_guard(
+                settings, action=f"网页写操作 {request.method} {request.url.path}"
+            ):
                 return await fn(*args, **kwargs)
         except FissueError as exc:
             # 409 而不是 500：这是「此刻有别处在写，你稍后再来」，不是服务故障
@@ -344,14 +348,19 @@ def _exclusive_write(fn):
 
 
 @asynccontextmanager
-async def _write_guard(settings: Settings, *, action: str) -> AsyncIterator[None]:
+async def _write_guard(
+    settings: Settings, *, action: str, kind: str = "request"
+) -> AsyncIterator[None]:
     """写操作的互斥：进程内闸门 + 跨进程 flock。
 
     抽成独立上下文管理器，是因为**后台作业也要用它**：作业由请求提交，但请求返回后锁不能
     跟着放（否则作业还在跑，另一次写就能同时进来）。作业在自己的任务里进出这两道闸门，
     见 ``web/jobs.py``。
+
+    ``action`` / ``kind`` 会一路传到状态页（见 ``lockfile.GATE_KINDS``），于是页面上
+    能说清「现在是谁在写、写了多久」，而不是只报一个 pid。
     """
-    async with WRITE_GATE.hold_or_fail(action=action):
+    async with WRITE_GATE.hold_or_fail(action=action, kind=kind):
         with single_flight(settings, action=action):
             yield
 
@@ -1404,11 +1413,21 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
 
     @app.get("/jobs", response_class=HTMLResponse)
     async def jobs_page(request: Request) -> HTMLResponse:
-        """任务页：作业历史（含日志）。提交入口在总览的控制面板。"""
+        """任务页：作业历史（含日志）。提交入口在总览的控制面板。
+
+        ``writer`` 必须一起传：这张表只列**从网页提交的作业**，而正在写的很可能是常驻服务的
+        定时轮次。真机实测就卡在这个缝里——角标说「写操作进行中」，这一页却空空如也，用户既
+        不知道是谁在写、也取消不了。页面靠 ``writer.kind`` 把两者分开说清楚。
+        """
         return templates.TemplateResponse(
             request,
             "jobs.html",
-            _page_context(request, nav="jobs", jobs=request.app.state.jobs.to_dict()),
+            _page_context(
+                request,
+                nav="jobs",
+                jobs=request.app.state.jobs.to_dict(),
+                writer=writer_panel(_settings(request)),
+            ),
         )
 
     @app.get("/repos", response_class=HTMLResponse)
