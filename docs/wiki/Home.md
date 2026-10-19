@@ -43,7 +43,7 @@ Fissue 把「分诊（triage）→ 验证 → 修复」这一整套流程自动�
 - 页面位于仓库的 `docs/wiki/`，采用 **GitHub Wiki 兼容**的形态：`Home` / `_Sidebar` / `_Footer` 加一组扁平命名页。
 - 每页遵循同一约定：**本页给出结论与摘要，深水区仍以仓库文档为准**（[README](../../README.md)、[docs/DESIGN.md](../DESIGN.md)、[docs/USAGE.md](../USAGE.md)、[docs/ENV.md](../ENV.md)、[docs/AUTH.md](../AUTH.md)、[SECURITY.md](../../SECURITY.md)、[BENCHMARK.md](../../BENCHMARK.md)）。
 - 链接一律是可点击的相对链接：页内互链用 `页面名.md`，指向仓库文档用 `../xxx.md`。在 GitHub、AtomGit 的网页浏览与任意本地 Markdown 阅读器里都能直接点开。
-- **发布到 GitHub Wiki**：把 `docs/wiki/*.md` 推到 `Fissue.wiki.git` 即可；Wiki 渲染器要求页间链接**不带 `.md` 后缀**（如 `[概览](Overview)`），而指向仓库内文档的 `../xxx.md` 链接需要改写成仓库的完整 URL。发布前做个批量替换即可，本页其余内容不用动。
+- **发布到平台 Wiki（GitHub / AtomGit）**：用 `python scripts/publish_wiki.py`——默认**干跑**（只报告会改什么），确认后加 `--push --remote <wiki 仓库的 git 地址>` 发布。脚本会按 Wiki 渲染器的要求把页间链接的 `.md` 去掉、把指向仓库文档的链接换成完整 URL，且**代码块与行内代码里的示例一律不动**。注意：平台的 wiki 仓库是**懒创建**的——必须先在网页上点「创建第一页」保存一次，否则 `git push` 会被拒（`Repository not found`），而且没有任何 API 能代做。
 
 ---
 

@@ -169,6 +169,8 @@ GET  /api/auth/2fa/pending              取回「已生成、还没确认」的�
 GET  /api/auth/api-keys                 列出（只回 prefix/名称/时间）
 POST /api/auth/api-keys                创建（仅此一次回明文）
 POST /api/auth/api-keys/{id}/revoke    吊销
+GET  /api-keys                          管理页（列表 / 创建 / 吊销；已并入左侧导航）
+POST /api/auth/legacy-token            把旧口令手工导入成一条 API Key（兼容垫片，后续版本移除）
 ```
 
 ---

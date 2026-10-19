@@ -61,7 +61,7 @@ fissue sandbox serve                     # 监听 /var/run/fissue-runner.sock
 FISSUE_SANDBOX_RUNNER_SOCKET=/run/fissue-runner.sock   # 等价 sandbox.forwarder.socket
 ```
 
-- 默认 socket：`cfg.forwarder.socket`（默认 `/var/run/fissue-runner.sock`）。
+- 默认 socket：`sandbox.forwarder.socket`（默认 `/var/run/fissue-runner.sock`）。
 - **非 Windows** 使用 Unix domain socket（`AF_UNIX`）；**Windows 不支持 Unix socket 转发**，
   会报错并提示改用 inline 模式——实际会自动回退 inline。
 

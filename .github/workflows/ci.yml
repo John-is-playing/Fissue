@@ -71,7 +71,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: ruff
-        run: python -m ruff check src tests
+        run: python -m ruff check src tests scripts
 
       - name: mypy
-        run: python -m mypy src/fissue tests
+        run: python -m mypy src/fissue tests scripts
