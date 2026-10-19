@@ -14,21 +14,30 @@ dependencies = [
     # 其根证书在系统信任库里但不在 certifi 里，装了它就能正常访问。
     "truststore>=0.9",
     "pydantic>=2.6",
-    "pydantic-settings>=2.2",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
     "sqlalchemy>=2.0",
+    # 代码里**没有** `import psycopg`，但它是必需的：SQLAlchemy 按 URL 里的 dialect
+    # 动态加载驱动（`postgresql+psycopg://`），静态扫描看不见它。
     "psycopg[binary]>=3.1",
-    "alembic>=1.13",
     "typer>=0.12",
     "rich>=13.7",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
+    # 由 `fastapi.templating.Jinja2Templates` 使用，代码里不直接 import。
     "jinja2>=3.1",
-    "apscheduler>=3.10",
-    "tenacity>=8.2",
-    "docker>=7.0",
 ]
+
+# 这里**没有**、以及为什么没有（免得有人"补齐"回来）。清理依据见
+# `tests/test_packaging.py`——它会断言「声明的每个包要么被代码 import、要么在豁免名单里」：
+#   * docker——沙盒要的是**宿主机的 `docker` 命令**（代码用 shutil.which + subprocess
+#     调 CLI，见 sandbox/runtime.py），不是 docker 这个 Python SDK。装 SDK 对容器隔离
+#     毫无帮助，而真正的依赖（宿主机的 docker）pip 装不了。
+#   * apscheduler——常驻服务用的是自己的轮询循环；它只在 logging_setup 的
+#     "第三方日志降噪"名单里作为字符串出现过，从未被使用。
+#   * tenacity——三处需要重试的地方（LLM 调用、克隆工作区、验证）都是自己写的有限退避。
+#   * alembic——表由 `create_all` 建（新表直接建，不需要迁移脚本）。
+#   * pydantic-settings——配置是 pydantic `BaseModel` + 自己读 yaml/.env（见 config.py）。
 
 [project.optional-dependencies]
 dev = [
