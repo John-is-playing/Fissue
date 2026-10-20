@@ -893,6 +893,35 @@ fissue requeue --failed --yes
 > 「重复修复 / 重复建 PR」再开一道口子，所以那里只留痕（`RawItem.stale_reasons`，
 > 导出与 API 都看得到），由你确认后放回。
 
+### 9.8 模型说「不修」，但你就是想修：`fissue force`
+
+评测会把条目拦在很多闸门后面：判成 FEATURE 直接打标签、疑似刷量不碰、优先级不够不修、
+验证后裁决 skip……这些结论是模型给的，**你认不认是你自己的事**。强制修复就是「人拍板」
+的入口——无论上述结论如何，把指定条目推进修复流程并**真提 PR**：
+
+```bash
+fissue force -k github:owner/repo#42 --dry-run   # 先看计划，不改状态
+fissue force -k github:owner/repo#42 --yes       # 强制修复
+fissue force -k github:owner/repo#42 --undo      # 取消强制
+```
+
+WebUI 里就是条目详情页的「**强制修复**」按钮（Issue 才有；PR 没有自动修复流程），
+列表页可勾选多条「强制修复选中」。已强制的条目带 ⚡ 徽标，随时点「取消强制」收回。
+
+强制时实际发生了什么：
+
+1. 条目打上 `force_fix` 标记（人工置位，流水线只读它、不会自行清掉）；
+2. 走一遍验证阶段——分类 / 刷量 / 可复现三道闸门对强制条目失效，
+   没有验证器的会顺手生成一个（修复器靠它判定修复，**这道闸不旁路**）；
+3. 条目直落「待修 tier1」，跳过定论队列与 LLM 裁决，由常驻服务 / `fissue fix` 接力提 PR。
+
+两条边界：
+
+- 已在修复流程中（fixing / pr_created / fix_queued）的条目强制时**保持原状**——
+  把已提过 PR 的条目拉回来重验会多开一个 PR；
+- 取消强制时，仍在待修队列的条目回退为「需人工」：它留在待修队列就没了依据
+  （候选过滤只认状态+优先级），放着会被修复循环反复捡起空转。
+
 ---
 
 ## 10. 成本控制
@@ -1060,6 +1089,7 @@ fissue eval  [-r owner/name] [--all] [--deep] [--limit N] [--json]
 fissue verify [-r owner/name] [--key KEY] [--limit N] [--json]
 fissue flush [--queue verify|fix_bug|fix_feature] [--force/--auto] [--limit N]
 fissue fix   [-r owner/name] [--key KEY] [--limit N] [--plan] [--dry-run] [--rounds N]
+fissue force [-k KEY ...] [--dry-run] [--yes] [--undo]   # 强制修复 / 取消（见 9.8）
 
 fissue report [-r owner/name] [-f markdown|json] [-o 路径] [--with-body]
 fissue export [-f json|markdown] [-o 路径] [--category X] [--status Y]

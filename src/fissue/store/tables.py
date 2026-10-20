@@ -103,6 +103,10 @@ class ItemRow(Base):
     category: Mapped[str] = mapped_column(String(16), default="unknown", index=True)
     status: Mapped[str] = mapped_column(String(32), default="new", index=True)
     priority: Mapped[str] = mapped_column(String(16), default="none", index=True)
+    # 强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都把它推进修复流程。
+    # 人工设置（WebUI / CLI / API）；流水线只读它、不会自行清掉。
+    # 旧库上的这一列由 `db.Database.ensure_schema` 的一次性迁移补上（create_all 不改已存在的表）。
+    force_fix: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)

@@ -435,15 +435,21 @@ class AutoFixer:
         max_rounds: int | None = None,
     ) -> FixAttempt:
         """修复单个 Issue 并（可选）提 PR。"""
-        # 策略闸门：只有 BUG 类、优先级 tier1/tier2 才修
+        # 策略闸门：只有 BUG 类、优先级 tier1/tier2 才修。
+        # 强制修复的条目由人拍板「要修」：评测缺失 / 优先级 / 刷量三道闸不再拦它；
+        # 验证器闸门**保留**（见下）——没有验证器，修复结果无从判定，强也强不了。
         evaluation = self.ctx.repo.latest_evaluation(item.key)
-        if evaluation is None:
+        if evaluation is None and not item.force_fix:
             return self._skip(item, "缺少评测结果")
         if item.item_type is not ItemType.ISSUE and self.settings.fix_policy.only_issues:
             return self._skip(item, "策略只自动修复 Issue")
-        if item.priority not in (Priority.TIER1, Priority.TIER2):
+        if item.priority not in (Priority.TIER1, Priority.TIER2) and not item.force_fix:
             return self._skip(item, f"优先级为 {item.priority.value}，不自动修复")
-        if evaluation.spam.suspicious:
+        if (
+            evaluation is not None
+            and evaluation.spam.suspicious
+            and not item.force_fix
+        ):
             return self._skip(item, "疑似刷量/重复，不自动修复")
         if self._has_open_attempt(item.key):
             return self._skip(item, "已存在修复尝试，跳过以免重复提 PR")

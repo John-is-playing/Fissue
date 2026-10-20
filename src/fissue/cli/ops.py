@@ -450,6 +450,91 @@ def requeue(
 
 
 # ---------------------------------------------------------------------------
+# force
+# ---------------------------------------------------------------------------
+
+# list 参数用模块级常量（同 REPO_OPT 的做法，规避 B008）
+KEY_OPT = typer.Option(None, "--key", "-k", help="条目键 platform:owner/name#number（可多次指定）")
+
+
+@app.command("force")
+def force(
+    key: list[str] = KEY_OPT,
+    undo: bool = typer.Option(False, "--undo", help="取消强制修复（清标记，待修条目回退 needs_manual）"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只列出要做什么，不改状态"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="不询问确认"),
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+) -> None:
+    """强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，把条目推进修复流程。
+
+    置位 force 标记后走一遍验证阶段——标记会旁路分类 / 刷量 / 可复现闸门（FEATURE
+    请求也照走，顺带补齐验证器），条目直落「待修 tier1」，由常驻服务 / ``fissue fix``
+    接力提 PR。随时用 ``--undo`` 收回。
+    """
+    if not key:
+        fail("请用 --key platform:owner/name#number 指定至少一条条目")
+    settings = load_cfg(config, env, verbose=verbose)
+
+    async def main() -> int:
+        from ..pipeline.context import RuntimeContext
+        from ..pipeline.stages import VerifyStage
+
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
+            ctx.init_db()
+            plan: list[tuple[str, str]] = []
+            for k in dict.fromkeys(key):
+                item = ctx.repo.get_item(k)
+                if item is None:
+                    emit(f"  {k}：条目不存在，跳过", style="yellow")
+                    continue
+                if undo:
+                    plan.append((k, "取消强制（清标记）"))
+                elif item.item_type is not ItemType.ISSUE:
+                    emit(f"  {k}：PR 没有自动修复流程，不能强制", style="yellow")
+                elif item.status in (ItemStatus.FIXING, ItemStatus.PR_CREATED):
+                    emit(f"  {k}：已在修复（或已提 PR），保持状态", style="yellow")
+                else:
+                    plan.append((k, f"强制修复（当前 {item.status.value}）"))
+            for k, why in plan:
+                emit(f"  {k} → {why}")
+            if not plan:
+                emit("（没有可处理的条目）")
+                return 0
+            if dry_run:
+                emit(f"（--dry-run：以上 {len(plan)} 条未改动）", style="yellow")
+                return 0
+            if not yes and not typer.confirm(f"确认处理以上 {len(plan)} 条？"):
+                emit("已取消（未改动任何条目）", style="yellow")
+                return 0
+
+            stage = VerifyStage(ctx)
+            for k, _why in plan:
+                if undo:
+                    ctx.repo.unforce_item(k)
+                    emit(f"  {k}：已取消强制", style="green")
+                    continue
+                ctx.repo.set_force_fix(k, True)
+                item = ctx.repo.get_item(k)
+                if item is None:  # 理论上不会消失；防御
+                    emit(f"  {k}：处理中消失，跳过", style="yellow")
+                    continue
+                try:
+                    await stage.run(item, ctx.repo.latest_evaluation(k))
+                except Exception as exc:
+                    emit(f"  {k}：强制修复失败：{type(exc).__name__}: {exc}", style="red")
+                    continue
+                fresh = ctx.repo.get_item(k)
+                if fresh is None:
+                    continue
+                emit(f"  {k}：状态 → {fresh.status.value}", style="green")
+            return 0
+
+    run_async(main())
+
+
+# ---------------------------------------------------------------------------
 # sandbox serve
 # ---------------------------------------------------------------------------
 

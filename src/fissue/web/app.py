@@ -110,6 +110,12 @@ class PurgeRequest(BaseModel):
     keys: list[str] = Field(default_factory=list)
 
 
+class ForceRequest(BaseModel):
+    """取消强制修复（清除 force 标记；仍在待修队列的条目回退 needs_manual）。"""
+
+    keys: list[str] = Field(default_factory=list)
+
+
 # ---------------------------------------------------------------------------
 # 应用工厂
 # ---------------------------------------------------------------------------
@@ -660,6 +666,62 @@ async def _work_fix(app: FastAPI, params: dict[str, Any], report: Report) -> dic
     return {"attempted": len(results), "dry_run": dry_run, "results": results}
 
 
+async def _work_force(app: FastAPI, params: dict[str, Any], report: Report) -> dict[str, Any]:
+    """强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，把指定条目推进修复流程。
+
+    每个 key：置 force 标记 → 过一遍验证阶段（标记会旁路分类 / 刷量 / 可复现闸门，
+    顺带补齐验证器）→ 直落「待修 tier1」，由修复循环（常驻服务 / CLI / 「修复选中」）
+    接力提 PR。已在修复中 / 已提 PR 的条目保持原状。
+    """
+    from ..pipeline.stages import VerifyStage
+
+    ctx = _ctx_of(app)
+    keys = list(params.get("keys") or [])
+    if not keys:
+        raise HTTPException(status_code=400, detail="请用 keys 指定要强制修复的条目")
+    stage = VerifyStage(ctx)
+    results: list[dict[str, Any]] = []
+    for index, key in enumerate(keys, start=1):
+        item = ctx.repo.get_item(key)
+        if item is None:
+            report(f"[{index}/{len(keys)}] {key}：条目不存在，跳过")
+            results.append({"key": key, "error": "不存在"})
+            continue
+        if item.item_type is not ItemType.ISSUE:
+            report(f"[{index}/{len(keys)}] {key}：PR 没有自动修复流程，不能强制")
+            results.append({"key": key, "error": "PR 没有自动修复流程"})
+            continue
+        if item.status in (ItemStatus.FIXING, ItemStatus.PR_CREATED):
+            report(f"[{index}/{len(keys)}] {key}：已在修复（或已提 PR），保持状态")
+            results.append(
+                {"key": key, "status": item.status.value, "note": "已在修复流程中（或已完成）"}
+            )
+            continue
+        ctx.repo.set_force_fix(key, True)
+        item = ctx.repo.get_item(key)
+        if item is None:  # 理论上不会消失（刚在上面读过）；防御
+            results.append({"key": key, "error": "处理中消失"})
+            continue
+        report(f"[{index}/{len(keys)}] 强制修复 {key}（进验证/修复流程）")
+        try:
+            r = await stage.run(item, ctx.repo.latest_evaluation(key))
+        except Exception as exc:
+            # 与 _work_verify 同口径：逐条兜住，一条失败不该让整批结果全丢。
+            report(f"{key}：强制修复失败：{type(exc).__name__}: {exc}")
+            results.append({"key": key, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        fresh = ctx.repo.get_item(key)
+        results.append(
+            {
+                "key": key,
+                "status": fresh.status.value if fresh else (r.status.value if r.status else ""),
+                "note": "；".join(r.notes) or r.skipped_reason or "",
+            }
+        )
+    report(f"强制修复完成：处理 {len(results)} 条")
+    return {"processed": len(results), "results": results}
+
+
 async def _work_flush(app: FastAPI, params: dict[str, Any], report: Report) -> dict[str, Any]:
     from ..pipeline.flush import FlushProcessor
     from ..pipeline.queue import QueueManager
@@ -698,6 +760,7 @@ _JOB_WORK: dict[str, Callable[[FastAPI, dict[str, Any], Report], Awaitable[dict[
     "verify": _work_verify,
     "fix": _work_fix,
     "flush": _work_flush,
+    "force": _work_force,
 }
 
 
@@ -935,6 +998,27 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             "counts": counts,
             "note": "本地数据已删除（平台上的条目未受影响，data/ 下的产物文件也保留）。",
         }
+
+    @app.post(f"{prefix}/items/unforce")
+    @_exclusive_write
+    async def unforce_items(
+        request: Request, body: ForceRequest, _: None = Depends(auth)
+    ) -> dict[str, Any]:
+        """取消强制修复：清除标记；仍在待修队列的条目回退 needs_manual。
+
+        与 purge 同口径：不存在的 key 不报错，响应里区分 ``unforced`` 与 ``missing``。
+        """
+        _require_writable(_settings(request))
+        repo = _repo(request)
+        wanted = list(dict.fromkeys(str(k) for k in body.keys))
+        if not wanted:
+            raise HTTPException(status_code=400, detail="keys 不能为空")
+        unforced: list[str] = []
+        missing: list[str] = []
+        for key in wanted:
+            item = repo.unforce_item(key)
+            (unforced if item is not None else missing).append(key)
+        return {"unforced": unforced, "missing": missing}
 
     # -- 队列 -------------------------------------------------------------
 

@@ -179,6 +179,10 @@ button.ghost { background: transparent; }
 
 .stale { color: var(--warn); border-color: var(--warn-line); background: var(--warn-bg); }
 
+/* 强制修复：人工置位的标记。与状态色区分开（状态色表的是流水线走到哪），
+   这一枚表的是「人拍板要修」，用告警色最容易扫到。 */
+.force { color: var(--warn); border-color: var(--warn-line); background: var(--warn-bg); }
+
 /* 配置/环境告警：三条等级各有颜色，左侧色条比整体染色更容易扫读。 */
 .alert {
   display: flex; gap: 10px; align-items: flex-start; background: var(--panel);

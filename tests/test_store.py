@@ -1334,3 +1334,76 @@ def test_list_scan_runs_reads_back_what_scan_wrote(repo) -> None:
     assert runs[1].created == 3 and runs[1].error is None
     # 只按仓库过滤
     assert repo.list_scan_runs(repo_key="github:other/repo") == []
+
+
+# ---------------------------------------------------------------------------
+# 强制修复（force）：旧库迁移与仓储方法
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_schema_adds_force_fix_to_old_items_table(tmp_path) -> None:
+    """旧库（建表时还没有 force_fix 列）：ensure_schema 补列，存量行默认 False。
+
+    回归：create_all 不改已存在的表——常驻服务的库是长跑的，不补这一刀，
+    任何带这列的查询都会立刻 no such column。
+    """
+    import sqlite3
+
+    from fissue.store.db import Database
+
+    db_path = tmp_path / "old.db"
+    con = sqlite3.connect(db_path)
+    con.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, key VARCHAR(767) UNIQUE, "
+        "status VARCHAR(32) DEFAULT 'new', priority VARCHAR(16) DEFAULT 'none')"
+    )
+    con.execute("INSERT INTO items (key, status) VALUES ('github:psf/requests#1', 'labeled')")
+    con.commit()
+    con.close()
+
+    Database(f"sqlite:///{db_path.as_posix()}").ensure_schema()
+
+    con = sqlite3.connect(db_path)
+    cols = {row[1] for row in con.execute("PRAGMA table_info(items)")}
+    (value,) = con.execute("SELECT force_fix FROM items").fetchone()
+    con.close()
+    assert "force_fix" in cols
+    assert not value
+
+
+def test_force_fix_flag_round_trip(repo, sample_issue) -> None:
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    assert not _item(repo, sample_issue.key).force_fix
+
+    fresh = repo.set_force_fix(sample_issue.key, True)
+    assert fresh is not None and fresh.force_fix
+    assert _item_row(repo, sample_issue.key).force_fix
+
+
+def test_unforce_demotes_fix_queued_to_needs_manual(repo, sample_issue) -> None:
+    """待修条目取消强制：清标记并回退 needs_manual（候选过滤只认 status+tier，不能留着）。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    repo.set_force_fix(sample_issue.key, True)
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+
+    fresh = repo.unforce_item(sample_issue.key)
+    assert fresh is not None
+    assert fresh.force_fix is False
+    assert fresh.status is ItemStatus.NEEDS_MANUAL
+
+
+def test_unforce_keeps_other_statuses_and_reports_missing(repo, sample_issue) -> None:
+    """非待修状态取消强制：只清标记不动状态；不存在的 key 返回 None。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    repo.set_force_fix(sample_issue.key, True)
+    repo.set_item_status(sample_issue.key, ItemStatus.LABELED)
+
+    fresh = repo.unforce_item(sample_issue.key)
+    assert fresh is not None
+    assert fresh.force_fix is False
+    assert fresh.status is ItemStatus.LABELED
+
+    assert repo.unforce_item("github:psf/requests#404") is None

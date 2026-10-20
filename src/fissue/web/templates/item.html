@@ -18,6 +18,11 @@
   <button onclick="approveMerge()">确认可合并（打标签）</button>
   <button onclick="reEval()">重新深度评测</button>
   <button onclick="reVerify()">重新验证</button>
+  {% if data.type == 'issue' %}
+  {# 强制修复：PR 没有自动修复流程，不给入口。已强制的条目旁边给「取消」。 #}
+  <button onclick="forceFix()">强制修复</button>
+  {% if data.force_fix %}<button onclick="unforceFix()">取消强制</button>{% endif %}
+  {% endif %}
   {# 破坏性操作放在行尾、且措辞写明「本地数据 / 不可撤销」，别和上面那几个常用动作混在一起。 #}
   <button class="danger" onclick="deleteItem()">删除本地数据</button>
 </div>
@@ -31,6 +36,9 @@
       <span class="tag">{{ data.type }}</span>
       <span class="tag {{ data.evaluation.category if data.evaluation else 'unknown' }}">{{ data.evaluation.category if data.evaluation else '未分类' }}</span>
       <span class="tag status-{{ data.status }}">流水线：{{ data.status }}</span>
+      {% if data.force_fix %}
+      <span class="tag force" title="强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都推进修复流程">⚡ 强制</span>
+      {% endif %}
       {% if data.conclusion_stale %}
       <span class="tag stale" title="{{ data.conclusion_stale | join('；') }}">⚠️ 结论已过期</span>
       {% endif %}
@@ -272,6 +280,36 @@
 
   function reVerify() {
     Fissue.runJob("verify", {keys: [KEY]}, {autoReload: true});
+  }
+
+  // 强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何都推进修复流程。
+  // 走作业（验证阶段要顺带补验证器，分钟级），完成后直落「待修 tier1」。
+  function forceFix() {
+    Fissue.confirm(
+      "强制修复这一条？",
+      "无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都会推进修复流程并**真提 PR**。" +
+        "尚未验证过会先生成验证器；之后可随时点「取消强制」收回。"
+    ).then(function (ok) {
+      if (ok) Fissue.runJob("force", {keys: [KEY]}, {autoReload: true});
+    });
+  }
+
+  function unforceFix() {
+    Fissue.confirm(
+      "取消强制修复？",
+      "清除强制标记；若它还在待修队列，会回退为「需人工」。"
+    ).then(function (ok) {
+      if (!ok) return;
+      Fissue.api("/items/unforce", {method: "POST", body: {keys: [KEY]}})
+        .then(function (r) {
+          Fissue.toast(
+            "已取消强制" + ((r.missing || []).length ? "（" + r.missing.length + " 条已不存在）" : ""),
+            "ok", {timeout: 5000}
+          );
+          setTimeout(function () { location.reload(); }, 900);
+        })
+        .catch(function (err) { Fissue.toast("取消失败", "bad", {detail: err.message, timeout: 0}); });
+    });
   }
 
   // 删除本地数据。两步确认，并把「连带删掉了什么」如实报出来——破坏性操作只回一句

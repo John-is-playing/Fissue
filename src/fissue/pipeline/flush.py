@@ -159,8 +159,16 @@ class FlushProcessor:
             priority = p["priority"]
 
             if queue_kind == QueueName.VERIFY.value:
+                # 强制修复：结论已人拍板，优先于 LLM 的（含 skip）。也覆盖「强制前已在
+                # 验证队列里」的残留条目——它就该直落待修，不能被裁决判成 SKIPPED / 需人工。
+                it = self.ctx.repo.get_item(key)
+                if it is not None and it.force_fix:
+                    report.fix_candidates.append((key, Priority.TIER1))
+                    self.ctx.repo.set_item_status(
+                        key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1
+                    )
                 # Issue-BUG：只有明确 fix 且优先级为 tier1/tier2 才派发自动修复
-                if verdict == "fix" and priority in (Priority.TIER1, Priority.TIER2):
+                elif verdict == "fix" and priority in (Priority.TIER1, Priority.TIER2):
                     report.fix_candidates.append((key, priority))
                     self.ctx.repo.set_item_status(key, ItemStatus.FIX_QUEUED, priority=priority)
                 elif verdict == "skip":

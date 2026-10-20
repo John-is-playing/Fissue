@@ -94,6 +94,7 @@
   <button data-needs-pick disabled onclick="bulk('verify')">验证选中</button>
   <button data-needs-pick disabled onclick="bulkFixDry()">试跑修复选中</button>
   <button data-needs-pick disabled class="danger" onclick="bulkFixReal()">修复选中并提 PR</button>
+  <button data-needs-pick disabled onclick="bulkForce()" title="无论评测结论如何都推进修复流程（真提 PR）">强制修复选中</button>
   <button data-needs-pick disabled class="danger" onclick="bulkDelete()">删除选中</button>
   {% endif %}
 </div>
@@ -148,7 +149,10 @@
       </td>
       {# 真实的流水线状态。旧版这里写的是 `row.evaluation and '已评测' or '待评测'`——
          筛了 status、表格里却看不到 status，而且 payload 里当时根本没有它。 #}
-      <td class="shrink"><span class="tag status-{{ row.status }}" title="流水线状态">{{ row.status }}</span></td>
+      <td class="shrink">
+        <span class="tag status-{{ row.status }}" title="流水线状态">{{ row.status }}</span>
+        {% if row.force_fix %}<span class="tag force" title="已强制修复：无论评测结论如何都推进修复流程">⚡</span>{% endif %}
+      </td>
       <td>
         {% if row.evaluation %}
           <span class="clamp">{{ row.evaluation.summary }}</span>
@@ -215,6 +219,19 @@ fissue eval --all</pre>
       .then(function (ok) {
         if (ok) Fissue.runJob('fix', {keys: keys, dry_run: false}, {autoReload: true});
       });
+  }
+
+  // 批量强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何都推进修复流程，走作业。
+  function bulkForce() {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.confirm(
+      '强制修复选中的 ' + keys.length + ' 条？',
+      '无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都会推进修复流程并**真提 PR**；' +
+        '尚未验证过会先生成验证器。之后可在条目页点「取消强制」收回。'
+    ).then(function (ok) {
+      if (ok) Fissue.runJob('force', {keys: keys}, {autoReload: true});
+    });
   }
 
   // 批量删除本地数据。走批量端点（而不是逐条 DELETE）：一次事务、一个写闸门，

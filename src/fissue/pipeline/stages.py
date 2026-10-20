@@ -26,6 +26,7 @@ from ..models import (
     Evaluation,
     ItemStatus,
     ItemType,
+    Priority,
     QueueName,
     RawItem,
     VerifierKind,
@@ -229,14 +230,29 @@ class VerifyStage:
         if item.item_type is not ItemType.ISSUE:
             result.skipped_reason = "非 Issue，不走 Issue 验证流程"
             return result
-        if evaluation is not None and evaluation.category is not Category.BUG:
+        # 强制修复：已经在修复流程中（或已提过 PR）→ 保持原状。特别是不能把
+        # pr_created 的条目拉回待修重验——那会多开一个 PR。
+        if item.force_fix and item.status in (
+            ItemStatus.FIXING,
+            ItemStatus.PR_CREATED,
+            ItemStatus.FIX_QUEUED,
+        ):
+            result.skipped_reason = "已强制修复且已在修复流程中（或已完成），保持状态"
+            result.status = item.status
+            return result
+        if (
+            evaluation is not None
+            and evaluation.category is not Category.BUG
+            and not item.force_fix
+        ):
             result.skipped_reason = f"分类为 {evaluation.category.value}，不走 BUG 验证流程"
             return result
 
         # 策略闸门：疑似刷量/重复的条目在**生成验证器之前**就要排除。
         # 否则会为一条刷量请求白跑一轮沙盒（envkit #14 实测：评测已判 spam，
         # 验证阶段仍生成验证器并给出 fix 结论），也会为重复条目重复建验证器。
-        if evaluation is not None and evaluation.spam.suspicious:
+        # 强制修复的条目由人拍板「要修」，此闸门不再拦它。
+        if evaluation is not None and evaluation.spam.suspicious and not item.force_fix:
             kinds = "".join(
                 [
                     "刷量" if evaluation.spam.is_spam else "",
@@ -272,7 +288,8 @@ class VerifyStage:
                 result.notes.append("无法自动化验证，已标记需人工，清单已生成供复核")
                 return result
 
-            if not base_result.reproducible:
+            # 强制修复：复现不了也照修——「要不要修」已由人拍板，复现结论只是参考。
+            if not base_result.reproducible and not item.force_fix:
                 self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
                 result.status = ItemStatus.NEEDS_MANUAL
                 result.notes.append(f"问题未能复现：{base_result.conclusion}")
@@ -302,6 +319,15 @@ class VerifyStage:
                     result.status = ItemStatus.NEEDS_MANUAL
                     result.skipped_reason = why
                     return result
+
+            # 强制修复 → 结论就是「修」（人拍板的），跳过定论队列与 LLM 裁决，直接待修。
+            if item.force_fix:
+                self.ctx.repo.set_item_status(
+                    item.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1
+                )
+                result.status = ItemStatus.FIX_QUEUED
+                result.notes.append("强制修复：跳过定论队列，直接待修")
+                return result
 
             # 已验证可复现 → 入验证队列，等批量 flush 打标签
             self.ctx.repo.set_item_status(item.key, ItemStatus.QUEUED)
@@ -749,7 +775,12 @@ class Pipeline:
             # 所以在这里按 category 一刀切会把功能类 PR 全部挡在门外，导致
             # 「只改文档却宣称实现了功能」这类 PR 无人识破（envkit #18 实测：
             # 停在 labeled、没有任何结论，fix_feature 队列一条都没有）。
-            if r.evaluation.category is not Category.BUG and item.item_type is ItemType.ISSUE:
+            # 强制修复的条目不短路：FEATURE 也照走验证/修复流程（闸门在 VerifyStage 内）。
+            if (
+                r.evaluation.category is not Category.BUG
+                and item.item_type is ItemType.ISSUE
+                and not item.force_fix
+            ):
                 self.ctx.repo.set_item_status(item.key, ItemStatus.LABELED)
                 combined.add(
                     StageResult(

@@ -110,6 +110,8 @@ def item_to_dict(
         # 原先这里没有，于是看板的「状态」列只能拿「有没有评测」凑数，页面上筛了
         # status 却在表格里找不到状态。
         "status": item.status.value,
+        # 强制修复：人工置位的标记，列表 / 详情 / API 都要看得见（页面据此给「取消强制」入口）。
+        "force_fix": item.force_fix,
         "labels": item.labels,
         "author": item.author,
         "author_kind": item.author_kind.value,

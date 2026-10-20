@@ -172,6 +172,7 @@ def _item_to_domain(row: ItemRow, *, with_comments: bool = True) -> RawItem:
         category=Category(row.category or "unknown"),
         status=ItemStatus(row.status or "new"),
         priority=Priority(row.priority or "none"),
+        force_fix=bool(row.force_fix),
         raw=dict(row.raw or {}),
     )
 
@@ -504,6 +505,28 @@ class Repository:
             if priority is not None:
                 values["priority"] = priority.value
             s.execute(update(ItemRow).where(ItemRow.key == key).values(**values))
+
+    def set_force_fix(self, key: str, value: bool) -> RawItem | None:
+        """置位 / 清除条目的强制修复标记（只动标记；状态机由流水线推进）。"""
+        with self.db.session() as s:
+            s.execute(update(ItemRow).where(ItemRow.key == key).values(force_fix=value))
+        return self.get_item(key)
+
+    def unforce_item(self, key: str) -> RawItem | None:
+        """取消强制修复：清标记；仍在待修队列的条目回退 ``needs_manual``。
+
+        取消后它没有留在待修队列的依据了——候选过滤只认 status + tier，留着会被
+        修复循环反复捡起空转。
+        """
+        item = self.get_item(key)
+        if item is None:
+            return None
+        with self.db.session() as s:
+            values: dict[str, Any] = {"force_fix": False}
+            if item.status is ItemStatus.FIX_QUEUED:
+                values["status"] = ItemStatus.NEEDS_MANUAL.value
+            s.execute(update(ItemRow).where(ItemRow.key == key).values(**values))
+        return self.get_item(key)
 
     def merge_item_labels(self, key: str, labels: Sequence[str]) -> list[str]:
         """把「刚写到平台上的标签」并进本地快照，返回合并后的标签集合。

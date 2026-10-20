@@ -21,11 +21,17 @@ from fissue.models import (
     RawItem,
     RepoRef,
     Scores,
+    VerifierKind,
+    VerifierOutcome,
+    VerifierResult,
+    VerifierRun,
+    VerifierSpec,
 )
 from fissue.pipeline.context import RuntimeContext
 from fissue.pipeline.fetcher import Fetcher, FetchStats, _collect_types
 from fissue.pipeline.flush import FlushProcessor
 from fissue.pipeline.queue import QueueManager
+from fissue.pipeline.stages import VerifyStage
 
 GH = "https://api.github.com"
 
@@ -2352,3 +2358,121 @@ def test_is_closed_covers_every_platform_wording() -> None:
         assert pr(openish).is_closed is False, openish
     # `merged` 标志比 state 更直接（GitHub 已合并 PR 的 state 也是 closed）
     assert pr("open", merged=True).is_closed is True
+
+
+# ---------------------------------------------------------------------------
+# 强制修复（force）：闸门旁路是**人的决定**优先于**模型的结论**
+# ---------------------------------------------------------------------------
+
+
+def _repro_result(key: str, *, reproducible: bool) -> VerifierResult:
+    outcome = VerifierOutcome.FAIL if reproducible else VerifierOutcome.PASS
+    return VerifierResult(
+        kind=VerifierKind.EXECUTABLE,
+        base_run=VerifierRun(item_key=key, stage="base", outcome=outcome, f2p_ok=reproducible),
+        f2p_satisfied=reproducible,
+        conclusion="可复现" if reproducible else "不可复现",
+    )
+
+
+def _stub_force_stage(ctx, monkeypatch, *, reproducible: bool = True):
+    """搭一个不触网 / 不进沙盒的 VerifyStage：打桩工作区与验证器生成。
+
+    返回 (stage, calls)：calls["generate"] 数了生成验证器的次数——
+    「该不该顺手生成验证器」本身就是强制流程该被断言的行为。
+    """
+    calls: dict[str, int] = {"generate": 0}
+
+    async def fake_clone(_cfg):
+        return object()
+
+    async def fake_generate(**kwargs):
+        calls["generate"] += 1
+        item = kwargs["item"]
+        return (
+            7,
+            VerifierSpec(kind=VerifierKind.EXECUTABLE, command="pytest"),
+            _repro_result(item.key, reproducible=reproducible),
+        )
+
+    monkeypatch.setattr(ctx, "clone_workspace", fake_clone)
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", fake_generate)
+    monkeypatch.setattr(ctx.settings.verifier, "regression_gate", "off")
+    monkeypatch.setattr(stage := VerifyStage(ctx), "_repo_context", lambda _ws, _cfg: "")
+    return stage, calls
+
+
+async def test_verify_stage_force_feature_goes_to_fix_queued(ctx, repo, monkeypatch) -> None:
+    """强制修复 FEATURE 请求：分类闸门不再拦，验证器补完后直落待修 tier1。"""
+    item = _seed_issue(repo, 51, category=Category.FEATURE)
+    repo.set_force_fix(item.key, True)
+    stage, calls = _stub_force_stage(ctx, monkeypatch)
+
+    r = await stage.run(repo.get_item(item.key), repo.latest_evaluation(item.key))
+
+    assert calls["generate"] == 1, "必须顺手生成验证器——修复器靠它判定修复"
+    fresh = repo.get_item(item.key)
+    assert fresh is not None
+    assert fresh.status is ItemStatus.FIX_QUEUED
+    assert fresh.priority is Priority.TIER1
+    assert r.queued is None, "强制条目直落待修，不登记定论队列"
+
+
+async def test_verify_stage_force_unreproducible_still_fix_queued(ctx, repo, monkeypatch) -> None:
+    """强制修复：复现不了也照修（NEEDS_MANUAL 只留给非强制条目）。"""
+    item = _seed_issue(repo, 52)
+    repo.set_force_fix(item.key, True)
+    stage, _calls = _stub_force_stage(ctx, monkeypatch, reproducible=False)
+
+    await stage.run(repo.get_item(item.key), repo.latest_evaluation(item.key))
+
+    fresh = repo.get_item(item.key)
+    assert fresh is not None
+    assert fresh.status is ItemStatus.FIX_QUEUED, f"强制条目不该停在需人工：{fresh.status}"
+
+
+async def test_verify_stage_force_in_fix_flow_is_noop(ctx, repo, monkeypatch) -> None:
+    """强制修复 + 已在修复流程中（fix_queued / fixing / pr_created）：不重验、不动状态。
+
+    尤其 pr_created：把它拉回来重验会多开一个 PR。
+    """
+    item = _seed_issue(repo, 53)
+    repo.set_force_fix(item.key, True)
+    repo.set_item_status(item.key, ItemStatus.PR_CREATED)
+
+    async def boom(**_kwargs):
+        raise AssertionError("已在修复流程中的条目不该再进验证")
+
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", boom)
+    r = await VerifyStage(ctx).run(repo.get_item(item.key), repo.latest_evaluation(item.key))
+
+    fresh = repo.get_item(item.key)
+    assert fresh is not None
+    assert fresh.status is ItemStatus.PR_CREATED
+    assert r.skipped_reason and "保持状态" in r.skipped_reason
+
+
+async def test_flush_apply_force_bypasses_skip_verdict(ctx, repo, monkeypatch) -> None:
+    """强制修复：LLM 裁决 skip 也直落待修 tier1（人的决定优先于裁决）。
+
+    覆盖「强制前已在验证队列」的残留条目：它不该被裁决判成 SKIPPED。
+    """
+    item = _seed_issue(repo, 54)
+    repo.set_item_status(item.key, ItemStatus.QUEUED)
+    repo.set_force_fix(item.key, True)
+    processor = FlushProcessor(ctx)
+
+    async def fake_label(_payload, _labels):
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", fake_label)
+    entries = [{"key": item.key, "item_type": "issue", "title": item.title, "labels": []}]
+    conclusions = [{"key": item.key, "verdict": "skip", "priority": Priority.NONE}]
+
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    fresh = repo.get_item(item.key)
+    assert fresh is not None
+    assert fresh.status is ItemStatus.FIX_QUEUED
+    assert fresh.priority is Priority.TIER1
+    assert (item.key, Priority.TIER1) in report.fix_candidates

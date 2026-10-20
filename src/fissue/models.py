@@ -290,6 +290,9 @@ class RawItem(BaseModel):
     category: Category = Category.UNKNOWN
     status: ItemStatus = ItemStatus.NEW
     priority: Priority = Priority.NONE
+    #: 强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都把它推进修复流程。
+    #: 人工设置；流水线只读它、不会自行清掉。
+    force_fix: bool = False
     raw: dict[str, Any] = Field(default_factory=dict)
 
     @property

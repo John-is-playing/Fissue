@@ -138,8 +138,32 @@ class Database:
         if self._schema_ready:
             return
         Base.metadata.create_all(self.engine)
+        self._migrate_items_force_fix()
         self._schema_ready = True
         log.debug("数据库表已确保存在：%s", self._safe_url())
+
+    def _migrate_items_force_fix(self) -> None:
+        """给旧库（建表时还没有 ``force_fix`` 列）补列。
+
+        ``create_all`` 只建缺失的表、**不改**已存在的表——常驻服务的库是长跑的，
+        不加这一刀，旧库上任何带这列的查询都会 ``no such column`` 直接崩。
+        SQLite 用 PRAGMA 查列再 ALTER；PostgreSQL 原生支持 ``ADD COLUMN IF NOT EXISTS``。
+        全新库（列已随 create_all 建出）两条路径都是空操作。
+        """
+        with self.engine.begin() as conn:
+            if conn.dialect.name == "postgresql":
+                conn.execute(
+                    text(
+                        "ALTER TABLE items ADD COLUMN IF NOT EXISTS "
+                        "force_fix BOOLEAN NOT NULL DEFAULT FALSE"
+                    )
+                )
+            else:
+                cols = {row[1] for row in conn.execute(text("PRAGMA table_info(items)"))}
+                if "force_fix" not in cols:
+                    conn.execute(
+                        text("ALTER TABLE items ADD COLUMN force_fix BOOLEAN NOT NULL DEFAULT 0")
+                    )
 
     def has_schema(self) -> bool:
         """表是否已存在（用于给用户提示「请先执行 fissue db init」）。"""

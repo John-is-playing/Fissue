@@ -11,6 +11,30 @@
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **强制修复（force）**：对任意条目，无论评测结论（分类 / 刷量 / 优先级 / 裁决）如何，
+  都可将其强制推进修复流程（真提 PR）——「要不要修」由人拍板，模型结论降为参考：
+  - **WebUI**：条目详情页「强制修复」按钮（仅 Issue，PR 无自动修复流程）；列表页勾选后
+    「强制修复选中」；已强制的条目带 ⚡ 徽标，旁边给「取消强制」；
+  - **API**：`POST /api/v1/items/force` 不再单设——走作业 `POST /api/v1/jobs/force`
+    （可轮询进度，验证阶段要生成验证器，分钟级）；取消走 `POST /api/v1/items/unforce`；
+  - **CLI**：`fissue force -k platform:owner/name#number [--dry-run] [--yes]`、
+    `fissue force -k ... --undo` 取消；
+  - **旁路范围**：FEATURE 短路（非 BUG 直接打标签）、验证阶段的分类 / 刷量 / 可复现闸门、
+    LLM 裁决（skip 也照修）、修复阶段的优先级 / 刷量 / 缺评测闸门全部旁路；
+    条目直落「待修 tier1」，由常驻服务 / `fissue fix` 接力提 PR；
+  - **保留的闸门**：验证器闸门不旁路——没有验证器无从判定修复，条目没有验证器时
+    验证阶段会顺手生成一个；已在修复流程中（fixing / pr_created / fix_queued）的条目
+    强制时保持原状（防重复开 PR）；
+  - **取消**：清标记；仍在待修队列的条目回退 `needs_manual`（候选过滤只认 status+tier，
+    留着会被反复捡起空转）；
+  - **旧库迁移**：`items.force_fix` 列由 `ensure_schema` 一次性迁移补上
+    （`create_all` 不改已存在的表；PostgreSQL 用 `ADD COLUMN IF NOT EXISTS`，
+    SQLite 先查 `PRAGMA table_info` 再 `ALTER`）。
+
 ## [1.1.0] - 2026-10-20
 
 > **正式版**：`rel/v1.1.0-b1…b4` 四个预发布快照的收口——`pyproject.toml` 与 `__version__`

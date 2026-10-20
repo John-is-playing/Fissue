@@ -301,6 +301,47 @@ async def test_fix_item_skips_when_attempt_exists(fixer_ctx, repo, sample_issue)
     assert "重复" in (attempt.error or "")
 
 
+# ---------------------------------------------------------------------------
+# 强制修复：评测缺失 / 优先级 / 刷量 三道闸不再拦；
+# 验证器闸门保留——没有验证器无从判定修复，强也强不了。
+# ---------------------------------------------------------------------------
+
+
+async def test_fix_item_force_bypasses_priority_and_spam(fixer_ctx, repo, sample_issue) -> None:
+    """优先级 none + 疑似刷量的强制条目：该拦它的是验证器闸门，而不是这两道。"""
+    from fissue.models import SpamSignal
+
+    _register(repo, sample_issue)
+    ev = Evaluation(
+        category=Category.BUG,
+        priority=Priority.NONE,
+        model="s",
+        spam=SpamSignal(is_spam=True),
+    )
+    repo.save_evaluation(sample_issue.key, ev)
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED)
+    item = repo.get_item(sample_issue.key)
+    assert item is not None
+    item.force_fix = True
+
+    attempt = await AutoFixer(fixer_ctx).fix_item(item)
+    assert attempt.outcome is FixOutcome.SKIPPED
+    assert "验证器" in (attempt.error or ""), f"应停在验证器闸门：{attempt.error}"
+
+
+async def test_fix_item_force_without_evaluation_reaches_verifier_gate(fixer_ctx, repo, sample_issue) -> None:
+    """没有评测的强制条目：评测闸门不再拦，仍停在验证器闸门。"""
+    _register(repo, sample_issue)
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED)
+    item = repo.get_item(sample_issue.key)
+    assert item is not None
+    item.force_fix = True
+
+    attempt = await AutoFixer(fixer_ctx).fix_item(item)
+    assert attempt.outcome is FixOutcome.SKIPPED
+    assert "验证器" in (attempt.error or ""), f"应停在验证器闸门：{attempt.error}"
+
+
 async def test_fix_item_retries_after_needs_manual(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
     """NEEDS_MANUAL 不该把条目永久封禁，允许重试。
 

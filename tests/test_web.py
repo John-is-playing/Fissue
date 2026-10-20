@@ -978,6 +978,79 @@ def test_purge_items_rejects_an_empty_key_list(client) -> None:
     assert "keys" in r.json()["detail"]
 
 
+def test_unforce_clears_flag_and_demotes_fix_queued(client) -> None:
+    """取消强制：清标记；仍在待修队列的条目回退 needs_manual；不存在的 key 如实报 missing。"""
+    repo = client.repo
+    repo.set_force_fix(KEY, True)
+    repo.set_item_status(KEY, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+
+    r = client.post("/api/v1/items/unforce", json={"keys": [KEY, "github:psf/requests#999"]})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["unforced"] == [KEY]
+    assert body["missing"] == ["github:psf/requests#999"]
+    fresh = repo.get_item(KEY)
+    assert fresh is not None
+    assert fresh.force_fix is False
+    assert fresh.status is ItemStatus.NEEDS_MANUAL
+
+
+def test_unforce_rejects_an_empty_key_list(client) -> None:
+    assert client.post("/api/v1/items/unforce", json={"keys": []}).status_code == 400
+
+
+def test_force_job_sets_flag_and_drives_stage(client, monkeypatch) -> None:
+    """force 作业：置位标记并交由验证阶段推进（阶段本体打桩，行为由流水线测试覆盖）。"""
+    from fissue.pipeline.stages import StageResult, VerifyStage
+
+    seen: list[str] = []
+
+    async def fake_run(self, item, evaluation=None, *, workspace=None):
+        seen.append(item.key)
+        self.ctx.repo.set_item_status(item.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+        return StageResult(key=item.key, status=ItemStatus.FIX_QUEUED, notes=["桩：直落待修"])
+
+    monkeypatch.setattr(VerifyStage, "run", fake_run)
+    r = client.post("/api/v1/jobs/force", json={"keys": [KEY]})
+    assert r.status_code == 202, r.text
+    job = _wait_for_job(client, r.json()["job"]["id"])
+    assert job["status"] == "done", job
+    assert seen == [KEY]
+    fresh = client.repo.get_item(KEY)
+    assert fresh is not None
+    assert fresh.force_fix is True
+    assert fresh.status is ItemStatus.FIX_QUEUED
+    assert job["result"]["results"][0]["status"] == "fix_queued"
+
+
+def test_force_job_rejects_pr_items(client, sample_pr, monkeypatch) -> None:
+    """PR 没有自动修复流程：强制时逐条报 error，不置位。"""
+    from fissue.pipeline.stages import VerifyStage
+
+    async def boom(self, *_args, **_kwargs):
+        raise AssertionError("PR 不该进验证阶段")
+
+    monkeypatch.setattr(VerifyStage, "run", boom)
+    rid = client.repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    client.repo.upsert_item(rid, sample_pr)
+
+    r = client.post("/api/v1/jobs/force", json={"keys": [sample_pr.key]})
+    assert r.status_code == 202, r.text
+    job = _wait_for_job(client, r.json()["job"]["id"])
+    assert job["status"] == "done", job
+    assert "PR" in job["result"]["results"][0]["error"]
+    fresh = client.repo.get_item(sample_pr.key)
+    assert fresh is not None and fresh.force_fix is False
+
+
+def test_force_job_rejects_empty_keys(client) -> None:
+    r = client.post("/api/v1/jobs/force", json={"keys": []})
+    assert r.status_code == 202, r.text
+    job = _wait_for_job(client, r.json()["job"]["id"])
+    assert job["status"] == "failed"
+    assert "keys" in job["error"]
+
+
 def test_delete_item_is_blocked_in_read_only(settings, repo, sample_issue) -> None:
     from fastapi.testclient import TestClient
 
