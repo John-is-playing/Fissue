@@ -1341,11 +1341,14 @@ def test_list_scan_runs_reads_back_what_scan_wrote(repo) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_schema_adds_force_fix_to_old_items_table(tmp_path) -> None:
-    """旧库（建表时还没有 force_fix 列）：ensure_schema 补列，存量行默认 False。
+@pytest.mark.parametrize("method", ["ensure_schema", "create_all"])
+def test_old_items_table_gets_force_fix_column(tmp_path, method) -> None:
+    """旧库（建表时还没有 force_fix 列）：两个建表入口都要补列，存量行默认 False。
 
     回归：create_all 不改已存在的表——常驻服务的库是长跑的，不补这一刀，
-    任何带这列的查询都会立刻 no such column。
+    任何带这列的查询都会立刻 no such column。参数化覆盖两个入口是因为
+    Web/常驻服务的启动路径走 create_all（不是 ensure_schema）——树莓派部署时
+    只挂在 ensure_schema 上，旧 SQLite 库直接崩，实炸过一次。
     """
     import sqlite3
 
@@ -1361,7 +1364,7 @@ def test_ensure_schema_adds_force_fix_to_old_items_table(tmp_path) -> None:
     con.commit()
     con.close()
 
-    Database(f"sqlite:///{db_path.as_posix()}").ensure_schema()
+    getattr(Database(f"sqlite:///{db_path.as_posix()}"), method)()
 
     con = sqlite3.connect(db_path)
     cols = {row[1] for row in con.execute("PRAGMA table_info(items)")}

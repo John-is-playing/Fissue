@@ -124,6 +124,9 @@ class Database:
         高频路径请改用 :meth:`ensure_schema`。
         """
         Base.metadata.create_all(self.engine)
+        # Web/常驻服务的启动路径走这里（而不是 ensure_schema）——迁移必须两个入口都跑，
+        # 否则旧库上任何带新列的查询都会 no such column（树莓派部署时实炸过）。
+        self._migrate_items_force_fix()
         self._schema_ready = True
         log.info("数据库表已就绪：%s", self._safe_url())
 
