@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -377,6 +379,33 @@ async def test_atomgit_fetch_pr_with_linked_issues(atomgit) -> None:
     pr = items[0]
     assert pr.base_branch == "master" and pr.head_repo == "dev/requests"
     assert pr.linked_issues == [3, 4]
+
+
+@respx.mock
+@pytest.mark.parametrize("adapter_fixture", ["atomgit", "gitee"])
+async def test_v5_since_param_is_strict_iso8601_with_colon_offset(
+    request, adapter_fixture
+) -> None:
+    """`since` 必须带**冒号**的时区偏移（`+08:00`）。
+
+    AtomGit 的 Spring 侧只认 `yyyy-MM-dd'T'HH:mm:ssXXX`：2026-10-20 树莓派实测，
+    `%z` 的 `+0800` 写法被 400（PARAMETER_ERROR）拒掉，整个 AtomGit 仓库的抓取因此
+    中止、游标永不推进——页面上就表现为「绑定了仓库也抓不到任何东西」。
+    """
+    adapter = request.getfixturevalue(adapter_fixture)
+    base = ATOMGIT if adapter_fixture == "atomgit" else GITEE
+    route = respx.get(f"{base}/repos/psf/requests/issues").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    since = datetime(2026, 9, 20, 12, 34, 56, 789012, tzinfo=timezone.utc)
+    [i async for i in adapter.fetch_items(REPO, item_types=[ItemType.ISSUE], since=since)]
+
+    sent = route.calls.last.request.url.params["since"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}([+-]\d{2}:\d{2}|Z)", sent), (
+        f"since 格式不符合 AtomGit 的严格 ISO 8601：{sent!r}"
+    )
+    assert re.search(r"[+-]\d{4}$", sent) is None, f"无冒号偏移会被 400 拒掉：{sent!r}"
 
 
 def test_resolve_repos_prefers_registered_repo_regardless_of_platform(settings) -> None:

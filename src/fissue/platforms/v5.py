@@ -136,7 +136,11 @@ class V5Adapter(PlatformAdapter):
         if ItemType.ISSUE in wanted:
             params: dict[str, Any] = {"state": state, "sort": "updated", "direction": "desc"}
             if since is not None:
-                params["since"] = since.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+                # AtomGit（Spring/Java 侧）只认严格 ISO 8601：`yyyy-MM-dd'T'HH:mm:ssXXX`，
+                # 即偏移必须带冒号（`+08:00`）。`%z` 产出 `+0800` 会被 400 拒掉（2026-10-20
+                # 树莓派实测：PARAMETER_ERROR，整轮 AtomGit 抓取因此中止、游标不推进）。
+                # isoformat 对 Gitee 同样合法（更标准的写法）。
+                params["since"] = since.astimezone().isoformat(timespec="seconds")
             async for batch in self._paginate(f"{self._repo_api(repo)}/issues", params=params):
                 for payload in batch:
                     # v5 的 issues 列表可能混入 PR（带 pull_request 字段），按类型分流
