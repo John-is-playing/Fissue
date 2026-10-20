@@ -8,9 +8,8 @@ from collections.abc import Iterator
 from typing import Any
 from urllib.parse import quote
 
-from fastapi.testclient import TestClient
-
 import pytest
+from fastapi.testclient import TestClient
 
 from fissue.models import (
     Category,
