@@ -1250,9 +1250,15 @@ def test_stats_cache_refreshes_in_background_and_bump_wakes_it() -> None:
         # bump 触发提前刷新：下一份快照的 n 必须变
         cache.bump()
         deadline = time.monotonic() + 3
-        while time.monotonic() < deadline and cache.get()["n"] == first:
+        snap = None
+        while time.monotonic() < deadline:
+            snap = cache.get()
+            assert snap is not None
+            if snap["n"] != first:
+                break
             time.sleep(0.02)
-        assert cache.get()["n"] > first
+        assert snap is not None
+        assert snap["n"] > first
         assert cache.build_count >= 2
     finally:
         cache.stop()
