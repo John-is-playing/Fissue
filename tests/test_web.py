@@ -1067,6 +1067,19 @@ def test_delete_item_is_blocked_in_read_only(settings, repo, sample_issue) -> No
 # ---------------------------------------------------------------------------
 
 
+def test_repos_page_renders_item_counts_not_dict_methods(client) -> None:
+    """仓库页「条目」列必须是数字——不是 dict.items() 的 repr。
+
+    回归：模板写 `{{ r.items }}` 时 Jinja 的属性查找会命中 dict 自带的
+    items() 方法（属性优先于按键取值），条目列与「移出」按钮的 data-items
+    会渲染成 "<built-in method items of dict object at 0x…>"。
+    """
+    r = client.get("/repos")
+    assert r.status_code == 200, r.text
+    assert "built-in method" not in r.text
+    assert 'data-items="1"' in r.text, "夹具有一条条目：计数应渲染成数字"
+
+
 def test_cancel_button_is_present_on_job_pages(client) -> None:
     """「取消」按钮要在总览的任务面板与「任务」页都出现，且接线在共用的 app.js 里。
 

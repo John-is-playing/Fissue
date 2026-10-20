@@ -82,7 +82,9 @@
           </div>
         </td>
         <td>{{ r.platform }}</td>
-        <td class="num">{{ r.items }}</td>
+        {# 必须用括号取值：`r.items` 会被 Jinja 解析成 dict 自带的 items() **方法**
+           （属性查找优先于按键取值），页面上渲染出 "<built-in method items of dict…>"。 #}
+        <td class="num">{{ r['items'] }}</td>
         <td class="muted small">
           {% if r.last_scanned_at %}{{ r.last_scanned_at[:19].replace('T', ' ') }}{% else %}从未抓取{% endif %}
         </td>
@@ -117,7 +119,7 @@
                     {% if not view.writable %}disabled{% endif %}>{{ '启用' if not r.enabled else '停用' }}</button>
             <button class="danger" data-act="remove"
                     data-platform="{{ r.platform }}" data-owner="{{ slug[0] }}" data-name="{{ slug[1] }}"
-                    data-items="{{ r.items }}"
+                    data-items="{{ r['items'] }}"
                     {% if not view.writable %}disabled{% endif %}>移出</button>
           </div>
           {% endif %}
