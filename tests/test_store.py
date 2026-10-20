@@ -366,6 +366,62 @@ def test_queue_independence(repo: Repository) -> None:
     assert stats["fix_feature"]["pending"] == 1
 
 
+def test_queue_panel_summary_matches_per_call_composition(repo: Repository) -> None:
+    """``queue_panel_summary`` 一条查询的结果必须与旧「每口径一次查询」拼法逐项一致。
+
+    这是面板从 10 次往返改 1 条 GROUP BY 的重构基准：counts / pending / waiting
+    三个口径必须与各自的独立方法完全一致；``oldest_at`` 必须是 done 且未 flush
+    里最老的 ``finished_at``（已 flush 的、更新的都不算）。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    _seed(repo, number=51)
+    now = datetime.now(timezone.utc)
+
+    with repo.db.session() as s:
+        s.add_all(
+            [
+                QueueEntryRow(queue="verify", item_key="k-pending-1", status="pending", payload={}, result={}),
+                QueueEntryRow(queue="verify", item_key="k-pending-2", status="pending", payload={}, result={}),
+                QueueEntryRow(queue="verify", item_key="k-done-old", status="done", payload={}, result={},
+                              finished_at=now - timedelta(hours=2)),
+                QueueEntryRow(queue="verify", item_key="k-done-new", status="done", payload={}, result={},
+                              finished_at=now - timedelta(minutes=1)),
+                QueueEntryRow(queue="verify", item_key="k-done-flushed", status="done", payload={}, result={},
+                              finished_at=now - timedelta(hours=5), flushed_at=now - timedelta(hours=4)),
+                QueueEntryRow(queue="fix_bug", item_key="k-fix-pending", status="pending", payload={}, result={}),
+                QueueEntryRow(queue="fix_feature", item_key="k-fix-running", status="running", payload={}, result={}),
+            ]
+        )
+
+    summary = repo.queue_panel_summary()
+
+    # counts 与 queue_stats 同口径
+    stats = repo.queue_stats()
+    assert summary["verify"]["counts"] == stats["verify"]
+    assert summary["fix_bug"]["counts"] == stats["fix_bug"]
+    assert summary["fix_feature"]["counts"] == stats["fix_feature"]
+
+    # pending 与 queue_pending_count 同口径
+    for queue in (QueueName.VERIFY, QueueName.FIX_BUG, QueueName.FIX_FEATURE):
+        assert summary[queue.value]["pending"] == repo.queue_pending_count(queue)
+
+    # waiting 与 len(queue_unflushed) 一致（这里是真实计数，不受其 500 条上限影响）
+    assert summary["verify"]["waiting"] == len(repo.queue_unflushed(QueueName.VERIFY)) == 2
+    assert summary["fix_bug"]["waiting"] == 0
+    assert summary["fix_feature"]["waiting"] == 0
+
+    # oldest_at 是两条「done 且未 flush」里最老那条（flushed 的与更新的不算）
+    oldest = summary["verify"]["oldest_at"]
+    assert oldest is not None
+    if oldest.tzinfo is None:
+        oldest = oldest.replace(tzinfo=timezone.utc)
+    assert abs((oldest - (now - timedelta(hours=2))).total_seconds()) < 2
+    age = repo.oldest_unflushed_age(QueueName.VERIFY)
+    assert age is not None and abs(age - 7200) < 60
+    assert summary["fix_feature"]["oldest_at"] is None
+
+
 def test_unflushed_age_and_mark_flushed(repo: Repository) -> None:
     _seed(repo, number=13)
     key = "github:psf/requests#13"

@@ -122,10 +122,13 @@ Work = Callable[[Job], Awaitable[dict[str, Any] | None]]
 class JobRegistry:
     """进程内的作业表。"""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, on_complete: Callable[[], None] | None = None) -> None:
         self.settings = settings
         self._jobs: dict[str, Job] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        #: 作业结束（完成/失败/取消）后的回调，例如唤醒聚合缓存做提前刷新。
+        #: 由启动时注入（``create_app`` 的 lifespan）；不设则为 None。
+        self.on_complete: Callable[[], None] | None = on_complete
 
     # -- 查询 -------------------------------------------------------------
 
@@ -199,6 +202,11 @@ class JobRegistry:
         finally:
             job.finished_at = datetime.now(timezone.utc)
             self._tasks.pop(job.id, None)
+            if self.on_complete is not None:
+                try:
+                    self.on_complete()
+                except Exception:  # noqa: BLE001 - 唤醒缓存失败不该影响作业收尾
+                    log.warning("作业完成回调失败", exc_info=True)
 
     def cancel(self, job: Job) -> Job:
         """请求取消一个仍在跑的作业。

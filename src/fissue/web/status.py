@@ -80,8 +80,11 @@ def queue_panel(repo: Any, settings: Settings) -> list[dict[str, Any]]:
     白花钱。这里只读 ``repo`` 的计数与阈值**原样展示**（``待定论 3 / 阈值 10``），
     **不在前端重算「该不该 flush」**：那个判定只有服务端一份（``QueueManager.should_flush``），
     看板不复制它——复制出来的第二份口径迟早会和第一份不一样。
+
+    计数走 :meth:`Repository.queue_panel_summary` **一条聚合查询**——旧拼法是 10 次
+    数据库往返，远程库上光这个面板就是秒级（见该方法注释）。
     """
-    stats = repo.queue_stats()
+    summary = repo.queue_panel_summary()
     panel: list[dict[str, Any]] = []
     for queue in QueueName:
         spec = (
@@ -89,26 +92,42 @@ def queue_panel(repo: Any, settings: Settings) -> list[dict[str, Any]]:
             if queue is QueueName.VERIFY
             else settings.queues.fix_queue
         )
+        s = summary.get(queue.value, {"counts": {}, "pending": 0, "waiting": 0, "oldest_at": None})
+        oldest = s.get("oldest_at")
+        if oldest is not None:
+            if oldest.tzinfo is None:
+                oldest = oldest.replace(tzinfo=timezone.utc)
+            oldest_seconds: float | None = (datetime.now(timezone.utc) - oldest).total_seconds()
+        else:
+            oldest_seconds = None
         panel.append(
             {
                 "name": queue.value,
-                "counts": stats.get(queue.value, {}),
-                "pending": repo.queue_pending_count(queue),
-                "waiting": len(repo.queue_unflushed(queue)),
+                "counts": s["counts"],
+                "pending": s["pending"],
+                "waiting": s["waiting"],
                 "flush_size": spec.flush_size,
                 "idle_flush_seconds": spec.idle_flush_seconds,
-                "oldest_seconds": repo.oldest_unflushed_age(queue),
+                "oldest_seconds": oldest_seconds,
             }
         )
     return panel
 
 
-def repo_overview(app: FastAPI, settings: Settings, repo: Any) -> list[dict[str, Any]]:
-    """每个监控仓库的一行：配置里的、库里的、以及两者是否一致。"""
-    rows = {r.slug: r for r in repo.list_repos()}
+def repo_overview(
+    app: FastAPI, settings: Settings, repo: Any, *, rows: list[Any] | None = None
+) -> list[dict[str, Any]]:
+    """每个监控仓库的一行：配置里的、库里的、以及两者是否一致。
+
+    ``rows``：已取好的 ``repo.list_repos()`` 结果。:func:`collect_aggregates` 一批里要
+    用同一份表两次（面板 + 仓库数），传入复用可省一次往返；单独调用时行为不变。
+    """
+    if rows is None:
+        rows = repo.list_repos()
+    by_slug = {r.slug: r for r in rows}
     out: list[dict[str, Any]] = []
     for cfg in settings.repos:
-        row = rows.get(cfg.slug)
+        row = by_slug.get(cfg.slug)
         pending = row.cursor if row is not None else {}
         out.append(
             {
@@ -132,7 +151,7 @@ def repo_overview(app: FastAPI, settings: Settings, repo: Any) -> list[dict[str,
     # 只在库里、不在配置里的「孤儿」仓库：说明 config.yaml / 覆盖层把某条移除了，
     # 但历史数据还在。不显示的话，用户会奇怪「条目怎么还在」。
     known = {c.slug for c in settings.repos}
-    for slug, row in rows.items():
+    for slug, row in by_slug.items():
         if slug not in known:
             out.append(
                 {
@@ -186,15 +205,18 @@ def _sandbox_section(app: FastAPI, settings: Settings, *, probe: bool) -> dict[s
 
 def _alerts(
     settings: Settings,
-    repo: Any,
     *,
     usage: dict[str, Any],
     locks_ok: bool,
+    stale_count: int = 0,
 ) -> list[dict[str, str]]:
     """把「当前配置/环境有什么不对」写成可操作的一条条。
 
     为什么要有它：新手最常见的问题不是「功能不work」，而是「我少配了一个东西，而没有任何地方
     告诉我」。每条都带 ``hint``（怎么办），而不是只说「未配置」。
+
+    ``stale_count``（过期结论条数）由 :func:`collect` 传入——它在聚合数据里查一次即可，
+    这里若再查一遍，远程库上就是白多一个往返。
     """
     alerts: list[dict[str, str]] = []
 
@@ -248,11 +270,10 @@ def _alerts(
             "本平台没有 flock：跨进程互斥不生效——别同时跑常驻服务与 CLI，会重复评测、重复计费。",
             f"当前平台：{sys.platform}。",
         )
-    stale = repo.items_with_stale_conclusions()
-    if stale:
+    if stale_count:
         add(
             "warn",
-            f"有 {len(stale)} 条条目的结论已过期（内容改过、当时正在执行，没自动重评）。",
+            f"有 {stale_count} 条条目的结论已过期（内容改过、当时正在执行，没自动重评）。",
             "执行 fissue requeue --stale 把它们放回流水线。",
         )
     if usage.get("calls") and usage.get("total_tokens", 0) > 0:
@@ -286,24 +307,57 @@ def writer_panel(settings: Settings) -> dict[str, Any]:
     }
 
 
+def collect_aggregates(app: FastAPI, settings: Settings, repo: Any) -> dict[str, Any]:
+    """一组**不带过滤条件**的聚合查询（队列面板、全局概览、今日用量……）。
+
+    这些数字不随用户的筛选而变，只随作业推进缓慢变化——所以一次性取齐后交给
+    后台刷新缓存（:mod:`fissue.web.cache`）持有：看板前台读缓存，不再把这些
+    往返落在「切换页面」的路径上。仓库行只查一次（``list_repos``），面板与
+    仓库数共用。
+
+    远端 PostgreSQL 上这一批约 10 个往返，是页面慢的大头；本地 SQLite 上本来就
+    便宜，走缓存后也更省。
+    """
+    from ..store import export as exp
+
+    repos_rows = repo.list_repos()
+    return {
+        "queues": queue_panel(repo, settings),
+        "summary": exp.summarize(repo),
+        "usage": repo.usage_today(),
+        "repos": repo_overview(app, settings, repo, rows=repos_rows),
+        "repos_in_db": len(repos_rows),
+        "items_total": repo.count_items(),
+        "scans": repo.list_scan_runs(limit=15),
+        "stale": len(repo.items_with_stale_conclusions()),
+    }
+
+
 def collect(
     app: FastAPI,
     settings: Settings,
     repo: Any,
     *,
     with_sandbox: bool = False,
+    aggregates: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """拼出状态快照。
 
     ``with_sandbox`` 会真的探测一次沙盒（起一次 Docker 调用），所以默认关闭：状态页每 2 秒
     轮询一次，每次都敲 Docker 既慢又吵。
+
+    ``aggregates``：后台刷新缓存持有的聚合数据（:func:`collect_aggregates` 的返回值）。
+    不传时**现算**——CLI 的 ``fissue status`` 与冷启动首屏走这条路径。两条路拼装的
+    是一份代码，页面上的数字与 API 里的数字永远同一口径。
     """
+    if aggregates is None:
+        aggregates = collect_aggregates(app, settings, repo)
     now = datetime.now(timezone.utc)
     # 平台没有 flock（Windows）时跨进程互斥不生效——这条要作为告警出现在页面上，
     # 而不是等用户发现「同一条被评测了两遍、钱花了两份」。
     locks_ok = fcntl is not None
 
-    usage = repo.usage_today()
+    usage = aggregates["usage"]
     started = getattr(app.state, "started_at", None)
     jobs = getattr(app.state, "jobs", None)
     db_url = ""
@@ -336,8 +390,8 @@ def collect(
         "database": {
             "backend": _backend_of(str(settings.database.url)),
             "url": mask_url(db_url or str(settings.database.url)),
-            "items": repo.count_items(),
-            "repos": len(repo.list_repos()),
+            "items": aggregates["items_total"],
+            "repos": aggregates["repos_in_db"],
         },
         "llm": {
             "model": settings.llm.model,
@@ -349,9 +403,11 @@ def collect(
             "today": usage,
         },
         "sandbox": _sandbox_section(app, settings, probe=with_sandbox),
-        "queues": queue_panel(repo, settings),
+        "queues": aggregates["queues"],
+        # 全局概览（不带过滤）：总览页直接用它，不再各自现查一遍。
+        "summary": aggregates["summary"],
         "jobs": jobs.to_dict() if jobs is not None else {"jobs": [], "current": None},
-        "repos": repo_overview(app, settings, repo),
+        "repos": aggregates["repos"],
         "scans": [
             {
                 "repo_key": row.repo_key,
@@ -364,7 +420,7 @@ def collect(
                 "error": row.error,
                 "running": row.finished_at is None,
             }
-            for row in repo.list_scan_runs(limit=15)
+            for row in aggregates["scans"]
         ],
-        "alerts": _alerts(settings, repo, usage=usage, locks_ok=locks_ok),
+        "alerts": _alerts(settings, usage=usage, locks_ok=locks_ok, stale_count=aggregates["stale"]),
     }

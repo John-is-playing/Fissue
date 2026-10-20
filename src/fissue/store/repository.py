@@ -10,7 +10,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
-from sqlalchemy import Select, and_, delete, func, or_, select, update
+from sqlalchemy import Select, and_, case, delete, func, or_, select, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session, selectinload
 
@@ -1305,6 +1305,44 @@ class Repository:
         out: dict[str, dict[str, int]] = {}
         for queue, status, count in rows:
             out.setdefault(queue, {})[status] = int(count)
+        return out
+
+    def queue_panel_summary(self) -> dict[str, dict[str, Any]]:
+        """队列面板（``web/status.py::queue_panel``）需要的全部计数，**一条查询**。
+
+        旧的面板拼法每个队列各查一次独立语句：stats（1 次）+ 每队列 3 次（pending /
+        未 flush / 最老完成时间）= 10 个数据库往返。远程 PostgreSQL 上仅这一个面板
+        的渲染就是秒级。这里合并成一条 GROUP BY，用条件聚合把三个口径一次取出：
+
+        * ``counts`` —— 每个 status 的计数（与 :meth:`queue_stats` 同口径）
+        * ``pending`` —— status=pending 的条数
+        * ``waiting`` —— done 且未 flush 的**真实条数**（旧实现用 ``len(queue_unflushed())``，
+          受其 500 条 limit 上限，积压超过 500 时会静默少算）
+        * ``oldest_at`` —— done 且未 flush 中最老的 ``finished_at``（没有则 None）
+        """
+        unflushed = and_(QueueEntryRow.status == "done", QueueEntryRow.flushed_at.is_(None))
+        with self.db.session() as s:
+            rows = s.execute(
+                select(
+                    QueueEntryRow.queue,
+                    QueueEntryRow.status,
+                    func.count(),
+                    func.sum(case((unflushed, 1), else_=0)),
+                    func.min(case((unflushed, QueueEntryRow.finished_at), else_=None)),
+                ).group_by(QueueEntryRow.queue, QueueEntryRow.status)
+            ).all()
+        out: dict[str, dict[str, Any]] = {}
+        for queue, status, count, unflushed_count, oldest in rows:
+            entry = out.setdefault(
+                queue,
+                {"counts": {}, "pending": 0, "waiting": 0, "oldest_at": None},
+            )
+            entry["counts"][str(status)] = int(count)
+            if status == "pending":
+                entry["pending"] = int(count)
+            entry["waiting"] += int(unflushed_count or 0)
+            if oldest is not None and (entry["oldest_at"] is None or oldest < entry["oldest_at"]):
+                entry["oldest_at"] = oldest
         return out
 
     def save_batch_conclusion(

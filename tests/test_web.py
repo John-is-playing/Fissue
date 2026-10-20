@@ -1190,3 +1190,154 @@ def test_jobs_page_has_no_stop_button_for_another_process(client, monkeypatch) -
 
     assert "不在本表" in html, "仍要解释它是谁"
     assert 'data-act="stop-round"' not in html
+
+
+# ---------------------------------------------------------------------------
+# 聚合状态缓存（web/cache.py）
+# ---------------------------------------------------------------------------
+
+
+def test_queue_panel_does_not_issue_per_queue_queries(repo, settings, monkeypatch) -> None:
+    """队列面板必须走单查询的 ``queue_panel_summary``，不再逐口径发查询。
+
+    这是页面提速的根因之一：旧拼法每渲染一次面板就是 10 个数据库往返，
+    远端 PostgreSQL 上仅面板一项就是秒级。
+    """
+    from fissue.models import QueueName
+    from fissue.web.status import queue_panel
+
+    calls: list[str] = []
+    for name in ("queue_stats", "queue_pending_count", "queue_unflushed", "oldest_unflushed_age"):
+        original = getattr(repo, name)
+
+        def _make(_name: str, _orig) -> Any:
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                calls.append(_name)
+                return _orig(*args, **kwargs)
+
+            return wrapper
+
+        monkeypatch.setattr(repo, name, _make(name, original))
+
+    panel = queue_panel(repo, settings)
+
+    assert calls == [], f"面板不该再逐口径查询，却调用了：{calls}"
+    assert [p["name"] for p in panel] == [q.value for q in QueueName]
+
+
+def test_stats_cache_refreshes_in_background_and_bump_wakes_it() -> None:
+    """后台线程定期刷新；bump 能提前唤醒一轮刷新；前台读取永不阻塞。"""
+    from fissue.web.cache import StatsCache
+
+    builds = 0
+
+    def build() -> dict[str, Any]:
+        nonlocal builds
+        builds += 1
+        return {"n": builds}
+
+    cache = StatsCache(build, interval=0.2)
+    cache.start()
+    try:
+        # 首份快照由后台线程产出（冷启动的 get() 同步兜底也算数）
+        deadline = time.monotonic() + 3
+        snap = None
+        while time.monotonic() < deadline and (snap := cache.get()) is None:
+            time.sleep(0.02)
+        assert snap is not None
+        first = snap["n"]
+
+        # bump 触发提前刷新：下一份快照的 n 必须变
+        cache.bump()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and cache.get()["n"] == first:
+            time.sleep(0.02)
+        assert cache.get()["n"] > first
+        assert cache.build_count >= 2
+    finally:
+        cache.stop()
+
+
+def test_stats_cache_build_failure_keeps_stale_snapshot() -> None:
+    """刷新失败（数据库抖动）时保留旧快照：看板宁要 2 秒前的数字，不要空白。"""
+    from fissue.web.cache import StatsCache
+
+    state = {"fail": False}
+    attempts = 0
+
+    def build() -> dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        if state["fail"]:
+            raise RuntimeError("db down")
+        return {"ok": True}
+
+    cache = StatsCache(build, interval=30.0)  # 长周期：只靠 bump 驱动第二次刷新
+    cache.start()
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and cache.get() is None:
+            time.sleep(0.02)
+        assert cache.get() == {"ok": True}
+        ok_count = cache.build_count
+
+        state["fail"] = True
+        cache.bump()
+        before_attempts = attempts
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and attempts <= before_attempts:
+            time.sleep(0.05)
+        # 失败的那轮刷新跑过且未计入成功次数；前台仍拿到旧快照
+        assert attempts > before_attempts
+        assert cache.build_count == ok_count
+        assert cache.get() == {"ok": True}
+    finally:
+        cache.stop()
+
+
+def test_collect_with_cached_aggregates_matches_live(client) -> None:
+    """``collect`` 传入缓存聚合与现算必须逐项一致（口径不能因缓存而变）。"""
+    from fissue.web import status as st_mod
+
+    app = client.app
+    settings = app.state.settings
+    repo = app.state.repo
+    live = st_mod.collect(app, settings, repo)
+    agg = st_mod.collect_aggregates(app, settings, repo)
+    cached = st_mod.collect(app, settings, repo, aggregates=agg)
+
+    for key in ("queues", "summary", "repos", "scans"):
+        assert cached[key] == live[key], f"口径漂移：{key}"
+    assert cached["llm"]["today"] == live["llm"]["today"]
+    assert cached["database"]["items"] == live["database"]["items"]
+    assert cached["database"]["repos"] == live["database"]["repos"]
+
+
+def test_pages_are_served_from_background_cache(client) -> None:
+    """页面请求不触发聚合的同步重算：背景数字全部命中后台刷新缓存。
+
+    回归目标：远端数据库上「切换页面 = 十来个串行往返 = 几秒」。lifespan 已启动
+    ``StatsCache``，首份快照就绪后，页面请求只应读缓存——刷新总次数不随页面
+    请求增加。
+    """
+    cache = client.app.state.stats_cache
+    assert cache is not None
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and cache.get() is None:
+        time.sleep(0.02)
+    assert cache.get() is not None, "首份快照应在后台就绪"
+
+    # 用一次 bump 刷新把时间基线拉到现在，避免撞上周期刷新的边界
+    cache.bump()
+    pre = cache.build_count
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and cache.build_count == pre:
+        time.sleep(0.02)
+    baseline = cache.build_count
+
+    assert client.get("/").status_code == 200
+    assert client.get("/items").status_code == 200
+    assert client.get("/queues").status_code == 200
+
+    assert cache.build_count == baseline, "页面请求不应触发聚合的同步重算"

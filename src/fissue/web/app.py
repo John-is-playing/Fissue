@@ -167,6 +167,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = st
         app.state.db = database
         app.state.repo = Repository(database)
+        # 聚合状态缓存：后台线程每 2 秒重算一整套「不带过滤」的聚合数字，看板
+        # 前台只读缓存——远端数据库的往返不再落在切换页面的路径上（见
+        # web/cache.py 的模块说明）。build 闭包每次现取 app.state：设置页热重载
+        # 会替换 state.settings，捕获在闭包里的旧对象不能用。
+        from .cache import StatsCache
+        from .status import collect_aggregates
+
+        stats_cache = StatsCache(
+            lambda: collect_aggregates(app, app.state.settings, app.state.repo)
+        )
+        app.state.stats_cache = stats_cache
+        stats_cache.start()
+        app.state.jobs.on_complete = stats_cache.bump
         # 鉴权是**启动期**就要就位的：旧口令一次性迁移（docs/AUTH.md §7），
         # 以及「还没有管理员账号」时生成引导口令并打印（§3.4）。
         # 两件都放在这里而不是请求期：它们每次进程启动只该发生一次。
@@ -175,8 +188,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         warn_if_unprovisioned(st, store)
         log.info("Web/API 已就绪（只读=%s，API 前缀=%s）", st.web.read_only, st.api.prefix)
         yield
-        # 先把在跑的作业收掉，再关日志：作业里可能正握着 flock 或占着沙盒目录，
-        # 直接退出只会留下「Task was destroyed but it is pending」与半截的临时目录。
+        # 先停聚合缓存的后台线程（它可能正握着数据库会话），再把在跑的作业收掉：
+        # 作业里可能正握着 flock 或占着沙盒目录，直接退出只会留下「Task was
+        # destroyed but no pending」与半截的临时目录。
+        stats_cache.stop()
         await app.state.jobs.shutdown()
         log.info("Web/API 关闭")
 
@@ -406,6 +421,19 @@ def _settings_of(app: FastAPI) -> Settings:
     if getattr(state, "settings", None) is None:  # pragma: no cover - lifespan 已设好
         state.settings = load_settings()
     return state.settings
+
+
+def _aggregates_of(app: FastAPI) -> dict[str, Any] | None:
+    """后台刷新缓存里的聚合快照。
+
+    ``None`` 表示缓存还没就绪（TestClient 没跑 lifespan 的兜底路径、或启动后
+    首份快照未算完）——调用方回退到**现算**，页面功能不受影响，只是那一次
+    多付几个数据库往返。
+    """
+    cache = getattr(app.state, "stats_cache", None)
+    if cache is None:
+        return None
+    return cache.get() or None
 
 
 def _ctx_of(app: FastAPI):
@@ -736,7 +764,11 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         """
         _ensure_state(request)
         return collect_status(
-            request.app, _settings(request), _repo(request), with_sandbox=sandbox
+            request.app,
+            _settings(request),
+            _repo(request),
+            with_sandbox=sandbox,
+            aggregates=_aggregates_of(request.app),
         )
 
     # -- 条目 -------------------------------------------------------------
@@ -1259,19 +1291,17 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
         与「条目」页分开，是因为两者关心的事不同：总览回答「有没有问题、在不在跑、花了多少钱」，
         条目页回答「这一条是什么」。混在一页时，光筛选器就把告警挤到看不见的地方。
         """
-        from ..store import export as exp
-
         r = _repo(request)
         st = _settings(request)
-        snapshot = collect_status(request.app, st, r)
+        snapshot = collect_status(request.app, st, r, aggregates=_aggregates_of(request.app))
         return templates.TemplateResponse(
             request,
             "overview.html",
             _page_context(
                 request,
                 nav="overview",
-                total=r.count_items(),
-                summary=exp.summarize(r),
+                total=snapshot["database"]["items"],
+                summary=snapshot["summary"],
                 queues=snapshot["queues"],
                 usage=snapshot["llm"]["today"],
                 budget=st.llm.budget,
@@ -1366,6 +1396,18 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
             for i in items
         ]
         pages = max(1, (total + limit - 1) // limit)
+        # 背景数字（队列面板 / 今日用量）不随筛选而变 → 读后台刷新缓存。
+        agg = _aggregates_of(request.app)
+        queues = (agg or {}).get("queues")
+        if queues is None:
+            queues = queue_panel(r, st)
+        usage = (agg or {}).get("usage")
+        if usage is None:
+            usage = r.usage_today()
+        # 概览卡片：无筛选且缓存里有全局概览时直接复用（同一口径）；
+        # 有筛选时必须现算——卡片必须跟着筛选动（见 export.summarize 的口径约束）。
+        if any(filters.values()) or (summary := (agg or {}).get("summary")) is None:
+            summary = exp.summarize(r, **filters)
         return templates.TemplateResponse(
             request,
             "items.html",
@@ -1376,9 +1418,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                 total=total,
                 base_qs=base_qs,
                 page_qs=page_qs,
-                summary=exp.summarize(r, **filters),
-                queues=queue_panel(r, st),
-                usage=r.usage_today(),
+                summary=summary,
+                queues=queues,
+                usage=usage,
                 jobs=request.app.state.jobs.to_dict(),
                 problems=problems,
                 page=page,
@@ -1406,7 +1448,11 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
         轮询后的样子不一样」。
         """
         snapshot = collect_status(
-            request.app, _settings(request), _repo(request), with_sandbox=sandbox
+            request.app,
+            _settings(request),
+            _repo(request),
+            with_sandbox=sandbox,
+            aggregates=_aggregates_of(request.app),
         )
         return templates.TemplateResponse(
             request,
@@ -1431,15 +1477,21 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
             }
             for q in QueueName
         }
+        agg = _aggregates_of(request.app)
+        queues = (agg or {}).get("queues")
+        if queues is None:
+            queues = queue_panel(r, st)
         return templates.TemplateResponse(
             request,
             "queues.html",
             _page_context(
                 request,
                 nav="queues",
-                queues=queue_panel(r, st),
+                queues=queues,
                 decisions=decisions,
-                stats=r.queue_stats(),
+                # 明细统计就是面板里那份 counts（同一口径）——不再为它单开一次
+                # ``queue_stats`` 查询。
+                stats={q["name"]: q["counts"] for q in queues},
                 jobs=request.app.state.jobs.to_dict(),
             ),
         )
