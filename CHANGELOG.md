@@ -11,6 +11,51 @@
 
 ---
 
+## [1.1.0] - 2026-10-20
+
+> **正式版**：`rel/v1.1.0-b1…b4` 四个预发布快照的收口——`pyproject.toml` 与 `__version__`
+> 由 `1.0.0` 提升为 `1.1.0`。本版主体是把登录从单一全局口令换成**会话 + 多 API Key +
+> 可信内网**（[docs/AUTH.md](./docs/AUTH.md) 方案 B）、默认后端切到 **SQLite**（零依赖开箱即用）、
+> Web 看板加**后台刷新缓存**（远端库下页面切换提速两个量级）。逐条细节见下方
+> `[1.1.0-b1]`…`[1.1.0-b4]` 各段。
+
+### 新增
+
+- **会话鉴权**：`fissue/auth/` 纯标准库内核（PBKDF2-HMAC-SHA256、RFC 6238 TOTP、API Key、
+  一次性恢复码）、`/login` + `/api/auth/*`、首次引导一次性口令（用后即焚）、CSRF、
+  2FA 二维码（自带离线编码器，不经任何外部服务）
+- **可信内网与 API Key 管理**：`web.trusted_networks`（CIDR 内等同回环）、`/api-keys` 页、
+  `fissue auth …` 本机自救通道；旧口令经兼容垫片自动导入为 `prefix=legacy` 的 Key（后续版本移除）
+- **SQLite 默认后端**：全新机器 `fissue db init` 不再要求先搭 PostgreSQL
+- **看板后台刷新缓存**：队列面板 10 次数据库往返合并为 1 条 GROUP BY + 后台线程每 2 秒
+  重算聚合、前台只读缓存；实测（同一远端 PostgreSQL）总览 4.8s → 2ms、条目页 7.4s → 0.45s
+- **「停掉当前这一轮」**：常驻轮次登记进 `RoundControl`，页面可取消本进程轮次
+  （跨进程不给按钮——那份 task 在别的进程内存里）
+- **LLM 计费/预算/生成参数入设置页**：回填当前生效值、保存热重载、非法值 400 且文件不动
+- **Fissue Wiki**（21 页）与幂等发布脚本 `scripts/publish_wiki.py`
+
+### 变更
+
+- **写闸门可观测性**：状态页与角标显示「写操作进行中：<种类> + <谁在写>（已跑 Ns）」，
+  任务页「不在本表」提示条说清为什么看不见、怎么才能停
+- **fail-closed 判据**：放行当且仅当 `web.auth.enabled`（默认 true）或声明了可信网段；
+  `api.token` / `api.auth_required` 删除，唯一开关是 `web.auth.enabled`
+- **CI 与打包**：覆盖率软门（`fail_under = 79`）、`py.typed`、pre-commit、Dependabot；
+  删 5 个从未被 import 的依赖并由 `tests/test_packaging.py` 固化
+
+### 修复
+
+- **数据库连接串加载期校验**（三条入口同一规则）+ 写配置端点重载失败说清「已写盘」
+- **复审 15 处**（`[1.1.0-b2]`）：鉴权后界面写不了、base 分支被静默清空、连接串明文回显等
+- **`mypy` 清零**（`[1.1.0-b3]`）+ 缓存轮询测试 `dict | None` 索引 + 3 个测试函数补注解
+
+### 验证
+
+- 全量单测 **1118 passed / 7 skipped**（b4 快照处）、`ruff` 与 `mypy` 全仓通过（CI 口径 95 文件）
+- PostgreSQL 后端已完成真实部署验证；**Gitee 写操作仍未验证**（平台限制），口径不变
+
+---
+
 ## [1.1.0-b4] - 2026-10-20
 
 > **预发布快照**：`rel/v1.1.0-b4`（做法同 b1/b2/b3：不动 `pyproject.toml` 与 `__version__`，
