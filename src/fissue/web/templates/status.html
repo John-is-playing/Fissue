@@ -168,7 +168,8 @@
       ["限额", "CPU=" + esc(sb.limits.cpus) + " · 内存=" + esc(sb.limits.memory_mb) + "MB · 超时=" + esc(sb.limits.timeout_seconds) + "s"],
       ["可用性", sb.ready === null
         ? '<span class="muted">' + esc(sb.reason) + "</span>"
-        : (sb.ready ? tag("就绪", "status-pr_created") : tag("不可用", "status-failed")) + " " + esc(sb.reason)],
+        : (sb.ready ? tag("就绪", "status-pr_created") : tag("不可用", "status-failed")) + " " + esc(sb.reason)
+          + (sb.probed_at ? ' <span class="muted small">探测于 ' + esc(sb.probed_at.replace("T", " ").slice(11, 19)) + " UTC</span>" : "")],
     ]);
 
     // 模型与数据库

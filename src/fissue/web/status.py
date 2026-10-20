@@ -182,15 +182,23 @@ def _sandbox_section(app: FastAPI, settings: Settings, *, probe: bool) -> dict[s
         "user": sb.user or "（镜像默认）",
         "limits": sb.limits.model_dump(),
         "ready": None,
+        "probed_at": None,
         "reason": "未探测（加 ?sandbox=1 触发）",
     }
     if not probe:
+        # 每 2 秒的轮询不敲 Docker，但也**不能把上一次探测结果丢回「未探测」**——
+        # 探测后紧接着的下一轮普通轮询就会把用户刚看到的结果抹掉（真机实炸过）。
+        # 结果缓存在 app.state（进程内，重启即清，不会跨进程串味）。
+        cached = getattr(app.state, "sandbox_probe", None)
+        if cached is not None:
+            out["ready"] = cached["ready"]
+            out["probed_at"] = cached["at"]
+            out["reason"] = cached["reason"]
         return out
     if not sb.enabled:
         out["reason"] = "沙盒已关闭（sandbox.enabled=false）——验证器无法运行"
         return out
-    # 探测会真的起一次 Docker 调用（本地模式则直接可用），所以只在显式要求时做，
-    # 免得每 2 秒一次的状态轮询都在敲 Docker。
+    # 探测会真的起一次 Docker 调用，所以只在显式要求时做。
     try:
         from ..sandbox.runtime import DockerRuntime
 
@@ -200,6 +208,13 @@ def _sandbox_section(app: FastAPI, settings: Settings, *, probe: bool) -> dict[s
     except Exception as exc:  # noqa: BLE001 - 探测失败本身就是状态的一部分
         out["ready"] = False
         out["reason"] = f"{type(exc).__name__}: {exc}"
+    # 记下探测时间：结果可能过期（Docker 守护进程后来停了），页面上看得见。
+    out["probed_at"] = _iso(datetime.now(timezone.utc))
+    app.state.sandbox_probe = {
+        "ready": out["ready"],
+        "reason": out["reason"],
+        "at": out["probed_at"],
+    }
     return out
 
 

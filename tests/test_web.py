@@ -1080,6 +1080,23 @@ def test_repos_page_renders_item_counts_not_dict_methods(client) -> None:
     assert 'data-items="1"' in r.text, "夹具有一条条目：计数应渲染成数字"
 
 
+def test_sandbox_probe_result_survives_subsequent_polls(client) -> None:
+    """探测结果要缓存：不带 ?sandbox=1 的普通轮询不得把它抹回「未探测」。
+
+    回归：状态页每 2 秒轮询一次，探测后紧接着的下一轮（不带 sandbox 参数）
+    原先直接返回「未探测（加 ?sandbox=1 触发）」，用户在页面上刚看到的
+    就绪/不可用只存在一瞬间。现在结果缓存在 app.state，带上探测时间。
+    """
+    probed = client.get("/api/v1/status", params={"sandbox": "1"}).json()["sandbox"]
+    assert probed["ready"] is not None, "显式探测必须给出真结果"
+    assert probed["probed_at"], "探测要留下时间戳（结果可能过期，页面据此提示）"
+
+    after = client.get("/api/v1/status").json()["sandbox"]
+    assert after["ready"] == probed["ready"], f"结果被抹回了：{after}"
+    assert after["reason"] == probed["reason"]
+    assert after["probed_at"] == probed["probed_at"]
+
+
 def test_cancel_button_is_present_on_job_pages(client) -> None:
     """「取消」按钮要在总览的任务面板与「任务」页都出现，且接线在共用的 app.js 里。
 
