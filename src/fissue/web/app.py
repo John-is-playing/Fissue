@@ -44,6 +44,7 @@ from .auth import AUTH_PREFIX, page_guard_middleware
 from .auth import register as register_auth
 from .hooks import parse_event, signature_ok
 from .jobs import Job, JobRegistry
+from .markdown import render_job_event
 from .status import collect as collect_status
 from .status import queue_panel, writer_panel
 
@@ -1115,7 +1116,11 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         job = request.app.state.jobs.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail=f"作业不存在：{job_id}")
-        return job.to_dict()
+        payload = job.to_dict()
+        # render=1：事件附带服务端渲染好的安全 html（详情页时间线用，前端只拼接）。
+        if request.query_params.get("render") == "1":
+            payload["events"] = [render_job_event(ev) for ev in payload["events"]]
+        return payload
 
     @app.post(f"{prefix}/jobs/{{kind}}", status_code=202)
     async def submit_job(
@@ -1171,6 +1176,16 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             raise HTTPException(
                 status_code=409, detail=f"任务已经结束（{job.status}），没有可取消的东西"
             )
+        if job.kind == "round":
+            # 轮次任务没有自己的 task 可取消（它的 task 在常驻服务的循环里），
+            # 走「停止当前这一轮」的入口——与任务页的停止按钮同一逻辑。
+            from ..service.control import ROUNDS
+
+            stopped = ROUNDS.request_stop()
+            if stopped is None:
+                raise HTTPException(status_code=409, detail="本进程没有正在跑的轮次，无需停止")
+            job.canceled_by = "user"
+            return {"ok": True, "message": f"已请求停止轮次：{stopped.name}"}
         registry.cancel(job)
         return {
             "job": job.to_dict(),
@@ -1596,6 +1611,27 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                 nav="jobs",
                 jobs=request.app.state.jobs.to_dict(),
                 writer=writer_panel(_settings(request)),
+            ),
+        )
+
+    @app.get("/jobs/{job_id}", response_class=HTMLResponse)
+    async def job_detail_page(request: Request, job_id: str) -> HTMLResponse:
+        """任务详情：结构化事件流（LLM 流式输出 + 工具动作），运行中自动刷新。
+
+        鉴权与同区其他页面一致，走 ``page_guard_middleware``（页面统一入口），
+        不挂在 REST API 的 ``auth`` 依赖上——那是 ``_register_api`` 作用域内的局部变量。
+        """
+        job = request.app.state.jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"作业不存在或已被清理：{job_id}")
+        return templates.TemplateResponse(
+            request,
+            "jobs_detail.html",
+            _page_context(
+                request,
+                nav="jobs",
+                job=job.to_dict(),
+                events_html="".join(render_job_event(ev)["html"] for ev in job.events),
             ),
         )
 

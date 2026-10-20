@@ -130,6 +130,11 @@ class PRCreator:
         self.ctx = ctx
         self.settings = ctx.settings
 
+    def _tool(self, name: str, detail: str, *, ok: bool | None = None) -> None:
+        """把一次平台/文件动作记进当前任务的观察槽（有任务在看时）。"""
+        if self.ctx.job_sink is not None:
+            self.ctx.job_sink.tool(name, detail, ok=ok)
+
     async def submit(
         self,
         *,
@@ -157,6 +162,7 @@ class PRCreator:
             attempt.outcome = FixOutcome.NEEDS_MANUAL
             attempt.patch_path = path
             attempt.error = "pr_strategy.mode=patch_only：只产出补丁，不自动提 PR"
+            self._tool("补丁文件", f"patch_only：只产出补丁 {path}，不自动提 PR")
             return attempt
 
         branch = branch_name(strategy.branch_prefix, item)
@@ -197,6 +203,11 @@ class PRCreator:
                 "该修复已有开放 PR #%s，跳过推送与重复创建：%s",
                 existing_pr.get("number"), item.key,
             )
+            self._tool(
+                "平台 PR",
+                f"该修复已有开放 PR #{existing_pr.get('number')}：{existing_pr.get('url')}",
+                ok=True,
+            )
             return attempt
 
         # 2) 提交并推送
@@ -207,6 +218,7 @@ class PRCreator:
             attempt.outcome = FixOutcome.NEEDS_MANUAL
             attempt.branch = branch
             attempt.error = f"推送失败：{push_err}"
+            self._tool("推送分支", f"推送 {head_prefix} 失败：{push_err}", ok=False)
             return attempt
 
         # 3) 提 PR
@@ -225,6 +237,7 @@ class PRCreator:
             attempt.fork = f"{head_repo.owner}/{head_repo.name}"
             attempt.error = f"创建 PR 失败（分支已推送）：{exc}"
             log.error("创建 PR 失败 %s：%s", item.key, exc)
+            self._tool("平台 PR", f"创建 PR 失败（分支已推送）：{exc}", ok=False)
             return attempt
 
         attempt.branch = branch
@@ -236,6 +249,7 @@ class PRCreator:
         # 4) 打 AI 标签（标识这是 AI 产物）
         await self._label_pr(item, repo_cfg, result.get("number"), adapter)
         log.info("已提 PR %s → %s", item.key, attempt.pr_url)
+        self._tool("平台 PR", f"已提 PR #{result.get('number')}：{result.get('url')}", ok=True)
         return attempt
 
     # -- fork -------------------------------------------------------------
@@ -422,7 +436,7 @@ class AutoFixer:
     def __init__(self, ctx: RuntimeContext) -> None:
         self.ctx = ctx
         self.settings = ctx.settings
-        self.agent = FixAgent(ctx.llm, ctx.repo, ctx.verifier, ctx.settings)
+        self.agent = FixAgent(ctx.llm, ctx.repo, ctx.verifier, ctx.settings, sink=ctx.job_sink)
         self.pr_creator = PRCreator(ctx)
 
     # -- 单条 -------------------------------------------------------------

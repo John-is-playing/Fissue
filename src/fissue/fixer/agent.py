@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,7 @@ from ..models import (
     RawItem,
     VerifierSpec,
 )
+from ..observers import JobSink
 from ..store.repository import Repository
 from ..verifier.runner import VerifierRunner, failed_test_ids_from_output
 from ..workspace import RepoWorkspace
@@ -55,6 +57,8 @@ class AgentTrace:
 
     rounds: int = 0
     actions: list[str] = field(default_factory=list)
+    #: 若设置了观察槽，把每条 :meth:`note` 转发成当前任务的一条工具事件。
+    on_note: Callable[[str], None] | None = field(default=None, repr=False)
     written_files: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
     test_outputs: list[str] = field(default_factory=list)
@@ -93,6 +97,8 @@ class AgentTrace:
         self.actions.append(text)
         if len(self.actions) > 200:
             del self.actions[:100]
+        if self.on_note is not None:
+            self.on_note(text)
 
 
 class FixAgent:
@@ -104,12 +110,17 @@ class FixAgent:
         repo: Repository,
         runner: VerifierRunner,
         settings: Settings,
+        *,
+        sink: JobSink | None = None,
     ) -> None:
         self.client = client
         self.repo = repo
         self.runner = runner
         self.settings = settings
         self.cfg: AutoFixConfig = settings.auto_fix
+        #: 观察槽（当前任务）：agent 的每个动作（读 / 写 / 跑验证器）都以工具事件
+        #: 进任务详情页。没有任务在看时为 None（CLI 路径）。
+        self.sink = sink
 
     # -- 主流程 -----------------------------------------------------------
 
@@ -133,6 +144,9 @@ class FixAgent:
         """
         rounds_limit = max_rounds or self.cfg.agent_max_rounds
         trace = AgentTrace()
+        if self.sink is not None:
+            sink = self.sink
+            trace.on_note = lambda t: sink.tool("修复 Agent", t)
         attempt = FixAttempt(item_key=item.key, outcome=FixOutcome.SKIPPED)
 
         if not self.cfg.enabled:

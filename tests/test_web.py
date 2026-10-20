@@ -1450,3 +1450,59 @@ def test_pages_are_served_from_background_cache(client) -> None:
     assert client.get("/queues").status_code == 200
 
     assert cache.build_count == baseline, "页面请求不应触发聚合的同步重算"
+
+
+# ---------------------------------------------------------------------------
+# 任务详情：结构化事件 + 渲染 API + 详情页
+# ---------------------------------------------------------------------------
+
+
+def test_job_detail_page_and_rendered_events(client) -> None:  # noqa: ANN001
+    from fissue.web.jobs import RUNNING, Job
+
+    registry = client.app.state.jobs
+    job = Job(id="detail1", kind="evaluate")
+    job.status = RUNNING
+    job.report("开始评测")
+    job.llm_start(purpose="evaluation", model="test-model")
+    job.llm_delta("# 结论\n\n**真实**缺陷")
+    job.llm_end(model="test-model", from_fallback=False, usage={"total_tokens": 42})
+    job.tool("验证器", "base 验证：已复现", ok=True)
+    registry._jobs[job.id] = job
+
+    raw = client.get("/api/v1/jobs/detail1").json()
+    assert raw["events"][1]["text"] == "# 结论\n\n**真实**缺陷"
+    assert "html" not in raw["events"][0]
+
+    rendered = client.get("/api/v1/jobs/detail1?render=1").json()
+    assert "LLM · evaluation" in rendered["events"][1]["html"]
+    assert '<h1 class="md-h">结论</h1>' in rendered["events"][1]["html"]
+    assert rendered["events"][2]["html"].startswith('<div class="ev ev-tool ok"')
+
+    page = client.get("/jobs/detail1")
+    assert page.status_code == 200
+    assert "ev-llm" in page.text
+    assert "验证器" in page.text
+
+    assert client.get("/jobs/no-such-job").status_code == 404
+
+
+def test_jobs_page_links_to_detail(client) -> None:  # noqa: ANN001
+    from fissue.web.jobs import DONE, Job
+
+    registry = client.app.state.jobs
+    job = Job(id="linked1", kind="scan")
+    job.status = DONE
+    registry._jobs[job.id] = job
+    assert 'href="/jobs/linked1"' in client.get("/jobs").text
+
+
+def test_round_job_cancel_requests_stop_of_the_round(client) -> None:  # noqa: ANN001
+    from fissue.web.jobs import RUNNING
+
+    registry = client.app.state.jobs
+    job = registry.begin_round("常驻服务：测试轮次")
+    assert job.status == RUNNING
+    # ROUNDS 里没有真实在跑的轮次 → 应如实 409，而不是假装取消了
+    r = client.post(f"/api/v1/jobs/{job.id}/cancel")
+    assert r.status_code == 409

@@ -21,8 +21,8 @@
     </div>
     <div class="small muted">
       {% if writer.kind == 'round' %}
-      本页只列**从网页提交的作业**；上面这条是常驻服务自己调度的轮次，所以不在这张表里。
-      它可以在下面就地停掉；想看它跑到哪一步，去「状态监测」页。
+      上面这条是常驻服务自己调度的轮次；它已**登记为任务**（类型 <code>round</code>）进入下方任务列表，
+      实时进度（LLM 输出、工具动作）可在它的「详情」页查看，也可以就地停掉。
       {% elif writer.kind == 'cli' %}
       它是**另一个进程**在写（命令行或另一个服务）。本进程看不到它的进度，也无法从页面取消——
       要等它结束，或先停掉那个进程。
@@ -59,6 +59,7 @@
       <span class="spacer"></span>
       <button class="danger" data-act="cancel-job" data-job="{{ jobs.current.id }}">取消任务</button>
       {% endif %}
+      <a class="small" href="/jobs/{{ jobs.current.id }}">详情 →</a>
     </div>
     <div class="progress-line" id="cur-progress">{{ jobs.current.progress }}</div>
     {% if jobs.current.log %}<pre id="cur-log">{{ jobs.current.log | join('\n') }}</pre>{% endif %}
@@ -78,8 +79,9 @@
       <span class="muted small">{{ j.duration_seconds }}s</span>
       <span class="muted small">{{ (j.created_at or '')[:19].replace('T', ' ') }}</span>
       <span class="spacer"></span>
+      <a class="small" href="/jobs/{{ j.id }}">详情</a>
       {% if j.live and not read_only %}
-      <button class="danger" data-act="cancel-job" data-job="{{ j.id }}">取消</button>
+      <button class="danger" data-act="cancel-job" data-job="{{ j.id }}">{{ '停止这一轮' if j.kind == 'round' else '取消' }}</button>
       {% endif %}
       <span class="muted small">{{ j.params }}</span>
     </div>

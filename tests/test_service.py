@@ -418,3 +418,77 @@ async def test_run_once_wires_the_verify_step_between_eval_and_flush(settings, r
     assert order[2:] == ["_verify_pending", "_flush_queues", "_run_fixes"], \
         f"验证必须排在评测之后、flush 之前：{order}"
     assert set(result) >= {"fetch", "evaluated", "verify", "flush", "fix"}
+
+
+# ---------------------------------------------------------------------------
+# 轮次登记：常驻轮次以 round 类型任务进入作业表
+# ---------------------------------------------------------------------------
+
+
+async def test_run_once_registers_the_round_as_a_task(settings, monkeypatch) -> None:  # noqa: ANN001
+    """常驻轮次登记为 round 类型任务：任务页可见、观察槽在轮体前置上、结束收尾 done。"""
+    from typing import Any
+
+    from fastapi.testclient import TestClient
+
+    from fissue.web.app import create_app
+
+    service = FissueService(settings)
+
+    async def fake_round(*, round_name: str = "服务轮次") -> dict[str, Any]:
+        from fissue.observers import current_job_sink
+
+        sink = current_job_sink.get()
+        assert sink is not None, "观察槽必须在轮体运行前置上"
+        sink.tool("测试", "轮体跑过", ok=True)
+        return {"repos": 0, "round_name": round_name}
+
+    monkeypatch.setattr(service, "_run_round", fake_round)
+    with TestClient(create_app(settings)) as c:
+        service.app = c.app
+        result = await service.run_once()
+
+    assert result == {"repos": 0, "round_name": "服务轮次"}
+    jobs = c.app.state.jobs.to_dict()
+    rounds = [j for j in jobs["jobs"] if j["kind"] == "round"]
+    assert len(rounds) == 1
+    assert rounds[0]["status"] == "done"
+    assert rounds[0]["result"] == result
+    assert any(e["type"] == "tool" for e in rounds[0]["events"])
+
+
+async def test_run_once_without_web_does_not_register(settings, monkeypatch) -> None:  # noqa: ANN001
+    from typing import Any
+
+    service = FissueService(settings)
+
+    async def fake_round(*, round_name: str = "服务轮次") -> dict[str, Any]:
+        return {"repos": 0}
+
+    monkeypatch.setattr(service, "_run_round", fake_round)
+    assert await service.run_once() == {"repos": 0}
+
+
+async def test_run_once_marks_the_round_canceled(settings, monkeypatch) -> None:  # noqa: ANN001
+    import asyncio
+    from typing import Any
+
+    import pytest
+    from fastapi.testclient import TestClient
+
+    from fissue.web.app import create_app
+
+    service = FissueService(settings)
+
+    async def fake_round(*, round_name: str = "服务轮次") -> dict[str, Any]:
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(service, "_run_round", fake_round)
+    with TestClient(create_app(settings)) as c:
+        service.app = c.app
+        with pytest.raises(asyncio.CancelledError):
+            await service.run_once()
+    jobs = c.app.state.jobs.to_dict()
+    rounds = [j for j in jobs["jobs"] if j["kind"] == "round"]
+    assert len(rounds) == 1
+    assert rounds[0]["status"] == "canceled"

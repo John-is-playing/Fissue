@@ -58,10 +58,48 @@ class FissueService:
         #: 正在跑的 uvicorn 实例（`with_web` 时才有）。退出时要**请它自己停**
         #: （`should_exit`），而不是 cancel 它的任务——原因见 `run_forever` 的收尾段。
         self._web_server: Any | None = None
+        #: ``with_web`` 时的 FastAPI 实例（在 ``_web_loop`` 里创建）。轮次用它把自己
+        #: 登记进任务表；没起 Web 界面时为 None，轮次不登记（纯 CLI 常驻模式没有
+        #: 界面可看，登记了也无人消费）。
+        self.app: Any | None = None
 
     # -- 生命周期 ---------------------------------------------------------
 
     async def run_once(self, *, round_name: str = "服务轮次") -> dict[str, Any]:
+        """一轮：（Web 在跑时）登记为任务 → 跑 → 收尾。
+
+        为什么值得登记：常驻服务的轮次原先在任务列表里不可见——「写闸门被握着，但
+        不知道是谁的」，用户也看不到它的实时进度。现在轮次与网页作业一样成为
+        ``round`` 类型的任务，LLM 输出与工具动作流进该任务的事件，详情页共用。
+
+        观察槽（``current_job_sink``）必须在 ``_run_round`` **之前**置上：RuntimeContext
+        构造时读它，决定要不要给 LLM 客户端挂流式观察桥。
+        """
+        from ..observers import current_job_sink
+        from ..web.jobs import CANCELED, DONE, FAILED
+
+        registry = self.app.state.jobs if self.app is not None else None
+        job = registry.begin_round(f"常驻服务：{round_name}") if registry is not None else None
+        token = current_job_sink.set(job)
+        try:
+            result = await self._run_round(round_name=round_name)
+        except asyncio.CancelledError:
+            if registry is not None and job is not None:
+                registry.finish_round(
+                    job, status=CANCELED, error="轮次被取消（页面请求停止或服务退出）"
+                )
+            raise
+        except Exception as exc:  # noqa: BLE001 - 只为收尾任务记录，异常照常抛出
+            if registry is not None and job is not None:
+                registry.finish_round(job, status=FAILED, error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            current_job_sink.reset(token)
+        if registry is not None and job is not None and job.live:
+            registry.finish_round(job, status=DONE, result=result)
+        return result
+
+    async def _run_round(self, *, round_name: str = "服务轮次") -> dict[str, Any]:
         """跑完整的一轮：扫描 → 评测 → flush → 修复。
 
         ``round_name`` 会作为写闸门的名字出现在状态页上（「常驻服务：扫描轮次」）。
@@ -319,8 +357,10 @@ class FissueService:
 
             from ..web.app import create_app
 
+            app = create_app(self.settings)
+            self.app = app
             config = uvicorn.Config(
-                create_app(self.settings),
+                app,
                 host=self.settings.web.host,
                 port=self.settings.web.port,
                 log_level=self.settings.app.log_level,

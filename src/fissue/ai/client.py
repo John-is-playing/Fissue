@@ -18,7 +18,7 @@ import random
 import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -148,6 +148,20 @@ class BudgetGuard:
 # ---------------------------------------------------------------------------
 
 
+class LLMEmitter(Protocol):
+    """LLM 流式输出观察者（可选；不设置时客户端完全不流式）。
+
+    实现是 ``pipeline.context`` 里的桥：它把回调转给「当前任务槽」
+    （见 ``observers``）。客户端自己不知道有没有人在看——那是运行时事实。
+    """
+
+    def llm_start(self, *, purpose: str, model: str) -> None: ...
+
+    def llm_delta(self, text: str) -> None: ...
+
+    def llm_end(self, *, model: str, from_fallback: bool, usage: dict[str, Any] | None) -> None: ...
+
+
 class LLMClient:
     """异步 OpenAI 兼容客户端。"""
 
@@ -166,6 +180,8 @@ class LLMClient:
         self._client = client
         self._owns_client = client is None
         self._json_mode_supported: bool | None = None
+        #: 流式输出观察者。任务要实时展示 LLM 输出时挂上桥；CLI / 无观察 = None（走原路）。
+        self.sink: LLMEmitter | None = None
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -259,14 +275,18 @@ class LLMClient:
         async with self._semaphore:
             if self.budget_guard is not None:
                 self.budget_guard.check(estimated_tokens=_estimate_tokens(messages))
-            data = await self._post_with_retry(payload, use_json=use_json)
+            data = await self._request(
+                payload, use_json=use_json, purpose=purpose, from_fallback=from_fallback
+            )
 
         if data is None:
             # JSON mode 不被支持 → 去掉后重试一次
             payload.pop("response_format", None)
             self._json_mode_supported = False
             async with self._semaphore:
-                data = await self._post_with_retry(payload, use_json=False)
+                data = await self._request(
+                    payload, use_json=False, purpose=purpose, from_fallback=from_fallback
+                )
 
         if data is None:
             raise LLMError("模型返回为空")
@@ -299,6 +319,144 @@ class LLMClient:
             raw=data,
             from_fallback=from_fallback,
         )
+
+    async def _request(
+        self,
+        payload: dict[str, Any],
+        *,
+        use_json: bool,
+        purpose: str,
+        from_fallback: bool,
+    ) -> dict[str, Any] | None:
+        """按「有没有观察者在场」选传输方式，返回**同形状**的响应 dict。
+
+        有观察者（``sink`` 已挂）→ SSE 流式，正文逐块推给任务事件；没有 → 原一次性
+        POST。两条路返回同样的「非流式响应」结构，下游对 content / usage /
+        finish_reason / tool_calls 的解析零改动。
+        """
+        if self.sink is None:
+            return await self._post_with_retry(payload, use_json=use_json)
+        return await self._stream_with_retry(
+            payload,
+            use_json=use_json,
+            purpose=purpose,
+            from_fallback=from_fallback,
+        )
+
+    @staticmethod
+    def _parse_sse(line: str) -> dict[str, Any] | None:
+        """解析一行 SSE 帧：``data: {...}`` → dict；``data: [DONE]`` / 空行 / 非 data → None。"""
+        line = line.strip()
+        if not line.startswith("data:"):
+            return None
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            return None
+        try:
+            return json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+    async def _stream_with_retry(
+        self,
+        payload: dict[str, Any],
+        *,
+        use_json: bool,
+        purpose: str,
+        from_fallback: bool,
+    ) -> dict[str, Any] | None:
+        """流式 POST（SSE）＋退避重试，把流组装成「非流式响应」dict 返回。
+
+        仅在 ``sink`` 已设置时使用（有任务要实时展示 LLM 输出）。重试语义与
+        :meth:`_post_with_retry` 一致（同样的可重试错误、同样的退避）；流中断按网络
+        错误处理、整次调用重发——已推出的部分正文留在任务事件里，作为「失败的第一次
+        尝试」记录，这是最诚实的展示。
+
+        ``usage`` 依赖 ``stream_options.include_usage`` 的最后一帧：兼容端点不支持该
+        参数时会静默忽略，本次统计就是 0——**调用前**的预算检查（budget_guard.check）
+        不受影响，只是事后统计偏少。
+        """
+        url = self.config.chat_completions_url
+        # 与 _post_with_retry 同一道闸：max_retries=0 意味着一次请求都不发。
+        if self.config.max_retries < 1:
+            raise LLMError(
+                f"llm.max_retries={self.config.max_retries} 不会发出任何请求（它表示总尝试次数，至少为 1）；"
+                "想「不重试」请填 1。"
+            )
+        emitter = self.sink
+        if emitter is None:
+            # _request 只在 sink 在场时才分发到这里；这道闸只为类型收窄与防未来误用。
+            raise LLMError("流式传输未挂观察桥（内部错误）")
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_payload["stream_options"] = {"include_usage": True}
+        model = str(stream_payload["model"])
+        delay = 1.0
+        for attempt in range(1, self.config.max_retries + 1):
+            parts: list[str] = []
+            usage_raw: dict[str, Any] = {}
+            finish_reason = ""
+            emitter.llm_start(purpose=purpose, model=model)
+            try:
+                async with self.client.stream("POST", url, json=stream_payload) as resp:
+                    if resp.status_code == 200:
+                        async for line in resp.aiter_lines():
+                            chunk = self._parse_sse(line)
+                            if chunk is None:
+                                continue
+                            choices = chunk.get("choices") or []
+                            if not choices:
+                                # include_usage 的最后一帧（只有 usage、没有 choices）
+                                usage_raw = chunk.get("usage") or usage_raw
+                                continue
+                            delta = choices[0].get("delta") or {}
+                            piece = delta.get("content")
+                            if piece:
+                                parts.append(str(piece))
+                                emitter.llm_delta(str(piece))
+                            fr = choices[0].get("finish_reason")
+                            if fr:
+                                finish_reason = str(fr)
+                    else:
+                        body = (await resp.aread()).decode("utf-8", "replace")[:500]
+                        emitter.llm_end(
+                            model=model, from_fallback=from_fallback, usage=usage_raw or None
+                        )
+                        # JSON mode 不支持 → 交给上层降级（与 _post_with_retry 同口径）
+                        if use_json and resp.status_code in (400, 422) and "response_format" in body.lower():
+                            log.info("该端点不支持 response_format=json_object，降级为文本解析")
+                            return None
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            if attempt >= self.config.max_retries:
+                                raise LLMError(f"LLM 服务错误 {resp.status_code}：{body}")
+                            retry_after = _retry_after(resp)
+                            log.warning("LLM 限流/服务错误 %s，%.1fs 后重试", resp.status_code, retry_after)
+                            await asyncio.sleep(retry_after or delay)
+                            delay = min(delay * 2, 30.0)
+                            continue
+                        raise LLMError(f"LLM 请求失败 {resp.status_code}：{body}")
+            except httpx.HTTPError as exc:
+                emitter.llm_end(model=model, from_fallback=from_fallback, usage=usage_raw or None)
+                # TLS 问题不重试：立即给出可操作提示，避免白等几轮退避
+                if is_ssl_error(exc):
+                    raise LLMError(f"连接失败（{url}）：{exc}\n{ssl_help_text()}") from exc
+                if attempt >= self.config.max_retries:
+                    raise LLMError(f"网络错误：{exc}") from exc
+                log.warning("LLM 网络异常（第 %d 次）：%s", attempt, exc)
+                await asyncio.sleep(delay + random.uniform(0, 0.5))
+                delay = min(delay * 2, 30.0)
+                continue
+            emitter.llm_end(model=model, from_fallback=from_fallback, usage=usage_raw or None)
+            return {
+                "choices": [
+                    {
+                        "message": {"content": "".join(parts), "tool_calls": []},
+                        "finish_reason": finish_reason or "stop",
+                    }
+                ],
+                "usage": usage_raw,
+            }
+        raise LLMError("LLM 请求重试耗尽（流式）")  # pragma: no cover
 
     async def _post_with_retry(self, payload: dict[str, Any], *, use_json: bool) -> dict[str, Any] | None:
         """POST 并在可重试错误上退避重试。

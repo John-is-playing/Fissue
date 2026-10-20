@@ -119,6 +119,8 @@ def test_all_three_loops_register_and_swallow_cancellation() -> None:
     text = (REPO_ROOT / "src" / "fissue" / "service" / "daemon.py").read_text(encoding="utf-8")
 
     assert text.count("with ROUNDS.register(") == 3, "三条循环都要登记当前轮次"
-    assert text.count("except asyncio.CancelledError:") == 3, "三条循环都要接住取消"
+    # 4 = 三条循环各一处 + ``run_once`` 的轮次登记包装层一处（把被取消的轮次收尾成
+    # canceled 任务，而不是让 CancelledError 直接穿透）。
+    assert text.count("except asyncio.CancelledError:") == 4, "每条循环与轮次包装层都要接住取消"
     for name in ("扫描轮次", "flush 轮次", "修复轮次"):
         assert f'ROUNDS.register("{name}")' in text

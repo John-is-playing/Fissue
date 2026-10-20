@@ -20,6 +20,7 @@ from ..config import RepoConfig, Settings, load_settings
 from ..errors import ConfigError
 from ..logging_setup import get_logger
 from ..models import Platform, RepoRef
+from ..observers import JobSink, current_job_sink
 from ..platforms.base import PlatformAdapter
 from ..platforms.registry import build_adapter
 from ..sandbox.forwarder import SandboxManager
@@ -31,6 +32,35 @@ from ..verifier.runner import VerifierRunner
 from ..workspace import RepoWorkspace
 
 log = get_logger(__name__)
+
+
+class _LLMBridge:
+    """把 LLMClient 的流式回调转给当前任务的观察槽（没有则空操作）。
+
+    客户端只认 ``LLMEmitter`` 协议；「有没有人在看」是运行时事实——桥承担这个
+    间接层，``LLMClient`` 不必知道上下文变量。
+    """
+
+    def __init__(self, ctx: RuntimeContext) -> None:
+        self._ctx = ctx
+
+    def _sink(self) -> JobSink | None:
+        return self._ctx.job_sink
+
+    def llm_start(self, *, purpose: str, model: str) -> None:
+        sink = self._sink()
+        if sink is not None:
+            sink.llm_start(purpose=purpose, model=model)
+
+    def llm_delta(self, text: str) -> None:
+        sink = self._sink()
+        if sink is not None:
+            sink.llm_delta(text)
+
+    def llm_end(self, *, model: str, from_fallback: bool, usage: dict[str, Any] | None) -> None:
+        sink = self._sink()
+        if sink is not None:
+            sink.llm_end(model=model, from_fallback=from_fallback, usage=usage)
 
 
 @dataclass
@@ -46,6 +76,8 @@ class RuntimeContext:
     verifier: VerifierRunner
     generator: VerifierGenerator
     regression_gate: RegressionGate
+    #: 当前任务的观察槽（Web 作业 / 常驻轮次）；None = 没有人在看（CLI / 独立脚本）。
+    job_sink: JobSink | None = field(default=None, repr=False)
     _adapters: dict[str, PlatformAdapter] = field(default_factory=dict, repr=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
@@ -64,7 +96,7 @@ class RuntimeContext:
         verifier = VerifierRunner(sandbox, repo, st, client=llm)
         regression_gate = RegressionGate(sandbox, repo, st)
 
-        return cls(
+        ctx = cls(
             settings=st,
             db=db,
             repo=repo,
@@ -75,6 +107,11 @@ class RuntimeContext:
             generator=generator,
             regression_gate=regression_gate,
         )
+        # 观察：当前有任务（Web 作业 / 常驻轮次）挂了观察槽 → LLM 输出流进该任务
+        # 的事件；没有（CLI / 独立脚本）→ 桥是空操作，零开销。
+        ctx.job_sink = current_job_sink.get()
+        llm.sink = _LLMBridge(ctx)
+        return ctx
 
     @classmethod
     @asynccontextmanager

@@ -37,6 +37,7 @@ from ..config import Settings
 from ..errors import WriterBusy
 from ..lockfile import WRITE_GATE, single_flight
 from ..logging_setup import get_logger
+from ..observers import current_job_sink
 
 log = get_logger(__name__)
 
@@ -62,6 +63,16 @@ MAX_JOBS = 30
 #: 关闭时等待作业收尾的秒数。
 SHUTDOWN_GRACE_SECONDS = 3.0
 
+#: 单个任务保留的结构化事件上限。长跑作业（评测几百条）每条一个 llm 事件，
+#: 不设上限既吃内存，详情页也要滚到天荒地老。
+MAX_EVENTS = 800
+
+#: 单次 LLM 调用保留的正文字符上限（留尾部——结论一般在结尾）。
+MAX_LLM_TEXT = 40_000
+
+#: 单条工具事件的 detail 字符上限（测试输出可能很长，留尾部——失败在结尾）。
+MAX_TOOL_DETAIL = 8_000
+
 
 def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
@@ -77,6 +88,9 @@ class Job:
     status: str = QUEUED
     progress: str = ""
     log: list[str] = field(default_factory=list)
+    #: 结构化事件（log / llm / tool），详情页（``/jobs/<id>``）据此渲染。
+    #: 原 ``log`` 保留兼容：任务列表页、状态页、吐司都读它，模板不用改。
+    events: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] | None = None
     error: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -91,11 +105,67 @@ class Job:
         return self.status in LIVE
 
     def report(self, message: str) -> None:
-        """记一行进度。工作函数里调它，前端下一次轮询就能看到。"""
+        """记一行进度。工作函数里调它，前端下一次轮询就能看到。
+
+        同时写进结构化事件（type=log）：详情页渲染 events、列表页读 log——
+        两个视图同源，不会各说各话。
+        """
         self.progress = message
         self.log.append(message)
         if len(self.log) > MAX_LOG_LINES:
             del self.log[: len(self.log) - MAX_LOG_LINES]
+        self._event({"type": "log", "ts": _iso(datetime.now(timezone.utc)), "text": message})
+
+    # -- 结构化事件（实现 observers.JobSink 协议） -------------------------
+
+    def _event(self, ev: dict[str, Any]) -> dict[str, Any]:
+        self.events.append(ev)
+        if len(self.events) > MAX_EVENTS:
+            # 末尾可能正挂着「进行中」的 llm 事件，所以只从头裁
+            del self.events[: len(self.events) - MAX_EVENTS]
+        return ev
+
+    def llm_start(self, *, purpose: str, model: str) -> None:
+        self._event(
+            {
+                "type": "llm",
+                "ts": _iso(datetime.now(timezone.utc)),
+                "purpose": purpose,
+                "model": model,
+                "text": "",
+                "done": False,
+                "from_fallback": False,
+                "usage": None,
+            }
+        )
+
+    def llm_delta(self, text: str) -> None:
+        for ev in reversed(self.events):
+            if ev.get("type") == "llm" and not ev.get("done"):
+                ev["text"] = ev.get("text", "") + text
+                if len(ev["text"]) > MAX_LLM_TEXT:
+                    ev["text"] = ev["text"][-MAX_LLM_TEXT:]
+                break
+
+    def llm_end(self, *, model: str, from_fallback: bool, usage: dict[str, Any] | None) -> None:
+        for ev in reversed(self.events):
+            if ev.get("type") == "llm" and not ev.get("done"):
+                ev["done"] = True
+                ev["model"] = model
+                ev["from_fallback"] = from_fallback
+                ev["usage"] = usage
+                break
+
+    def tool(self, name: str, detail: str, *, ok: bool | None = None) -> None:
+        self._event(
+            {
+                "type": "tool",
+                "ts": _iso(datetime.now(timezone.utc)),
+                "name": name,
+                "detail": detail[-MAX_TOOL_DETAIL:],
+                "ok": ok,
+            }
+        )
 
     def to_dict(self) -> dict[str, Any]:
         end = self.finished_at or datetime.now(timezone.utc)
@@ -106,6 +176,7 @@ class Job:
             "status": self.status,
             "progress": self.progress,
             "log": list(self.log),
+            "events": list(self.events),
             "result": self.result,
             "error": self.error,
             "created_at": _iso(self.created_at),
@@ -177,6 +248,10 @@ class JobRegistry:
     async def _run(self, job: Job, work: Work) -> None:
         job.status = RUNNING
         job.report("开始")
+        # 登记观察槽：工作体里 LLM / agent / 验证器做的一切都会写进这个任务的事件
+        # （详情页的流式展示由此而来）。ContextVar 按任务隔离，必须在 finally 复位——
+        # 否则复用同一任务上下文的下一个工作体会看到死槽。
+        token = current_job_sink.set(job)
         try:
             # 两道闸门都在**作业自己的任务里**握：见模块开头「与写闸门的关系」。
             async with WRITE_GATE.hold_or_fail(action=f"作业 {job.kind} {job.id}", kind="job"):
@@ -200,6 +275,7 @@ class JobRegistry:
             job.report(f"失败：{job.error}")
             log.warning("作业失败：%s（%s）：%s", job.id, job.kind, exc)
         finally:
+            current_job_sink.reset(token)
             job.finished_at = datetime.now(timezone.utc)
             self._tasks.pop(job.id, None)
             if self.on_complete is not None:
@@ -225,6 +301,46 @@ class JobRegistry:
         if task is not None:
             task.cancel()
         return job
+
+    # -- 常驻轮次（只登记，不起任务） ----------------------------------------
+
+    def begin_round(self, name: str) -> Job:
+        """把常驻服务的一轮登记为任务（仅用于展示与观察）。
+
+        与 :meth:`submit` 不同：轮次**已经**在自己的事件循环里作为任务在跑（且自己
+        握着写闸门），这里只建一个 Job 记录供事件写入，不另起任务。在跑期间它也会
+        出现在 ``current()`` 里——于是轮次进行中提交网页任务会直接 409，比旧的
+        「先受理、抢闸门时才失败」更诚实。
+        """
+        job = Job(id=uuid.uuid4().hex[:8], kind="round", params={"round": name})
+        job.status = RUNNING
+        job.report(f"轮次开始：{name}")
+        self._jobs[job.id] = job
+        self._prune()
+        log.info("轮次登记为任务：%s（%s）", job.id, name)
+        return job
+
+    def finish_round(
+        self,
+        job: Job,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        """收尾轮次任务。由 daemon 在轮次结束（成功 / 失败 / 取消）后调用，状态由
+        调用方决定——取消是**预期**结果，不该在页面上显示成红色故障。"""
+        if job.status in LIVE:
+            job.status = status
+            job.result = result
+            job.error = error
+            job.finished_at = datetime.now(timezone.utc)
+            job.report(f"轮次结束：{status}" + (f"（{error}）" if error else ""))
+            if self.on_complete is not None:
+                try:
+                    self.on_complete()
+                except Exception:  # noqa: BLE001 - 唤醒缓存失败不该影响轮次收尾
+                    log.warning("作业完成回调失败", exc_info=True)
 
     def _prune(self) -> None:
         """只留最近 ``MAX_JOBS`` 条**已结束**的；在跑的永不删。"""

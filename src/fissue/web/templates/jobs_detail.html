@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Fissue · 任务 {{ job.id }}{% endblock %}
+{% block heading %}任务详情{% endblock %}
+{% block subtitle %}<a href="/jobs">← 返回任务列表</a>{% endblock %}
+
+{% block header_extra %}
+  {% set cls = 'ok' if job.status == 'done' else ('bad' if job.status == 'failed' else ('stale' if job.status == 'canceled' else 'unknown')) %}
+  <span class="tag {{ cls }}">{{ job.status }}</span>
+{% endblock %}
+
+{% block content %}
+<div class="panel">
+  <h2>{{ job.kind }} <span class="tag">{{ job.id }}</span></h2>
+  <div class="small muted">
+    提交于 {{ (job.created_at or '')[:19].replace('T', ' ') }}
+    {% if job.finished_at %} · 结束于 {{ job.finished_at[:19].replace('T', ' ') }}{% endif %}
+    {% if job.duration_seconds is not none %} · 耗时 {{ job.duration_seconds }}s{% endif %}
+    {% if job.params %} · 参数 <code>{{ job.params }}</code>{% endif %}
+  </div>
+  {% if job.error %}
+  <div class="alert error"><span class="a-level">失败</span><pre style="margin:0">{{ job.error }}</pre></div>
+  {% endif %}
+  {% if job.live and not read_only %}
+  <div class="row mt">
+    {% if job.kind == 'round' %}
+    <button class="danger" type="button" data-act="cancel-job" data-job="{{ job.id }}">停止这一轮</button>
+    <span class="small muted">会在最近的等待点中断它：正在进行的<b>单条</b>操作（例如正在建 PR）可能只完成一半。</span>
+    {% else %}
+    <button class="danger" type="button" data-act="cancel-job" data-job="{{ job.id }}">取消任务</button>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% if job.result and job.status == 'done' %}
+  <h3 class="mt">结果</h3>
+  <pre class="muted">{{ job.result | tojson(indent=2) }}</pre>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>事件流</h2>
+  {# 首屏由服务端渲染（events_html）；运行中由下面的轮询用同样格式刷新。 #}
+  <div id="timeline">{{ events_html }}</div>
+  {% if not job.live %}
+  <div class="muted small">任务已结束，以上为本次运行的完整记录。</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  // 运行中：每 1.5s 轮询 API。事件附带服务端渲染好的安全 html（内容已转义），
+  // 前端只负责拼接——不解析、不信任任何客户端数据。
+  // 结束后：提示一次但不跳走——用户进详情页就是为了读完整结果。
+  (async function loop() {
+    var job = null;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      try {
+        job = await Fissue.api('/jobs/{{ job.id }}?render=1', {silent: true});
+        break;
+      } catch (e) {
+        if (attempt === 3) {
+          document.getElementById('timeline').insertAdjacentHTML(
+            'afterbegin',
+            '<div class="alert error"><span class="a-level">读不到</span><div>读不到任务状态（服务可能重启过，或这条任务已被清理）：' +
+            Fissue.escapeHtml(e.message) + '</div></div>');
+          return;
+        }
+        await new Promise(function (r) { setTimeout(r, 1000 * (attempt + 1)); });
+      }
+    }
+    var tl = document.getElementById('timeline');
+    if (tl) tl.innerHTML = (job.events || []).map(function (ev) { return ev.html; }).join('');
+    if (job.live) {
+      setTimeout(loop, 1500);
+    } else {
+      Fissue.toast('任务已结束：' + job.status, job.status === 'done' ? 'ok' : 'bad', {timeout: 0});
+    }
+  })();
+</script>
+{% endblock %}
