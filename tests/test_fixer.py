@@ -1011,7 +1011,7 @@ def _fixable(repo, item) -> None:
                        VerifierSpec(kind=VerifierKind.EXECUTABLE, command="python -m pytest -q"))
 
 
-def _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch, *, gate=None):
+def _stub_fix_path(fixer, fixer_ctx, sample_issue, monkeypatch, *, gate=None) -> list[str | None]:
     """把克隆 / Agent / 完整 F2P / 回归门 / 补丁落盘都打桩，只留待测环节是真的。
 
     返回「每次 Agent 调用收到的 prior_failure」列表——返修断言全靠它。

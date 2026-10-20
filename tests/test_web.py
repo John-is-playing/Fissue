@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterator
 from typing import Any
 from urllib.parse import quote
+
+from fastapi.testclient import TestClient
 
 import pytest
 
@@ -120,13 +123,11 @@ def _github_payload(repo: str = "psf/requests", number: int = 42) -> bytes:
 
 
 @pytest.fixture
-def hook_client(settings, repo, monkeypatch):
+def hook_client(settings, repo, monkeypatch) -> Iterator[TestClient]:
     """开了 webhook 的客户端；平台密钥固定 `hook-secret`，并把「后台那一轮」打桩。
 
     真跑那一轮会烧 token、还会写平台，所以这里只记录「被调度过」。
     """
-    from fastapi.testclient import TestClient
-
     from fissue.service.daemon import FissueService
     from fissue.web.app import create_app
 

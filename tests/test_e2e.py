@@ -96,7 +96,7 @@ def e2e_settings(settings, tmp_path: Path):
 
 
 @pytest.fixture
-def e2e_ctx(e2e_settings, repo, template_repo, monkeypatch):
+def e2e_ctx(e2e_settings, repo, template_repo, monkeypatch) -> RuntimeContext:
     """构造 Context，并把「克隆仓库」替换为「复制模板仓库」。"""
     import asyncio
     import shutil
