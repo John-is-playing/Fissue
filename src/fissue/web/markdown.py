@@ -279,4 +279,8 @@ def _render_checklist_verdict(obj: dict[str, Any]) -> str:
         )
     if lis:
         parts.append("<ul class=\"cl-items\">" + "".join(lis) + "</ul>")
+        parts.append(
+            '<div class="cl-legend">✗ = 该条在被判定状态下不满足'
+            "（功能未实现时，base 判定全部不满足是预期结果，并非「拒绝修复」）</div>"
+        )
     return f'<div class="cl-verdict">{" ".join(parts)}</div>'

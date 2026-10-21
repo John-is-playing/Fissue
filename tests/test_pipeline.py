@@ -1831,7 +1831,7 @@ async def test_generate_and_validate_judges_checklist_with_llm(ctx, repo, monkey
     spec = VerifierSpec(
         kind=VerifierKind.CHECKLIST,
         name="增加 MySQL 存储后端支持（可核查清单）",
-        checklist=["【配置入口】config.example.yaml 列出 MySQL 支持形式"],
+        checklist=["`pyproject.toml` 声明 mysql 可选依赖"],
         expect_fail_on_base=True,
     )
 
@@ -1842,7 +1842,17 @@ async def test_generate_and_validate_judges_checklist_with_llm(ctx, repo, monkey
         async def refine(self, spec, **kw):
             return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
 
+    class _WS:
+        def list_files(self, **kw):
+            return ["pyproject.toml"]
+
+        def read(self, rel, **kw):
+            return "[project]\nname = 'demo'"
+
+    seen: dict[str, str] = {}
+
     async def fake_chat_json(messages, **kw):
+        seen["user"] = next(m["content"] for m in messages if m["role"] == "user")
         return (
             {
                 "passed": False,
@@ -1859,7 +1869,7 @@ async def test_generate_and_validate_judges_checklist_with_llm(ctx, repo, monkey
 
     vid, got_spec, result = await ctx.verifier.generate_and_validate(
         item=item,
-        workspace=object(),
+        workspace=_WS(),
         repo_context="仓库文件（节选）：\n- pyproject.toml",
         generator=ctx.generator,
     )
@@ -1872,6 +1882,135 @@ async def test_generate_and_validate_judges_checklist_with_llm(ctx, repo, monkey
     runs = repo.verifier_runs(item.key, stage="base")
     assert len(runs) == 1 and runs[0].verifier_id == vid
     assert repo.get_item(item.key).status is ItemStatus.VERIFIER_READY
+    # 判定证据含清单引用文件的内容（不只是文件树）
+    assert "仓库文件（节选）" in seen["user"]
+    assert "name = 'demo'" in seen["user"]
+
+
+async def test_verify_stage_force_checklist_goes_to_fix_queue(ctx, repo, monkeypatch) -> None:
+    """force_fix 清单项：不再卡 needs_manual 死胡同，直落待修队列（tier1）。
+
+    修得过不过由修复主循环的「修复后清单判定」判定——人已拍板「要修」，
+    不该被「无法自动判定」挡住。
+    """
+    from fissue.models import (
+        Category,
+        Evaluation,
+        ItemStatus,
+        Priority,
+        VerifierKind,
+        VerifierResult,
+        VerifierSpec,
+    )
+    from fissue.pipeline.stages import VerifyStage
+
+    item = _seed_issue(repo, 37, category=Category.FEATURE)
+    item.force_fix = True
+    ev = Evaluation(category=Category.FEATURE, priority=Priority.NONE, model="stub")
+    repo.save_evaluation(item.key, ev)
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="MySQL 支持（清单）",
+        checklist=["`config.example.yaml` 列出 MySQL 支持形式"],
+    )
+    placeholder = VerifierResult(
+        kind=spec.kind, f2p_satisfied=False, conclusion="清单判定（base）：未全部满足"
+    )
+
+    async def fake_gav(**kw):
+        return 1, spec, placeholder
+
+    monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", fake_gav)
+
+    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+
+    assert result.status is ItemStatus.FIX_QUEUED
+    assert repo.get_item(item.key).status is ItemStatus.FIX_QUEUED
+    assert any("清单型" in n for n in result.notes)
+
+
+def test_checklist_evidence_includes_referenced_files(ctx) -> None:
+    """证据组装：仓库上下文 + 清单 backtick 引用的文件内容 + diff。
+
+    URL、不存在的文件 token 不进证据。
+    """
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        checklist=[
+            "`pyproject.toml` 声明 mysql extra",
+            "`config.example.yaml` 提供 MySQL 示例",
+            "`mysql://user:pw@host/db` 连接串形式",
+            "不存在的文件 `no_such_file.py`",
+        ],
+    )
+
+    class _WS:
+        def list_files(self, **kw):
+            return ["pyproject.toml", "config.example.yaml"]
+
+        def read(self, rel, **kw):
+            return f"内容-{rel}"
+
+    ev = ctx.verifier.checklist_evidence(spec, _WS(), "repo-ctx", diff="diff-here")
+    assert "repo-ctx" in ev
+    assert "=== pyproject.toml ===" in ev and "内容-pyproject.toml" in ev
+    assert "=== config.example.yaml ===" in ev
+    assert "no_such_file" not in ev
+    assert "本次改动 diff" in ev and "diff-here" in ev
+
+
+def test_checklist_evidence_ambiguous_basename_skipped(ctx) -> None:
+    """basename 命中多个文件的引用视为歧义、跳过；唯一 basename 仍会读出。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        checklist=["`README.md` 有 MySQL 章节", "`unique.txt` 有说明"],
+    )
+
+    class _WS:
+        def list_files(self, **kw):
+            return ["a/README.md", "b/README.md", "unique.txt"]
+
+        def read(self, rel, **kw):
+            return f"内容-{rel}"
+
+    ev = ctx.verifier.checklist_evidence(spec, _WS(), "")
+    assert "README.md ===" not in ev
+    assert "内容-unique.txt" in ev
+
+
+async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
+    """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    item = _seed_issue(repo, 38)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a", "b", "c"])
+    vid = repo.save_verifier(item.key, spec)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [
+                    {"index": 1, "satisfied": False, "reason": "证据不足"},
+                    {"index": 2, "satisfied": False, "reason": "证据不足"},
+                    {"index": 3, "satisfied": False, "reason": "未声明"},
+                ],
+                "conclusion": "0/3 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+    run = await ctx.verifier.verify_checklist(
+        item_key=item.key, item=item, spec=spec, output="ev", verifier_id=vid
+    )
+    assert "判定仅供参考" in run.stdout.split("\n")[0]
 
 
 async def test_generate_and_validate_checklist_all_satisfied_on_base(ctx, repo, monkeypatch) -> None:
@@ -1910,9 +2049,16 @@ async def test_generate_and_validate_checklist_all_satisfied_on_base(ctx, repo, 
     monkeypatch.setattr(ctx.generator, "refine", gen.refine)
     monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
 
+    class _WS:
+        def list_files(self, **kw):
+            return []
+
+        def read(self, rel, **kw):
+            return ""
+
     _vid, _spec, result = await ctx.verifier.generate_and_validate(
         item=item,
-        workspace=object(),
+        workspace=_WS(),
         repo_context="仓库文件（节选）：\n- pyproject.toml",
         generator=ctx.generator,
     )
@@ -1997,13 +2143,20 @@ async def test_verify_stage_checklist_llm_judgement_recorded(ctx, repo, monkeypa
         def tool(self, name: str, detail: str, *, ok: bool | None = None) -> None:
             self.calls.append({"name": name, "detail": detail, "ok": ok})
 
+    class _WS:
+        def list_files(self, **kw):
+            return []
+
+        def read(self, rel, **kw):
+            return ""
+
     gen = _Gen()
     monkeypatch.setattr(ctx.generator, "generate", gen.generate)
     monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
     monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
     ctx.job_sink = _Sink()
 
-    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+    result = await VerifyStage(ctx).run(item, ev, workspace=_WS())
 
     assert result.status is ItemStatus.NEEDS_MANUAL
     assert any("清单判定" in n for n in result.notes)

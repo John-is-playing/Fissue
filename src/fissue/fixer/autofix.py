@@ -36,6 +36,8 @@ from ..models import (
     Priority,
     RawItem,
     VerifierKind,
+    VerifierOutcome,
+    VerifierResult,
     VerifierSpec,
 )
 from ..pipeline.context import RuntimeContext
@@ -352,13 +354,16 @@ class PRCreator:
     ) -> tuple[str, str]:
         """生成 PR 标题与正文（LLM 优先，失败则用模板）。"""
         default_title = f"fix: 修复 #{item.number} {item.title[:70]}"
+        verifier_cmd = spec.command or (
+            f"清单型（无可执行命令，LLM 逐条判定 {len(spec.checklist)} 项）"
+        )
         try:
             data, _usage = await self.ctx.llm.chat_json(
                 prompts.fix_pr_body_prompt(
                     item,
                     summary=trace.summary or "自动修复",
                     changed_files=trace.written_files,
-                    verifier_command=spec.command,
+                    verifier_command=verifier_cmd,
                     f2p_ok=f2p_ok,
                 ),
                 purpose=f"fix_pr_body:{item.repo}",
@@ -381,19 +386,26 @@ class PRCreator:
             "> 🤖 本 PR 由 **Fissue** 自动生成，请人工复核后再合并。\n"
             f"> 关联 Issue：#{item.number}\n"
             f"> 验证器：`{spec.name}`（{spec.kind.value}）\n"
-            f"> fail-to-pass：{'✅ 通过' if f2p_ok else '❌ 未通过'}\n"
+            f"> {self._verification_label(spec)}：{'✅ 通过' if f2p_ok else '❌ 未通过'}\n"
         )
         if "Fissue" in body:
             return body
         return body + footer
+
+    @staticmethod
+    def _verification_label(spec: VerifierSpec) -> str:
+        """验证结论的展示标签：清单型没有 fail-to-pass，用「清单判定」。"""
+        return (
+            "清单判定（fix）" if spec.kind is VerifierKind.CHECKLIST else "fail-to-pass"
+        )
 
     def _template_body(self, item: RawItem, *, trace: AgentTrace, spec: VerifierSpec, f2p_ok: bool) -> str:
         lines = [
             f"## 修复内容\n\n自动修复了 #{item.number}：{item.title}\n",
             "## 验证\n",
             f"- 验证器：`{spec.name}`（{spec.kind.value}）",
-            f"- 运行命令：`{spec.command or '(清单型)'}`",
-            f"- fail-to-pass：{'✅ 通过' if f2p_ok else '❌ 未通过'}",
+            f"- 运行命令：`{spec.command or f'清单型（LLM 逐条判定 {len(spec.checklist)} 项）'}`",
+            f"- {self._verification_label(spec)}：{'✅ 通过' if f2p_ok else '❌ 未通过'}",
         ]
         if trace.written_files:
             lines.append("\n## 改动文件\n")
@@ -472,8 +484,8 @@ class AutoFixer:
         if verifier is None:
             return self._skip(item, "缺少验证器，无法验证修复")
         verifier_id, spec = verifier
-        if spec.kind is VerifierKind.CHECKLIST:
-            return self._skip(item, "清单型验证器无法自动判定修复结果")
+        # 清单型不再是死胡同：修完后 LLM 在修复工作区上逐条重判
+        # （见 :meth:`_judge_checklist_on_fix`），过没过同样能判定。
 
         repo_cfg = self._repo_config(item)
         self.ctx.repo.set_item_status(item.key, ItemStatus.FIXING)
@@ -527,17 +539,23 @@ class AutoFixer:
                         )
                     )
 
-                # 2) 提 PR 前再跑一次完整 F2P（防止 Agent 自说自话）
-                ctx_verify = VerifyContext(
-                    workspace=workspace,
-                    item=item,
-                    spec=spec,
-                    repo_slug=repo_cfg.slug,
-                    test_hint=repo_cfg.test_hint,
-                )
-                final = await self.ctx.verifier.verify_fix(
-                    ctx_verify, verifier_id=verifier_id
-                )
+                # 2) 提 PR 前的权威复核（防止 Agent 自说自话）：
+                #    可执行型 → 完整 F2P；清单型 → LLM 在修复工作区上逐条重判。
+                if spec.kind is VerifierKind.CHECKLIST:
+                    final = await self._judge_checklist_on_fix(
+                        item, workspace, spec, verifier_id, repo_context
+                    )
+                else:
+                    ctx_verify = VerifyContext(
+                        workspace=workspace,
+                        item=item,
+                        spec=spec,
+                        repo_slug=repo_cfg.slug,
+                        test_hint=repo_cfg.test_hint,
+                    )
+                    final = await self.ctx.verifier.verify_fix(
+                        ctx_verify, verifier_id=verifier_id
+                    )
                 f2p_ok = final.f2p_satisfied or not self.settings.verifier.require_f2p
 
                 # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
@@ -557,7 +575,12 @@ class AutoFixer:
 
                 problems: list[str] = []
                 if not f2p_ok:
-                    problems.append(f"最终 F2P 未通过：{final.conclusion}")
+                    gate_label = (
+                        "最终清单判定未通过"
+                        if spec.kind is VerifierKind.CHECKLIST
+                        else "最终 F2P 未通过"
+                    )
+                    problems.append(f"{gate_label}：{final.conclusion}")
                 if not reg_ok:
                     problems.append(f"回归门未通过：{reg_why}")
                 if review is not None and review.blocking:
@@ -715,6 +738,47 @@ class AutoFixer:
         return report
 
     # -- 失败降级 ---------------------------------------------------------
+
+    async def _judge_checklist_on_fix(
+        self,
+        item: RawItem,
+        workspace: RepoWorkspace,
+        spec: VerifierSpec,
+        verifier_id: int | None,
+        repo_context: str,
+    ) -> VerifierResult:
+        """修复后清单判定：修完后 LLM 在修复工作区上逐条重判。
+
+        证据 = 仓库上下文 + 清单引用的文件内容（从修复后工作区读）+ 本次改动
+        diff（见 :meth:`VerifierRunner.checklist_evidence`）。全部满足（PASS）
+        视同 F2P 关通过、继续提 PR；否则未满足项的理由进入 ``conclusion``，
+        作为返修反馈喂回 Agent（与 F2P/回归门失败走同一条反馈通道）。
+        """
+        evidence = self.ctx.verifier.checklist_evidence(
+            spec, workspace, repo_context, diff=workspace.diff()
+        )
+        run = await self.ctx.verifier.verify_checklist(
+            item_key=item.key,
+            item=item,
+            spec=spec,
+            output=evidence,
+            stage="fix",
+            verifier_id=verifier_id,
+        )
+        lines = (run.stdout or "").split("\n")
+        first = lines[0] if lines else ""
+        if run.outcome is VerifierOutcome.PASS:
+            conclusion = f"清单判定（fix）：{first}"
+        else:
+            missing = "\n".join(ln for ln in lines if ln.startswith("- [False]"))
+            conclusion = f"清单判定（fix）：{first}；未满足项：\n{missing}" if missing else f"清单判定（fix）：{first}"
+            conclusion = conclusion[:1800]
+        return VerifierResult(
+            kind=spec.kind,
+            fix_run=run,
+            f2p_satisfied=bool(run.f2p_ok),
+            conclusion=conclusion,
+        )
 
     async def _run_regression_gate(
         self,

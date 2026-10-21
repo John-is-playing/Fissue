@@ -276,15 +276,26 @@ async def test_fix_item_skips_without_verifier(fixer_ctx, repo, sample_issue) ->
     assert "验证器" in (attempt.error or "")
 
 
-async def test_fix_item_skips_checklist_verifier(fixer_ctx, repo, sample_issue) -> None:
+async def test_fix_item_checklist_passes_gate(fixer_ctx, repo, sample_issue, monkeypatch) -> None:
+    """清单型不再是 autofix 死胡同（回归：曾硬跳过并报「无法自动判定修复结果」）。
+
+    必须越过策略闸门进入修复流程——修得过不过由「修复后清单判定」判定。
+    哨兵异常只为证明流程走到了克隆那一步，绝不真 clone 远端
+    （子进程不受测试网络守卫保护，会挂死）。
+    """
     _register(repo, sample_issue)
     repo.save_evaluation(sample_issue.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
     repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
     repo.save_verifier(sample_issue.key, VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["能跑通"]))
 
+    async def _stop(repo_cfg, **kwargs):
+        raise RuntimeError("已越过闸门（哨兵）")
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _stop)
+
     attempt = await AutoFixer(fixer_ctx).fix_item(repo.get_item(sample_issue.key))
-    assert attempt.outcome is FixOutcome.SKIPPED
-    assert "清单型" in (attempt.error or "")
+    assert attempt.outcome is not FixOutcome.SKIPPED
+    assert "已越过闸门" in (attempt.error or "")
 
 
 async def test_fix_item_skips_when_attempt_exists(fixer_ctx, repo, sample_issue) -> None:
@@ -2108,3 +2119,216 @@ async def test_barren_streak_resets_after_a_write(settings, workspace, sample_is
 
     assert llm.calls > 3, "r1 的写入应当把空转计数清零，否则第 3 轮就被误判为空转"
     assert "空转" in (attempt.error or "")
+
+
+# ---------------------------------------------------------------------------
+# 清单型验证器 × 修复闭环（B）：修复后 LLM 在修复工作区上逐条重判
+# ---------------------------------------------------------------------------
+
+
+async def test_judge_checklist_on_fix_pass(fixer_ctx, repo, sample_issue, workspace, monkeypatch) -> None:
+    """全部满足 → f2p_satisfied；证据含清单引用文件内容 + 本次 diff。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    _register(repo, sample_issue)
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="MySQL 支持",
+        checklist=["`tests/test_a.py` 包含 test_x 用例"],
+    )
+    vid = repo.save_verifier(sample_issue.key, spec)
+    workspace.write("app.py", "def f():\n    return 2\n")
+
+    seen: dict[str, str] = {}
+
+    async def fake_chat_json(messages, **kw):
+        seen["user"] = next(m["content"] for m in messages if m["role"] == "user")
+        return (
+            {
+                "passed": True,
+                "items": [{"index": 1, "satisfied": True, "reason": "已实现"}],
+                "conclusion": "1/1 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(fixer_ctx.verifier.client, "chat_json", fake_chat_json)
+    fixer = AutoFixer(fixer_ctx)
+    result = await fixer._judge_checklist_on_fix(sample_issue, workspace, spec, vid, "repo-ctx")
+
+    assert result.f2p_satisfied is True
+    assert "清单判定（fix）" in result.conclusion
+    assert "1/1 项满足" in result.conclusion
+    ev = seen["user"]
+    assert "repo-ctx" in ev
+    assert "test_x" in ev                      # 清单引用文件的内容被读进证据
+    assert "return 2" in ev                    # 本次改动 diff 被附上
+
+
+async def test_judge_checklist_on_fix_fail_includes_missing(fixer_ctx, repo, sample_issue, workspace, monkeypatch) -> None:
+    """未全部满足：未满足项理由进结论，供修复循环反馈给 Agent。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    _register(repo, sample_issue)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, name="MySQL 支持", checklist=["a", "b"])
+    vid = repo.save_verifier(sample_issue.key, spec)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [
+                    {"index": 1, "satisfied": False, "reason": "未实现 DSN 解析"},
+                    {"index": 2, "satisfied": True, "reason": "已声明"},
+                ],
+                "conclusion": "1/2 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(fixer_ctx.verifier.client, "chat_json", fake_chat_json)
+    fixer = AutoFixer(fixer_ctx)
+    result = await fixer._judge_checklist_on_fix(sample_issue, workspace, spec, vid, "")
+    assert result.f2p_satisfied is False
+    assert "清单判定（fix）" in result.conclusion
+    assert "未实现 DSN 解析" in result.conclusion
+
+
+async def test_fix_item_checklist_pass_judgement_submits_pr(
+    fixer_ctx, repo, sample_issue, workspace, monkeypatch
+) -> None:
+    """全链路：Agent 修复 → 修复后判定全部满足 → 回归门过 → 提 PR。"""
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key, VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["能跑通"]))
+
+    async def _clone(repo_cfg, **kwargs):
+        return workspace
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _clone)
+    monkeypatch.setattr(fixer_ctx.settings.auto_fix, "review_rounds", 0)
+    monkeypatch.setattr(fixer_ctx.settings.auto_fix, "regression_retries", 0)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": True,
+                "items": [{"index": 1, "satisfied": True, "reason": "已实现"}],
+                "conclusion": "1/1 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(fixer_ctx.verifier.client, "chat_json", fake_chat_json)
+
+    class _A:
+        async def run(self, **kw):
+            return (
+                FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS, rounds=1),
+                AgentTrace(),
+            )
+
+    submitted: dict = {}
+
+    async def fake_submit(**kw):
+        submitted.update(kw)
+        kw["attempt"].pr_url = "http://pr/1"
+        kw["attempt"].outcome = FixOutcome.SUCCESS
+        return kw["attempt"]
+
+    async def _reg(self, **kw):
+        return True, ""
+
+    fixer = AutoFixer(fixer_ctx)
+    monkeypatch.setattr(fixer, "agent", _A())
+    monkeypatch.setattr(fixer.pr_creator, "submit", fake_submit)
+    monkeypatch.setattr(AutoFixer, "_run_regression_gate", _reg)
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key))
+    assert attempt.outcome is FixOutcome.SUCCESS
+    assert attempt.pr_url == "http://pr/1"
+    assert submitted["f2p_ok"] is True
+
+
+async def test_fix_item_checklist_fail_judgement_needs_manual(
+    fixer_ctx, repo, sample_issue, workspace, monkeypatch
+) -> None:
+    """修复后判定未全部满足且重试余额用尽 → needs_manual，error 带未满足项理由。"""
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import FixAttempt
+
+    _register(repo, sample_issue)
+    repo.save_evaluation(sample_issue.key, Evaluation(category=Category.BUG, priority=Priority.TIER1, model="s"))
+    repo.set_item_status(sample_issue.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1)
+    repo.save_verifier(sample_issue.key, VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a", "b"]))
+
+    async def _clone(repo_cfg, **kwargs):
+        return workspace
+
+    monkeypatch.setattr(fixer_ctx, "clone_workspace", _clone)
+    monkeypatch.setattr(fixer_ctx.settings.auto_fix, "review_rounds", 0)
+    monkeypatch.setattr(fixer_ctx.settings.auto_fix, "regression_retries", 0)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [
+                    {"index": 1, "satisfied": False, "reason": "未实现 DSN 解析"},
+                    {"index": 2, "satisfied": True, "reason": "已声明"},
+                ],
+                "conclusion": "1/2 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(fixer_ctx.verifier.client, "chat_json", fake_chat_json)
+
+    class _A:
+        async def run(self, **kw):
+            return (
+                FixAttempt(item_key=sample_issue.key, outcome=FixOutcome.SUCCESS, rounds=1),
+                AgentTrace(),
+            )
+
+    async def _reg(self, **kw):
+        return True, ""
+
+    fixer = AutoFixer(fixer_ctx)
+    monkeypatch.setattr(fixer, "agent", _A())
+    monkeypatch.setattr(AutoFixer, "_run_regression_gate", _reg)
+
+    attempt = await fixer.fix_item(repo.get_item(sample_issue.key))
+    assert attempt.outcome is FixOutcome.NEEDS_MANUAL
+    assert "清单判定（fix）" in (attempt.error or "")
+    assert "未实现 DSN 解析" in (attempt.error or "")
+
+
+async def test_run_verifier_checklist_short_circuit(settings) -> None:
+    """清单型无可执行命令：不跑沙盒、返回验收提示。
+
+    runner 传 None——代码路径若真去调 run_once 会直接报错，即守门。
+    """
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["能跑通"])
+    trace = AgentTrace()
+    out = await _agent(settings)._run_verifier(
+        None, None, spec, trace, verifier_id=None, round_index=1
+    )
+    assert "清单型验证器" in out and "LLM" in out
+
+
+def test_checklist_command_lists_items() -> None:
+    """agent prompt 的验收标准：逐条列清单 + 明说无可执行命令。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a", "b"])
+    cmd = FixAgent._checklist_command(spec)
+    assert "1. a" in cmd and "2. b" in cmd
+    assert "无可执行命令" in cmd

@@ -35,6 +35,7 @@ from ..models import (
     FixAttempt,
     FixOutcome,
     RawItem,
+    VerifierKind,
     VerifierSpec,
 )
 from ..observers import JobSink
@@ -222,7 +223,11 @@ class FixAgent:
                 prompts.fix_agent_step_prompt(
                     item,
                     repo_context=repo_context,
-                    verifier_command=spec.command or "(无)",
+                    verifier_command=(
+                        self._checklist_command(spec)
+                        if spec.kind is VerifierKind.CHECKLIST
+                        else (spec.command or "(无)")
+                    ),
                     last_test_output=last_output,
                     round_index=round_index,
                     max_rounds=rounds_limit,
@@ -338,6 +343,13 @@ class FixAgent:
                 return self._finalize(attempt, trace, workspace)
 
             if action == "done":
+                if spec.kind is VerifierKind.CHECKLIST:
+                    # 清单型的权威判定在修复主循环的「修复后清单判定」（类比可执行型
+                    # 提 PR 前的完整 F2P 复核）：agent 回 done 即可收工，过没过以重判为准。
+                    trace.summary = str(data.get("summary") or "清单修复完成（待修复后清单判定）")
+                    attempt.outcome = FixOutcome.SUCCESS
+                    attempt.rounds = round_index
+                    return self._finalize(attempt, trace, workspace)
                 last_output = await self._run_verifier(
                     item, workspace, spec, trace, verifier_id=verifier_id, round_index=round_index
                 )
@@ -666,6 +678,15 @@ class FixAgent:
 
     # -- 验证器执行 -------------------------------------------------------
 
+    @staticmethod
+    def _checklist_command(spec: VerifierSpec) -> str:
+        """清单型给 agent 的「验收标准」：逐条列清单，明说验收方式。"""
+        items = "\n".join(f"{i}. {c}" for i, c in enumerate(spec.checklist, 1))
+        return (
+            "（无可执行命令；验收方式：修复完成后 LLM 会在仓库现状上逐条判定下列清单）\n"
+            + items
+        )
+
     async def _run_verifier(
         self,
         item: RawItem,
@@ -676,6 +697,13 @@ class FixAgent:
         verifier_id: int | None,
         round_index: int,
     ) -> str:
+        if spec.kind is VerifierKind.CHECKLIST:
+            # 清单型没有可执行命令：不在沙盒里跑。权威判定是修复主循环的
+            # 「修复后清单判定」（改完后 LLM 逐条重判）；每轮给模型同一个提示，
+            # 让它知道验收方式，而不是反复去「跑测试」。
+            note = "（清单型验证器：无可执行命令，修复完成后由 LLM 在仓库现状上逐条判定）"
+            trace.note(note)
+            return note
         run = await self.runner.run_once(
             item_key=item.key,
             workspace=workspace,

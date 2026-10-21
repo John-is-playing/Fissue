@@ -532,9 +532,17 @@ class VerifierRunner:
         )
         passed = bool(data.get("passed"))
         conclusion = str(data.get("conclusion") or "")
-        items = data.get("items") or []
+        items = [i for i in (data.get("items") or []) if isinstance(i, dict)]
+        # 退化提示：过半条目「证据不足」时，这次判定基本没有判别力——明说仅供参考，
+        # 免得下游把它当成确定结论。
+        if items:
+            insufficient = sum(
+                1 for i in items if "证据不足" in str(i.get("reason") or "")
+            )
+            if insufficient * 2 >= len(items):
+                conclusion = f"{conclusion}；多数条目证据不足，判定仅供参考".strip("；")
         detail = "\n".join(
-            f"- [{i.get('satisfied')}] {i.get('reason', '')}" for i in items if isinstance(i, dict)
+            f"- [{i.get('satisfied')}] {i.get('reason', '')}" for i in items
         )
         run = VerifierRun(
             verifier_id=verifier_id,
@@ -550,17 +558,87 @@ class VerifierRunner:
         self.repo.save_verifier_run(run)
         return run
 
+    # -- 清单判定证据 -------------------------------------------------------
+
+    def checklist_evidence(
+        self,
+        spec: VerifierSpec,
+        workspace: RepoWorkspace | None,
+        repo_context: str,
+        *,
+        diff: str | None = None,
+    ) -> str:
+        """清单判定的证据：仓库上下文 + 清单引用的文件内容 +（修复后）diff。
+
+        清单条目大多指向具体文件内容（pyproject.toml 的依赖声明、某个解析函数
+        等）。只给文件树 + README 时 LLM 只能逐条回「证据不足」，判定退化成
+        常量——实测（MySQL 功能请求 16 项全部「证据不足」）即此因。这里把清单
+        条目引用的文件从工作区读出来喂进去；修复后（fix 阶段）判定再附上 diff，
+        LLM 才能看到「到底改了什么」。
+        """
+        parts: list[str] = []
+        if repo_context:
+            parts.append(repo_context)
+        if workspace is not None:
+            chunks = self._referenced_file_chunks(spec, workspace)
+            if chunks:
+                parts.append("清单引用的文件（相关摘录）：\n" + "\n\n".join(chunks))
+        if diff:
+            parts.append("本次改动 diff：\n" + diff[:8000])
+        return "\n\n".join(parts) if parts else "（无证据）"
+
+    def _referenced_file_chunks(
+        self, spec: VerifierSpec, workspace: RepoWorkspace, *, max_files: int = 6
+    ) -> list[str]:
+        """从清单条目里抽出路径型引用，从工作区读出文件片段。
+
+        只认 backtick 包裹、无空格、无 URL 的短 token；必须命中工作区真实文件
+        （先按精确路径，再按唯一 basename），否则忽略。每文件最多 6KB、
+        最多 ``max_files`` 个文件。
+        """
+        if not spec.checklist:
+            return []
+        tokens = re.findall(r"`([^`]+)`", " ".join(spec.checklist))
+        files = workspace.list_files()
+        by_name: dict[str, list[str]] = {}
+        for f in files:
+            by_name.setdefault(f.rsplit("/", 1)[-1], []).append(f)
+        chunks: list[str] = []
+        seen: set[str] = set()
+        for tok in tokens:
+            if len(chunks) >= max_files:
+                break
+            tok = tok.strip()
+            if not tok or len(tok) > 120 or " " in tok or "://" in tok:
+                continue
+            rel = tok if tok in files else None
+            if rel is None:
+                hits = by_name.get(tok.rsplit("/", 1)[-1], [])
+                rel = hits[0] if len(hits) == 1 else None
+            if rel is None or rel in seen:
+                continue
+            seen.add(rel)
+            try:
+                content = workspace.read(rel, max_bytes=6000).strip()[:6000]
+            except Exception as exc:
+                log.warning("读清单引用文件失败 %s：%s", rel, exc)
+                continue
+            chunks.append(f"=== {rel} ===\n{content}")
+        return chunks
+
     async def _judge_checklist(
         self,
         item: RawItem,
         verifier_id: int,
         spec: VerifierSpec,
         repo_context: str,
+        workspace: RepoWorkspace | None = None,
     ) -> VerifierResult:
         """清单型：把证据交 LLM 逐条判定（Q16 的降级路径）。
 
-        证据用仓库上下文——与生成清单时的输入同源，保证清单条目和判定
-        证据口径一致。base 上判「未全部满足」（FAIL）符合
+        证据由 :meth:`checklist_evidence` 组装——仓库上下文之外，再把清单
+        条目引用的文件内容读进来（只给文件树时 LLM 只能逐条回「证据不足」，
+        判定退化成常量）。base 上判「未全部满足」（FAIL）符合
         ``expect_fail_on_base`` 的预期方向；base 上判「全部满足」（PASS）
         说明问题可能已解决，下游按「未复现」对待。逐条明细已由
         :meth:`verify_checklist` 持久化，可在验证记录里查看。
@@ -571,11 +649,12 @@ class VerifierRunner:
                 f2p_satisfied=False,
                 conclusion="清单型验证器：无 LLM 客户端，无法逐条判定，转人工复核",
             )
+        evidence = self.checklist_evidence(spec, workspace, repo_context)
         run = await self.verify_checklist(
             item_key=item.key,
             item=item,
             spec=spec,
-            output=repo_context or "（无仓库上下文）",
+            output=evidence,
             stage="base",
             verifier_id=verifier_id,
         )
@@ -619,9 +698,12 @@ class VerifierRunner:
         for round_index in range(1, max_rounds + 1):
             verifier_id = self.repo.save_verifier(item.key, spec, rounds=round_index)
             if spec.kind is VerifierKind.CHECKLIST:
-                # 清单型没有可执行命令：把仓库上下文交 LLM 逐条判定。判定结论
-                # 只是人工复核的参考，不构成 F2P 证明（f2p 仍为 false）。
-                result = await self._judge_checklist(item, verifier_id, spec, repo_context)
+                # 清单型没有可执行命令：把证据（仓库上下文 + 清单引用的文件内容）
+                # 交 LLM 逐条判定。判定结论只是人工复核的参考，不构成 F2P 证明
+                # （f2p 仍为 false）。
+                result = await self._judge_checklist(
+                    item, verifier_id, spec, repo_context, workspace
+                )
                 self.repo.set_verifier_f2p(verifier_id, False)
                 self.repo.set_item_status(item.key, ItemStatus.VERIFIER_READY)
                 return verifier_id, spec, result

@@ -352,6 +352,7 @@ td.shrink, th.shrink { width: 1%; white-space: nowrap; }
 .cl-conclusion { font-weight: 600; }
 .cl-items { margin: 4px 0 0; padding-left: 0; list-style: none; }
 .cl-item { padding: 1px 0; }
+.cl-legend { margin-top: 4px; font-size: 0.85em; opacity: 0.65; }
 
 /* Markdown 渲染结果（.md 容器内） */
 .md p { margin: .4em 0; }

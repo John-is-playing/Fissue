@@ -305,6 +305,18 @@ class VerifyStage:
                     )
 
             if spec.kind is VerifierKind.CHECKLIST:
+                if item.force_fix:
+                    # 强制修复：清单型的可修性已由「修复后清单判定」打通——修复主循环
+                    # 会在改完后于修复工作区上重判 LLM 逐条判定。人已拍板要修，
+                    # 直落待修队列，不再走 needs_manual 死胡同。
+                    self.ctx.repo.set_item_status(
+                        item.key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1
+                    )
+                    result.status = ItemStatus.FIX_QUEUED
+                    if base_result.base_run is not None:
+                        result.notes.append(f"清单判定：{base_result.conclusion}")
+                    result.notes.append("强制修复：清单型，修复完成后 LLM 在修复工作区重判")
+                    return result
                 self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
                 result.status = ItemStatus.NEEDS_MANUAL
                 if base_result.base_run is not None:

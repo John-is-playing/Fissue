@@ -148,6 +148,9 @@ def test_llm_event_checklist_verdict_renders_structured_card() -> None:
     assert "cl-conclusion" in html_out and "MySQL 支持未实现" in html_out
     assert html_out.count("tool-mark ok") >= 1
     assert html_out.count("tool-mark bad") >= 1
+    # 图例行：澄清 ✗ 的语义，防止被误读成「LLM 拒绝修复」
+    assert 'class="cl-legend"' in html_out
+    assert "并非「拒绝修复」" in html_out
     assert "已声明" in html_out and "证据不足" in html_out
 
 

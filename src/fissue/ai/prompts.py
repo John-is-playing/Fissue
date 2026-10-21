@@ -479,15 +479,21 @@ def checklist_judge_prompt(item: RawItem, *, checklist: Sequence[str], output: s
     """
     items = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(checklist))
     user = f"""下面是针对某个问题的验证清单，以及对应的证据。
+你判定的是仓库的**当前状态**（证据所表示的状态，可能是未修复的 base 代码，也可能是已修复后的代码）：
 请逐条判断清单各项在当前状态下是否满足，并给出整体结论。
-某一条若因证据不足无法确认，请将该条判为不满足，reason 写「证据不足」。
+
+判定规则：
+- 证据足够时，必须给出确定判定（满足/不满足），并在 reason 里引用证据依据。
+- 文件树本身也是证据：文件树中不存在的文件可判「不存在」；README 未提及某功能也可作辅助证据。
+- 仅当证据确实未覆盖某一条时，才将该条判为不满足、reason 写「证据不足」。
 
 验证清单：
 {items}
 
-证据（可能是执行输出，也可能是仓库文件树 / README / API 契约等快照）：
+证据（可能是执行输出，也可能是仓库上下文快照：文件树 / README / API 契约，
+外加清单引用的文件内容与改动 diff）：
 ```
-{_truncate(output, 8000)}
+{_truncate(output, 24000)}
 ```
 
 问题背景：
@@ -497,7 +503,7 @@ def checklist_judge_prompt(item: RawItem, *, checklist: Sequence[str], output: s
 {{
   "passed": true,
   "items": [{{"index": 1, "satisfied": true, "reason": "…"}}],
-  "conclusion": "一句话结论"
+  "conclusion": "一句话总结：X/Y 项满足；若有未满足项，附主要缺口。不要用「无法验证/无法合并/拒绝判定」这类措辞"
 }}"""
     return [
         {"role": "system", "content": SYSTEM_TRIAGE},
