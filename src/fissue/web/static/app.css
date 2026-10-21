@@ -347,6 +347,12 @@ td.shrink, th.shrink { width: 1%; white-space: nowrap; }
 .tool-mark.ok { color: var(--ok); }
 .tool-mark.bad { color: var(--bad); }
 
+/* 清单判定卡（checklist_judge 输出，web/markdown.py） */
+.cl-verdict { display: flex; flex-direction: column; gap: 4px; }
+.cl-conclusion { font-weight: 600; }
+.cl-items { margin: 4px 0 0; padding-left: 0; list-style: none; }
+.cl-item { padding: 1px 0; }
+
 /* Markdown 渲染结果（.md 容器内） */
 .md p { margin: .4em 0; }
 .md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: .7em 0 .3em; line-height: 1.3; }

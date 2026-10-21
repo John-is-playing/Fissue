@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fissue.web.markdown import render_job_event, render_markdown
 
 # ---------------------------------------------------------------------------
@@ -81,7 +83,7 @@ def test_llm_event_json_body_becomes_code_block() -> None:
     ev = render_job_event(
         _llm_ev(text='{"ok": true}', usage={"total_tokens": 9})
     )
-    assert '<pre class="md-pre"><code>' in ev["html"]
+    assert '<pre class="md-pre lang-json"><code>' in ev["html"]
     # html.escape 把引号转成 &quot;（浏览器显示回来仍是 "）
     assert "&quot;ok&quot;: true" in ev["html"]
     assert "9 tokens" in ev["html"]
@@ -99,10 +101,54 @@ def test_llm_event_streaming_marker() -> None:
     assert 'class="spinner small"' in ev["html"]
 
 
-def test_llm_event_partial_json_falls_back_to_markdown() -> None:
-    # 流式中途 JSON 不完整：不能报错，降级按 Markdown（此处即纯文本）渲染
-    ev = render_job_event(_llm_ev(text='{"a":', done=False))
-    assert '<p>{"a":</p>' in ev["html"]
+def test_llm_event_fenced_json_renders_pretty_block() -> None:
+    # 模型把 JSON 包在 ```json 围栏里 → 也要解析成格式化代码块
+    ev = render_job_event(_llm_ev(text='```json\n{"kind": "executable"}\n```', done=True))
+    assert "lang-json" in ev["html"]
+    assert "&quot;kind&quot;: &quot;executable&quot;" in ev["html"]
+
+
+def test_llm_event_json_with_preamble_renders_pretty_block() -> None:
+    # 前言 + JSON → 平衡截取后解析
+    ev = render_job_event(
+        _llm_ev(text='好的，以下是验证器：\n{"kind": "checklist", "name": "x"}', done=True)
+    )
+    assert "lang-json" in ev["html"]
+    assert "&quot;name&quot;: &quot;x&quot;" in ev["html"]
+
+
+def test_llm_event_partial_json_renders_plain_pre() -> None:
+    # 流式中途 JSON 不完整：纯 pre 呈现，不能报错，也不能让 Markdown 弄花
+    ev = render_job_event(_llm_ev(text='{"note": "use **bold** text', done=False))
+    assert '<pre class="md-pre json-inflight">' in ev["html"]
+    assert "<b>bold</b>" not in ev["html"]  # 事件头部的 <b> 不算，只查正文没被弄花
+    assert "<i>" not in ev["html"]
+
+
+def test_llm_event_partial_json_with_preamble_renders_plain_pre() -> None:
+    # 前言 + 未闭合 JSON（花括号不平衡）同样按在途 JSON 处理
+    ev = render_job_event(_llm_ev(text='好的，结果如下：\n{"a":', done=False))
+    assert '<pre class="md-pre json-inflight">' in ev["html"]
+    assert "<p>" not in ev["html"]
+
+
+def test_llm_event_checklist_verdict_renders_structured_card() -> None:
+    # 清单判定输出（conclusion + 逐条 satisfied）→ 结构化判定卡，逐条 ✓/✗
+    obj = {
+        "passed": False,
+        "items": [
+            {"index": 1, "satisfied": True, "reason": "已声明"},
+            {"index": 2, "satisfied": False, "reason": "证据不足"},
+        ],
+        "conclusion": "MySQL 支持未实现",
+    }
+    ev = render_job_event(_llm_ev(text=json.dumps(obj, ensure_ascii=False), done=True))
+    html_out = ev["html"]
+    assert 'class="cl-verdict"' in html_out
+    assert "cl-conclusion" in html_out and "MySQL 支持未实现" in html_out
+    assert html_out.count("tool-mark ok") >= 1
+    assert html_out.count("tool-mark bad") >= 1
+    assert "已声明" in html_out and "证据不足" in html_out
 
 
 def test_tool_event_escapes_detail_and_marks_ok() -> None:

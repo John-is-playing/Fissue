@@ -17,6 +17,8 @@ import json
 import re
 from typing import Any
 
+from ..ai.client import extract_json
+
 #: 链接只允许 http(s) / mailto——``javascript:`` 之类不渲染成链接，留作纯文本。
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(((?:https?|mailto):[^)\s]+)\)")
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
@@ -202,16 +204,79 @@ def render_job_event(ev: dict[str, Any]) -> dict[str, Any]:
 
 
 def _render_llm_body(text: str) -> str:
-    """LLM 事件正文：整体可解析为 JSON 时按代码块格式化（评测 / 裁决 / agent
-    动作的输出正是 JSON），否则走 Markdown 渲染。流式中途（JSON 不完整）会
-    自然落到 Markdown 分支，结束后的下一帧补上代码块形态。"""
+    """LLM 事件正文：
+
+    - 完整且可解析为 JSON（容忍 ```` ``` ```` 围栏与前言）→ 格式化代码块；
+      形状匹配「清单判定」（conclusion + 逐条 satisfied）时渲染成结构化
+      判定卡（逐条 ✓/✗），比 JSON 块直观。
+    - 像 JSON 但尚不完整（流式中途）→ 纯 ``<pre>``，防止 Markdown 把 JSON
+      里的 ``*``/``**`` 弄成粗斜体。
+    - 其余 → Markdown。
+    """
     stripped = text.strip()
-    if stripped[:1] in {"{", "["}:
-        try:
-            obj = json.loads(stripped)
-        except json.JSONDecodeError:
-            obj = None
+    if stripped:
+        obj = extract_json(stripped)
         if obj is not None:
-            pretty = json.dumps(obj, ensure_ascii=False, indent=2)
-            return f'<pre class="md-pre"><code>{html.escape(pretty)}</code></pre>'
+            return _render_json_body(obj)
+        if _looks_json_in_progress(stripped):
+            return f'<pre class="md-pre json-inflight">{html.escape(text)}</pre>'
     return render_markdown(text)
+
+
+def _looks_json_in_progress(stripped: str) -> bool:
+    """启发式：整体解析失败（否则走不到这里）且形像在途 JSON——开头是代码
+    围栏，或已出现花括号但尚未闭合。误伤（普通 Markdown 恰好花括号不平衡）
+    只是少了一份列表排版，可接受。"""
+    if stripped[:3] == "```":
+        return True
+    if "{" in stripped:
+        return stripped.count("{") > stripped.count("}")
+    return False
+
+
+def _render_json_body(obj: Any) -> str:
+    if _is_checklist_verdict(obj):
+        return _render_checklist_verdict(obj)
+    pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+    return f'<pre class="md-pre lang-json"><code>{html.escape(pretty)}</code></pre>'
+
+
+def _is_checklist_verdict(obj: Any) -> bool:
+    """清单判定 JSON 的形状（见 checklist_judge_prompt 的输出约定）。"""
+    if not isinstance(obj, dict) or "conclusion" not in obj:
+        return False
+    items = obj.get("items")
+    return (
+        isinstance(items, list)
+        and bool(items)
+        and all(isinstance(i, dict) and "satisfied" in i for i in items)
+    )
+
+
+def _render_checklist_verdict(obj: dict[str, Any]) -> str:
+    """清单判定：结论在前、逐条 ✓/✗ 带理由——比 JSON 块直观。"""
+    passed = obj.get("passed")
+    mark_cls = "ok" if passed is True else ("bad" if passed is False else "")
+    parts: list[str] = []
+    conclusion = str(obj.get("conclusion") or "").strip()
+    if conclusion:
+        mark = "✓" if passed is True else ("✗" if passed is False else "")
+        parts.append(
+            f'<div class="cl-conclusion"><span class="tool-mark {mark_cls}">{mark}</span> '
+            f"{html.escape(conclusion)}</div>"
+        )
+    lis: list[str] = []
+    for idx, item in enumerate(obj.get("items") or [], 1):
+        if not isinstance(item, dict):
+            continue
+        ok = item.get("satisfied")
+        cls = "ok" if ok is True else ("bad" if ok is False else "")
+        mark = "✓" if ok is True else ("✗" if ok is False else "")
+        reason = str(item.get("reason") or "").strip() or f"第 {idx} 条"
+        lis.append(
+            f'<li class="cl-item {cls}"><span class="tool-mark {cls}">{mark}</span> '
+            f"{html.escape(reason)}</li>"
+        )
+    if lis:
+        parts.append("<ul class=\"cl-items\">" + "".join(lis) + "</ul>")
+    return f'<div class="cl-verdict">{" ".join(parts)}</div>'
