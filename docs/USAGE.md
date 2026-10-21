@@ -441,7 +441,8 @@ fissue verify --repo psf/requests --json
 
 - **base 就通过** → 验证器不可靠 → 自动让 AI 修正（最多 3 轮）→ 仍不行则标 `needs_manual`
 - **base 报错/超时** → 结论不可信 → 标 `needs_manual`
-- **仓库无测试框架** → 降级为自然语言清单 → 标 `needs_manual` 待人工复核
+- **仓库无测试框架** → 降级为自然语言清单 → LLM 按仓库上下文逐条判定
+  （明细落验证记录）→ 标 `needs_manual` 待人工复核
 
 验证通过的条目进入 **verify 队列**，等批量 flush。
 

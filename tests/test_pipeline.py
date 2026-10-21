@@ -1721,8 +1721,204 @@ async def test_verify_stage_checklist_event_does_not_claim_not_reproduced(
     tools = [t for t in ctx.job_sink.calls if t["name"] == "验证器"]
     assert len(tools) == 1
     assert "未能复现" not in tools[0]["detail"]
-    assert "待" in tools[0]["detail"] and "判定" in tools[0]["detail"]
+    assert "判定" in tools[0]["detail"]
     assert tools[0]["ok"] is None  # 无成败结论，不该挂红 ✗
+
+
+async def test_generate_and_validate_judges_checklist_with_llm(ctx, repo, monkeypatch) -> None:
+    """清单型验证器：生成后把仓库上下文交 LLM 逐条判定（接通此前无调用方的
+    verify_checklist 路径）。base 上判「未全部满足」→ 符合 expect_fail_on_base
+    的预期方向，验证器算「可复现」（base_run=FAIL），但 f2p 仍为 false
+    （清单不构成 F2P 证明）；逐条明细落验证记录，条目标 verifier_ready。"""
+    from fissue.ai.client import Usage
+    from fissue.models import ItemStatus, VerifierKind, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 34)
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="增加 MySQL 存储后端支持（可核查清单）",
+        checklist=["【配置入口】config.example.yaml 列出 MySQL 支持形式"],
+        expect_fail_on_base=True,
+    )
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [{"index": 1, "satisfied": False, "reason": "证据不足"}],
+                "conclusion": "MySQL 支持未实现",
+            },
+            None,
+        )
+
+    gen = _Gen()
+    monkeypatch.setattr(ctx.generator, "generate", gen.generate)
+    monkeypatch.setattr(ctx.generator, "refine", gen.refine)
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+
+    vid, got_spec, result = await ctx.verifier.generate_and_validate(
+        item=item,
+        workspace=object(),
+        repo_context="仓库文件（节选）：\n- pyproject.toml",
+        generator=ctx.generator,
+    )
+
+    assert got_spec.kind is VerifierKind.CHECKLIST
+    assert result.base_run is not None
+    assert result.reproducible is True       # base 未全部满足 → 符合预期方向
+    assert result.f2p_satisfied is False     # 清单不构成 F2P 证明
+    assert "未全部满足" in result.conclusion and "MySQL 支持未实现" in result.conclusion
+    runs = repo.verifier_runs(item.key, stage="base")
+    assert len(runs) == 1 and runs[0].verifier_id == vid
+    assert repo.get_item(item.key).status is ItemStatus.VERIFIER_READY
+
+
+async def test_generate_and_validate_checklist_all_satisfied_on_base(ctx, repo, monkeypatch) -> None:
+    """清单在 base 上被 LLM 判「全部满足」→ 问题可能已解决 → 不算复现。"""
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 36)
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="增加 MySQL 存储后端支持（可核查清单）",
+        checklist=["【配置入口】config.example.yaml 列出 MySQL 支持形式"],
+        expect_fail_on_base=True,
+    )
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": True,
+                "items": [{"index": 1, "satisfied": True, "reason": "已声明"}],
+                "conclusion": "MySQL 支持已实现",
+            },
+            None,
+        )
+
+    gen = _Gen()
+    monkeypatch.setattr(ctx.generator, "generate", gen.generate)
+    monkeypatch.setattr(ctx.generator, "refine", gen.refine)
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+
+    _vid, _spec, result = await ctx.verifier.generate_and_validate(
+        item=item,
+        workspace=object(),
+        repo_context="仓库文件（节选）：\n- pyproject.toml",
+        generator=ctx.generator,
+    )
+
+    assert result.reproducible is False      # base 全满足 → 按「未复现」对待
+    assert "全部满足" in result.conclusion and "MySQL 支持已实现" in result.conclusion
+
+
+async def test_generate_and_validate_checklist_without_llm_client(ctx, repo, monkeypatch) -> None:
+    """无 LLM 客户端：不报错，回退「转人工复核」，且不留下假的 base 运行记录。"""
+    from fissue.ai.client import Usage
+    from fissue.models import VerifierKind, VerifierSpec
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 37)
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="增加 MySQL 存储后端支持（可核查清单）",
+        checklist=["【配置入口】config.example.yaml 列出 MySQL 支持形式"],
+    )
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+        async def refine(self, spec, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+    gen = _Gen()
+    monkeypatch.setattr(ctx.generator, "generate", gen.generate)
+    monkeypatch.setattr(ctx.generator, "refine", gen.refine)
+    monkeypatch.setattr(ctx.verifier, "client", None)
+
+    _vid, _spec, result = await ctx.verifier.generate_and_validate(
+        item=item,
+        workspace=object(),
+        repo_context="仓库文件（节选）：\n- pyproject.toml",
+        generator=ctx.generator,
+    )
+
+    assert result.base_run is None
+    assert result.reproducible is False
+    assert "人工" in result.conclusion
+    assert repo.verifier_runs(item.key, stage="base") == []
+
+
+async def test_verify_stage_checklist_llm_judgement_recorded(ctx, repo, monkeypatch) -> None:
+    """VerifyStage 全链路：清单的 LLM 逐条判定结果进入任务事件与条目备注，
+    不再出现「未能复现」；条目转 needs_manual，备注含判定结论。"""
+    from fissue.ai.client import Usage
+    from fissue.models import (
+        Category,
+        Evaluation,
+        ItemStatus,
+        Priority,
+        VerifierKind,
+        VerifierSpec,
+    )
+    from fissue.verifier.generator import GeneratedVerifier
+
+    item = _seed_issue(repo, 35)
+    ev = Evaluation(category=Category.BUG, priority=Priority.TIER1, model="stub")
+    repo.save_evaluation(item.key, ev)
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="增加 MySQL 存储后端支持（可核查清单）",
+        checklist=["【配置入口】config.example.yaml 列出 MySQL 支持形式"],
+    )
+
+    class _Gen:
+        async def generate(self, item, **kw):
+            return GeneratedVerifier(spec=spec, usage=Usage(), warnings=[])
+
+    async def fake_chat_json(messages, **kw):
+        return ({"passed": False, "items": [], "conclusion": "MySQL 支持未实现"}, None)
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def tool(self, name: str, detail: str, *, ok: bool | None = None) -> None:
+            self.calls.append({"name": name, "detail": detail, "ok": ok})
+
+    gen = _Gen()
+    monkeypatch.setattr(ctx.generator, "generate", gen.generate)
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+    monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
+    ctx.job_sink = _Sink()
+
+    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+
+    assert result.status is ItemStatus.NEEDS_MANUAL
+    assert any("清单判定" in n for n in result.notes)
+    tools = [t for t in ctx.job_sink.calls if t["name"] == "验证器"]
+    assert len(tools) == 1
+    assert tools[0]["detail"].startswith("清单 LLM 逐条判定")
+    assert "未能复现" not in tools[0]["detail"]
+    assert tools[0]["ok"] is None
 
 
 # ---------------------------------------------------------------------------

@@ -94,7 +94,8 @@ fix  阶段：在修复/合并后代码上跑 → 必须通过（exit=0）→ �
 * **base 就通过** → 判定「验证器不可靠」，触发 LLM 修正（最多 `verifier.max_rounds` 轮）；
   仍不可靠则标记 `needs_manual`，绝不据此自动修码。
 * **base 直接 ERROR/TIMEOUT** → 结论不可信，不进入自动修复。
-* **无测试框架** → 降级为 `checklist` 型，由 LLM 逐条判读执行输出；
+* **无测试框架** → 降级为 `checklist` 型，由 LLM 按证据逐条判定
+  （有命令时用执行输出；无可执行命令时用仓库上下文快照作证据）；
   也可直接用 `fissue verify` 人工复核。
 
 ### 4.1 既有测试回归门（pass-to-pass）

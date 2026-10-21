@@ -149,7 +149,7 @@
 | `verifier.mode` | `hybrid` | `executable / checklist / hybrid` |
 | `verifier.require_f2p` | `true` | F2P：修复前必失败、修复后必通过 |
 | `verifier.max_rounds` | `2` | 验证器不可靠时自校正的最大轮次 |
-| `verifier.allow_checklist_fallback` | `true` | 无测试框架时降级为自然语言清单 |
+| `verifier.allow_checklist_fallback` | `true` | 无测试框架时降级为自然语言清单（LLM 按仓库上下文逐条判定） |
 | `verifier.regression_gate` | `strict` | `off / warn / strict`，见[验证器与 F2P](Verifier-and-F2P.md#2-回归门regression-gate) |
 | `verifier.regression_command` | `null` | 留空 → 仓库级 `test_hint` → 探测（pytest / npm test / go test…） |
 | `verifier.regression_timeout_seconds` | `900` | 回归门独立预算（单测验证器默认 600） |

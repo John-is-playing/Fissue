@@ -519,6 +519,7 @@ class VerifierRunner:
         spec: VerifierSpec,
         output: str,
         stage: str = "base",
+        verifier_id: int | None = None,
     ) -> VerifierRun:
         """清单型验证器：把输出交 LLM 逐条判定（Q16 的降级路径）。"""
         if self.client is None:
@@ -536,6 +537,7 @@ class VerifierRunner:
             f"- [{i.get('satisfied')}] {i.get('reason', '')}" for i in items if isinstance(i, dict)
         )
         run = VerifierRun(
+            verifier_id=verifier_id,
             item_key=item_key,
             stage=stage,
             outcome=VerifierOutcome.PASS if passed else VerifierOutcome.FAIL,
@@ -547,6 +549,47 @@ class VerifierRunner:
         run.stdout = f"{conclusion}\n{detail}"
         self.repo.save_verifier_run(run)
         return run
+
+    async def _judge_checklist(
+        self,
+        item: RawItem,
+        verifier_id: int,
+        spec: VerifierSpec,
+        repo_context: str,
+    ) -> VerifierResult:
+        """清单型：把证据交 LLM 逐条判定（Q16 的降级路径）。
+
+        证据用仓库上下文——与生成清单时的输入同源，保证清单条目和判定
+        证据口径一致。base 上判「未全部满足」（FAIL）符合
+        ``expect_fail_on_base`` 的预期方向；base 上判「全部满足」（PASS）
+        说明问题可能已解决，下游按「未复现」对待。逐条明细已由
+        :meth:`verify_checklist` 持久化，可在验证记录里查看。
+        """
+        if self.client is None:
+            return VerifierResult(
+                kind=spec.kind,
+                f2p_satisfied=False,
+                conclusion="清单型验证器：无 LLM 客户端，无法逐条判定，转人工复核",
+            )
+        run = await self.verify_checklist(
+            item_key=item.key,
+            item=item,
+            spec=spec,
+            output=repo_context or "（无仓库上下文）",
+            stage="base",
+            verifier_id=verifier_id,
+        )
+        llm_conclusion = (run.stdout or "").split("\n", 1)[0]
+        if run.outcome is VerifierOutcome.FAIL:
+            conclusion = f"清单判定（base）：未全部满足 — {llm_conclusion}"
+        else:
+            conclusion = f"清单判定（base）：全部满足 — {llm_conclusion}"
+        return VerifierResult(
+            kind=spec.kind,
+            base_run=run,
+            f2p_satisfied=False,
+            conclusion=conclusion,
+        )
 
     # -- 修正循环 ---------------------------------------------------------
 
@@ -576,12 +619,9 @@ class VerifierRunner:
         for round_index in range(1, max_rounds + 1):
             verifier_id = self.repo.save_verifier(item.key, spec, rounds=round_index)
             if spec.kind is VerifierKind.CHECKLIST:
-                # 清单型只能由人工/LLM 判定，这里直接给出「待判定」
-                result = VerifierResult(
-                    kind=spec.kind,
-                    f2p_satisfied=False,
-                    conclusion="清单型验证器：需执行后由 LLM 逐条判定",
-                )
+                # 清单型没有可执行命令：把仓库上下文交 LLM 逐条判定。判定结论
+                # 只是人工复核的参考，不构成 F2P 证明（f2p 仍为 false）。
+                result = await self._judge_checklist(item, verifier_id, spec, repo_context)
                 self.repo.set_verifier_f2p(verifier_id, False)
                 self.repo.set_item_status(item.key, ItemStatus.VERIFIER_READY)
                 return verifier_id, spec, result

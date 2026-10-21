@@ -283,12 +283,19 @@ class VerifyStage:
             result.verifier_result = base_result
             if self.ctx.job_sink is not None:
                 if spec.kind is VerifierKind.CHECKLIST:
-                    # 清单型没有可执行命令：base 验证**根本没跑过**（command 为空、无测试文件），
-                    # 说「未能复现」等于谎称测过没复现——如实说「待判定」。
-                    self.ctx.job_sink.tool(
-                        "验证器",
-                        "清单型验证器：无可执行命令，已生成核查清单，待 LLM/人工逐条判定",
-                    )
+                    # 清单型没有可执行命令：base 验证**根本没跑过**，不说「复现/
+                    # 未能复现」。LLM 逐条判定完成时如实报判定结论（不挂成败
+                    # 标记——清单在 base 上「未全部满足」是正常预期，不是错误）。
+                    if base_result.base_run is not None:
+                        self.ctx.job_sink.tool(
+                            "验证器",
+                            f"清单 LLM 逐条判定：{(base_result.conclusion or '')[:200]}",
+                        )
+                    else:
+                        self.ctx.job_sink.tool(
+                            "验证器",
+                            "清单型验证器：无 LLM 客户端，已生成核查清单，转人工逐条判定",
+                        )
                 else:
                     self.ctx.job_sink.tool(
                         "验证器",
@@ -300,7 +307,14 @@ class VerifyStage:
             if spec.kind is VerifierKind.CHECKLIST:
                 self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)
                 result.status = ItemStatus.NEEDS_MANUAL
-                result.notes.append("无法自动化验证，已标记需人工，清单已生成供复核")
+                if base_result.base_run is not None:
+                    result.notes.append(f"清单判定：{base_result.conclusion}")
+                    if not base_result.reproducible and spec.expect_fail_on_base:
+                        result.notes.append(
+                            "清单在 base 上全部满足：问题可能已解决或评估有误，请人工复核"
+                        )
+                else:
+                    result.notes.append("清单型验证器：无法自动验证，转 needs_manual，已生成清单供人工复核")
                 return result
 
             # 强制修复：复现不了也照修——「要不要修」已由人拍板，复现结论只是参考。

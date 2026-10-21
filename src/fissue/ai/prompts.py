@@ -472,15 +472,20 @@ def verifier_prompt(
 
 
 def checklist_judge_prompt(item: RawItem, *, checklist: Sequence[str], output: str) -> list[dict[str, str]]:
-    """把可执行验证器降级为「人/模型读输出判定」时使用。"""
+    """清单型验证器交 LLM 按证据逐条判定时使用（Q16）。
+
+    ``output`` 是判定证据：有命令时的执行输出，或清单无可执行命令时的
+    仓库上下文快照（文件树 / README / API 契约）。
+    """
     items = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(checklist))
-    user = f"""下面是针对某个问题的验证清单，以及执行验证后得到的输出。
-请逐条判断是否满足，并给出整体结论。
+    user = f"""下面是针对某个问题的验证清单，以及对应的证据。
+请逐条判断清单各项在当前状态下是否满足，并给出整体结论。
+某一条若因证据不足无法确认，请将该条判为不满足，reason 写「证据不足」。
 
 验证清单：
 {items}
 
-执行输出（可能包含日志、测试结果、报错）：
+证据（可能是执行输出，也可能是仓库文件树 / README / API 契约等快照）：
 ```
 {_truncate(output, 8000)}
 ```
