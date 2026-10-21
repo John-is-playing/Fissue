@@ -282,12 +282,20 @@ class VerifyStage:
             result.verifier_kind = spec.kind
             result.verifier_result = base_result
             if self.ctx.job_sink is not None:
-                self.ctx.job_sink.tool(
-                    "验证器",
-                    f"base 验证（{spec.kind.value}）：{'已复现' if base_result.reproducible else '未能复现'}"
-                    f" — {(base_result.conclusion or '')[:200]}",
-                    ok=base_result.reproducible,
-                )
+                if spec.kind is VerifierKind.CHECKLIST:
+                    # 清单型没有可执行命令：base 验证**根本没跑过**（command 为空、无测试文件），
+                    # 说「未能复现」等于谎称测过没复现——如实说「待判定」。
+                    self.ctx.job_sink.tool(
+                        "验证器",
+                        "清单型验证器：无可执行命令，已生成核查清单，待 LLM/人工逐条判定",
+                    )
+                else:
+                    self.ctx.job_sink.tool(
+                        "验证器",
+                        f"base 验证（{spec.kind.value}）：{'已复现' if base_result.reproducible else '未能复现'}"
+                        f" — {(base_result.conclusion or '')[:200]}",
+                        ok=base_result.reproducible,
+                    )
 
             if spec.kind is VerifierKind.CHECKLIST:
                 self.ctx.repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL)

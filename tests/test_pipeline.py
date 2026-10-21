@@ -1664,6 +1664,67 @@ async def test_verify_stage_blocks_suspicious_before_generating(
     assert repo.get_item(item.key).status is ItemStatus.SKIPPED
 
 
+async def test_verify_stage_checklist_event_does_not_claim_not_reproduced(
+    ctx, repo, monkeypatch
+) -> None:
+    """清单型验证器：base 验证**根本没跑过**（无可执行命令），事件必须如实说「待判定」，
+    不能写「未能复现」——那等于谎称测过没复现。
+
+    回归（2026-10-21 常驻轮次实测，Fissue 的 MySQL 功能请求 issue）：任务详情页
+    显示「base 验证（checklist）：未能复现」，误导以为验证器跑过且判定失败。
+    """
+    from fissue.models import (
+        Category,
+        Evaluation,
+        ItemStatus,
+        Priority,
+        VerifierKind,
+        VerifierResult,
+        VerifierSpec,
+    )
+
+    item = _seed_issue(repo, 33)
+    ev = Evaluation(category=Category.BUG, priority=Priority.TIER1, model="stub")
+    repo.save_evaluation(item.key, ev)
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        name="增加 MySQL 存储后端支持（可核查清单）",
+        language="python",
+        files={},
+        command="",
+        checklist=["【配置入口】config.example.yaml 明确列出 MySQL 支持形式"],
+    )
+    placeholder = VerifierResult(
+        kind=spec.kind,
+        f2p_satisfied=False,
+        conclusion="清单型验证器：需执行后由 LLM 逐条判定",
+    )
+
+    async def fake_gav(**kw):
+        return 1, spec, placeholder
+
+    class _Sink:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def tool(self, name: str, detail: str, *, ok: bool | None = None) -> None:
+            self.calls.append({"name": name, "detail": detail, "ok": ok})
+
+    monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
+    monkeypatch.setattr(ctx.verifier, "generate_and_validate", fake_gav)
+    ctx.job_sink = _Sink()
+
+    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+
+    assert result.status is ItemStatus.NEEDS_MANUAL
+    tools = [t for t in ctx.job_sink.calls if t["name"] == "验证器"]
+    assert len(tools) == 1
+    assert "未能复现" not in tools[0]["detail"]
+    assert "待" in tools[0]["detail"] and "判定" in tools[0]["detail"]
+    assert tools[0]["ok"] is None  # 无成败结论，不该挂红 ✗
+
+
 # ---------------------------------------------------------------------------
 # PR-FEATURE 必须验证（不能按 category 一刀切挡掉）
 # ---------------------------------------------------------------------------
