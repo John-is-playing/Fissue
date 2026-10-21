@@ -63,6 +63,17 @@
   弄成粗斜体；「清单判定」JSON（conclusion + 逐条 satisfied）渲染为结构化
   判定卡（整体结论 + 逐条 ✓/✗ + 理由），比 JSON 块直观。
 
+### Fixed
+
+- **flush 不再把已在修复流程中的条目反复拉回待修**：`FlushProcessor.apply`
+  的强制修复分支此前对 `force_fix` 条目无条件落 `fix_queued`——只要条目有
+  验证队列条目（如强制前已排队验证），常驻 flush 每处理一次就把它拉回
+  「待修」，而失败的尝试（needs_manual）不挡 `_has_open_attempt`（只拦
+  SUCCESS），同一条目每轮被重新修复、每轮烧一整轮 agent；已提过 PR 的
+  条目甚至会被开第二个 PR。现在：已在 fixing / pr_created / fix_queued、
+  或已有修复尝试的条目，派发决定直接跳过（flush 报告计入「修复流程中
+  跳过」并记日志）；真正「强制且从未修过」的条目仍照旧直落待修 tier1。
+
 ## [1.1.0] - 2026-10-20
 
 > **正式版**：`rel/v1.1.0-b1…b4` 四个预发布快照的收口——`pyproject.toml` 与 `__version__`

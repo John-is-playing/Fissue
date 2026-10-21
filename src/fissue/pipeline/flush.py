@@ -55,13 +55,15 @@ class FlushReport:
     fix_candidates: list[tuple[str, Priority]] = field(default_factory=list)
     label_errors: list[str] = field(default_factory=list)
     verdicts: dict[str, str] = field(default_factory=dict)
+    #: 本次 flush 因条目已在修复流程中（或已修过）而放弃派发决定的条目
+    skipped_in_fix: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
         return (
             f"[{self.queue}] 结论 {len(self.verdicts)} 条，"
             f"打标 {len(self.labeled)}，待修复 {len(self.fix_candidates)}，"
-            f"打标失败 {len(self.label_errors)}"
+            f"打标失败 {len(self.label_errors)}，修复流程中跳过 {len(self.skipped_in_fix)}"
         )
 
 
@@ -159,10 +161,35 @@ class FlushProcessor:
             priority = p["priority"]
 
             if queue_kind == QueueName.VERIFY.value:
+                it = self.ctx.repo.get_item(key)
+                if (
+                    it is not None
+                    and it.status in (
+                        ItemStatus.FIXING,
+                        ItemStatus.PR_CREATED,
+                        ItemStatus.FIX_QUEUED,
+                    )
+                ):
+                    # 条目已在修复流程中（或已提过 PR）：这条队列条目是残留/迟到者。
+                    # 再落回 fix_queued 会给 pr_created 的条目开第二个 PR、或抢走别的
+                    # 进程正在修的条目——派发决定弃掉（条目本身照常标记已 flush）。
+                    log.info(
+                        "flush 跳过条目 %s 的派发：条目已在修复流程中（status=%s）",
+                        key, it.status.value,
+                    )
+                    report.skipped_in_fix.append(key)
+                    continue
                 # 强制修复：结论已人拍板，优先于 LLM 的（含 skip）。也覆盖「强制前已在
                 # 验证队列里」的残留条目——它就该直落待修，不能被裁决判成 SKIPPED / 需人工。
-                it = self.ctx.repo.get_item(key)
                 if it is not None and it.force_fix:
+                    if self.ctx.repo.fix_attempts(key):
+                        # 已尝试过修复（无论成败）：强制决定已被执行。失败的尝试不挡
+                        # _has_open_attempt（它只拦 SUCCESS），残留条目每被 flush 一次
+                        # 就把条目重新拉回待修——常驻服务会反复重修同一条目、每轮
+                        # 烧一整轮 agent。
+                        log.info("flush 跳过 %s 的重新入队：已有修复尝试（残留条目）", key)
+                        report.skipped_in_fix.append(key)
+                        continue
                     report.fix_candidates.append((key, Priority.TIER1))
                     self.ctx.repo.set_item_status(
                         key, ItemStatus.FIX_QUEUED, priority=Priority.TIER1

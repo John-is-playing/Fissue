@@ -616,6 +616,99 @@ async def test_flush_processor_pr_never_auto_merges(ctx, repo, monkeypatch) -> N
     report = await processor.apply(QueueName.FIX_BUG.value, entries, conclusions)
     assert report.verdicts[pr.key] == "merge"
     assert repo.get_item_row(pr.key).status == ItemStatus.LABELED.value
+
+
+# ---------------------------------------------------------------------------
+# flush 派发守卫：残留队列条目不得把已修/在修条目拉回待修
+# （Pi 实测 Fissue#1：强制修复的条目被残留条目反复拉回，常驻服务每轮重修）
+# ---------------------------------------------------------------------------
+
+
+def _flush_env(processor, monkeypatch, item, verdict="fix", priority=Priority.TIER1):
+    async def fake_label(payload, labels):
+        return True, ""
+
+    monkeypatch.setattr(processor, "_safe_label", fake_label)
+    entries = [{"key": item.key, "repo": item.repo, "number": item.number, "item_type": "issue"}]
+    conclusions = [{"key": item.key, "verdict": verdict, "labels": ["bug"],
+                    "priority": priority, "reason": "r", "confidence": 0.9}]
+    return entries, conclusions
+
+
+async def test_flush_skips_dispatch_when_item_already_in_fix_flow(ctx, repo, monkeypatch) -> None:
+    """已 pr_created / fixing / fix_queued 的条目：残留队列条目只标记已 flush，
+    不再落回 fix_queued（否则 pr_created 会开第二个 PR）。"""
+    from fissue.pipeline.flush import FlushProcessor
+
+    processor = FlushProcessor(ctx)
+    item = _seed_issue(repo, 60)
+    repo.set_force_fix(item.key, True)
+    repo.set_item_status(item.key, ItemStatus.PR_CREATED, priority=Priority.TIER1)
+    entries, conclusions = _flush_env(processor, monkeypatch, item)
+
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    assert report.fix_candidates == []
+    assert report.skipped_in_fix == [item.key]
+    assert repo.get_item_row(item.key).status == ItemStatus.PR_CREATED.value
+
+
+async def test_flush_force_branch_skips_when_fix_already_attempted(ctx, repo, monkeypatch) -> None:
+    """强制条目已有修复尝试（无论成败）：强制决定已执行，残留条目不得再拉回
+    待修——失败的尝试不挡 _has_open_attempt（只拦 SUCCESS），不拦就会每轮重修。"""
+    from fissue.models import FixAttempt, FixOutcome
+    from fissue.pipeline.flush import FlushProcessor
+
+    processor = FlushProcessor(ctx)
+    item = _seed_issue(repo, 61)
+    repo.set_force_fix(item.key, True)
+    repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL, priority=Priority.TIER1)
+    repo.save_fix_attempt(
+        FixAttempt(item_key=item.key, outcome=FixOutcome.NEEDS_MANUAL, error="达到最大轮次")
+    )
+    entries, conclusions = _flush_env(processor, monkeypatch, item)
+
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    assert report.fix_candidates == []
+    assert report.skipped_in_fix == [item.key]
+    assert repo.get_item_row(item.key).status == ItemStatus.NEEDS_MANUAL.value
+
+
+async def test_flush_force_branch_still_queues_fresh_residual_entry(ctx, repo, monkeypatch) -> None:
+    """原意图保留：强制条目 + 强制前已在验证队列的残留条目 + 从未修过 → 仍直落
+    待修 tier1（不能被裁决判成 SKIPPED / 需人工）。"""
+    from fissue.pipeline.flush import FlushProcessor
+
+    processor = FlushProcessor(ctx)
+    item = _seed_issue(repo, 62)
+    repo.set_force_fix(item.key, True)
+    repo.set_item_status(item.key, ItemStatus.NEEDS_MANUAL, priority=Priority.NONE)
+    entries, conclusions = _flush_env(processor, monkeypatch, item)
+
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    assert report.fix_candidates == [(item.key, Priority.TIER1)]
+    assert report.skipped_in_fix == []
+    row = repo.get_item_row(item.key)
+    assert row.status == ItemStatus.FIX_QUEUED.value
+    assert row.priority == Priority.TIER1.value
+
+
+async def test_flush_fix_verdict_does_not_requeue_pr_created_item(ctx, repo, monkeypatch) -> None:
+    """非强制条目同样受状态守卫保护（断线恢复等边缘路径）。"""
+    from fissue.pipeline.flush import FlushProcessor
+
+    processor = FlushProcessor(ctx)
+    item = _seed_issue(repo, 63)
+    repo.set_item_status(item.key, ItemStatus.PR_CREATED, priority=Priority.TIER1)
+    entries, conclusions = _flush_env(processor, monkeypatch, item)
+
+    report = await processor.apply(QueueName.VERIFY.value, entries, conclusions)
+
+    assert report.fix_candidates == []
+    assert report.skipped_in_fix == [item.key]
+    assert repo.get_item_row(item.key).status == ItemStatus.PR_CREATED.value
     assert not report.fix_candidates
 
 
