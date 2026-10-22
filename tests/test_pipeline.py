@@ -2202,6 +2202,102 @@ def test_verifier_prompt_forbids_checklist_when_repo_has_tests(sample_issue) -> 
     assert "mock" in text
 
 
+async def test_run_once_missing_verifier_file_is_error(ctx, repo, monkeypatch, tmp_path) -> None:
+    """验证器文件在容器里不存在（pytest 用法错误 exit=4）→ 必须判 ERROR。
+
+    回归（2026-10-22 Pi 实测）：沙盒 files 通道没把验证器文件送进容器可见位置，
+    base 阶段把「跑都没跑起来」判成「问题已复现」，12 轮修复全部空转。
+    """
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierSpec
+    from fissue.sandbox.protocol import ExecResult
+
+    item = _seed_issue(repo, 43)
+    spec = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE,
+        command="python -m pytest tests/test_x.py -q",
+        files={"tests/test_x.py": "def test_x():\n    assert True\n"},
+    )
+    vid = repo.save_verifier(item.key, spec)
+
+    class _WS:
+        def __init__(self) -> None:
+            self.root = tmp_path
+            self.files: dict[str, str] = {}
+
+        def write(self, rel: str, content: str):
+            self.files[rel] = content
+
+        def read(self, rel: str, max_bytes: int = 200_000) -> str:
+            return self.files[rel]
+
+        def exists(self, rel: str) -> bool:
+            return rel in self.files
+
+        def delete(self, rel: str) -> bool:
+            self.files.pop(rel, None)
+            return True
+
+        def harden_git(self) -> None:
+            return None
+
+    async def fake_run(req):
+        return ExecResult(
+            ok=True,
+            exit_code=4,
+            stdout="",
+            stderr="ERROR: file or directory not found: tests/test_x.py\n\n",
+        )
+
+    monkeypatch.setattr(ctx.verifier.sandbox, "run", fake_run)
+    ws = _WS()
+    run = await ctx.verifier.run_once(
+        item_key=item.key,
+        workspace=cast(Any, ws),
+        spec=spec,
+        stage="base",
+        verifier_id=vid,
+    )
+    assert run.outcome is VerifierOutcome.ERROR
+    # 物化的验证器文件跑完即还原，不留痕
+    assert ws.files == {}
+
+
+def test_materialize_and_restore_verifier_files(ctx) -> None:
+    """宿主侧物化：新文件跑完删除，已存在文件跑完还原原内容。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    class _WS:
+        def __init__(self) -> None:
+            self.files = {"tests/existing.py": "old"}
+
+        def write(self, rel: str, content: str):
+            self.files[rel] = content
+
+        def read(self, rel: str, max_bytes: int = 200_000) -> str:
+            return self.files[rel]
+
+        def exists(self, rel: str) -> bool:
+            return rel in self.files
+
+        def delete(self, rel: str) -> bool:
+            self.files.pop(rel, None)
+            return True
+
+    ws = _WS()
+    spec = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE,
+        command="x",
+        files={"tests/new.py": "new", "tests/existing.py": "verifier"},
+    )
+    backups = ctx.verifier._materialize_verifier_files(cast(Any, ws), spec)
+    assert ws.files["tests/new.py"] == "new"
+    assert ws.files["tests/existing.py"] == "verifier"
+
+    ctx.verifier._restore_verifier_files(cast(Any, ws), backups)
+    assert "tests/new.py" not in ws.files
+    assert ws.files["tests/existing.py"] == "old"
+
+
 async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
     """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
     from fissue.models import VerifierKind, VerifierSpec

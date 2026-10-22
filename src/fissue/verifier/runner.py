@@ -192,6 +192,11 @@ _VERIFIER_BROKEN_HINTS = (
     "collected 0 items",
     "no tests ran",
     "interrupted: ",
+    # pytest 的用法错误：命令里的目标文件不存在（``ERROR: file or directory not
+    # found: tests/test_reproduce.py``，exit=4）。实测（Pi 部署）：沙盒的
+    # ``files`` 通道没把验证器文件送进容器可见的位置，base 阶段就把「跑都没跑
+    # 起来」当成了「问题已复现」——假阳性必须堵死。
+    "file or directory not found",
 )
 
 #: 这些异常若**抛在验证器自己的文件里**，基本可判定是验证器调用了不存在的
@@ -439,14 +444,24 @@ class VerifierRunner:
             label=label or f"{item_key}:{stage}",
         )
 
+        materialized = self._materialize_verifier_files(workspace, spec)
         try:
             exec_result = await self.sandbox.run(req)
         finally:
+            # 验证器自带文件跑完即收，免得被 PR 提交流程捡进改动集。
+            self._restore_verifier_files(workspace, materialized)
             # 沙盒刚在**同一个工作区**里跑过不可信代码（PR 代码 + 模型生成的验证器），而宿主
             # 随后要在这个工作区里 add/commit/push。动宿主 git 之前先把 `.git` 收回可信状态
             # ——钩子与 config 里的 filter/textconv/credential.helper 都是执行入口。
             await asyncio.to_thread(workspace.harden_git)
         outcome = classify_outcome(exec_result, link_ok=True)
+
+        # 命令目标（验证器自己的文件）不存在 → 这条执行根本没跑起来，它不是被测行为
+        # 的证据。退出码与断言失败一样都是非零，必须显式改判 ERROR，否则 base 阶段会把
+        # 「文件找不到」当成「问题已复现」（实测：Pi 上 12 轮修复全撞在这上面）。
+        hints = f"{getattr(exec_result, 'stdout', '') or ''}\n{getattr(exec_result, 'stderr', '') or ''}".lower()
+        if outcome is VerifierOutcome.FAIL and "file or directory not found" in hints:
+            outcome = VerifierOutcome.ERROR
 
         artifacts_dir = None
         if self.settings.sandbox.keep_artifacts:
@@ -472,6 +487,49 @@ class VerifierRunner:
             item_key, stage, outcome.value, run.exit_code, run.duration_seconds,
         )
         return run
+
+    # -- 验证器文件物化 ----------------------------------------------------
+
+    @staticmethod
+    def _materialize_verifier_files(
+        workspace: RepoWorkspace, spec: VerifierSpec
+    ) -> list[tuple[str, str | None]]:
+        """把验证器自带文件写进**宿主工作区**，返回可回滚的备份。
+
+        为什么不只依赖沙盒的 ``files`` 通道：实测（Pi 部署）容器看到的
+        ``/workspace`` 与宿主工作区不是同一份内容，``files`` 写进去的文件
+        在容器里根本不存在，pytest 直接
+        ``ERROR: file or directory not found: tests/test_reproduce.py``（exit 4）
+        ——12 轮修复全部撞在这上面。宿主落盘后，工作区挂进容器即可见，
+        与部署形态无关。跑完由 :meth:`_restore_verifier_files` 还原。
+        """
+        backups: list[tuple[str, str | None]] = []
+        for rel, content in spec.files.items():
+            try:
+                backup = workspace.read(rel, max_bytes=200_000) if workspace.exists(rel) else None
+            except Exception:
+                backup = None
+            try:
+                workspace.write(rel, content)
+            except Exception as exc:
+                log.warning("验证器文件落盘失败 %s：%s", rel, exc)
+                continue
+            backups.append((rel, backup))
+        return backups
+
+    @staticmethod
+    def _restore_verifier_files(
+        workspace: RepoWorkspace, backups: list[tuple[str, str | None]]
+    ) -> None:
+        """还原/删除宿主侧物化的验证器文件（agent 在同一路径写过也不受影响）。"""
+        for rel, backup in backups:
+            try:
+                if backup is None:
+                    workspace.delete(rel)
+                else:
+                    workspace.write(rel, backup)
+            except Exception as exc:
+                log.warning("恢复验证器文件失败 %s：%s", rel, exc)
 
     # -- 完整 F2P 流程 ----------------------------------------------------
 

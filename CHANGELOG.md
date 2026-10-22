@@ -113,6 +113,17 @@
 
 ### Fixed
 
+- **验证器文件未落进沙盒 / 「文件找不到」被误判为已复现**：Pi 部署实测，
+  容器里的 `/workspace` 与宿主工作区不一致时，沙盒 `files` 通道写进去的验证器
+  文件在容器里不存在，pytest 报 `ERROR: file or directory not found:
+  tests/test_reproduce.py`（exit=4）——而 base 阶段把这条「跑都没跑起来」当成
+  「问题已复现」，12 轮修复全部空转后落 `needs_manual`。修复：
+  - 验证器自带文件改由**宿主侧写入工作区**（执行前物化、执行后还原/删除，
+    不依赖 forwarder 的 files 通道，也不留痕进 PR）；
+  - 输出含 pytest 用法错误「file or directory not found」时一律改判
+    `ERROR`（验证器自身问题），不再当复现证据；并纳入验证器自错特征，
+    自动触发验证器修正/重生成。
+
 - **flush 不再把已在修复流程中的条目反复拉回待修**：`FlushProcessor.apply`
   的强制修复分支此前对 `force_fix` 条目无条件落 `fix_queued`——只要条目有
   验证队列条目（如强制前已排队验证），常驻 flush 每处理一次就把它拉回
