@@ -520,13 +520,20 @@ class VerifierRunner:
         output: str,
         stage: str = "base",
         verifier_id: int | None = None,
+        force: bool = False,
     ) -> VerifierRun:
-        """清单型验证器：把输出交 LLM 逐条判定（Q16 的降级路径）。"""
+        """清单型验证器：把输出交 LLM 逐条判定（Q16 的降级路径）。
+
+        ``force``：强制修复条目改用强制性措辞（见
+        :func:`~fissue.ai.prompts.checklist_judge_prompt`）。
+        """
         if self.client is None:
             raise VerifierError("清单型验证器需要 LLM 客户端做判定")
 
         data, _ = await self.client.chat_json(
-            prompts.checklist_judge_prompt(item, checklist=spec.checklist, output=output),
+            prompts.checklist_judge_prompt(
+                item, checklist=spec.checklist, output=output, force=force
+            ),
             purpose=f"checklist_judge:{item.repo}",
             default={},
         )
@@ -560,6 +567,123 @@ class VerifierRunner:
 
     # -- 清单判定证据 -------------------------------------------------------
 
+    #: 清单条目里可能出现的路径文本（**不要求 backtick**）：生成端把结构化
+    #: 条目 str() 成 dict 文本后，文件名往往是裸词（pyproject.toml、
+    #: docs/ENV.md），只认 backtick 会让抽取完全落空。
+    _REF_PATH_RE = re.compile(
+        r"(?<![\w./-])(?:[\w.-]+/)*[\w.-]+\.(?:toml|yaml|yml|md|txt|cfg|ini|json|lock|env"
+        r"|py|ts|tsx|js|jsx|go|rs|java|kt|rb|php|cs|c|h|cpp|hpp|sh)(?![\w])"
+    )
+    #: 清单条目里可能被引用的代码符号（Settings / resolve_dialect …）。
+    _REF_SYMBOL_RE = re.compile(r"\b(?:[A-Z][A-Za-z0-9]{2,}|[a-z][a-z0-9]*_[a-z0-9_]{2,})\b")
+    _SRC_EXTS = (
+        ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".kt",
+        ".rb", ".php", ".cs", ".c", ".h", ".cpp",
+    )
+
+    @staticmethod
+    def _item_text(entry: object) -> str:
+        """清单条目可能是纯文本，也可能是生成端 ``str()`` 过的 dict 文本。"""
+        return entry if isinstance(entry, str) else str(entry)
+
+    def _checklist_text(self, spec: VerifierSpec) -> str:
+        return " ".join(self._item_text(c) for c in spec.checklist)
+
+    @staticmethod
+    def _read_chunk(workspace: RepoWorkspace, rel: str, *, per_file: int = 6000) -> str:
+        try:
+            content = workspace.read(rel, max_bytes=per_file).strip()[:per_file]
+        except Exception as exc:
+            log.warning("读清单引用文件失败 %s：%s", rel, exc)
+            return ""
+        return f"=== {rel} ===\n{content}" if content else ""
+
+    def _resolve_refs(self, workspace: RepoWorkspace, names: Iterable[str]) -> list[str]:
+        """把路径文本解析成工作区真实文件（先精确，再唯一 basename）。"""
+        files = workspace.list_files()
+        by_name: dict[str, list[str]] = {}
+        for f in files:
+            by_name.setdefault(f.rsplit("/", 1)[-1], []).append(f)
+        out: list[str] = []
+        seen: set[str] = set()
+        for name in names:
+            name = name.strip()
+            if not name or len(name) > 160 or " " in name or "://" in name:
+                continue
+            rel = name if name in files else None
+            if rel is None:
+                hits = by_name.get(name.rsplit("/", 1)[-1], [])
+                rel = hits[0] if len(hits) == 1 else None
+            if rel is not None and rel not in seen:
+                seen.add(rel)
+                out.append(rel)
+        return out
+
+    def _symbol_chunks(
+        self,
+        spec: VerifierSpec,
+        workspace: RepoWorkspace,
+        *,
+        seen: set[str],
+        max_files: int = 4,
+        max_scanned: int = 300,
+        max_bytes: int = 3_000_000,
+    ) -> list[str]:
+        """清单里提到的代码符号（Settings / resolve_dialect…）→ 找到定义它的文件。
+
+        这类引用没有路径可抽取，但恰恰是「源码在哪」的答案。只认定义
+        （def/class/func/function/…）不认引用，避免把每个调用点都读进来；
+        扫描有文件数与总字节预算，大仓库不会被拖垮。
+        """
+        if not spec.checklist:
+            return []
+        symbols = list(dict.fromkeys(self._REF_SYMBOL_RE.findall(self._checklist_text(spec))))[:30]
+        if not symbols:
+            return []
+        chunks: list[str] = []
+        scanned = 0
+        budget = max_bytes
+        for rel in workspace.list_files():
+            if len(chunks) >= max_files or scanned >= max_scanned or budget <= 0:
+                break
+            if rel in seen or not rel.lower().endswith(self._SRC_EXTS):
+                continue
+            try:
+                content = workspace.read(rel, max_bytes=200_000)
+            except Exception:
+                continue
+            scanned += 1
+            budget -= len(content)
+            for sym in symbols:
+                pat = re.compile(
+                    rf"(?:^|\n)\s*(?:async\s+def|def|class|func|function|interface"
+                    rf"|struct|fn|pub\s+fn)\s+{re.escape(sym)}\b"
+                )
+                if pat.search(content):
+                    chunk = self._read_chunk(workspace, rel)
+                    if chunk:
+                        chunks.append(chunk)
+                    break
+        return chunks
+
+    def _evidence_file_chunks(
+        self, spec: VerifierSpec, workspace: RepoWorkspace
+    ) -> list[str]:
+        """路径引用（backtick 或裸文本）优先，其次符号定义文件。"""
+        if not spec.checklist:
+            return []
+        text = self._checklist_text(spec)
+        candidates = re.findall(r"`([^`]+)`", text) + self._REF_PATH_RE.findall(text)
+        chunks: list[str] = []
+        seen: set[str] = set()
+        for rel in self._resolve_refs(workspace, candidates)[:8]:
+            chunk = self._read_chunk(workspace, rel)
+            if chunk:
+                chunks.append(chunk)
+                seen.add(rel)
+        chunks.extend(self._symbol_chunks(spec, workspace, seen=seen))
+        return chunks
+
     def checklist_evidence(
         self,
         spec: VerifierSpec,
@@ -572,59 +696,20 @@ class VerifierRunner:
 
         清单条目大多指向具体文件内容（pyproject.toml 的依赖声明、某个解析函数
         等）。只给文件树 + README 时 LLM 只能逐条回「证据不足」，判定退化成
-        常量——实测（MySQL 功能请求 16 项全部「证据不足」）即此因。这里把清单
-        条目引用的文件从工作区读出来喂进去；修复后（fix 阶段）判定再附上 diff，
-        LLM 才能看到「到底改了什么」。
+        常量——实测（MySQL 功能请求 16 项全部「证据不足」）即此因。抽取两条腿：
+        路径文本（含裸文件名）与代码符号定义文件；修复后（fix 阶段）判定再附上
+        diff，LLM 才能看到「到底改了什么」。
         """
         parts: list[str] = []
         if repo_context:
             parts.append(repo_context)
         if workspace is not None:
-            chunks = self._referenced_file_chunks(spec, workspace)
+            chunks = self._evidence_file_chunks(spec, workspace)
             if chunks:
                 parts.append("清单引用的文件（相关摘录）：\n" + "\n\n".join(chunks))
         if diff:
             parts.append("本次改动 diff：\n" + diff[:8000])
         return "\n\n".join(parts) if parts else "（无证据）"
-
-    def _referenced_file_chunks(
-        self, spec: VerifierSpec, workspace: RepoWorkspace, *, max_files: int = 6
-    ) -> list[str]:
-        """从清单条目里抽出路径型引用，从工作区读出文件片段。
-
-        只认 backtick 包裹、无空格、无 URL 的短 token；必须命中工作区真实文件
-        （先按精确路径，再按唯一 basename），否则忽略。每文件最多 6KB、
-        最多 ``max_files`` 个文件。
-        """
-        if not spec.checklist:
-            return []
-        tokens = re.findall(r"`([^`]+)`", " ".join(spec.checklist))
-        files = workspace.list_files()
-        by_name: dict[str, list[str]] = {}
-        for f in files:
-            by_name.setdefault(f.rsplit("/", 1)[-1], []).append(f)
-        chunks: list[str] = []
-        seen: set[str] = set()
-        for tok in tokens:
-            if len(chunks) >= max_files:
-                break
-            tok = tok.strip()
-            if not tok or len(tok) > 120 or " " in tok or "://" in tok:
-                continue
-            rel = tok if tok in files else None
-            if rel is None:
-                hits = by_name.get(tok.rsplit("/", 1)[-1], [])
-                rel = hits[0] if len(hits) == 1 else None
-            if rel is None or rel in seen:
-                continue
-            seen.add(rel)
-            try:
-                content = workspace.read(rel, max_bytes=6000).strip()[:6000]
-            except Exception as exc:
-                log.warning("读清单引用文件失败 %s：%s", rel, exc)
-                continue
-            chunks.append(f"=== {rel} ===\n{content}")
-        return chunks
 
     async def _judge_checklist(
         self,
@@ -650,12 +735,14 @@ class VerifierRunner:
                 conclusion="清单型验证器：无 LLM 客户端，无法逐条判定，转人工复核",
             )
         evidence = self.checklist_evidence(spec, workspace, repo_context)
+        force = bool(item.force_fix and self.settings.verifier.checklist_force_prompt)
         run = await self.verify_checklist(
             item_key=item.key,
             item=item,
             spec=spec,
             output=evidence,
             stage="base",
+            force=force,
             verifier_id=verifier_id,
         )
         llm_conclusion = (run.stdout or "").split("\n", 1)[0]

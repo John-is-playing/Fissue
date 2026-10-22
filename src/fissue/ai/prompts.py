@@ -471,17 +471,30 @@ def verifier_prompt(
     ]
 
 
-def checklist_judge_prompt(item: RawItem, *, checklist: Sequence[str], output: str) -> list[dict[str, str]]:
+def checklist_judge_prompt(
+    item: RawItem, *, checklist: Sequence[str], output: str, force: bool = False
+) -> list[dict[str, str]]:
     """清单型验证器交 LLM 按证据逐条判定时使用（Q16）。
 
     ``output`` 是判定证据：有命令时的执行输出，或清单无可执行命令时的
-    仓库上下文快照（文件树 / README / API 契约）。
+    仓库上下文 + 清单引用的文件内容（+ 修复后阶段的 diff）。
+
+    ``force``：强制修复（人已拍板要修）条目改用强制性措辞——不接受
+    「无法验证 / 证据不足即不满足」的回避，证据确实不足时必须点名缺什么。
     """
     items = "\n".join(f"{i + 1}. {c}" for i, c in enumerate(checklist))
+    force_block = ""
+    if force:
+        force_block = """
+本次判定对应的是**强制修复**：人已明确决定要修，请按「当前实现到什么程度」给出判定。
+- 不要用「无法验证 / 拒绝判定 / 证据不足即不满足」回避；证据足够时必须给出确定判定（满足/不满足）。
+- 证据确实不足时，reason 必须写明**缺哪个文件、哪段代码或哪条测试输出**——这是后续补齐证据的方向。
+- conclusion 用「X/Y 项满足；主要缺口：…」格式，不要写「不能视为已验证/可合并」。
+"""
     user = f"""下面是针对某个问题的验证清单，以及对应的证据。
 你判定的是仓库的**当前状态**（证据所表示的状态，可能是未修复的 base 代码，也可能是已修复后的代码）：
 请逐条判断清单各项在当前状态下是否满足，并给出整体结论。
-
+{force_block}
 判定规则：
 - 证据足够时，必须给出确定判定（满足/不满足），并在 reason 里引用证据依据。
 - 文件树本身也是证据：文件树中不存在的文件可判「不存在」；README 未提及某功能也可作辅助证据。
@@ -493,7 +506,7 @@ def checklist_judge_prompt(item: RawItem, *, checklist: Sequence[str], output: s
 证据（可能是执行输出，也可能是仓库上下文快照：文件树 / README / API 契约，
 外加清单引用的文件内容与改动 diff）：
 ```
-{_truncate(output, 24000)}
+{_truncate(output, 36000)}
 ```
 
 问题背景：

@@ -248,6 +248,10 @@ class VerifierConfig(BaseModel):
     require_f2p: bool = True
     max_rounds: int = 3
     allow_checklist_fallback: bool = True
+    #: 强制修复（force_fix）条目的清单判定是否改用「强制性提示词」：
+    #: 明说人已拍板要修，禁止用「无法验证 / 证据不足」回避，证据确实不足时
+    #: 必须点名缺哪个文件、哪段代码——否则判定会退化成「拒绝执行」。
+    checklist_force_prompt: bool = True
     # -- verify 命令的执行调度（Q7）----------------------------------------
     # 单条验证的耗时几乎全在「LLM 生成验证器」上（实测数万字符推理，
     # 单次数十秒到数分钟），沙盒执行只占 1~2 秒。条目之间彼此独立

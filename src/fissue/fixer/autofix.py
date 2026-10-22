@@ -757,6 +757,7 @@ class AutoFixer:
         evidence = self.ctx.verifier.checklist_evidence(
             spec, workspace, repo_context, diff=workspace.diff()
         )
+        force = bool(item.force_fix and self.settings.verifier.checklist_force_prompt)
         run = await self.ctx.verifier.verify_checklist(
             item_key=item.key,
             item=item,
@@ -764,6 +765,7 @@ class AutoFixer:
             output=evidence,
             stage="fix",
             verifier_id=verifier_id,
+            force=force,
         )
         lines = (run.stdout or "").split("\n")
         first = lines[0] if lines else ""

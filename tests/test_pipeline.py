@@ -1984,6 +1984,131 @@ def test_checklist_evidence_ambiguous_basename_skipped(ctx) -> None:
     assert "内容-unique.txt" in ev
 
 
+def test_checklist_evidence_bare_paths_without_backticks(ctx) -> None:
+    """清单条目里的路径常常是裸文本（生成端把结构化条目 str() 成 dict 文本）——
+    不要求 backtick 也要读出文件内容。
+
+    回归（2026-10-22 实测）：MySQL 清单条目形如
+    ``{'id': 'C1', 'item': ..., 'how_to_judge': '查看 pyproject.toml …'}``，
+    抽取只认 backtick → 一个文件都没读到，判定 1/11 全「证据不足」。
+    """
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        checklist=[
+            "{'id': 'C1', 'item': '配置层接受 MySQL 连接串', "
+            "'how_to_judge': \"查看 pyproject.toml 的 optional-dependencies "
+            "与 config.example.yaml 的示例\"}",
+        ],
+    )
+
+    class _WS:
+        def list_files(self, **kw):
+            return ["pyproject.toml", "config.example.yaml"]
+
+        def read(self, rel, **kw):
+            return f"内容-{rel}"
+
+    ev = ctx.verifier.checklist_evidence(spec, _WS(), "")
+    assert "=== pyproject.toml ===" in ev and "内容-pyproject.toml" in ev
+    assert "=== config.example.yaml ===" in ev
+
+
+def test_checklist_evidence_symbol_definition_file(ctx) -> None:
+    """清单提到的代码符号（Settings / resolve_dialect）→ 找到定义它的文件并读出。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    spec = VerifierSpec(
+        kind=VerifierKind.CHECKLIST,
+        checklist=[
+            "构造 Settings 并传入 mysql:// DSN",
+            "确认 resolve_dialect 把 mysql 映射为 mysql 方言",
+        ],
+    )
+
+    class _WS:
+        def list_files(self, **kw):
+            return ["src/app/config.py", "src/app/store.py", "src/app/unrelated.py"]
+
+        def read(self, rel, **kw):
+            return {
+                "src/app/config.py": "class Settings:\n    pass\n",
+                "src/app/store.py": "def resolve_dialect(url):\n    return 'mysql'\n",
+                "src/app/unrelated.py": "x = 1\n",
+            }[rel]
+
+    ev = ctx.verifier.checklist_evidence(spec, _WS(), "")
+    assert "=== src/app/config.py ===" in ev
+    assert "=== src/app/store.py ===" in ev
+    assert "unrelated.py" not in ev
+
+
+async def test_verify_checklist_force_prompt_wording(ctx, repo, monkeypatch) -> None:
+    """force=True 时判定 prompt 带「强制修复」措辞；默认不带。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    item = _seed_issue(repo, 39)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a"])
+    vid = repo.save_verifier(item.key, spec)
+    seen: dict[str, str] = {}
+
+    async def fake_chat_json(messages, **kw):
+        seen["user"] = messages[-1]["content"]
+        return (
+            {
+                "passed": False,
+                "items": [{"index": 1, "satisfied": False, "reason": "缺证据"}],
+                "conclusion": "0/1 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+
+    await ctx.verifier.verify_checklist(
+        item_key=item.key, item=item, spec=spec, output="ev", verifier_id=vid, force=True
+    )
+    assert "强制修复" in seen["user"]
+    assert "缺哪个文件" in seen["user"]
+
+    await ctx.verifier.verify_checklist(
+        item_key=item.key, item=item, spec=spec, output="ev", verifier_id=vid
+    )
+    assert "强制修复" not in seen["user"]
+
+
+async def test_judge_checklist_force_follows_item_and_config(ctx, repo, monkeypatch) -> None:
+    """base 判定的强制措辞由 item.force_fix + verifier.checklist_force_prompt 共同决定。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    item = _seed_issue(repo, 40)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a"])
+    vid = repo.save_verifier(item.key, spec)
+    seen: dict[str, str] = {}
+
+    async def fake_chat_json(messages, **kw):
+        seen["user"] = messages[-1]["content"]
+        return (
+            {
+                "passed": False,
+                "items": [{"index": 1, "satisfied": False, "reason": "未实现"}],
+                "conclusion": "0/1 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+    item.force_fix = True
+
+    await ctx.verifier._judge_checklist(item, vid, spec, "ctx")
+    assert "强制修复" in seen["user"]
+
+    monkeypatch.setattr(ctx.settings.verifier, "checklist_force_prompt", False)
+    await ctx.verifier._judge_checklist(item, vid, spec, "ctx")
+    assert "强制修复" not in seen["user"]
+
+
 async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
     """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
     from fissue.models import VerifierKind, VerifierSpec
