@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -2319,7 +2319,7 @@ async def test_run_verifier_checklist_short_circuit(settings) -> None:
     spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["能跑通"])
     trace = AgentTrace()
     out = await _agent(settings)._run_verifier(
-        None, None, spec, trace, verifier_id=None, round_index=1
+        cast(Any, None), cast(Any, None), spec, trace, verifier_id=None, round_index=1
     )
     assert "清单型验证器" in out and "LLM" in out
 

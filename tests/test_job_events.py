@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -100,8 +100,10 @@ async def test_registry_run_exposes_the_job_as_sink(settings) -> None:  # noqa: 
     seen: dict[str, Any] = {}
 
     async def work(j: Job) -> dict[str, Any]:
-        seen["sink"] = current_job_sink.get()
-        current_job_sink.get().tool("测试", "动作", ok=True)
+        sink = current_job_sink.get()
+        seen["sink"] = sink
+        assert sink is not None
+        sink.tool("测试", "动作", ok=True)
         return {"ok": 1}
 
     await reg._run(job, work)
@@ -269,7 +271,7 @@ def test_runtime_context_picks_up_the_job_sink(settings) -> None:  # noqa: ANN00
 
 
 def test_llm_bridge_forwards_to_the_sink() -> None:
-    from fissue.pipeline.context import _LLMBridge
+    from fissue.pipeline.context import RuntimeContext, _LLMBridge
 
     calls: list[tuple] = []
     sink = SimpleNamespace(
@@ -277,7 +279,7 @@ def test_llm_bridge_forwards_to_the_sink() -> None:
         llm_delta=lambda t: calls.append(("delta", t)),
         llm_end=lambda **kw: calls.append(("end", kw)),
     )
-    bridge = _LLMBridge(SimpleNamespace(job_sink=sink))
+    bridge = _LLMBridge(cast(RuntimeContext, SimpleNamespace(job_sink=sink)))
     bridge.llm_start(purpose="p", model="m")
     bridge.llm_delta("x")
     bridge.llm_end(model="m", from_fallback=False, usage={"total_tokens": 1})
@@ -289,9 +291,9 @@ def test_llm_bridge_forwards_to_the_sink() -> None:
 
 
 def test_llm_bridge_is_a_noop_without_sink() -> None:
-    from fissue.pipeline.context import _LLMBridge
+    from fissue.pipeline.context import RuntimeContext, _LLMBridge
 
-    bridge = _LLMBridge(SimpleNamespace(job_sink=None))
+    bridge = _LLMBridge(cast(RuntimeContext, SimpleNamespace(job_sink=None)))
     bridge.llm_start(purpose="p", model="m")  # 不得抛异常
     bridge.llm_delta("x")
     bridge.llm_end(model="m", from_fallback=False, usage=None)

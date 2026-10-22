@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -1808,7 +1808,7 @@ async def test_verify_stage_checklist_event_does_not_claim_not_reproduced(
     monkeypatch.setattr(ctx.verifier, "generate_and_validate", fake_gav)
     ctx.job_sink = _Sink()
 
-    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+    result = await VerifyStage(ctx).run(item, ev, workspace=cast(Any, object()))
 
     assert result.status is ItemStatus.NEEDS_MANUAL
     tools = [t for t in ctx.job_sink.calls if t["name"] == "验证器"]
@@ -1924,7 +1924,7 @@ async def test_verify_stage_force_checklist_goes_to_fix_queue(ctx, repo, monkeyp
     monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
     monkeypatch.setattr(ctx.verifier, "generate_and_validate", fake_gav)
 
-    result = await VerifyStage(ctx).run(item, ev, workspace=object())
+    result = await VerifyStage(ctx).run(item, ev, workspace=cast(Any, object()))
 
     assert result.status is ItemStatus.FIX_QUEUED
     assert repo.get_item(item.key).status is ItemStatus.FIX_QUEUED
@@ -2281,7 +2281,7 @@ async def test_verify_stage_checklist_llm_judgement_recorded(ctx, repo, monkeypa
     monkeypatch.setattr(VerifyStage, "_repo_context", lambda self, ws, cfg: "")
     ctx.job_sink = _Sink()
 
-    result = await VerifyStage(ctx).run(item, ev, workspace=_WS())
+    result = await VerifyStage(ctx).run(item, ev, workspace=cast(Any, _WS()))
 
     assert result.status is ItemStatus.NEEDS_MANUAL
     assert any("清单判定" in n for n in result.notes)
