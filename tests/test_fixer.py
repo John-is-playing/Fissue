@@ -1495,7 +1495,7 @@ async def test_fork_failure_stops_without_pushing_upstream(
         pushed.append(1)
         raise AssertionError("fork 失败时不该推送任何分支")
 
-    async def fake_text(item, *, trace, spec, f2p_ok):
+    async def fake_text(item, *, trace, spec, f2p_ok, verification_note=""):
         return "标题", "正文"
 
     monkeypatch.setattr(adapter, "fork_repo", fake_fork)
@@ -1548,7 +1548,7 @@ async def test_existing_pr_is_reused_without_pushing(fixer_ctx, repo, sample_iss
         pushed.append(1)
         raise AssertionError("已有开放 PR 时不该推送任何分支")
 
-    async def fake_text(item, *, trace, spec, f2p_ok):
+    async def fake_text(item, *, trace, spec, f2p_ok, verification_note=""):
         return "标题", "正文"
 
     monkeypatch.setattr(adapter, "find_open_pr", fake_find)
@@ -2306,6 +2306,65 @@ async def test_fix_item_checklist_fail_judgement_needs_manual(
     assert attempt.outcome is FixOutcome.NEEDS_MANUAL
     assert "清单判定（fix）" in (attempt.error or "")
     assert "未实现 DSN 解析" in (attempt.error or "")
+
+
+async def test_judge_checklist_on_fix_ignores_runtime_gaps(
+    fixer_ctx, repo, sample_issue, workspace, monkeypatch
+) -> None:
+    """需真实服务（runtime_required）的缺口不算返修缺项：代码项满足即通过。"""
+    from fissue.models import VerifierKind, VerifierSpec
+
+    _register(repo, sample_issue)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, name="MySQL 支持", checklist=["a", "b"])
+    vid = repo.save_verifier(sample_issue.key, spec)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [
+                    {"index": 1, "satisfied": True, "runtime_required": False, "reason": "代码已实现"},
+                    {
+                        "index": 2,
+                        "satisfied": False,
+                        "runtime_required": True,
+                        "reason": "需真实 MySQL 实例；人工验证：fissue db check --url mysql://…",
+                    },
+                ],
+                "conclusion": "1/2 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(fixer_ctx.verifier.client, "chat_json", fake_chat_json)
+    fixer = AutoFixer(fixer_ctx)
+    result = await fixer._judge_checklist_on_fix(sample_issue, workspace, spec, vid, "")
+
+    assert result.f2p_satisfied is True
+    assert "清单判定（fix）" in result.conclusion
+    assert "未满足项" not in result.conclusion
+
+
+def test_pr_body_includes_verification_note(fixer_ctx, sample_issue) -> None:
+    """清单型 PR 正文带上验证说明（含需人工运行项）。"""
+    from fissue.fixer.agent import AgentTrace
+    from fissue.models import VerifierKind, VerifierSpec
+
+    fixer = AutoFixer(fixer_ctx)
+    creator = fixer.pr_creator
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, name="清单", checklist=["a"])
+
+    body = creator._decorate_body("x", sample_issue, spec, True, "2 项需人工运行验证（第 3、5 项）")
+    assert "验证说明" in body and "需人工运行验证" in body
+
+    body2 = creator._template_body(
+        sample_issue,
+        trace=AgentTrace(),
+        spec=spec,
+        f2p_ok=True,
+        verification_note="按清单逐条人工验证",
+    )
+    assert "验证说明" in body2 and "逐条人工验证" in body2
 
 
 async def test_run_verifier_checklist_short_circuit(settings) -> None:

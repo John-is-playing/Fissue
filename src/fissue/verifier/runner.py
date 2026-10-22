@@ -537,9 +537,18 @@ class VerifierRunner:
             purpose=f"checklist_judge:{item.repo}",
             default={},
         )
-        passed = bool(data.get("passed"))
         conclusion = str(data.get("conclusion") or "")
         items = [i for i in (data.get("items") or []) if isinstance(i, dict)]
+        runtime = [i for i in items if i.get("runtime_required")]
+        code_items = [i for i in items if not i.get("runtime_required")]
+        # 闸门只卡「代码可验证」项：需要真实外部服务（MySQL/网络/性能基准）的条目
+        # 在沙盒里造不出运行证据，按「实现是否到位」判定、只作人工验证提示——
+        # 否则功能类修复会被永远卡死（实测 MySQL 清单多条要求真实实例输出）。
+        passed = (
+            all(bool(i.get("satisfied")) for i in code_items)
+            if code_items
+            else bool(data.get("passed"))
+        )
         # 退化提示：过半条目「证据不足」时，这次判定基本没有判别力——明说仅供参考，
         # 免得下游把它当成确定结论。
         if items:
@@ -548,8 +557,18 @@ class VerifierRunner:
             )
             if insufficient * 2 >= len(items):
                 conclusion = f"{conclusion}；多数条目证据不足，判定仅供参考".strip("；")
+        if runtime:
+            idx = "、".join(str(i.get("index") or "?") for i in runtime)
+            conclusion = (
+                f"{conclusion}；{len(runtime)} 项需人工运行验证（第 {idx} 项）"
+            ).strip("；")
         detail = "\n".join(
-            f"- [{i.get('satisfied')}] {i.get('reason', '')}" for i in items
+            (
+                f"- [{i.get('satisfied')}] (需人工运行) {i.get('reason', '')}"
+                if i.get("runtime_required")
+                else f"- [{i.get('satisfied')}] {i.get('reason', '')}"
+            )
+            for i in items
         )
         run = VerifierRun(
             verifier_id=verifier_id,
@@ -559,7 +578,7 @@ class VerifierRunner:
             stdout=detail,
             stderr="",
             f2p_ok=passed,
-            error=None if passed else "清单未全部满足",
+            error=None if passed else "清单中代码可验证项未全部满足",
         )
         run.stdout = f"{conclusion}\n{detail}"
         self.repo.save_verifier_run(run)

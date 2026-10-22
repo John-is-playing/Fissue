@@ -148,6 +148,7 @@ class PRCreator:
         spec: VerifierSpec,
         f2p_ok: bool,
         diff: str,
+        verification_note: str = "",
     ) -> FixAttempt:
         """把修复推送并提 PR。"""
         strategy = self.settings.auto_fix.pr_strategy
@@ -156,7 +157,8 @@ class PRCreator:
 
         # 生成 PR 文案
         title, body = await self._compose_pr_text(
-            item, trace=trace, spec=spec, f2p_ok=f2p_ok
+            item, trace=trace, spec=spec, f2p_ok=f2p_ok,
+            verification_note=verification_note,
         )
 
         if strategy.mode == "patch_only":
@@ -351,6 +353,7 @@ class PRCreator:
         trace: AgentTrace,
         spec: VerifierSpec,
         f2p_ok: bool,
+        verification_note: str = "",
     ) -> tuple[str, str]:
         """生成 PR 标题与正文（LLM 优先，失败则用模板）。"""
         default_title = f"fix: 修复 #{item.number} {item.title[:70]}"
@@ -372,14 +375,25 @@ class PRCreator:
             title = str(data.get("title") or default_title)[:120]
             body = str(data.get("body") or "")
             if body.strip():
-                return title, self._decorate_body(body, item, spec, f2p_ok)
+                return title, self._decorate_body(
+                    body, item, spec, f2p_ok, verification_note
+                )
         except Exception as exc:
             log.warning("生成 PR 文案失败（用模板兜底）：%s", exc)
 
-        body = self._template_body(item, trace=trace, spec=spec, f2p_ok=f2p_ok)
+        body = self._template_body(
+            item, trace=trace, spec=spec, f2p_ok=f2p_ok, verification_note=verification_note
+        )
         return default_title, body
 
-    def _decorate_body(self, body: str, item: RawItem, spec: VerifierSpec, f2p_ok: bool) -> str:
+    def _decorate_body(
+        self,
+        body: str,
+        item: RawItem,
+        spec: VerifierSpec,
+        f2p_ok: bool,
+        verification_note: str = "",
+    ) -> str:
         """确保 AI 标识与验证信息一定出现在正文里（不依赖模型）。"""
         footer = (
             "\n\n---\n"
@@ -388,6 +402,8 @@ class PRCreator:
             f"> 验证器：`{spec.name}`（{spec.kind.value}）\n"
             f"> {self._verification_label(spec)}：{'✅ 通过' if f2p_ok else '❌ 未通过'}\n"
         )
+        if verification_note.strip():
+            footer += f"> 验证说明：{verification_note.strip()[:1200]}\n"
         if "Fissue" in body:
             return body
         return body + footer
@@ -399,7 +415,15 @@ class PRCreator:
             "清单判定（fix）" if spec.kind is VerifierKind.CHECKLIST else "fail-to-pass"
         )
 
-    def _template_body(self, item: RawItem, *, trace: AgentTrace, spec: VerifierSpec, f2p_ok: bool) -> str:
+    def _template_body(
+        self,
+        item: RawItem,
+        *,
+        trace: AgentTrace,
+        spec: VerifierSpec,
+        f2p_ok: bool,
+        verification_note: str = "",
+    ) -> str:
         lines = [
             f"## 修复内容\n\n自动修复了 #{item.number}：{item.title}\n",
             "## 验证\n",
@@ -407,6 +431,8 @@ class PRCreator:
             f"- 运行命令：`{spec.command or f'清单型（LLM 逐条判定 {len(spec.checklist)} 项）'}`",
             f"- {self._verification_label(spec)}：{'✅ 通过' if f2p_ok else '❌ 未通过'}",
         ]
+        if verification_note.strip():
+            lines.append(f"- 验证说明：{verification_note.strip()[:1200]}")
         if trace.written_files:
             lines.append("\n## 改动文件\n")
             lines.extend(f"- `{p}`" for p in trace.written_files[:20])
@@ -643,6 +669,9 @@ class AutoFixer:
                 spec=spec,
                 f2p_ok=final.f2p_satisfied,
                 diff=attempt.diff,
+                verification_note=(
+                    final.conclusion if spec.kind is VerifierKind.CHECKLIST else ""
+                ),
             )
             self.ctx.repo.save_fix_attempt(attempt)
             return attempt
@@ -772,7 +801,12 @@ class AutoFixer:
         if run.outcome is VerifierOutcome.PASS:
             conclusion = f"清单判定（fix）：{first}"
         else:
-            missing = "\n".join(ln for ln in lines if ln.startswith("- [False]"))
+            # 只把「代码可验证」项的未满足理由当返修反馈；「需人工运行」项不算缺项
+            missing = "\n".join(
+                ln
+                for ln in lines
+                if ln.startswith("- [False]") and "需人工运行" not in ln
+            )
             conclusion = f"清单判定（fix）：{first}；未满足项：\n{missing}" if missing else f"清单判定（fix）：{first}"
             conclusion = conclusion[:1800]
         return VerifierResult(

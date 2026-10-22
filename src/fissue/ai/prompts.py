@@ -387,18 +387,30 @@ def verifier_prompt(
     mode: str = "hybrid",
     test_hint: str | None = None,
     linked_context: str | None = None,
+    has_tests: bool = False,
 ) -> list[dict[str, str]]:
     """为 Issue/PR 生成验证器（可执行测试优先，无法自动化则清单）。
 
     ``linked_context``：关联 Issue 的正文。PR 作者往往只在正文里复述自己修的那**一个**
     场景，而该问题完整的复现用例/期望输出写在被修的 Issue 里——不喂这段材料，验证器
     只会覆盖 PR 自己提到的场景，从而放过「只修一半」的修复。
+
+    ``has_tests``：仓库已有测试框架（配置了 ``test_hint``）。此时**禁止** checklist：
+    清单型判定是 LLM 主观闸门，且常要求真实数据库/网络证据，而沙盒里造不出来；
+    应写可执行测试并用 mock 隔离外部依赖。
     """
     mode_rule = {
         "executable": '必须生成可执行测试（kind="executable"）。若确实无法自动化，仍选 executable 并尽量给出最接近的检查命令。',
         "checklist": '请生成自然语言验证清单（kind="checklist"），不写代码。',
         "hybrid": '优先生成可执行测试（kind="executable"）；若该问题确实无法用自动化测试验证，则返回 kind="checklist" 并给出可逐条判断的清单。',
     }.get(mode, "优先可执行测试，无法自动化则返回清单。")
+    if has_tests and mode != "checklist":
+        mode_rule = (
+            '仓库**已有测试框架**：必须生成 kind="executable" 的可执行测试，'
+            "**禁止**返回 checklist。外部依赖（数据库、网络、命令行服务）一律用 mock/打桩隔离——"
+            "断言实现细节（DSN 解析、方言映射、生成的 SQL/DDL 文本、配置项、依赖声明等），"
+            "**不要**尝试连接真实服务（沙盒里没有 MySQL/PostgreSQL 实例，也没有外网）。"
+        )
 
     user = f"""请为下面的问题编写一个**验证器**，用于证明「修复前问题存在，修复后问题消失」。
 
@@ -443,6 +455,10 @@ def verifier_prompt(
     且目标用例的断言是**能被未修复代码区分开**的（否则 base 阶段会直接通过）；
     同时确认第 9 条要求的回归断言都已写上。
 11. 若已有测试框架，优先复用（如项目用 pytest 就写 pytest 用例）。
+12. {("**仓库已有测试框架，清单型验证器在该仓库不被接受**——必须写可执行测试；"
+     "需要真实数据库/网络的部分用 mock 断言代码行为（SQL 文本、方言映射、配置解析、"
+     "依赖声明等），严禁依赖真实服务。" if has_tests and mode != "checklist" else
+     "若该问题确实无法写成可执行测试，可返回清单型验证器。")}
 
 仓库上下文：
 {repo_context}
@@ -499,6 +515,10 @@ def checklist_judge_prompt(
 - 证据足够时，必须给出确定判定（满足/不满足），并在 reason 里引用证据依据。
 - 文件树本身也是证据：文件树中不存在的文件可判「不存在」；README 未提及某功能也可作辅助证据。
 - 仅当证据确实未覆盖某一条时，才将该条判为不满足、reason 写「证据不足」。
+- **分级**：若某一条的实质要求是**真实外部服务**（真实 MySQL/PostgreSQL 实例、网络、
+  命令行服务、性能基准）才能验证，标 `"runtime_required": true`——这类条目按
+  「实现是否到位（代码 + 测试 + 文档）」判定，**不要**因证据里没有真实服务运行输出而判不满足，
+  且 reason 必须给出人工验证的具体命令；其余条目标 `"runtime_required": false`。
 
 验证清单：
 {items}
@@ -515,7 +535,7 @@ def checklist_judge_prompt(
 只输出 JSON：
 {{
   "passed": true,
-  "items": [{{"index": 1, "satisfied": true, "reason": "…"}}],
+  "items": [{{"index": 1, "satisfied": true, "runtime_required": false, "reason": "…"}}],
   "conclusion": "一句话总结：X/Y 项满足；若有未满足项，附主要缺口。不要用「无法验证/无法合并/拒绝判定」这类措辞"
 }}"""
     return [

@@ -2109,6 +2109,99 @@ async def test_judge_checklist_force_follows_item_and_config(ctx, repo, monkeypa
     assert "强制修复" not in seen["user"]
 
 
+async def test_verify_checklist_gates_on_code_items_only(ctx, repo, monkeypatch) -> None:
+    """闸门只卡「代码可验证」项：需真实外部服务的条目按实现到位判定，不当缺项。"""
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierSpec
+
+    item = _seed_issue(repo, 41)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a", "b"])
+    vid = repo.save_verifier(item.key, spec)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": False,
+                "items": [
+                    {"index": 1, "satisfied": True, "runtime_required": False, "reason": "代码已实现"},
+                    {
+                        "index": 2,
+                        "satisfied": False,
+                        "runtime_required": True,
+                        "reason": "需真实 MySQL 实例；人工验证：docker run mysql && fissue db check --url mysql://…",
+                    },
+                ],
+                "conclusion": "1/2 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+    run = await ctx.verifier.verify_checklist(
+        item_key=item.key, item=item, spec=spec, output="ev", verifier_id=vid, force=True
+    )
+    assert run.outcome is VerifierOutcome.PASS        # code 项全满足 → 闸门过
+    assert run.f2p_ok is True
+    assert "需人工运行验证" in run.stdout.split("\n")[0]
+    assert "(需人工运行)" in run.stdout
+
+
+async def test_verify_checklist_code_item_unsatisfied_fails(ctx, repo, monkeypatch) -> None:
+    """代码可验证项未满足 → 闸门不过（运行时项不参与）。"""
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierSpec
+
+    item = _seed_issue(repo, 42)
+    spec = VerifierSpec(kind=VerifierKind.CHECKLIST, checklist=["a", "b"])
+    vid = repo.save_verifier(item.key, spec)
+
+    async def fake_chat_json(messages, **kw):
+        return (
+            {
+                "passed": True,
+                "items": [
+                    {"index": 1, "satisfied": False, "runtime_required": False, "reason": "未实现"},
+                    {"index": 2, "satisfied": True, "runtime_required": True, "reason": "需实例"},
+                ],
+                "conclusion": "1/2 项满足",
+            },
+            None,
+        )
+
+    monkeypatch.setattr(ctx.verifier.client, "chat_json", fake_chat_json)
+    run = await ctx.verifier.verify_checklist(
+        item_key=item.key, item=item, spec=spec, output="ev", verifier_id=vid
+    )
+    assert run.outcome is VerifierOutcome.FAIL
+    assert "代码可验证项未全部满足" in (run.error or "")
+
+
+def test_generator_rejects_checklist_when_repo_has_tests(settings, sample_issue) -> None:
+    """仓库有测试框架（has_tests）时拒绝 checklist 降级；显式 checklist 模式除外。"""
+    from fissue.models import VerifierKind
+    from fissue.verifier.generator import VerifierGenerator
+
+    gen = VerifierGenerator.__new__(VerifierGenerator)
+    gen.settings = settings
+    gen.cfg = settings.verifier
+    data = {"kind": "checklist", "name": "x", "checklist": ["a"]}
+
+    assert gen.parse(data, item=sample_issue, mode="hybrid", has_tests=True).kind is VerifierKind.EXECUTABLE
+    assert gen.parse(data, item=sample_issue, mode="checklist", has_tests=True).kind is VerifierKind.CHECKLIST
+    assert gen.parse(data, item=sample_issue, mode="hybrid", has_tests=False).kind is VerifierKind.CHECKLIST
+    # 未给 kind 的兜底：有测试框架 → executable
+    assert gen.parse({}, item=sample_issue, mode="hybrid", has_tests=True).kind is VerifierKind.EXECUTABLE
+
+
+def test_verifier_prompt_forbids_checklist_when_repo_has_tests(sample_issue) -> None:
+    from fissue.ai import prompts
+
+    msgs = prompts.verifier_prompt(
+        sample_issue, repo_context="x", mode="hybrid", test_hint="python -m pytest -q", has_tests=True
+    )
+    text = msgs[-1]["content"]
+    assert "禁止" in text and "checklist" in text
+    assert "mock" in text
+
+
 async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
     """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
     from fissue.models import VerifierKind, VerifierSpec

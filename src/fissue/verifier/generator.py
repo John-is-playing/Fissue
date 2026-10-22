@@ -165,6 +165,7 @@ class VerifierGenerator:
     ) -> GeneratedVerifier:
         """生成验证器（单轮）。"""
         effective_mode = mode or self.cfg.mode
+        has_tests = bool((test_hint or "").strip())
         data, usage = await self.client.chat_json(
             prompts.verifier_prompt(
                 item,
@@ -172,11 +173,12 @@ class VerifierGenerator:
                 mode=effective_mode,
                 test_hint=test_hint,
                 linked_context=linked_context,
+                has_tests=has_tests,
             ),
             purpose=f"verifier:{item.repo}",
             default={},
         )
-        spec = self.parse(data, item=item, mode=effective_mode)
+        spec = self.parse(data, item=item, mode=effective_mode, has_tests=has_tests)
         warnings = validate_spec(spec)
         for w in warnings:
             log.warning("验证器校验 %s：%s", item.key, w)
@@ -196,12 +198,14 @@ class VerifierGenerator:
         linked_context: str | None = None,
     ) -> GeneratedVerifier:
         """验证器行为不对时，带着证据让模型修正。"""
+        has_tests = bool((test_hint or "").strip())
         messages = prompts.verifier_prompt(
             item,
             repo_context=repo_context,
             mode=self.cfg.mode,
             test_hint=test_hint,
             linked_context=linked_context,
+            has_tests=has_tests,
         )
         messages.append(
             {
@@ -215,15 +219,17 @@ class VerifierGenerator:
             }
         )
         data, usage = await self.client.chat_json(messages, purpose=f"verifier_refine:{item.repo}", default={})
-        new_spec = self.parse(data, item=item, mode=self.cfg.mode) if data else spec
+        new_spec = self.parse(data, item=item, mode=self.cfg.mode, has_tests=has_tests) if data else spec
         warnings = validate_spec(new_spec)
         return GeneratedVerifier(spec=new_spec, usage=usage, warnings=warnings)
 
     # -- 解析 -------------------------------------------------------------
 
-    def parse(self, data: dict[str, Any], *, item: RawItem, mode: str) -> VerifierSpec:
+    def parse(
+        self, data: dict[str, Any], *, item: RawItem, mode: str, has_tests: bool = False
+    ) -> VerifierSpec:
         """把 LLM 返回的 JSON 解析为 :class:`VerifierSpec`，缺字段时给出可用兜底。"""
-        kind = self._parse_kind(data.get("kind"), mode)
+        kind = self._parse_kind(data.get("kind"), mode, has_tests=has_tests)
 
         files: dict[str, str] = {}
         raw_files = data.get("files")
@@ -275,17 +281,27 @@ class VerifierGenerator:
             notes=str(data.get("notes") or "")[:2000],
         )
 
-    def _parse_kind(self, value: Any, mode: str) -> VerifierKind:
+    def _parse_kind(self, value: Any, mode: str, *, has_tests: bool = False) -> VerifierKind:
         text = str(value or "").strip().lower()
+        kind: VerifierKind | None = None
         for k in VerifierKind:
             if k.value == text:
-                return k
-        # 按配置模式兜底
-        if mode == "checklist":
-            return VerifierKind.CHECKLIST
-        if not self.cfg.allow_checklist_fallback and mode == "hybrid":
+                kind = k
+                break
+        if kind is None:
+            # 按配置模式兜底
+            if mode == "checklist":
+                return VerifierKind.CHECKLIST
             return VerifierKind.EXECUTABLE
-        return VerifierKind.EXECUTABLE
+        # 仓库有测试框架：清单型降级不被接受——清单是 LLM 主观闸门，且常要求真实
+        # 数据库/网络证据（沙盒里造不出来）。强制可执行验证器，外部依赖用 mock。
+        if has_tests and mode != "checklist" and kind is VerifierKind.CHECKLIST:
+            log.warning(
+                "仓库已有测试框架（test_hint）且模式为 %s：拒绝 checklist 降级，改用 executable",
+                mode,
+            )
+            return VerifierKind.EXECUTABLE
+        return kind
 
     @staticmethod
     def _guess_language(files: dict[str, str]) -> str:

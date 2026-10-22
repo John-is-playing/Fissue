@@ -149,7 +149,7 @@
 | `verifier.mode` | `hybrid` | `executable / checklist / hybrid` |
 | `verifier.require_f2p` | `true` | F2P：修复前必失败、修复后必通过 |
 | `verifier.max_rounds` | `2` | 验证器不可靠时自校正的最大轮次 |
-| `verifier.allow_checklist_fallback` | `true` | 无测试框架时降级为自然语言清单（LLM 按证据逐条判定；force 修复的条目由修复后判定决定提 PR） |
+| `verifier.allow_checklist_fallback` | `true` | 无测试框架时降级为自然语言清单（LLM 按证据逐条判定；配置了 `test_hint` 的仓库**不允许**降级，强制可执行验证器） |
 | `verifier.checklist_force_prompt` | `true` | `force_fix` 条目的清单判定改用强制性提示词（禁止「无法验证」回避，证据不足须点名缺哪个文件/代码）；关掉则回退普通措辞 |
 | `verifier.regression_gate` | `strict` | `off / warn / strict`，见[验证器与 F2P](Verifier-and-F2P.md#2-回归门regression-gate) |
 | `verifier.regression_command` | `null` | 留空 → 仓库级 `test_hint` → 探测（pytest / npm test / go test…） |
