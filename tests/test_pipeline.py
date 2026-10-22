@@ -2298,6 +2298,86 @@ def test_materialize_and_restore_verifier_files(ctx) -> None:
     assert ws.files["tests/existing.py"] == "old"
 
 
+async def test_run_once_conftest_import_error_is_error(ctx, repo, monkeypatch, tmp_path) -> None:
+    """仓库 conftest 在沙盒里加载失败（缺依赖）→ 同样判 ERROR，不算复现。"""
+    from fissue.models import VerifierKind, VerifierOutcome, VerifierSpec
+    from fissue.sandbox.protocol import ExecResult
+
+    item = _seed_issue(repo, 44)
+    spec = VerifierSpec(
+        kind=VerifierKind.EXECUTABLE,
+        command="python -m pytest .fissue_verifier/test_x.py -q",
+        files={".fissue_verifier/test_x.py": "def test_x():\n    assert True\n"},
+    )
+    vid = repo.save_verifier(item.key, spec)
+
+    class _WS:
+        def __init__(self) -> None:
+            self.root = tmp_path
+            self.files: dict[str, str] = {}
+
+        def write(self, rel: str, content: str):
+            self.files[rel] = content
+
+        def read(self, rel: str, max_bytes: int = 200_000) -> str:
+            return self.files[rel]
+
+        def exists(self, rel: str) -> bool:
+            return rel in self.files
+
+        def delete(self, rel: str) -> bool:
+            self.files.pop(rel, None)
+            return True
+
+        def harden_git(self) -> None:
+            return None
+
+    async def fake_run(req):
+        return ExecResult(
+            ok=True,
+            exit_code=4,
+            stdout="",
+            stderr=(
+                "ImportError while loading conftest '/workspace/tests/conftest.py'.\n"
+                "E   ModuleNotFoundError: No module named 'yaml'\n"
+            ),
+        )
+
+    monkeypatch.setattr(ctx.verifier.sandbox, "run", fake_run)
+    ws = _WS()
+    run = await ctx.verifier.run_once(
+        item_key=item.key,
+        workspace=cast(Any, ws),
+        spec=spec,
+        stage="base",
+        verifier_id=vid,
+    )
+    assert run.outcome is VerifierOutcome.ERROR
+    assert "用法错误" in (run.error or "")
+
+
+def test_verifier_self_error_accepts_broken_error() -> None:
+    """ERROR（跑不起来）且 error 标明用法错误 → 视为验证器自错，触发修正回路。"""
+    from fissue.models import VerifierOutcome
+    from fissue.verifier.runner import verifier_self_error
+
+    broken = VerifierRun(
+        item_key="k",
+        stage="base",
+        outcome=VerifierOutcome.ERROR,
+        error="验证器命令用法错误（pytest exit=4）：目标文件不存在或 conftest 加载失败",
+    )
+    assert verifier_self_error(broken) is not None
+
+    sandbox_error = VerifierRun(
+        item_key="k",
+        stage="base",
+        outcome=VerifierOutcome.ERROR,
+        error="拒绝挂载 '/etc'：不在允许的根之下",
+    )
+    assert verifier_self_error(sandbox_error) is None
+
+
 async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
     """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
     from fissue.models import VerifierKind, VerifierSpec

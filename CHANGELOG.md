@@ -123,6 +123,13 @@
   - 输出含 pytest 用法错误「file or directory not found」时一律改判
     `ERROR`（验证器自身问题），不再当复现证据；并纳入验证器自错特征，
     自动触发验证器修正/重生成。
+  - 推广到 **pytest exit=4**（目标文件不存在 / conftest 加载失败）与
+    「while loading conftest」：沙盒镜像只含运行时、没有仓库第三方依赖，
+    仓库 conftest 里 `import yaml` 之类会让整轮跑不起来——这类「测试压根没跑」
+    现在一律判 `ERROR`，并接入验证器自错→修正回路。
+  - 生成端提示同步收紧：验证器文件**不要放进 `tests/`**（避开仓库 conftest），
+    放到 `.fissue_verifier/` 等独立目录；优先 AST/文本静态断言，导入被测代码
+    必须包 `try/except`、缺依赖时降级为静态检查。
 
 - **flush 不再把已在修复流程中的条目反复拉回待修**：`FlushProcessor.apply`
   的强制修复分支此前对 `force_fix` 条目无条件落 `fix_queued`——只要条目有

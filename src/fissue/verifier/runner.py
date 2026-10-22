@@ -197,6 +197,9 @@ _VERIFIER_BROKEN_HINTS = (
     # ``files`` 通道没把验证器文件送进容器可见的位置，base 阶段就把「跑都没跑
     # 起来」当成了「问题已复现」——假阳性必须堵死。
     "file or directory not found",
+    # 仓库自己的 conftest 在沙盒里加载失败（缺第三方依赖，如 ``import yaml``）：
+    # 同样是「测试压根没跑」，不能算复现。
+    "while loading conftest",
 )
 
 #: 这些异常若**抛在验证器自己的文件里**，基本可判定是验证器调用了不存在的
@@ -239,6 +242,14 @@ def verifier_self_error(run: VerifierRun, *, verifier_files: Iterable[str] = ())
     → 验证器写错；抛在被测库的文件里 → 真缺陷。``verifier_files`` 传该验证器
     写入工作区的文件路径（``spec.files`` 的键）。
     """
+    if run.outcome is VerifierOutcome.ERROR:
+        # 沙盒层判定的「跑都没跑起来」（pytest 用法错误 / conftest 加载失败 /
+        # 目标文件不存在）同样是验证器自身问题，必须走修正回路，不能当作复现证据。
+        if run.error and any(
+            key in run.error for key in ("用法错误", "目标文件不存在", "收集失败")
+        ):
+            return run.error
+        return None
     if run.outcome is not VerifierOutcome.FAIL:
         return None
 
@@ -456,11 +467,24 @@ class VerifierRunner:
             await asyncio.to_thread(workspace.harden_git)
         outcome = classify_outcome(exec_result, link_ok=True)
 
-        # 命令目标（验证器自己的文件）不存在 → 这条执行根本没跑起来，它不是被测行为
-        # 的证据。退出码与断言失败一样都是非零，必须显式改判 ERROR，否则 base 阶段会把
-        # 「文件找不到」当成「问题已复现」（实测：Pi 上 12 轮修复全撞在这上面）。
+        # 「跑都没跑起来」不等于「问题已复现」。pytest exit=4 是用法错误（目标文件
+        # 不存在 / conftest 加载失败），hint 命中的是同类症状；两者都必须改判 ERROR，
+        # 否则 base 阶段会把环境问题当成复现证据（实测：Pi 上先撞文件不存在，后撞
+        # conftest 缺 yaml，12 轮修复全程空转）。
         hints = f"{getattr(exec_result, 'stdout', '') or ''}\n{getattr(exec_result, 'stderr', '') or ''}".lower()
-        if outcome is VerifierOutcome.FAIL and "file or directory not found" in hints:
+        broken_reason: str | None = None
+        if outcome is VerifierOutcome.FAIL:
+            command = (spec.command or "").lower()
+            code = getattr(exec_result, "exit_code", None)
+            if code == 4 and "pytest" in command:
+                broken_reason = (
+                    "验证器命令用法错误（pytest exit=4）：目标文件不存在或 conftest 加载失败"
+                )
+            elif "file or directory not found" in hints:
+                broken_reason = "验证器命令的目标文件不存在"
+            elif any(h in hints for h in _VERIFIER_BROKEN_HINTS[:2]):
+                broken_reason = "验证器测试收集失败（conftest/import 错误）"
+        if broken_reason:
             outcome = VerifierOutcome.ERROR
 
         artifacts_dir = None
@@ -479,7 +503,7 @@ class VerifierRunner:
             ),
             duration_seconds=round(time.monotonic() - started, 3),
             artifacts_dir=artifacts_dir,
-            error=getattr(exec_result, "error", None),
+            error=getattr(exec_result, "error", None) or broken_reason,
         )
         self.repo.save_verifier_run(run)
         log.info(
