@@ -111,6 +111,15 @@
   - **返修反馈**只包含代码可验证项的缺项（运行时缺口不算没修好），避免二次
     修复空转。
 
+- **回归门把「环境跑不起来」当成「修复破坏既有测试」**：沙盒镜像不含仓库第三方
+  依赖，仓库 conftest 里 `import yaml` 之类会让回归门命令以 pytest exit=4 失败，
+  strict 模式下被判成「修复破坏了既有测试」——实测 MySQL 条目的修复 F2P 已通过
+  （agent 轮 exit=0、fix 阶段 exit=0），却被回归门拖进返修循环，最终
+  `needs_manual`。修复：抽出共享判定 `run_broken_reason`（pytest exit=4 /
+  目标文件不存在 / conftest 加载失败），验证器与回归门统一按 `ERROR` 处理；
+  `judge_regression` 对 fix 阶段 ERROR 的既有处置是「不可归咎于修复、放行」，
+  F2P 通过的修复不再被反复返修。
+
 ### Fixed
 
 - **验证器文件未落进沙盒 / 「文件找不到」被误判为已复现**：Pi 部署实测，

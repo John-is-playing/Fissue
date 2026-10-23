@@ -26,7 +26,7 @@ from ..sandbox.forwarder import SandboxManager
 from ..sandbox.protocol import ExecRequest
 from ..store.repository import Repository
 from ..workspace import RepoWorkspace
-from .runner import CONTAINER_WORKDIR, classify_outcome, workspace_mounts
+from .runner import CONTAINER_WORKDIR, classify_outcome, run_broken_reason, workspace_mounts
 
 log = get_logger(__name__)
 
@@ -167,6 +167,18 @@ class RegressionGate:
             await asyncio.to_thread(workspace.harden_git)
 
         outcome = classify_outcome(exec_result, link_ok=True)
+        # 「跑都没跑起来」（pytest exit=4 / conftest 加载失败 / 目标文件不存在）不能
+        # 当成「修复破坏了既有测试」：沙盒镜像不含仓库第三方依赖，仓库 conftest 可能
+        # 直接 import 失败。这类失败按 ERROR 处理——judge_regression 对 fix 阶段 ERROR
+        # 的处置是「不可归咎于修复、放行」，否则 F2P 已通过的修复会被反复返修。
+        broken_reason = run_broken_reason(
+            getattr(exec_result, "exit_code", None),
+            command,
+            getattr(exec_result, "stdout", ""),
+            getattr(exec_result, "stderr", ""),
+        )
+        if broken_reason:
+            outcome = VerifierOutcome.ERROR
         artifacts_dir = None
         if self.settings.sandbox.keep_artifacts:
             artifacts_dir = str(self._save_artifacts(item_key, stage_tag, exec_result))

@@ -100,6 +100,31 @@ def classify_outcome(result: Any, *, timed_out: bool = False, link_ok: bool = Tr
     return VerifierOutcome.PASS if code == 0 else VerifierOutcome.FAIL
 
 
+def run_broken_reason(
+    exit_code: int | None, command: str, stdout: str | None, stderr: str | None
+) -> str | None:
+    """判断一次执行是否「压根没跑起来」；是则返回原因，否则 None。
+
+    这类失败与「断言失败」退出码一样非零，但语义完全不同：pytest 用法错误
+    （exit=4：目标文件不存在 / conftest 加载失败）、测试收集失败。把它当成
+    「问题已复现」或「修复破坏了既有测试」都是误判——实测（Pi）先后把
+    「文件找不到」当复现、把 conftest 缺依赖当回归失败，导致 12 轮空转与
+    通过后被反复返修。
+    """
+    text = f"{stdout or ''}\n{stderr or ''}".lower()
+    cmd = (command or "").lower()
+    if exit_code == 4 and "pytest" in cmd:
+        return "命令用法错误（pytest exit=4）：目标文件不存在或 conftest 加载失败"
+    if "file or directory not found" in text:
+        return "命令的目标文件不存在"
+    if any(
+        hint in text
+        for hint in ("errors during collection", "error collecting", "while loading conftest")
+    ):
+        return "测试收集失败（conftest/import 错误）"
+    return None
+
+
 def judge_f2p(
     spec: VerifierSpec,
     base: VerifierRun,
@@ -467,24 +492,16 @@ class VerifierRunner:
             await asyncio.to_thread(workspace.harden_git)
         outcome = classify_outcome(exec_result, link_ok=True)
 
-        # 「跑都没跑起来」不等于「问题已复现」。pytest exit=4 是用法错误（目标文件
-        # 不存在 / conftest 加载失败），hint 命中的是同类症状；两者都必须改判 ERROR，
-        # 否则 base 阶段会把环境问题当成复现证据（实测：Pi 上先撞文件不存在，后撞
-        # conftest 缺 yaml，12 轮修复全程空转）。
-        hints = f"{getattr(exec_result, 'stdout', '') or ''}\n{getattr(exec_result, 'stderr', '') or ''}".lower()
-        broken_reason: str | None = None
-        if outcome is VerifierOutcome.FAIL:
-            command = (spec.command or "").lower()
-            code = getattr(exec_result, "exit_code", None)
-            if code == 4 and "pytest" in command:
-                broken_reason = (
-                    "验证器命令用法错误（pytest exit=4）：目标文件不存在或 conftest 加载失败"
-                )
-            elif "file or directory not found" in hints:
-                broken_reason = "验证器命令的目标文件不存在"
-            elif any(h in hints for h in _VERIFIER_BROKEN_HINTS[:2]):
-                broken_reason = "验证器测试收集失败（conftest/import 错误）"
-        if broken_reason:
+        # 「跑都没跑起来」不等于「问题已复现」（pytest 用法错误 / conftest 加载
+        # 失败 / 目标文件不存在）。实测（Pi）先撞文件不存在、后撞 conftest 缺
+        # 依赖，base 阶段都把环境问题当成了复现证据，12 轮修复全程空转。
+        broken_reason = run_broken_reason(
+            getattr(exec_result, "exit_code", None),
+            spec.command or "",
+            getattr(exec_result, "stdout", ""),
+            getattr(exec_result, "stderr", ""),
+        )
+        if broken_reason and outcome is not VerifierOutcome.ERROR:
             outcome = VerifierOutcome.ERROR
 
         artifacts_dir = None

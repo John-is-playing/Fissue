@@ -2378,6 +2378,41 @@ def test_verifier_self_error_accepts_broken_error() -> None:
     assert verifier_self_error(sandbox_error) is None
 
 
+def test_run_broken_reason_classifies_environment_failures() -> None:
+    """「跑都没跑起来」的识别规则：pytest exit=4 / 目标文件缺失 / conftest 加载失败。"""
+    from fissue.verifier.runner import run_broken_reason
+
+    assert run_broken_reason(
+        4, "python -m pytest .fissue_verifier/x.py -q", "", "ERROR: file or directory not found: x"
+    ) is not None
+    assert run_broken_reason(
+        4, "python -m pytest -q", "", "ImportError while loading conftest '/workspace/tests/conftest.py'"
+    ) is not None
+    # 正常断言失败 → 不是环境问题
+    assert run_broken_reason(1, "python -m pytest -q", "3 failed, 3 passed", "") is None
+    # 非 pytest 的 exit=4 不武断判环境问题
+    assert run_broken_reason(4, "make test", "", "failure") is None
+
+
+def test_judge_regression_treats_fix_error_as_inconclusive() -> None:
+    """fix 阶段回归门 ERROR（环境跑不起来）→ 不可归咎于修复，放行。"""
+    from fissue.models import VerifierOutcome
+    from fissue.verifier.runner import judge_regression
+
+    base = VerifierRun(
+        item_key="k", stage="regression:base", outcome=VerifierOutcome.PASS, exit_code=0
+    )
+    fix = VerifierRun(
+        item_key="k",
+        stage="regression:fix",
+        outcome=VerifierOutcome.ERROR,
+        error="命令用法错误（pytest exit=4）：目标文件不存在或 conftest 加载失败",
+    )
+    ok, why = judge_regression(base, fix, mode="strict", f2p_satisfied=True)
+    assert ok is True
+    assert "不可归咎于修复" in why
+
+
 async def test_verify_checklist_marks_low_confidence(ctx, repo, monkeypatch) -> None:
     """过半条目「证据不足」时判定没有判别力——结论里标「仅供参考」。"""
     from fissue.models import VerifierKind, VerifierSpec
