@@ -47,6 +47,27 @@ log = get_logger(__name__)
 
 AGENT_STAGE = "agent"
 
+#: 单次 ``read`` 供给给模型的最大字符数。超出部分**在供给时就截断**（而不是等拼提示词
+#: 时再截）：这样「已读账本」记的就是模型**真正看到**的那段文本。否则账本按全文算指纹、
+#: 提示只渲染前 6000 字符，模型永远看不到后半段，却会被判「内容未变」永久拒绝。
+READ_SLICE_CHARS = 6000
+#: 已读正文（``--- 路径 ---`` 段落）送进提示词的总字符预算，超出按最旧优先淘汰。
+#: 36000 ≈ 原来「最多 6 个文件 × 6000 字符」的容量，容量不变、但淘汰改成 LRU 且与账本同步。
+READ_CONTEXT_CHARS = 36000
+#: 同时留在上下文窗口里的切片数上限（分片读会让切片数变多，不能只按字符算）。
+READ_CONTEXT_SLICES = 12
+#: 分片读单次最多取多少行（防止模型用 offset/limit 一次拉全量，白烧 token）。
+READ_RANGE_MAX_LINES = 400
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _normalize_path(path: str) -> str:
+    """统一路径写法：反斜杠转正斜杠、去掉 ``./`` 与前导 ``/``。"""
+    return path.replace("\\", "/").removeprefix("./").lstrip("/")
+
 
 class FixPolicyViolation(PolicyError):
     """违反修复策略（改动过大 / 触碰保护路径等）。"""
@@ -90,6 +111,9 @@ class AgentTrace:
     #: 已读到的**唯一**文件路径。用来判断一轮有没有取得「信息上的进展」——
     #: 判据只数写入会误杀真正的多轮探查（见 `run` 里空转闸门的说明）。
     read_paths: set[str] = field(default_factory=set)
+    #: 已补入过初始上下文（README 等）的文件名。**只补一次**：被淘汰后不再补，
+    #: 否则每一轮都会把同一份 README 重新塞进提示词，纯烧 token。
+    seeded: set[str] = field(default_factory=set)
     usage: Usage = field(default_factory=Usage)
     summary: str = ""
     give_up_reason: str | None = None
@@ -155,10 +179,14 @@ class FixAgent:
             return attempt, trace
 
         locked = set(spec.files.keys())          # 验证器文件在修复期间锁定
+        #: 当前**送给模型**的已读正文（标签 → 正文）。整份读的标签是路径，分片读是
+        #: ``路径:起行-止行``。dict 的插入顺序就是 LRU 顺序——重读会移到队尾，最晚淘汰。
         read_files: dict[str, str] = {}
-        #: 上次**真正**返回给模型的正文（path → 内容）。片段替换的「未变化」判定要用它，
-        #: 不能看 `read_files`：那一项可能已经被换成了「没有变化」的提示语。
-        seen_content: dict[str, str] = {}
+        #: 与 `read_files` **同生命周期**的账本（标签 → 正文指纹）。只有在同一段文本
+        #: 仍留在上下文窗口里时才拒绝重复读取；切片被淘汰时账本同步删除。
+        #: 为什么必须同步：账本原来永不淘汰，而窗口只留 6 个文件——第 7 个文件读一次就
+        #: 被挤出上下文，之后再读被判「内容未变」永久拒绝，模型其实从没看到过它。
+        served: dict[str, str] = {}
         last_output: str | None = None
         written_seen = 0                          # 上一轮结束时的写入文件数（判空转用）
         read_seen = 0                             # 上一轮结束时的已读文件数（同上）
@@ -217,7 +245,7 @@ class FixAgent:
                     if stop is not None:
                         return stop
 
-            read_files = self._pick_context(workspace, read_files, locked_files=spec.files)
+            self._seed_context(workspace, read_files, trace, locked_files=spec.files)
 
             data, usage = await self.client.chat_json(
                 prompts.fix_agent_step_prompt(
@@ -260,32 +288,52 @@ class FixAgent:
                         "② `give_up` 并说明为什么做不了。"
                     )
                     continue
-                paths = [str(p) for p in (data.get("paths") or []) if str(p).strip()]
-                served: list[str] = []
-                refused: list[str] = []
-                for p in paths[:10]:
-                    content = self._safe_read(workspace, p, trace, locked_files=spec.files)
-                    if content is None:
+                reqs = self._parse_reads(data)
+                if not reqs:
+                    trace.note("read 动作未提供 paths / ranges")
+                    last_output = (
+                        "`read` 必须给出 `paths`（整份文件）或 `ranges`"
+                        '（`[{"path": …, "offset": 起行号, "limit": 行数}]`）。'
+                    )
+                    continue
+                served_labels: list[str] = []
+                refused_labels: list[str] = []
+                for path, offset, limit in reqs[:10]:
+                    label, text = self._read_slice(
+                        workspace, path, offset, limit, locked_files=spec.files, trace=trace
+                    )
+                    if text is None:
                         continue
-                    if seen_content.get(p) == content:
-                        # 内容未变 → **拒绝**，而不是只回一句提示。实测（Fissue #1 真跑）：它把
-                        # 「再看一眼」当成了常规操作——9 轮里 8 次读的都是「内容未变」的那两个文件，
-                        # 每一次都算一个动作、把轮次耗掉。内容早就在它上下文里，再索取一次毫无意义。
-                        refused.append(p)
+                    digest = _digest(text)
+                    if label in read_files and served.get(label) == digest:
+                        # 同一段文本**确实还留在**上下文里才拒绝。实测（Fissue #1 真跑）：它把
+                        # 「再看一眼」当成了常规操作——9 轮里 8 次读的都是「内容未变」的那两个
+                        # 文件，每一次都算一个动作、把轮次耗掉。内容既在上下文里，再要一次毫无
+                        # 意义。注意判据必须看「是否还在窗口里」：切片被预算淘汰后账本同步删除，
+                        # 所以这里命中的都能确信模型仍看得到（这正是「读过一次就永远读不到」的修法）。
+                        refused_labels.append(label)
                         continue
-                    seen_content[p] = content
-                    read_files[p] = content
-                    trace.read_paths.add(p)
-                    served.append(p)
+                    # 重读会移到 LRU 队尾：让刚用到的内容最晚被淘汰。
+                    read_files.pop(label, None)
+                    read_files[label] = text
+                    served[label] = digest
+                    trace.read_paths.add(_normalize_path(path))
+                    served_labels.append(label)
                     # 记下读到的路径：轨迹里只有「rN: read」时，一旦出现只读不写的
                     # 空转，根本看不出它在反复读什么（实测踩过）。读失败本来就有
                     # 一行提示，读成功反而没有，信息最不对称。
-                    trace.note(f"    读了 {p}")
-                for p in refused:
-                    trace.note(f"    拒绝重复读 {p}（内容未变，已在上下文里）")
-                if refused and not served:
+                    trace.note(f"    读了 {label}")
+                self._prune_read_context(read_files, served, trace)
+                if refused_labels:
+                    trace.note(
+                        "    拒绝重复读 " + "、".join(refused_labels) + "（同样内容还在上下文里）"
+                    )
+                if refused_labels and not served_labels:
                     last_output = (
-                        "这些文件的内容没有变化，而且**早就在你的上下文里了**——不要重复索取。"
+                        "这些内容**早就在你的上下文里了**（没变化，也没因预算被移出）——不要重复索取。"
+                        "要看同一文件的**其他段落**，请用 "
+                        '`ranges`（`[{"path": …, "offset": 起始行, "limit": 行数}]`），'
+                        "而不是整份重读。"
                         '能改就 `write`（改几行用片段替换），改不了就 `give_up` 并说明原因。'
                     )
                 continue
@@ -621,26 +669,158 @@ class FixAgent:
 
     # -- 上下文选择 -------------------------------------------------------
 
-    def _pick_context(
+    #: 初始上下文候选：存在就补进窗口，帮助模型起步。
+    _SEED_FILES = (
+        "README.md",
+        "README.rst",
+        "CONTRIBUTING.md",
+        "pyproject.toml",
+        "setup.py",
+        "package.json",
+    )
+
+    def _seed_context(
         self,
         workspace: RepoWorkspace,
-        current: dict[str, str],
+        read_files: dict[str, str],
+        trace: AgentTrace,
         *,
         locked_files: dict[str, str] | None = None,
-        limit: int = 6,
-    ) -> dict[str, str]:
-        """给模型一个最小上下文：优先 README 与变更相关文件。"""
-        if len(current) >= limit:
-            return dict(list(current.items())[:limit])
+    ) -> None:
+        """补入 README 等起步文件（**每个只补一次**，淘汰后不再补）。
 
-        chosen = dict(current)
-        for name in ("README.md", "README.rst", "CONTRIBUTING.md", "pyproject.toml", "setup.py", "package.json"):
-            if name in chosen or len(chosen) >= limit:
+        不再回补的理由：窗口按 LRU 淘汰时最先走的正是这些最旧的条目，若每轮都补回来，
+        同一份 README 会反复占掉几千字符预算——纯烧 token。模型真需要它，显式 ``read`` 即可。
+        """
+        budget = READ_CONTEXT_CHARS - sum(len(v) for v in read_files.values())
+        for name in self._SEED_FILES:
+            if name in read_files or name in trace.seeded or budget <= 0:
                 continue
+            if len(read_files) >= READ_CONTEXT_SLICES:
+                break
             content = self._safe_read(workspace, name, None, locked_files=locked_files)
-            if content:
-                chosen[name] = content[:6000]
-        return chosen
+            if not content:
+                continue
+            text = content[:READ_SLICE_CHARS]
+            read_files[name] = text
+            trace.seeded.add(name)
+            budget -= len(text)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_reads(self, data: dict[str, Any]) -> list[tuple[str, int | None, int | None]]:
+        """把 ``read`` 动作解析成 ``(path, offset, limit)`` 列表。
+
+        兼容三种写法（弱模型经常混用，全收比让它猜「你们家怎么写的」划算）：
+        * ``paths: ["a.py"]`` —— 整份文件（旧格式，必须继续支持）；
+        * ``paths: [{"path": "a.py", "offset": 101, "limit": 80}]``；
+        * ``ranges: [{"path": "a.py", "offset": 101, "limit": 80}]`` —— 按行号读一段。
+        """
+        raw_paths = data.get("paths")
+        raw_ranges = data.get("ranges")
+        reqs: list[tuple[str, int | None, int | None]] = []
+        seen: set[tuple[str, int | None, int | None]] = set()
+
+        def take(raw: Any) -> None:
+            req: tuple[str, int | None, int | None]
+            if isinstance(raw, str):
+                path = raw.strip()
+                if path:
+                    req = (path, None, None)
+                else:
+                    return
+            elif isinstance(raw, dict):
+                path = str(raw.get("path") or raw.get("file") or "").strip()
+                if not path:
+                    return
+                offset = self._coerce_int(raw.get("offset", raw.get("start")))
+                limit = self._coerce_int(raw.get("limit", raw.get("lines")))
+                req = (path, offset, limit)
+            else:
+                return
+            if req not in seen:
+                seen.add(req)
+                reqs.append(req)
+
+        for raw in raw_paths if isinstance(raw_paths, list) else [raw_paths]:
+            take(raw)
+        for raw in raw_ranges if isinstance(raw_ranges, list) else [raw_ranges]:
+            take(raw)
+        return reqs
+
+    def _read_slice(
+        self,
+        workspace: RepoWorkspace,
+        path: str,
+        offset: int | None,
+        limit: int | None,
+        *,
+        locked_files: dict[str, str] | None = None,
+        trace: AgentTrace | None = None,
+    ) -> tuple[str, str | None]:
+        """读一段文件内容，返回 ``(标签, 正文)``；读不到时正文为 ``None``。
+
+        ``offset`` / ``limit`` 以**行**为单位，``offset`` 从 1 开始。超长内容在**这里**
+        就截断并附上续读提示（见 :data:`READ_SLICE_CHARS`）——账本因此记的是模型真正
+        看到的那段文本，不会出现「按全文判未变、却只看了前 6000 字符」的死角。
+        """
+        full = self._safe_read(workspace, path, trace, locked_files=locked_files)
+        if full is None:
+            return "", None
+        norm = _normalize_path(path)
+        if offset is None and not limit:
+            label = norm
+            if len(full) <= READ_SLICE_CHARS:
+                return label, full
+            head = full[:READ_SLICE_CHARS]
+            cut = head.count("\n")
+            hint = (
+                f"\n…（已截断：全文 {full.count(chr(10)) + 1} 行 / {len(full)} 字符；"
+                f'续读请用 ranges：{{"path": "{norm}", "offset": {cut + 1}, "limit": 200}}）'
+            )
+            return label, head + hint
+
+        lines = full.splitlines(keepends=True)
+        total = len(lines)
+        start = max(1, offset or 1)
+        count = READ_RANGE_MAX_LINES if not limit or limit <= 0 else min(limit, READ_RANGE_MAX_LINES)
+        if start > total:
+            if trace is not None:
+                trace.note(f"读文件失败：{norm} 只有 {total} 行，offset={start} 越界")
+            return "", None
+        selected = lines[start - 1 : start - 1 + count]
+        end = start + len(selected) - 1
+        text = "".join(selected)
+        label = f"{norm}:{start}-{end}"
+        if len(text) > READ_SLICE_CHARS:
+            text = text[:READ_SLICE_CHARS] + (
+                f"\n…（本段已截断：超过 {READ_SLICE_CHARS} 字符；缩小 limit 再读）"
+            )
+        return label, text
+
+    @staticmethod
+    def _prune_read_context(
+        read_files: dict[str, str], served: dict[str, str], trace: AgentTrace
+    ) -> None:
+        """把已读正文压进预算：超限时按**最旧**（最早供给）优先淘汰。
+
+        淘汰必须**同时**删掉账本（``served``）——否则被挤出上下文的内容会被判
+        「内容未变」永久拒绝，那正是「读过一次就再也读不到」的来源。淘汰后模型可以
+        立刻重新读取它（会计一次新进展），这才是正确语义。
+        """
+        total = sum(len(v) for v in read_files.values())
+        while len(read_files) > 1 and (
+            len(read_files) > READ_CONTEXT_SLICES or total > READ_CONTEXT_CHARS
+        ):
+            oldest = next(iter(read_files))
+            total -= len(read_files.pop(oldest))
+            served.pop(oldest, None)
+            trace.note(f"    上下文移出 {oldest}（预算已满，需要时可再次读取）")
 
     def _safe_read(
         self,

@@ -713,12 +713,15 @@ def fix_agent_step_prompt(
     if last_test_output:
         blocks.append("## 上一轮验证器输出\n```\n" + _truncate(last_test_output, 4000) + "\n```")
 
-    # 3) 已读到的文件
+    # 3) 已读到的文件（标签对分片读是 ``路径:起行-止行``）
     if read_files:
         parts = []
-        for path, content in list(read_files.items())[:20]:
-            parts.append(f"--- {path} ---\n{_truncate(content, 6000)}")
-        blocks.append("## 已读到的文件内容\n" + "\n\n".join(parts))
+        for label, content in list(read_files.items())[:20]:
+            parts.append(f"--- {label} ---\n{_truncate(content, 6000)}")
+        blocks.append(
+            "## 已读到的文件内容（这些正文就在你上下文里；要看同一文件的**其他段落**"
+            "请用 `ranges`，别整份重读）\n" + "\n\n".join(parts)
+        )
 
     blocks.append("## 仓库上下文\n" + repo_context)
     blocks.append("## 问题\n" + render_item(item, include_comments=False))
@@ -734,8 +737,12 @@ def fix_agent_step_prompt(
 ## 现在决定下一步动作
 
 可选动作：
-- `read`：读取若干文件（给出 paths）。**只读你还没读过的**——重读同一批不会带来新信息；
-  **内容没变过的文件会被直接拒绝**（它早就在你的上下文里），所以别指望靠重复读推进度。
+- `read`：读取文件。**只读你还没读过的**——重读同一批不会带来新信息；
+  **同样内容的片段会被直接拒绝**（它早就在你的上下文里），所以别指望靠重复读推进度。
+  两种写法（可同时给）：
+  * `paths`：`["src/a.py"]` —— 整份文件；超过 6000 字符会被截断，并附上续读行号；
+  * `ranges`：`[{{"path": "src/big.py", "offset": 201, "limit": 120}}]` —— 按行号读一段
+    （`offset` 从 1 开始，`limit` 是行数，单次最多 400 行）。大文件别整份读，用这个。
 - `write`：写入文件（给出 files）。写完系统会**自动**跑一次验证器，并把它这次的输出直接给你。
   每个路径的值有两种写法——**改几行就用第二种，别重写整份大文件**：
   * 完整内容：`"src/a.py": "…整份文件内容…"`（**新增**文件只能用它）；
@@ -760,7 +767,8 @@ def fix_agent_step_prompt(
 只输出 JSON：
 {{
   "action": "read | write | run | done | give_up",
-  "paths": ["要读的文件路径"],
+  "paths": ["要整份读取的文件路径"],
+  "ranges": [{{"path": "要分片读取的路径", "offset": 起始行号, "limit": 行数}}],
   "files": {{"要写入的路径": "完整内容字符串，或 {{find, replace}}，或它们的数组"}},
   "reason": "这一步的思路",
   "summary": "若 done：修复要点；若 give_up：原因"

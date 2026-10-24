@@ -1940,6 +1940,64 @@ async def test_repeated_read_of_an_unchanged_file_is_refused(
     assert "不要重复索取" in str(llm.history[2])
 
 
+async def test_evicted_context_can_be_read_again(settings, workspace, sample_issue) -> None:
+    """切片被预算挤出上下文后，**再读必须重新供给**，不能判「内容未变」永久拒绝。
+
+    回归：账本（旧名 ``seen_content``）只增不减，而窗口只保留最早 6 个文件——第 7 个文件
+    读一次就被挤出提示词，之后的读取全被拒。模型其实从没看到过它，却被告知「早就在你的
+    上下文里」；既烧掉轮次又拿不到内容，正是「读过一次就强制拒绝」的来源。
+    修法是账本与窗口**同生命周期**：切片淘汰时同步删账本。
+    """
+    from fissue.fixer.agent import READ_CONTEXT_CHARS
+
+    settings.auto_fix.stall_rounds = 0            # 关掉两条闸门，专心看读写账本
+    settings.auto_fix.no_write_rounds = 0
+    for i in range(8):                            # 8 × 6000 > 预算，必然淘汰最早的 a0
+        workspace.write(f"a{i}.py", "y" * (READ_CONTEXT_CHARS // 6))
+    steps = [{"action": "read", "paths": [f"a{i}.py"]} for i in range(8)]
+    steps += [{"action": "read", "paths": ["a0.py"]}, {"action": "give_up", "reason": "够了"}]
+    agent, _llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=12
+    )
+
+    assert sum("读了 a0.py" in a for a in trace.actions) == 2, trace.actions[-10:]
+    assert not any("拒绝重复读 a0.py" in a for a in trace.actions), "被淘汰的切片必须能再读"
+
+
+async def test_range_read_serves_only_requested_lines(settings, workspace, sample_issue) -> None:
+    """`ranges` 只给指定行；同一段再读被拒，换一段则正常供给。
+
+    为什么需要分片读：整份读在 6000 字符处截断，而账本按**全文**判「内容未变」——大文件
+    的后半段永远既读不到（没 offset 参数）、又会被拒，属于死角。现在供给时就截断，账本
+    记的是模型**真正看到**的那段，分片读因此可续。
+    """
+    settings.auto_fix.stall_rounds = 0
+    settings.auto_fix.no_write_rounds = 0
+    workspace.write("big.py", "".join(f"line{i}\n" for i in range(1, 301)))
+    same = {"action": "read", "ranges": [{"path": "big.py", "offset": 101, "limit": 20}]}
+    steps = [
+        same,
+        same,                                                             # 同段 → 拒绝
+        {"action": "read", "ranges": [{"path": "big.py", "offset": 121, "limit": 20}]},
+        {"action": "give_up", "reason": "够了"},
+    ]
+    agent, llm, _runner = _agent_with_runner(settings, steps, _StubRunner(None))
+
+    _attempt, trace = await agent.run(
+        item=sample_issue, workspace=workspace, spec=_SPEC, repo_context="ctx", max_rounds=12
+    )
+
+    # 读到的正文在**下一轮**提示词里才出现（动作在读到的那条提示之后才被处理）
+    seen = str(llm.history[1])
+    assert "big.py:101-120" in seen, "标签要标出所读行段"
+    assert "line101" in seen and "line120" in seen
+    assert "line100" not in seen and "line121" not in seen, "不该把整份文件塞给模型"
+    assert any("拒绝重复读 big.py:101-120" in a for a in trace.actions)
+    assert any("读了 big.py:121-140" in a for a in trace.actions)
+
+
 async def test_barren_guard_does_not_punish_exploration(settings, workspace, sample_issue) -> None:
     """每轮都读到**新文件** → 不算空转（别把多轮探查砍成停滞）。
 
