@@ -16,6 +16,7 @@
 | `fissue verify` | 生成验证器 + 沙盒 F2P 验证 |
 | `fissue flush` | 手动 flush 验证 / 修复队列 |
 | `fissue requeue` | 把卡住的条目放回流水线 |
+| `fissue force` | **强制修复**：不管评测结论如何，把指定条目推进修复流程（`-k platform:owner/name#number`，`--dry-run` 只看计划、`--yes` 直接执行、`--undo` 取消） |
 | `fissue fix` | 自动修复并提 PR（`--dry-run` 只产 patch） |
 | `fissue report` | 生成 Markdown / JSON 报告 |
 | `fissue export` | 导出全量数据 |
@@ -93,6 +94,26 @@ fissue requeue --failed [--yes]                # 失败条目重试
 
 > 为什么 `--stale` 不自动重评：条目内容实质变化时它可能已开工，自动回落会给「重复修复 / 重复建 PR」再开一道口子。
 > 那里只留痕（`stale_reasons`，导出与 API 可见），由人确认后放回。
+
+### `force`
+
+```bash
+fissue force -k platform:owner/name#number [--dry-run] [--yes]
+fissue force -k platform:owner/name#number --undo    # 取消强制
+```
+
+强制修复：**不管评测结论**（分类 / 刷量 / 优先级 / 裁决）如何，都把条目推进修复流程——「要不要修」由人拍板，模型结论降为参考。
+
+- `-k` / `--key`：条目键，可重复指定多个
+- `--dry-run`：只列出要做什么，不改状态
+- `--yes`：不询问确认
+- `--undo`：取消强制（清标记；仍在待修队列的条目回退 `needs_manual`）
+
+**旁路范围**：FEATURE 短路、验证阶段的分类 / 刷量 / 可复现闸门、LLM 裁决、修复阶段的优先级 / 刷量 / 缺评测闸门，全部旁路；条目直落「待修 tier1」，由常驻服务 / `fissue fix` 接力提 PR。
+
+**保留的闸门**：验证器闸门不旁路——没有验证器无从判定修复，条目没有验证器时验证阶段会顺手生成一个。已在修复流程中（`fixing` / `pr_created` / `fix_queued`）的条目强制时保持原状（防重复开 PR）。
+
+> PR 没有自动修复流程，不能强制。
 
 ### `fix`
 

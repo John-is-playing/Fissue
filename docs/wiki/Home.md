@@ -8,7 +8,7 @@
 这条是真 Bug 还是用户用错了？这个 PR 真的修好了吗？哪些可以放心让 AI 先修？
 Fissue 把「分诊（triage）→ 验证 → 修复」这一整套流程自动化，并留下**完整的评分理由与证据链**供人复核。
 
-它以 CLI、Web 仪表盘、REST API、常驻服务四种形态交付，Python 3.10+，存储默认 SQLite（生产 / 多机可换 PostgreSQL）。
+它以 CLI、Web 仪表盘、REST API、常驻服务四种形态交付，Python 3.10+，存储默认 SQLite（可选换 PostgreSQL，但**尚未在真实运行中验证**）。
 
 ---
 

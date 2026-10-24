@@ -56,8 +56,10 @@ ruff format --check src tests
 
 | job | 内容 |
 |---|---|
-| `pytest (py3.10 / py3.12)` | 矩阵取**最低支持版本** `3.10` 与一个现代版本 `3.12`；`python -m pytest -q -p no:cacheprovider` |
+| `pytest (py3.10 / py3.12 / py3.14)` | 矩阵取**最低支持版本** `3.10`、一个现代版本 `3.12`，以及本机实测跑通全量的 `3.14`；`python -m pytest -q -p no:cacheprovider` |
 | `ruff + mypy` | `python -m ruff check src tests` 与 `python -m mypy src/fissue tests` |
+
+单条用例有 **120s 硬超时**（`pytest-timeout`，配置在 `pyproject.toml` 的 `[tool.pytest.ini_options].timeout`）：本项目的网络守卫只放行 localhost，而本机代理也恰在 localhost，于是真实网络请求既不被拦下也不被 respx 拦截，只静默重试到超时——表现为 pytest **假死**。有了这条，同样的故障会在 120s 内变成一条明确的 `Timeout`，直接指到卡住的用例。
 
 设计要点（读 ci.yml 注释即得）：
 

@@ -36,6 +36,12 @@ fissue serve --with-web             # 常驻服务 + Web/API 同进程
 
 页面上还有操作按钮：扫描、评测、验证、Flush、试跑修复。
 
+**强制修复**（⚡ 徽标）：不管评测结论如何，把指定条目推进修复流程。
+
+- 条目详情页有「强制修复」按钮（仅 Issue，PR 无自动修复流程）；已强制的条目带 ⚡ 徽标，旁边给「取消强制」；
+- 列表页可勾选多条后「强制修复选中」；
+- 已在修复流程中的条目强制时保持原状（防重复开 PR）。
+
 ---
 
 ## 3. 鉴权
@@ -136,6 +142,12 @@ curl -X POST $BASE/actions/evaluate -H 'Content-Type: application/json' -d '{"li
 curl -X POST $BASE/actions/verify   -H 'Content-Type: application/json' -d '{"limit":10}'
 curl -X POST $BASE/queues/flush     -H 'Content-Type: application/json' -d '{"force":true}'
 curl -X POST $BASE/actions/fix      -H 'Content-Type: application/json' -d '{"dry_run":true,"limit":5}'
+
+# 强制修复：走作业接口（可轮询进度；验证阶段要生成验证器，分钟级）
+curl -X POST $BASE/jobs/force      -H 'Content-Type: application/json' \
+     -d '{"keys":["github:psf/requests#42"]}'
+curl -X POST $BASE/items/unforce   -H 'Content-Type: application/json' \
+     -d '{"keys":["github:psf/requests#42"]}'      # 取消强制
 
 # 人工闸门
 curl -X POST "$BASE/actions/approve-fix?key=github%3Apsf%2Frequests%2342" -d '{}' -H 'Content-Type: application/json'

@@ -143,7 +143,23 @@ fissue requeue --failed --yes         # 状态为 failed 的条目重试
 
 ---
 
-## 8. 成本控制
+## 8. 模型说「不修」，但你就是想修：`fissue force`
+
+评测结论只是参考——「要不要修」由人拍板。
+
+```bash
+fissue force -k github:psf/requests#42 --dry-run   # 先看计划，不改状态
+fissue force -k github:psf/requests#42 --yes       # 强制修复
+fissue force -k github:psf/requests#42 --undo      # 取消强制
+```
+
+置位强制标记后走一遍验证阶段，条目直落「待修 tier1」，由常驻服务 / `fissue fix` 接力提 PR。分类 / 刷量 / 可复现 / 优先级这些闸门在强制模式下全部旁路，**验证器闸门不旁路**——没有验证器无从判定修复。
+
+只在 Issue 上可用（PR 没有自动修复流程）；已在修复流程中的条目保持原状（防重复开 PR）。
+
+---
+
+## 9. 成本控制
 
 ### 各步骤的 token 消耗量级
 
@@ -197,7 +213,7 @@ fix_policy: { tier2: { max_difficulty: 20, min_importance: 0 } }
 
 ---
 
-## 9. 跑分基线：改动前后比一比
+## 10. 跑分基线：改动前后比一比
 
 `BENCHMARK.md` 里的数字来自「开发期累计运行」，期间项目自己在改代码、模型输出又不确定，
 于是那些数字**回答不了**最基本的问题——*这次改动让结果变好了还是变坏了？*
