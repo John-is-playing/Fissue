@@ -127,12 +127,16 @@ class WebhookChannel(Channel):
             "timestamp": int(time.time()),
         }
         headers = {"Content-Type": "application/json"}
+        # 序列化只做一次：签名必须覆盖**实际发出去的那串字节**。
+        # 原先签名算的是 `json.dumps(..., ensure_ascii=False)`（默认分隔符 `", "`），
+        # 而 httpx 的 `json=` 用的是紧凑分隔符 `(","  ":")` —— 接收方按请求体验签必然对不上，
+        # 于是 webhook 一旦配了 secret 就恒失败（且看起来像对方的签名算法有问题）。
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if self.cfg.secret:
-            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             sig = hmac.new(self.cfg.secret.encode("utf-8"), raw, hashlib.sha256).hexdigest()
             headers["X-Fissue-Signature"] = f"sha256={sig}"
         try:
-            resp = await _async_post(self.cfg.url, payload, headers)
+            resp = await _async_post(self.cfg.url, raw, headers)
         except Exception as exc:
             return False, f"网络错误：{exc}"
         if resp.status_code >= 400:
@@ -264,9 +268,14 @@ CHANNELS: dict[str, type[Channel]] = {
 }
 
 
-async def _async_post(url: str, payload: dict[str, Any], headers: dict[str, str]) -> httpx.Response:
+async def _async_post(url: str, body: bytes, headers: dict[str, str]) -> httpx.Response:
+    """按**给定的字节**发请求。
+
+    不接受 `dict` 让 httpx 自己序列化：那样调用方签名时的字节与发送时的字节可能不同
+    （分隔符、ensure_ascii 都会变），签名就没意义了。
+    """
     async with httpx.AsyncClient(timeout=TIMEOUT, verify=httpx_verify()) as client:
-        return await client.post(url, json=payload, headers=headers)
+        return await client.post(url, content=body, headers=headers)
 
 
 # ---------------------------------------------------------------------------

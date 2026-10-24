@@ -79,6 +79,11 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
+# 目标平台钉成 linux，与 CI（ubuntu-24.04）一致。
+# 不钉的话，在 Windows 上跑 mypy 会因为 `os.flock` / `os.killpg` / `socket.AF_UNIX`
+# 这些 POSIX-only 接口报十余处「Module has no attribute」，而 CI 上一条都不报——
+# 本机与 CI 结论相反时，人只会怀疑工具坏了，或者用 `# type: ignore` 把真问题盖掉。
+platform = "linux"
 
 [tool.coverage.report]
 # 覆盖率**软门**：略低于当前实测值，只为拦住「覆盖率倒退」，不追求一步到位的高门槛。

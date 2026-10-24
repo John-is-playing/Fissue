@@ -1736,3 +1736,114 @@ def test_is_already_exists_requires_an_explicit_marker() -> None:
         Exception('GitHub API 错误 422：POST /labels -> {"message":"Validation Failed"}')
     ) is False
     assert PlatformAdapter._is_already_exists(Exception("API 错误 409：颜色格式不合法")) is False
+
+
+# ---------------------------------------------------------------------------
+# GitLab：数据完整性边界
+#
+# 这些路径平时不触发，但一旦触发就是「数据悄悄不完整」：条目少抓了、评论被截断、
+# 变更拉不到却当成「没有变更」。前者会让评测基于残缺输入下结论，后者会让
+# 「只改了文档」这类判定直接失效——所以每条都要留下可判读的痕迹（计数 / 降级标记）。
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_gitlab_create_label_treats_already_exists_as_success(gl) -> None:
+    """「已经存在」= 目标已达成，返回 True；否则缓存不会记住它，每轮都白试一次。"""
+    pid = "psf%2Frequests"
+    respx.post(f"{GL}/projects/{pid}/labels").mock(
+        return_value=httpx.Response(409, json={"message": "Label already exists"})
+    )
+    assert await gl._create_label(REPO, "fissue-ai") is True
+
+
+@respx.mock
+async def test_gitlab_create_label_other_error_is_false(gl) -> None:
+    """参数错误（颜色不合法等）不能被当成「已存在」——那会让标签缓存谎报可用。"""
+    pid = "psf%2Frequests"
+    respx.post(f"{GL}/projects/{pid}/labels").mock(
+        return_value=httpx.Response(400, json={"message": "color is invalid"})
+    )
+    assert await gl._create_label(REPO, "fissue-ai") is False
+
+
+@respx.mock
+async def test_gitlab_create_label_success(gl) -> None:
+    pid = "psf%2Frequests"
+    route = respx.post(f"{GL}/projects/{pid}/labels").mock(return_value=httpx.Response(201, json={}))
+    assert await gl._create_label(REPO, "fissue-ai") is True
+    body = json.loads(route.calls.last.request.content)
+    assert body["name"] == "fissue-ai" and body["color"].startswith("#")
+
+
+@respx.mock
+async def test_gitlab_bad_payload_is_counted_not_fatal(gl) -> None:
+    """单条数据残缺只跳过这一条并计数，不能把整批抓取打断。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/issues").mock(
+        return_value=httpx.Response(200, json=[
+            {"iid": "not-a-number", "title": "坏数据"},
+            {"iid": 8, "title": "好的", "description": "d", "state": "opened", "labels": [],
+             "author": {"username": "u"}},
+        ])
+    )
+    respx.get(f"{GL}/projects/{pid}/issues/8/notes").mock(return_value=httpx.Response(200, json=[]))
+
+    items = [i async for i in gl.fetch_items(REPO, item_types=[ItemType.ISSUE])]
+
+    assert [i.number for i in items] == [8]
+    assert gl.skipped_build_failures == 1, "残缺条数要能被调用方读到（据此判「数据不完整」）"
+
+
+@respx.mock
+async def test_gitlab_notes_truncation_is_marked(gl) -> None:
+    """评论达到上限要打「可能被截断」标记，而不是当成「就这么多评论」。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/issues/5/notes").mock(
+        return_value=httpx.Response(200, json=[
+            {"body": f"c{i}", "system": False, "author": {"username": "u"}} for i in range(5)
+        ])
+    )
+
+    comments, note = await gl._fetch_notes(REPO, 5, limit=2)
+
+    assert len(comments) == 2
+    assert note == "comments_may_be_truncated#5", "截断必须带条号，人工复核才知道去看哪条"
+
+
+@respx.mock
+async def test_gitlab_fetch_files_degrades_to_empty_on_error(gl) -> None:
+    """拉变更失败返回空列表（并已由调用方记降级），不能把异常抛到验证阶段。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/merge_requests/6/changes").mock(
+        return_value=httpx.Response(404, text="not found")
+    )
+
+    assert await gl.fetch_files(REPO, 6) == []
+
+
+@respx.mock
+async def test_gitlab_fetch_diff_raises_contextual_error(gl) -> None:
+    """diff 是修复链路的硬输入：拉不到必须抛（带条号），不能静默返回空串。"""
+    from fissue.errors import PlatformError
+
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/merge_requests/6/changes").mock(
+        return_value=httpx.Response(404, text="not found")
+    )
+
+    with pytest.raises(PlatformError) as exc:
+        await gl.fetch_diff(REPO, 6)
+    assert "#6" in str(exc.value)
+
+
+@respx.mock
+async def test_gitlab_fetch_items_passes_since_as_updated_after(gl) -> None:
+    """增量抓取依赖 `updated_after`：参数没传出去就会悄悄退化成全量。"""
+    pid = "psf%2Frequests"
+    route = respx.get(f"{GL}/projects/{pid}/issues").mock(return_value=httpx.Response(200, json=[]))
+    since = datetime(2026, 3, 1, tzinfo=timezone.utc)
+
+    [i async for i in gl.fetch_items(REPO, item_types=[ItemType.ISSUE], since=since)]
+
+    assert "updated_after" in route.calls.last.request.url.params

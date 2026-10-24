@@ -16,6 +16,9 @@ data/*
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+# pytest-cov 在仓库根落下的覆盖率数据（每次带 --cov 跑测都会重写）
+.coverage
+.coverage.*
 
 # 本地数据库（SQLite 试用库，含抓取数据，不入版本库）
 *.db

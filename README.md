@@ -81,7 +81,7 @@ Fissue 把这一整套「分诊（triage）→ 验证 → 修复」流程自动�
 | 交付形态 | CLI + Web 仪表盘 + REST API + 常驻服务 |
 | 抓取平台 | GitHub · Gitee · AtomGit · GitLab（含自建实例） |
 | AI | 任意 OpenAI 兼容端点（DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM…） |
-| 存储 | SQLite（默认，零依赖）· PostgreSQL（生产 / 多机，需显式配置）；可导出 JSON / Markdown |
+| 存储 | SQLite（默认，零依赖，也是开发期唯一实测过的路径）· PostgreSQL（可选，需显式配置；**尚未在真实运行中验证**）；可导出 JSON / Markdown |
 | 沙盒 | Docker：禁网、限 CPU/内存/PID/时长、非 root、只读根、只挂隔离工作区、转发组件通道 |
 | 配置 | `.env`（密钥）+ `config.yaml`（业务配置） |
 
@@ -143,6 +143,7 @@ fissue web
 | `fissue verify` | 生成验证器 + 沙盒 F2P 验证 |
 | `fissue flush` | 手动 flush 验证/修复队列 |
 | `fissue requeue` | 把卡住的条目放回流水线（`--stale` = 结论过期但修复已开工；`--failed` = 失败重试） |
+| `fissue force` | **强制修复**：不管评测结论如何，把指定条目推进修复流程（`-k platform:owner/name#number`，`--dry-run` 只看计划、`--yes` 直接执行、`--undo` 取消强制） |
 | `fissue fix` | 自动修复并提 PR（`--dry-run` 只产 patch） |
 | `fissue report` | 生成 Markdown/JSON 报告 |
 | `fissue export` | 导出全量数据 |
@@ -151,6 +152,7 @@ fissue web
 | `fissue web` | Web 工作台 + REST API：总览 / 条目 / 队列 / 任务 / 监控仓库 / 状态监测 / 初始化向导 / 设置 |
 | `fissue sandbox serve` | 起沙盒转发组件（宿主侧常驻，沙盒执行的唯一通道）；`fissue sandbox check` 检查沙盒环境是否就绪 |
 | `fissue bench` | 跑分基线：`capture` 冻结 / `diff` 逐项对比（先判可比性）/ `list` 列出 |
+| `fissue auth` | Web/API 身份管理：`status` 看鉴权状态、`set-password` 建或改管理员口令、`reset` 重置、`key list/create/revoke/import-legacy` 管 API Key（详见 [docs/AUTH.md](docs/AUTH.md)） |
 
 ---
 
@@ -160,7 +162,7 @@ fissue web
 src/fissue/
   config.py       配置加载（.env + config.yaml）
   models.py       领域模型
-  store/          PostgreSQL 持久化 + JSON/MD 导出
+  store/          SQLAlchemy 持久化（SQLite 默认 / PostgreSQL 可选）+ JSON/MD 导出
   platforms/      GitHub / Gitee / AtomGit / GitLab 适配器
   ai/             OpenAI 兼容客户端、预算、提示词、评估器
   verifier/       验证器生成与 F2P 校验
