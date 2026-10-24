@@ -799,7 +799,20 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
 
     prefix = settings.api.prefix
     auth = _auth_dependency()
+    # 按域拆开注册。原先这里是一个 566 行的函数：路由一多，就没人能一眼看出「哪个域有
+    # 哪些端点、各自的闸门挂在哪」。切分只按域移动代码，注册顺序保持原样。
+    _register_api_observability(app, prefix, auth)
+    _register_api_items(app, prefix, auth)
+    _register_api_item_admin(app, prefix, auth)
+    _register_api_queues(app, prefix, auth)
+    _register_api_actions(app, prefix, auth)
+    _register_api_jobs(app, prefix, auth)
+    _register_api_webhooks(app, prefix, auth)
+    _register_api_misc(app, prefix, auth)
 
+
+def _register_api_observability(app: FastAPI, prefix: str, auth: Any) -> None:
+    """统计 / 状态：只读聚合（状态页每 2 秒轮询的就是它）。"""
     # -- 统计 -------------------------------------------------------------
 
     @app.get(f"{prefix}/stats")
@@ -835,6 +848,9 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             aggregates=_aggregates_of(request.app),
         )
 
+
+def _register_api_items(app: FastAPI, prefix: str, auth: Any) -> None:
+    """条目：列表 / 详情（只读）。"""
     # -- 条目 -------------------------------------------------------------
 
     @app.get(f"{prefix}/items")
@@ -948,6 +964,9 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         ]
         return data
 
+
+def _register_api_item_admin(app: FastAPI, prefix: str, auth: Any) -> None:
+    """条目管理：删除本地数据 / 强制修复 / 取消强制（破坏性或旁路类操作）。"""
     # -- 删除条目（本地数据） ---------------------------------------------
     #
     # 这是**破坏性且不可撤销**的操作，所以刻意比只读接口严格两道：
@@ -1021,6 +1040,9 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             (unforced if item is not None else missing).append(key)
         return {"unforced": unforced, "missing": missing}
 
+
+def _register_api_queues(app: FastAPI, prefix: str, auth: Any) -> None:
+    """队列：查看当前积压 / 手动 flush。"""
     # -- 队列 -------------------------------------------------------------
 
     @app.get(f"{prefix}/queues")
@@ -1053,6 +1075,8 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             request.app, {"queue": body.queue, "force": body.force}, _quiet_report
         )
 
+def _register_api_actions(app: FastAPI, prefix: str, auth: Any) -> None:
+    """同步动作：评测 / 验证 / 修复 / 扫描 / 审批（薄封装；点按钮走 jobs 那套）。"""
     # -- 动作 -------------------------------------------------------------
     #
     # 每个动作都只是「薄薄一层」：鉴权/只读闸门 → 调工作体（见上方 `_work_*`）。
@@ -1105,6 +1129,8 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             _quiet_report,
         )
 
+def _register_api_jobs(app: FastAPI, prefix: str, auth: Any) -> None:
+    """作业（长任务）：提交后立刻返回，前端轮询进度。"""
     # -- 作业（长任务）：提交后立刻返回，前端轮询进度 -------------------------
 
     @app.get(f"{prefix}/jobs")
@@ -1237,8 +1263,9 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
         ctx.repo.set_item_status(key, ItemStatus.LABELED)
         return {"key": key, "approved": True, "note": "已打 merge-approved 标签，请人工在平台上合并"}
 
-    # -- 导出 -------------------------------------------------------------
 
+def _register_api_webhooks(app: FastAPI, prefix: str, auth: Any) -> None:
+    """入站 webhook：平台推事件时后台跑一轮（边界 = 签名 + 仓库白名单）。"""
     # -- 入站 webhook：平台主动推「新 Issue / 新 PR」 ---------------------------
     #
     # 这个端点**刻意不挂** `Depends(auth)`、`_require_writable` 与两道写补刀：平台既不会带
@@ -1250,6 +1277,7 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
     async def webhook(
         platform: str, request: Request, background: BackgroundTasks
     ) -> dict[str, Any]:
+        settings = _settings(request)
         if not settings.webhooks.enabled:
             # 没启用就当它不存在（不告诉外面「这里有个端点」）
             raise HTTPException(status_code=404, detail="webhook 未启用")
@@ -1302,6 +1330,11 @@ def _register_api(app: FastAPI, settings: Settings) -> None:
             "action": event.action,
             "note": "已在后台触发一轮（抓取 → 评测 → 验证 → flush → 修复）",
         }
+
+
+def _register_api_misc(app: FastAPI, prefix: str, auth: Any) -> None:
+    """导出 / 停止当前轮次 / 健康检查。"""
+    # -- 导出 -------------------------------------------------------------
 
     @app.get(f"{prefix}/export")
     async def export_endpoint(

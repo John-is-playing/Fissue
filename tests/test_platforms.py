@@ -1847,3 +1847,253 @@ async def test_gitlab_fetch_items_passes_since_as_updated_after(gl) -> None:
     [i async for i in gl.fetch_items(REPO, item_types=[ItemType.ISSUE], since=since)]
 
     assert "updated_after" in route.calls.last.request.url.params
+
+
+# ---------------------------------------------------------------------------
+# Gitee / AtomGit（v5）：写操作兜底、分页截断、数据残缺
+#
+# v5 两个平台的文档都取不到（AtomGit 的文档页 404），所有写接口的形状都是**实测**出来的。
+# 因此这些路径的共同要求是：**失败了要留下可判读的痕迹**（降级标记 / 计数 / 抛带上下文的错），
+# 不能悄悄当成成功——那会让「结论已落地」变成一句谎话。
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_v5_default_branch_falls_back_to_master(gitee) -> None:
+    """仓库信息里没有 default_branch 时用 master，而不是空串（空串会让克隆失败）。"""
+    respx.get(f"{GITEE}/repos/psf/requests").mock(return_value=httpx.Response(200, json={}))
+    assert await gitee.get_default_branch(REPO) == "master"
+
+
+@respx.mock
+async def test_v5_create_label_reports_existence_correctly(gitee) -> None:
+    """「已存在」= 目标达成（True）；其他失败 = 不成立（False，让调用方稍后重试）。"""
+    route = respx.post(f"{GITEE}/repos/psf/requests/labels").mock(
+        side_effect=[
+            httpx.Response(409, json={"message": "Label already exists"}),
+            httpx.Response(400, json={"message": "name is invalid"}),
+        ]
+    )
+    assert await gitee._create_label(REPO, "fissue") is True
+    assert await gitee._create_label(REPO, "fissue") is False
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_v5_pr_detail_failure_marks_item_degraded(gitee) -> None:
+    """PR 详情拉不到时条目仍可用，但必须标残缺——验证阶段靠这些字段判「只改了文档」。"""
+    payload = {"number": 9, "title": "pr"}
+    respx.get(f"{GITEE}/repos/psf/requests/pulls/9").mock(
+        return_value=httpx.Response(404, text="not found")
+    )
+
+    merged, note = await gitee._merge_pr_detail(REPO, payload)
+
+    assert merged is payload and note == "pr_detail_unavailable#9"
+
+
+@respx.mock
+async def test_v5_pr_detail_merges_when_available(gitee) -> None:
+    payload = {"number": 9, "title": "pr"}
+    respx.get(f"{GITEE}/repos/psf/requests/pulls/9").mock(
+        return_value=httpx.Response(200, json={"head": {"ref": "fix"}, "additions": 2})
+    )
+
+    merged, note = await gitee._merge_pr_detail(REPO, payload)
+
+    assert note == "" and merged["head"] == {"ref": "fix"} and merged["title"] == "pr"
+
+
+@respx.mock
+async def test_v5_comments_truncation_is_marked(gitee) -> None:
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7/comments").mock(
+        return_value=httpx.Response(200, json=[
+            {"body": f"c{i}", "user": {"login": "u"}} for i in range(5)
+        ])
+    )
+
+    comments, note = await gitee._fetch_comments(REPO, 7, limit=2)
+
+    assert len(comments) == 2
+    assert note == "comments_may_be_truncated#7"
+
+
+@respx.mock
+async def test_v5_comments_failure_marks_degraded_not_fatal(gitee) -> None:
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7/comments").mock(
+        return_value=httpx.Response(404, text="not found")
+    )
+
+    comments, note = await gitee._fetch_comments(REPO, 7)
+
+    assert comments == [] and note == "comments_unavailable#7"
+
+
+@respx.mock
+async def test_v5_fetch_files_raises_so_caller_can_mark_degraded(gitee) -> None:
+    """这里**不能**返回空列表：否则「没有文件」与「没拉到文件」无法区分。"""
+    from fissue.errors import PlatformError
+
+    respx.get(f"{GITEE}/repos/psf/requests/pulls/9/files").mock(
+        return_value=httpx.Response(404, text="not found")
+    )
+
+    with pytest.raises(PlatformError):
+        await gitee.fetch_files(REPO, 9)
+
+
+@respx.mock
+async def test_v5_fetch_files_respects_max_files(gitee) -> None:
+    respx.get(f"{GITEE}/repos/psf/requests/pulls/9/files").mock(
+        return_value=httpx.Response(200, json=[
+            {"filename": f"f{i}.py", "additions": 1, "deletions": 0} for i in range(3)
+        ])
+    )
+
+    files = await gitee.fetch_files(REPO, 9, max_files=2)
+
+    assert [f.path for f in files] == ["f0.py", "f1.py"]
+
+
+async def test_v5_add_labels_is_noop_when_empty(gitee) -> None:
+    """空标签列表直接返回：实测空串会被平台拒（400），而调用方本来就只加不删。"""
+    await gitee.add_labels(REPO, 7, [])      # 没有任何 respx 路由 → 发请求就会失败
+
+
+@respx.mock
+async def test_v5_add_labels_falls_back_to_union_when_endpoint_unusable(gitee) -> None:
+    """平台已被确认不支持条目级标签端点时，直接走 PATCH 并集，不浪费一次失败请求。"""
+    gitee.item_label_endpoint_usable = False
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"labels": [{"name": "triage"}]})
+    )
+    patch = respx.patch(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    post = respx.post(f"{GITEE}/repos/psf/requests/issues/7/labels").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    await gitee.add_labels(REPO, 7, ["fissue"])
+
+    assert not post.called, "已确认不可用就不该再试"
+    sent = patch.calls[0].request.content.decode()
+    assert "triage" in sent and "fissue" in sent, "并集必须带上原有标签"
+
+
+@respx.mock
+async def test_v5_add_labels_falls_back_when_endpoint_errors(gitee) -> None:
+    """直连端点 400 时自动落到并集写法：哪个形状可用由真写的结果说了算。"""
+    respx.post(f"{GITEE}/repos/psf/requests/issues/7/labels").mock(
+        return_value=httpx.Response(400, json={"message": "Request body parsing error"})
+    )
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={"labels": "bug,ui"})
+    )
+    patch = respx.patch(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    await gitee.add_labels(REPO, 7, ["fissue"])
+
+    sent = patch.calls[0].request.content.decode()
+    assert "bug" in sent and "ui" in sent and "fissue" in sent
+
+
+@respx.mock
+async def test_v5_patch_labels_union_refuses_when_current_unknown(gitee) -> None:
+    """读不回就绝不写：替换语义下只发新增标签等于抹掉维护者原有的标签。"""
+    from fissue.errors import PlatformError
+
+    respx.get(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json=[])      # 不是 dict
+    )
+    patch = respx.patch(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    with pytest.raises(PlatformError):
+        await gitee._patch_labels_union(REPO, 7, ["fissue"], ItemType.ISSUE)
+    assert not patch.called
+
+
+@respx.mock
+async def test_v5_close_item_patches_state(gitee) -> None:
+    patch = respx.patch(f"{GITEE}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+    await gitee.close_item(REPO, 7)
+    assert '"state":"closed"' in patch.calls[0].request.content.decode()
+
+
+@respx.mock
+async def test_v5_fork_returns_full_name(gitee) -> None:
+    respx.get(f"{GITEE}/user").mock(return_value=httpx.Response(200, json={"login": "someone"}))
+    respx.post(f"{GITEE}/repos/psf/requests/forks").mock(
+        return_value=httpx.Response(201, json={"full_name": "me/requests"})
+    )
+
+    forked = await gitee.fork_repo(REPO)
+
+    assert forked.owner == "me" and forked.name == "requests"
+
+
+@respx.mock
+async def test_v5_fork_infers_owner_from_current_user(gitee) -> None:
+    """fork 接口没给可解析的名字时，按当前用户推断——而不是抛错或拼出个空 owner。"""
+    respx.get(f"{GITEE}/user").mock(return_value=httpx.Response(200, json={"login": "me"}))
+    respx.post(f"{GITEE}/repos/psf/requests/forks").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    forked = await gitee.fork_repo(REPO)
+
+    assert forked.owner == "me" and forked.name == "requests"
+
+
+@respx.mock
+async def test_v5_fork_raises_when_result_unresolvable(gitee) -> None:
+    """拿不到 fork 结果、也认不出当前用户时必须抛错（带原始响应），不能瞎猜。"""
+    from fissue.errors import PlatformError
+
+    respx.get(f"{GITEE}/user").mock(return_value=httpx.Response(200, json={}))
+    respx.post(f"{GITEE}/repos/psf/requests/forks").mock(
+        return_value=httpx.Response(201, json={})
+    )
+
+    with pytest.raises(PlatformError):
+        await gitee.fork_repo(REPO)
+
+
+@respx.mock
+async def test_atomgit_create_label_reports_existence_correctly(atomgit) -> None:
+    route = respx.post(f"{ATOMGIT}/repos/psf/requests/labels").mock(
+        side_effect=[
+            httpx.Response(409, json={"message": "Label already exists"}),
+            httpx.Response(400, json={"message": "Color must be a valid color code"}),
+        ]
+    )
+    assert await atomgit._create_label(REPO, "fissue") is True
+    assert await atomgit._create_label(REPO, "fissue") is False
+    assert route.call_count == 2
+
+
+async def test_atomgit_add_labels_is_noop_when_empty(atomgit) -> None:
+    await atomgit.add_labels(REPO, 7, [])
+
+
+@respx.mock
+async def test_atomgit_add_labels_requires_dict_payload(atomgit) -> None:
+    """条目本身返回的不是对象时放弃写入（同样是为了不抹掉维护者标签）。"""
+    from fissue.errors import PlatformError
+
+    respx.get(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json=["unexpected"])
+    )
+    patch = respx.patch(f"{ATOMGIT}/repos/psf/requests/issues/7").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    with pytest.raises(PlatformError):
+        await atomgit.add_labels(REPO, 7, ["fissue"])
+    assert not patch.called

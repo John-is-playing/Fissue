@@ -19,7 +19,15 @@ log = get_logger(__name__)
 
 
 def _label_names(labels: Any) -> list[str]:
-    """v5 的 labels 可能是字符串数组或对象数组。"""
+    """v5 的 labels 可能是字符串数组、对象数组，或**逗号分隔的单个字符串**。
+
+    最后那种形态必须单独处理：直接把它当可迭代对象，会按**字符**拆成
+    `["b", "u", "g"]`——而 `_label_names` 同时用于「读回现值」与「判定标签」，
+    拆错就会拿着垃圾标签去做并集写回（等于给仓库打上一堆单字母标签）。
+    v5 的打标签接口本身就用 `label1,label2` 这种字符串形状，读写两侧必须同口径。
+    """
+    if isinstance(labels, str):
+        labels = labels.split(",")
     out: list[str] = []
     for label in labels or []:
         # 对象数组取 name/title，字符串数组直接 str——写成一行三元，省掉 if/else 分支
@@ -28,6 +36,7 @@ def _label_names(labels: Any) -> list[str]:
             if isinstance(label, dict)
             else str(label)
         )
+        name = name.strip()
         if name:
             out.append(name)
     return out

@@ -7,6 +7,20 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Fissue" }]
 keywords = ["issue", "pull-request", "llm", "ai", "triage", "github", "gitee", "gitlab", "atomgit"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
+]
 
 dependencies = [
     "httpx>=0.27",
@@ -48,11 +62,23 @@ dev = [
     "mypy>=1.10",
     # 覆盖率：CI 用它出报告并卡一条**软门**（见 [tool.coverage.report].fail_under）。
     "pytest-cov>=5.0",
+    # 单测超时保护：见 [tool.pytest.ini_options].timeout 处的说明。
+    # 没有它时，「真实网络请求被静默重试到超时」这类故障表现为 pytest **假死**——
+    # 不出结果、不报错，只能干等到 CI 的 job 上限才看到一句 cancelled。
+    "pytest-timeout>=2.3",
     # 本地提交前钩子（.pre-commit-config.yaml 走 language: system，用的是本环境里的
     # ruff / mypy，因此这套钩子与 CI 跑的是同一版本——见 CONTRIBUTING.md 的教训：
     # 「没在本地跑 mypy 就会在 CI 上红」）。
     "pre-commit>=3.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/John-is-playing/Fissue"
+Repository = "https://github.com/John-is-playing/Fissue"
+Issues = "https://github.com/John-is-playing/Fissue/issues"
+Changelog = "https://github.com/John-is-playing/Fissue/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/John-is-playing/Fissue/blob/main/docs/USAGE.md"
+
 
 [project.scripts]
 fissue = "fissue.cli.main:app"
@@ -75,6 +101,13 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 单条测试的硬超时（秒）。这个项目踩过一次「pytest 假死」：conftest 的网络守卫只放行
+# localhost，而本机代理恰好也在 localhost，于是 httpx 的真实请求既没被守卫拦下、也没被
+# respx 拦截，只是静默重试到超时——表现为整个测试进程挂住、不报任何错。
+# 有了这条，同样的故障会在 120s 内变成一条明确的 `Timeout`，直接指到卡住的用例。
+# 取 120 而不是更短：本仓库最慢的用例（e2e 全链路）在 CI 上约 20~30s，留足余量。
+# 需要临时放宽的用例用 `@pytest.mark.timeout(N)` 单独覆盖。
+timeout = 120
 
 [tool.mypy]
 python_version = "3.10"

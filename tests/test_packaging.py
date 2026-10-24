@@ -52,6 +52,7 @@ _EXEMPT = {
     "jinja2": "由 fastapi.templating.Jinja2Templates 使用，代码里不直接 import",
     "pytest-asyncio": "pytest 插件：靠 entry point 加载（asyncio_mode=auto），代码里不 import",
     "pytest-cov": "pytest 插件：靠 entry point 加载（--cov 参数），代码里不 import",
+    "pytest-timeout": "pytest 插件：靠 entry point 加载（pyproject 里的 timeout 配置），代码里不 import",
     "ruff": "命令行 linter，只运行不 import",
     "mypy": "命令行类型检查器，只运行不 import",
     "pre-commit": "命令行工具，只在本地提交前钩子里运行，代码里不 import",

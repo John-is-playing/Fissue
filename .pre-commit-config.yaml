@@ -12,6 +12,13 @@
 # 本仓库没做 `ruff format`（那会要求重排 70+ 个文件，是与本项目无关的大 diff），
 # CI 的 lint job 也只跑 `ruff check`——这里保持一致，不引入 CI 不检查的规矩。
 
+# 为什么**没有**跑 pytest
+# ----------------------
+# 钩子只做「能秒级判定的检查」（ruff / mypy）；全量测试约 3 分钟，放进每次 commit 会被
+# 直接 `--no-verify` 绕过，反而更糟。测试的**超时保护**与 CI 同源，统一由
+# `pyproject.toml` 的 `[tool.pytest.ini_options].timeout` 决定：本地手跑 `pytest -q`
+# 与 CI 走的是同一份配置，不会出现「本地宽松、CI 超时」的错位。
+
 repos:
   - repo: local
     hooks:
