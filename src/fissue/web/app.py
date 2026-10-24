@@ -1416,6 +1416,22 @@ def _attempt_payload(attempt) -> dict[str, Any]:
 
 
 def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) -> None:
+    """注册 Web 页面路由。
+
+    按域拆开注册（原先是一个 333 行的单函数）：总览 / 条目 / 状态与队列 / 任务 /
+    配置页 / 条目详情。切分只按域移动代码，**注册顺序保持原样**。
+    """
+    _register_web_overview(app, templates)
+    _register_web_items(app, templates)
+    _register_web_status(app, templates)
+    _register_web_jobs(app, templates)
+    _register_web_config(app, templates)
+    _register_web_item_detail(app, templates)
+
+
+def _register_web_overview(app: FastAPI, templates: Jinja2Templates) -> None:
+    """总览：告警 + 统计 + 队列 + 用量 + 控制面板 + 任务与抓取记录。"""
+
     @app.get("/", response_class=HTMLResponse)
     async def overview(request: Request) -> HTMLResponse:
         """总览：告警 + 统计 + 队列 + 用量 + 控制面板 + 任务与抓取记录。
@@ -1443,6 +1459,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                 problems=[],
             ),
         )
+
+def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
+    """条目列表页：筛选 + 排序 + 分页。"""
 
     @app.get("/items", response_class=HTMLResponse)
     async def items_page(
@@ -1568,6 +1587,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
             ),
         )
 
+def _register_web_status(app: FastAPI, templates: Jinja2Templates) -> None:
+    """状态监测页 + 队列页。"""
+
     @app.get("/status", response_class=HTMLResponse)
     async def status_page(
         request: Request,
@@ -1628,6 +1650,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
             ),
         )
 
+def _register_web_jobs(app: FastAPI, templates: Jinja2Templates) -> None:
+    """任务列表页 + 任务详情页。"""
+
     @app.get("/jobs", response_class=HTMLResponse)
     async def jobs_page(request: Request) -> HTMLResponse:
         """任务页：作业历史（含日志）。提交入口在总览的控制面板。
@@ -1667,6 +1692,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                 events_html="".join(render_job_event(ev)["html"] for ev in job.events),
             ),
         )
+
+def _register_web_config(app: FastAPI, templates: Jinja2Templates) -> None:
+    """监控仓库页 / 设置页 / 初始化向导页。"""
 
     @app.get("/repos", response_class=HTMLResponse)
     async def repos_page(request: Request) -> HTMLResponse:
@@ -1718,6 +1746,9 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
                 setup_done=bool(_settings(request).repos) and bool(_settings(request).llm.api_key),
             ),
         )
+
+def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
+    """条目详情页。"""
 
     @app.get("/item/{key:path}", response_class=HTMLResponse)
     async def item_detail(request: Request, key: str) -> HTMLResponse:
