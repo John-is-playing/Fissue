@@ -632,17 +632,32 @@ def warn_if_unprovisioned(settings: Settings, store: AuthStore) -> str:
 
 
 def register(app: FastAPI, settings: Settings) -> None:
-    """注册 ``/api/auth/*`` 与 ``/login`` / ``/api-keys`` 两个页面。"""
-    prefix = AUTH_PREFIX
+    """注册 ``/api/auth/*`` 与 ``/login`` / ``/api-keys`` 两个页面。
 
-    def templates(request: Request) -> Any:
-        return request.app.state.templates
+    按域拆开注册。原先这里是一个 385 行的单函数：路由一多，就没人能一眼看出「哪个域有
+    哪些端点、各自的闸门挂在哪」。切分只按域移动代码，**注册顺序保持原样**。
+    """
+    _register_login_page(app, settings)
+    _register_session(app)
+    _register_bootstrap(app)
+    _register_account(app)
+    _register_two_factor(app)
+    _register_api_keys(app)
+    _register_api_keys_page(app)
 
-    def page_context(request: Request, *, nav: str = "", **extra: Any) -> dict[str, Any]:
-        from .app import _page_context
 
-        return _page_context(request, nav=nav, **extra)
+def _templates(request: Request) -> Any:
+    return request.app.state.templates
 
+
+def _page_ctx(request: Request, *, nav: str = "", **extra: Any) -> dict[str, Any]:
+    from .app import _page_context
+
+    return _page_context(request, nav=nav, **extra)
+
+
+def _register_login_page(app: FastAPI, settings: Settings) -> None:
+    """登录页：一个页面里走完「用户名+口令」→「2FA」两步。"""
     # -- 登录页 ----------------------------------------------------------
 
     @app.get("/login", response_class=HTMLResponse)
@@ -656,7 +671,7 @@ def register(app: FastAPI, settings: Settings) -> None:
         if identity.allowed:
             return RedirectResponse("/", status_code=303)
         store = store_of(request)
-        return templates(request).TemplateResponse(
+        return _templates(request).TemplateResponse(
             request,
             "login.html",
             {
@@ -671,6 +686,10 @@ def register(app: FastAPI, settings: Settings) -> None:
                 "next": request.query_params.get("next", "/"),
             },
         )
+
+def _register_session(app: FastAPI) -> None:
+    """会话：登录 → （2FA 校验）→ 建会话 → 登出，以及「当前是谁」。"""
+    prefix = AUTH_PREFIX
 
     # -- 会话 ------------------------------------------------------------
 
@@ -785,6 +804,10 @@ def register(app: FastAPI, settings: Settings) -> None:
             "trusted_networks": list(current.web.trusted_networks),
         }
 
+def _register_bootstrap(app: FastAPI) -> None:
+    """首次引导：建第一个管理员账号（只走一次）。"""
+    prefix = AUTH_PREFIX
+
     # -- 首次引导 --------------------------------------------------------
 
     @app.post(f"{prefix}/bootstrap")
@@ -813,6 +836,10 @@ def register(app: FastAPI, settings: Settings) -> None:
         log.info("已创建管理员账号：%s", username)
         return {"ok": True, "username": user.username, "csrf_token": csrf_token}
 
+def _register_account(app: FastAPI) -> None:
+    """账号自身：改口令（并踢掉其它会话）。"""
+    prefix = AUTH_PREFIX
+
     # -- 账号自身 --------------------------------------------------------
 
     @app.post(f"{prefix}/password")
@@ -829,6 +856,10 @@ def register(app: FastAPI, settings: Settings) -> None:
         kicked = store.delete_other_sessions(user.id, keep=identity.session_id)
         log.info("账号 %s 已修改口令，注销其它会话 %d 个", user.username, kicked)
         return {"ok": True, "kicked_sessions": kicked}
+
+def _register_two_factor(app: FastAPI) -> None:
+    """两步验证：生成密钥 / 查待激活 / 激活 / 关闭 / 重发恢复码。"""
+    prefix = AUTH_PREFIX
 
     # -- 两步验证 --------------------------------------------------------
 
@@ -924,19 +955,24 @@ def register(app: FastAPI, settings: Settings) -> None:
             "note": "旧恢复码已全部作废；新码只显示这一次。",
         }
 
-    # -- API Key ---------------------------------------------------------
+def _key_payload(row: Any) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "prefix": row.prefix,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
+        "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
+        "revoked": row.revoked_at is not None,
+        "legacy": row.prefix == LEGACY_KEY_PREFIX,
+    }
 
-    def _key_payload(row: Any) -> dict[str, Any]:
-        return {
-            "id": row.id,
-            "name": row.name,
-            "prefix": row.prefix,
-            "created_at": row.created_at.isoformat() if row.created_at else None,
-            "last_used_at": row.last_used_at.isoformat() if row.last_used_at else None,
-            "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
-            "revoked": row.revoked_at is not None,
-            "legacy": row.prefix == LEGACY_KEY_PREFIX,
-        }
+
+def _register_api_keys(app: FastAPI) -> None:
+    """API Key：列出 / 创建 / 吊销，以及旧口令手工导入。"""
+    prefix = AUTH_PREFIX
+
+    # -- API Key ---------------------------------------------------------
 
     @app.get(f"{prefix}/api-keys")
     async def list_api_keys(
@@ -1000,16 +1036,19 @@ def register(app: FastAPI, settings: Settings) -> None:
         )
         return {**_key_payload(row), "note": "旧口令现在可作为 Bearer 使用。"}
 
+def _register_api_keys_page(app: FastAPI) -> None:
+    """API Key 页面。"""
+
     # -- API Key 页面 ----------------------------------------------------
 
     @app.get("/api-keys", response_class=HTMLResponse)
     async def api_keys_page(request: Request) -> HTMLResponse:
         identity = resolve_identity(request)
         keys = store_of(request).list_keys() if identity.allowed else []
-        return templates(request).TemplateResponse(
+        return _templates(request).TemplateResponse(
             request,
             "apikeys.html",
-            page_context(
+            _page_ctx(
                 request,
                 nav="apikeys",
                 identity=identity,

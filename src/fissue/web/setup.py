@@ -40,7 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from ..config import (
@@ -945,25 +945,36 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
 
     ``settings`` 只用于**注册期**取 API 前缀等常量；处理函数里一律用 :func:`_current`
     现取，否则热重载后闭包里还是旧对象。
+
+    按域拆开注册（原先是一个 279 行的单函数）：仓库管理 / 设置 / 向导探活 / 向导应用。
+    切分只按域移动代码，**注册顺序保持原样**。
     """
-    from fastapi import Depends, Query
+    _register_repos(app, settings, auth=auth)
+    _register_settings(app, settings, auth=auth)
+    _register_probes(app, settings, auth=auth)
+    _register_apply(app, settings, auth=auth)
 
+
+def _platform_of(value: str) -> Platform:
+    try:
+        return Platform(value)
+    except ValueError as exc:
+        allowed = "、".join(p.value for p in Platform)
+        raise HTTPException(
+            status_code=400, detail=f"平台取值非法：{value!r}；可选：{allowed}"
+        ) from exc
+
+
+def find_index(settings: Settings, platform: Platform, owner: str, name: str) -> int:
+    for index, repo in enumerate(settings.repos):
+        if repo.platform is platform and repo.owner == owner and repo.name == name:
+            return index
+    raise HTTPException(status_code=404, detail=f"配置里没有这个仓库：{platform.value}:{owner}/{name}")
+
+
+def _register_repos(app: FastAPI, settings: Settings, *, auth: Any) -> None:
+    """监控仓库：列出 / 加入 / 改 / 移出，以及抓取前的探活。"""
     prefix = settings.api.prefix
-
-    def _platform_of(value: str) -> Platform:
-        try:
-            return Platform(value)
-        except ValueError as exc:
-            allowed = "、".join(p.value for p in Platform)
-            raise HTTPException(
-                status_code=400, detail=f"平台取值非法：{value!r}；可选：{allowed}"
-            ) from exc
-
-    def find_index(settings: Settings, platform: Platform, owner: str, name: str) -> int:
-        for index, repo in enumerate(settings.repos):
-            if repo.platform is platform and repo.owner == owner and repo.name == name:
-                return index
-        raise HTTPException(status_code=404, detail=f"配置里没有这个仓库：{platform.value}:{owner}/{name}")
 
     @app.get(f"{prefix}/repos")
     async def list_repos(request: Request, _: None = Depends(auth)) -> dict[str, Any]:
@@ -1066,6 +1077,10 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
         )
         return await probe_repo(settings, candidate.platform, candidate.owner, candidate.name)
 
+def _register_settings(app: FastAPI, settings: Settings, *, auth: Any) -> None:
+    """设置：读 / 写（.env 与覆盖层）。"""
+    prefix = settings.api.prefix
+
     # -- 设置 -------------------------------------------------------------
 
     @app.get(f"{prefix}/settings")
@@ -1097,6 +1112,10 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
                 else "已写盘并热重载，立即生效。"
             ),
         }
+
+def _register_probes(app: FastAPI, settings: Settings, *, auth: Any) -> None:
+    """向导探活：真的打一次 LLM / 数据库 / 平台（写盘前先确认能通）。"""
+    prefix = settings.api.prefix
 
     # -- 向导探活 ---------------------------------------------------------
 
@@ -1139,6 +1158,10 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
                 "error": "没有可用的 Token：请求里没带，当前配置里也没配。",
             }
         return await probe_platform(settings, body.platform, token)
+
+def _register_apply(app: FastAPI, settings: Settings, *, auth: Any) -> None:
+    """向导最后一步：写 .env + 覆盖层，热重载，可选立刻跑第一轮抓取。"""
+    prefix = settings.api.prefix
 
     @app.post(f"{prefix}/setup/apply")
     async def setup_apply(
@@ -1185,37 +1208,37 @@ def register(app: FastAPI, settings: Settings, *, auth: Any) -> None:
             "settings": settings_view(request, fresh),
         }
 
-    def _purge_repo(request: Request, repo: RepoConfig) -> int:
-        """把某个仓库的条目连同库里的行一起删掉（显式要求时才走）。
+def _purge_repo(request: Request, repo: RepoConfig) -> int:
+    """把某个仓库的条目连同库里的行一起删掉（显式要求时才走）。
 
-        **必须带上平台**：``slug`` 只是 ``owner/name``，不含平台——两个平台上可以有同名仓库，
-        项目自己的 ``Settings.repo()`` 也允许按平台消歧。只按 slug 删，会把另一个平台上
-        同名仓库的条目一并删掉（数据不可恢复）。
-        """
-        from sqlalchemy import delete
+    **必须带上平台**：``slug`` 只是 ``owner/name``，不含平台——两个平台上可以有同名仓库，
+    项目自己的 ``Settings.repo()`` 也允许按平台消歧。只按 slug 删，会把另一个平台上
+    同名仓库的条目一并删掉（数据不可恢复）。
+    """
+    from sqlalchemy import delete
 
-        from ..store.tables import ItemRow, RepoRow
+    from ..store.tables import ItemRow, RepoRow
 
-        platform = repo.platform.value
-        state = request.app.state
-        with state.db.session() as session:
-            count = len(
-                session.scalars(
-                    select_ids(ItemRow).where(
-                        ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
-                    )
-                ).all()
-            )
-            if count:
-                session.execute(
-                    delete(ItemRow).where(
-                        ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
-                    )
+    platform = repo.platform.value
+    state = request.app.state
+    with state.db.session() as session:
+        count = len(
+            session.scalars(
+                select_ids(ItemRow).where(
+                    ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
                 )
+            ).all()
+        )
+        if count:
             session.execute(
-                delete(RepoRow).where(RepoRow.slug == repo.slug, RepoRow.platform == platform)
+                delete(ItemRow).where(
+                    ItemRow.repo_slug == repo.slug, ItemRow.platform == platform
+                )
             )
-        return count
+        session.execute(
+            delete(RepoRow).where(RepoRow.slug == repo.slug, RepoRow.platform == platform)
+        )
+    return count
 
 
 def select_ids(model: Any) -> Any:
