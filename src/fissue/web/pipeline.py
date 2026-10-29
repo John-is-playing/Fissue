@@ -47,6 +47,21 @@ STUCK = "stuck"
 #: 刻意不含 ``capture``（抓取是瞬时的，没有「待抓取」这种积压）与 ``done``（终点不是工作队列）。
 KANBAN_STAGES: tuple[str, ...] = ("evaluate", "verify", "judge", "fix", "pr", STUCK)
 
+#: 「预设」：用户按**意图**挑，而不是按状态名挑。
+#: 每个预设就是一个阶段（外加两个特例），所以预设与阶段永远不会给出不同的结果——
+#: 两套筛选并存却各自算一遍，是筛选器最常见的错法。
+#:
+#: 键名用中文以外的安全标识（URL 里要传），标签给中文。
+PRESETS: tuple[tuple[str, str], ...] = (
+    ("stuck", "卡住的"),
+    ("evaluate", "待评测"),
+    ("verify", "待验证"),
+    ("judge", "待裁决"),
+    ("fix", "待修"),
+    ("pr", "已提 PR"),
+    ("done", "已出结论"),
+)
+
 #: 四条流水线（与 ``docs/DESIGN.md`` 的「四条流水线」一致）+ 未分类。
 #: 分类（BUG/FEATURE）决定走哪条链，所以行按「类型 × 分类」划分，而不是只按类型。
 LANES: tuple[tuple[str, str], ...] = (
@@ -127,6 +142,18 @@ def statuses_of_stage(key: str) -> list[ItemStatus]:
     if key == STUCK:
         return [s for s, stage in _STAGE_OF.items() if stage == STUCK]
     return [s for s, stage in _STAGE_OF.items() if stage == key]
+
+
+def preset_stage(preset: str) -> str | None:
+    """预设 → 它对应的阶段键（认不出的返回 ``None``）。
+
+    预设**只是阶段的别名**，不额外定义一套状态集合：否则「预设=待验证」与
+    「阶段=验证」会给出不同结果，而用户完全看不出该信哪个。
+    """
+    known = {key for key, _ in PRESETS}
+    if preset in known:
+        return preset
+    return None
 
 
 def stage_states(status: ItemStatus) -> list[str]:

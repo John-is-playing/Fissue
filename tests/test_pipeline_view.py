@@ -354,3 +354,35 @@ def test_statuses_of_stage_unknown_key_is_empty() -> None:
     from fissue.web.pipeline import statuses_of_stage
 
     assert statuses_of_stage("no-such-stage") == []
+
+
+# ---------------------------------------------------------------------------
+# 预设（preset）：阶段的友好别名
+# ---------------------------------------------------------------------------
+
+
+def test_preset_stage_maps_known_presets() -> None:
+    """预设就是阶段的别名——不另定义一套状态集合。"""
+    from fissue.web.pipeline import preset_stage
+
+    assert preset_stage("stuck") == "stuck"
+    assert preset_stage("evaluate") == "evaluate"
+    assert preset_stage("verify") == "verify"
+    assert preset_stage("fix") == "fix"
+    assert preset_stage("done") == "done"
+
+
+def test_preset_stage_rejects_unknown() -> None:
+    from fissue.web.pipeline import preset_stage
+
+    assert preset_stage("no-such-preset") is None
+
+
+def test_every_preset_is_a_valid_stage() -> None:
+    """每个预设都必须能解析成一个真实阶段——否则「预设」与「阶段」会给出不同结果。"""
+    from fissue.web.pipeline import PRESETS, preset_stage, statuses_of_stage
+
+    for key, _label in PRESETS:
+        resolved = preset_stage(key)
+        assert resolved is not None, key
+        assert statuses_of_stage(resolved), f"{key} 解析出的阶段没有任何状态"

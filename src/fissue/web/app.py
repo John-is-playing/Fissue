@@ -1558,6 +1558,7 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
         q: str | None = Query(None),
         stage: str | None = Query(None, description="流水线阶段（evaluate/verify/judge/fix/pr/stuck/done）"),
         lane: str | None = Query(None, description="流水线（issue-bug/issue-feature/pr-bug/pr-feature）"),
+        preset: str | None = Query(None, description="预设（卡住的/待评测/待验证/待裁决/待修/已提PR/已出结论）"),
         sort: str = Query("updated_at"),
         order: str = Query("desc"),
         limit: int = Query(50, ge=1, le=500),
@@ -1589,7 +1590,20 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
 
         # stage / lane 是**流水线视图**的筛选（看板格子点进来带的）。
         # 阶段 → 状态集合的映射由 web/pipeline.py 提供，与看板计数同一份口径。
+        #
+        # preset 是 stage 的**用户友好别名**（「卡住的」「待修」）。它不另定义一套状态
+        # 集合，只是换个说法——两套筛选并存却各自算一遍，是筛选器最常见的错法。
+        #
+        # 优先级：显式给的 stage 胜过 preset（它更精确）；两者都没给就是不过滤。
+        f_preset = preset or ""
         f_stage = stage or ""
+        if f_preset and not f_stage:
+            resolved = pipe.preset_stage(f_preset)
+            if resolved is None:
+                problems.append(f"preset 取值非法：{f_preset!r}")
+            else:
+                f_stage = resolved
+
         stage_statuses: list[ItemStatus] | None = None
         if f_stage:
             known = {key for key, _ in pipe.STAGES} | {pipe.DONE, pipe.STUCK}
@@ -1650,6 +1664,7 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
             "q": q or "",
             "stage": f_stage,
             "lane": f_lane,
+            "preset": f_preset,
             "sort": sort_key,
             "order": "desc" if order_desc else "asc",
             "limit": limit,
@@ -1718,6 +1733,7 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
                     (pipe.STUCK, pipe.stage_label(pipe.STUCK)),
                 ],
                 lane_options=list(pipe.LANES),
+                preset_options=list(pipe.PRESETS),
                 filters=shown,
             ),
         )

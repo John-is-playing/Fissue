@@ -593,3 +593,21 @@ tr.stalled td { background: rgba(255, 107, 107, .06); }
   .tl-dot { width: 20px; height: 20px; font-size: 11px; }
   .tl-panel .tl::before { left: 9px; }
 }
+
+/* --------------------------------------------------------------------------
+ * 「更多筛选」折叠区（web/templates/items.html）
+ *
+ * 它在**同一个 form 里**（`<details>` 放到 form 外时，里面的下拉框不会被提交，
+ * 于是「选了类型却没生效」而且不报错），所以要占满整行而不是跟着前面的 label 排。
+ * -------------------------------------------------------------------------- */
+.filters .more-filters { flex-basis: 100%; margin-top: 10px; }
+.more-filters > summary {
+  cursor: pointer; font-size: 13px; color: var(--muted); user-select: none;
+  padding: 4px 0;
+}
+.more-filters > summary::before { content: "▸ "; }
+.more-filters[open] > summary::before { content: "▾ "; }
+.more-filters > summary:hover { color: var(--fg); }
+.more-filters .filters {
+  border-top: 1px solid var(--line); padding-top: 12px;
+}

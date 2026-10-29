@@ -19,8 +19,17 @@
 <div class="banner">⚠️ {{ problem }}</div>
 {% endfor %}
 
-{# 筛选：仓库 / 类型 / 分类 / 优先级 / 状态 / 搜索 / 排序 / 每页条数。
-   取值一律来自后端枚举（原先模板里手写了一份 12 个状态的清单，漏掉了 classified / verifying）。 #}
+{# 筛选：主行只留**最常用的三个**（仓库 / 预设 / 搜索），其余收进「更多筛选」。
+   取值一律来自后端枚举（原先模板里手写了一份 12 个状态的清单，漏掉了 classified / verifying）。
+
+   为什么要收起来：这一页原先平铺着 9 个下拉框 + 3 个输入框，而**日常真正常用的只有
+   「看某仓库里卡住的那些」**——9 个同权重的框反而让人找不到那个。其余维度（类型 / 分类 /
+   优先级 / 状态 / 阶段 / 流水线 / 排序 / 每页）收进可折叠区，需要时再展开，
+   展开状态记在 localStorage 里。
+
+   预设是阶段的友好别名：「卡住的」「待修」比状态名（needs_manual / fix_queued）好认，
+   而它**不另定义一套状态集合**，只是换个说法——两套筛选并存却各自算一遍，
+   是筛选器最常见的错法。 #}
 <form class="filters" method="get">
   <label class="inline">仓库
     <select name="repo_slug">
@@ -30,6 +39,28 @@
       {% endfor %}
     </select>
   </label>
+  <label class="inline">预设
+    <select name="preset">
+      <option value="">全部</option>
+      {% for key, label in preset_options %}
+      <option value="{{ key }}" {% if filters.preset == key %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">搜索
+    <input type="search" name="q" value="{{ filters.q }}" placeholder="标题 / 正文 / 作者" style="width:180px">
+  </label>
+  <button type="submit" class="primary">筛选</button>
+  <a href="/items"><button type="button" class="ghost">重置</button></a>
+  <button type="button" class="ghost" id="more-toggle" aria-expanded="false">更多筛选 ▾</button>
+
+  {# 更多筛选：默认收起。里面是**精确到状态**的那些维度。
+     注意它必须在**同一个 form 里**——`<details>` 放到 form 外面时，里面那些下拉框
+     不会被提交，于是「选了类型却没生效」——而且不报错。 #}
+  <details class="more-filters" id="more-filters"
+           {% if filters.stage or filters.lane or filters.status or filters.category or filters.priority or filters.item_type %}open{% endif %}>
+    <summary>更多筛选（类型 / 分类 / 优先级 / 状态 / 阶段 / 流水线 / 排序）</summary>
+    <div class="filters mt">
   <label class="inline">类型
     <select name="item_type">
       <option value="">全部</option>
@@ -80,9 +111,6 @@
       {% endfor %}
     </select>
   </label>
-  <label class="inline">搜索
-    <input type="search" name="q" value="{{ filters.q }}" placeholder="标题 / 正文 / 作者" style="width:180px">
-  </label>
   <label class="inline">排序
     <select name="sort">
       {% for k in sort_keys %}
@@ -99,8 +127,9 @@
   <label class="inline">每页
     <input type="number" name="limit" value="{{ filters.limit }}" min="1" max="500" style="width:80px">
   </label>
-  <button type="submit" class="primary">筛选</button>
-  <a href="/items"><button type="button" class="ghost">重置</button></a>
+  <button type="submit" class="primary">应用</button>
+  </div>
+</details>
 </form>
 
 {# 批量操作：勾选行之后只对**选中项**操作。API 的 keys 参数一直支持，旧页面却只有
@@ -278,5 +307,38 @@ fissue eval --all</pre>
         });
     });
   }
+
+  // ---------------------------------------------------------------------
+  // 「更多筛选」展开/收起
+  // ---------------------------------------------------------------------
+  //
+  // 展开状态记在 localStorage：这一页的筛选区是**精确到状态**的那些维度，平时用不上，
+  // 但反复要用的也不少——每次都点开一次很烦。
+  // 注意服务端已经会「有精确筛选就默认展开」（details 的 open 属性），这里的 localStorage
+  // 只覆盖**用户自己**的展开/收起选择。
+  (function () {
+    var KEY = "fissue.items.more";
+    var box = document.getElementById("more-filters");
+    var btn = document.getElementById("more-toggle");
+    if (!box || !btn) return;
+
+    var saved = null;
+    try { saved = localStorage.getItem(KEY); } catch (e) { /* 隐私模式下写不了，忽略 */ }
+    if (saved === "open") box.open = true;
+    if (saved === "closed") box.open = false;
+
+    function sync() {
+      btn.textContent = box.open ? "更多筛选 ▴" : "更多筛选 ▾";
+      btn.setAttribute("aria-expanded", box.open ? "true" : "false");
+    }
+    sync();
+
+    btn.addEventListener("click", function () {
+      box.open = !box.open;
+      sync();
+      try { localStorage.setItem(KEY, box.open ? "open" : "closed"); } catch (e) { /* 同上 */ }
+    });
+    box.addEventListener("toggle", sync);
+  })();
 </script>
 {% endblock %}
