@@ -253,7 +253,10 @@ def summarize(counts: Iterable[tuple[str, str, str, int]]) -> dict[str, Any]:
             for lane in lanes.values()
         ],
         "totals": {
-            "items": total_items,
+            # 键名**不能**叫 `items`：Jinja 里 `view.totals.items` 会取到 dict 的
+            # `.items` 方法，页面上就渲染成 `<built-in method items of dict object at
+            # 0x...>`。`keys` / `values` / `get` 同理，一律避开。
+            "total": total_items,
             "stuck": totals.get(STUCK, 0),
             "done": totals.get(DONE, 0),
             "active": total_items - totals.get(STUCK, 0) - totals.get(DONE, 0),

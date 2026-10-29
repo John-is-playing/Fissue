@@ -1674,3 +1674,31 @@ def test_pipeline_kanban_link_points_at_working_filter(client, repo) -> None:  #
 
     items_html = client.get("/items", params={"lane": "issue-bug", "stage": "judge"}).text
     assert "看板跳转测试" in items_html
+
+
+def test_pipeline_page_renders_totals_as_numbers(client) -> None:  # noqa: ANN001
+    """摘要卡必须渲染出**数字**，不能是 Python 对象 repr。
+
+    这里守的是一个具体的坑：`totals` 字典的键一度叫 `items`，而 Jinja 的
+    `view.totals.items` 会取到 dict 的 `.items` **方法**，页面上于是显示
+    `<built-in method items of dict object at 0x...>`。
+
+    单测当时全绿——它们只断言 `summarize()` 返回的结构，没人看渲染结果。
+    所以这条直接查 HTML：抓「条目总数」那张卡的 `.v`。
+    """
+    html = client.get("/pipeline").text
+
+    # 摘要卡的四项标题都在
+    for label in ("条目总数", "在途", "已出结论", "需人工"):
+        assert label in html, label
+
+    # 任何一处都不该出现 Python 对象 repr
+    assert "built-in method" not in html, "模板把 dict 的方法当成值渲染了"
+    assert "object at 0x" not in html
+
+    # 「条目总数」那张卡里的值必须是纯数字
+    import re
+
+    m = re.search(r"条目总数\s*</div>\s*<div class=\"v\">([^<]*)</div>", html)
+    assert m, "没找到「条目总数」那张卡的数值节点"
+    assert m.group(1).strip().isdigit(), f"条目总数不是数字：{m.group(1)!r}"

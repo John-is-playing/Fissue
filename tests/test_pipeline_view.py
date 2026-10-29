@@ -170,7 +170,7 @@ def test_summarize_all_views_add_up_to_the_same_total() -> None:
     这是这一层最重要的不变式：视图之间对不上，比只有一种视图更糟。
     """
     view = summarize(_counts())
-    total = view["totals"]["items"]
+    total = view["totals"]["total"]
 
     funnel = sum(stage["count"] for stage in view["stages"])
     assert funnel + view["totals"]["done"] + view["totals"]["stuck"] == total
@@ -220,7 +220,7 @@ def test_summarize_stuck_bucket_is_reported() -> None:
 
 def test_summarize_empty_does_not_divide_by_zero() -> None:
     view = summarize([])
-    assert view["totals"]["items"] == 0
+    assert view["totals"]["total"] == 0
     assert all(stage["pct"] == 0 for stage in view["stages"])
 
 
@@ -234,7 +234,7 @@ def test_summarize_pct_is_relative_to_all_items() -> None:
 def test_summarize_accepts_status_enum_objects() -> None:
     """调用方可能传枚举而不是字符串，两种都要认。"""
     view = summarize([("issue", "bug", ItemStatus.NEW, 2)])  # type: ignore[list-item]
-    assert view["totals"]["items"] == 2
+    assert view["totals"]["total"] == 2
 
 
 # ---------------------------------------------------------------------------
