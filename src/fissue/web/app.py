@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -441,6 +441,42 @@ def _aggregates_of(app: FastAPI) -> dict[str, Any] | None:
     if cache is None:
         return None
     return cache.get() or None
+
+
+def _queue_block(request: Request) -> dict[str, Any]:
+    """队列块的数据：积压计数 + 权威 flush 判定。
+
+    为什么抽成函数：流水线页（看板要显示「该刷了吗」并给批量入口）与独立的队列页
+    都要这份数据。两处各拼一遍，迟早出现「看板说该刷、队列页说不用刷」——而 flush
+    会真调 LLM 出结论、并往平台上打标签，口径不一致的代价不是刷新一下就能抹掉的。
+
+    「该不该 flush」**只读** ``QueueManager.should_flush``，页面不重算（同一个理由：
+    第二份实现必然漂移）。
+    """
+    from ..pipeline.queue import QueueManager
+
+    st = _settings(request)
+    r = _repo(request)
+    ctx = _ctx_of(request.app)
+    qm = QueueManager(ctx)
+    decisions = {
+        q.value: {
+            "should_flush": (d := qm.should_flush(q)).should_flush,
+            "reason": d.reason,
+            "done_count": d.done_count,
+        }
+        for q in QueueName
+    }
+    agg = _aggregates_of(request.app)
+    queues = (agg or {}).get("queues")
+    if queues is None:
+        queues = queue_panel(r, st)
+    return {
+        "queues": queues,
+        "decisions": decisions,
+        # 明细统计就是面板里那份 counts（同一口径）——不再为它单开一次 queue_stats 查询。
+        "queue_stats": {q["name"]: q["counts"] for q in queues},
+    }
 
 
 def _ctx_of(app: FastAPI):
@@ -1472,6 +1508,7 @@ def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
                 stuck=stuck,
                 stages=list(view.STAGES),
                 repo_filter=repo_slug or "",
+                **_queue_block(request),
             ),
         )
 
@@ -1519,6 +1556,8 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
         priority: str | None = Query(None),
         item_type: str | None = Query(None),
         q: str | None = Query(None),
+        stage: str | None = Query(None, description="流水线阶段（evaluate/verify/judge/fix/pr/stuck/done）"),
+        lane: str | None = Query(None, description="流水线（issue-bug/issue-feature/pr-bug/pr-feature）"),
         sort: str = Query("updated_at"),
         order: str = Query("desc"),
         limit: int = Query(50, ge=1, le=500),
@@ -1526,6 +1565,7 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
     ) -> HTMLResponse:
         from ..store import export as exp
         from ..store.repository import ITEM_SORT_COLUMNS
+        from . import pipeline as pipe
 
         r = _repo(request)
         st = _settings(request)
@@ -1546,6 +1586,39 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
         f_status = pick(status, ItemStatus, "status")
         f_category = pick(category, Category, "category")
         f_priority = pick(priority, Priority, "priority")
+
+        # stage / lane 是**流水线视图**的筛选（看板格子点进来带的）。
+        # 阶段 → 状态集合的映射由 web/pipeline.py 提供，与看板计数同一份口径。
+        f_stage = stage or ""
+        stage_statuses: list[ItemStatus] | None = None
+        if f_stage:
+            known = {key for key, _ in pipe.STAGES} | {pipe.DONE, pipe.STUCK}
+            if f_stage not in known:
+                problems.append(f"stage 取值非法：{f_stage!r}")
+            else:
+                stage_statuses = pipe.statuses_of_stage(f_stage)
+
+        f_lane = lane or ""
+        lane_item_type: ItemType | None = None
+        lane_category: Category | None = None
+        if f_lane:
+            if f_lane == "unknown":
+                # 「未分类」不是一条真实流水线，而是「还没评出分类」——两类都算。
+                f_category = Category.UNKNOWN
+            else:
+                parts = f_lane.split("-", 1)
+                if len(parts) != 2 or parts[0] not in ("issue", "pr") or parts[1] not in (
+                    "bug",
+                    "feature",
+                ):
+                    problems.append(f"lane 取值非法：{f_lane!r}")
+                else:
+                    lane_item_type = ItemType.ISSUE if parts[0] == "issue" else ItemType.PR
+                    lane_category = Category.BUG if parts[1] == "bug" else Category.FEATURE
+                    # lane 已经指定了类型与分类，原来的同名字段就以 lane 为准。
+                    f_type = lane_item_type
+                    f_category = lane_category
+
         sort_key = sort if sort in ITEM_SORT_COLUMNS else "updated_at"
         if sort != sort_key:
             problems.append(
@@ -1575,6 +1648,8 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
             "category": category or "",
             "priority": priority or "",
             "q": q or "",
+            "stage": f_stage,
+            "lane": f_lane,
             "sort": sort_key,
             "order": "desc" if order_desc else "asc",
             "limit": limit,
@@ -1584,9 +1659,15 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
         base_qs = urlencode({k: v for k, v in shown.items() if v and k not in ("sort", "order")})
         page_qs = urlencode({k: v for k, v in shown.items() if v})
 
-        items = r.list_items(**filters, limit=limit, offset=offset,
+        # stage 是**状态集合**筛选：它与 status 互斥，statuses 更具体，所以以它为准。
+        # 概览卡片也用同一份筛选，否则「页脚说共 12 条、卡片说 30 条」——那种对不上
+        # 正是 summarize 与明细历史上反复出的老毛病。
+        query_filters: dict[str, Any] = dict(filters)
+        if stage_statuses is not None:
+            query_filters["statuses"] = stage_statuses
+        items = r.list_items(**query_filters, limit=limit, offset=offset,
                              order_by=sort_key, desc=order_desc)
-        total = r.count_items(**filters)
+        total = r.count_items(**query_filters)
         evals = r.evaluations_for([i.key for i in items])
         counts = r.comment_counts([i.key for i in items])
         rows = [
@@ -1630,6 +1711,13 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
                 categories=[c.value for c in Category],
                 priorities=[p.value for p in Priority],
                 types=[t.value for t in ItemType],
+                stage_options=[
+                    (key, label) for key, label in pipe.STAGES
+                ] + [
+                    (pipe.DONE, pipe.stage_label(pipe.DONE)),
+                    (pipe.STUCK, pipe.stage_label(pipe.STUCK)),
+                ],
+                lane_options=list(pipe.LANES),
                 filters=shown,
             ),
         )
@@ -1658,66 +1746,39 @@ def _register_web_status(app: FastAPI, templates: Jinja2Templates) -> None:
         return templates.TemplateResponse(
             request,
             "status.html",
-            _page_context(request, nav="status", snapshot=snapshot),
+            _page_context(
+                request,
+                nav="status",
+                snapshot=snapshot,
+                # 任务面板（原先独立的 /jobs 页）也在这里渲染：两者回答同一个问题
+                # ——「服务现在在干什么、有没有卡住」。`writer` 用来解释「写操作进行中
+                # 但表里没有对应的作业」这一类情况（常驻轮次不是网页作业）。
+                jobs=request.app.state.jobs.to_dict(),
+                writer=writer_panel(_settings(request)),
+            ),
         )
 
     @app.get("/queues", response_class=HTMLResponse)
-    async def queues_page(request: Request) -> HTMLResponse:
-        """队列页：积压计数 + 权威的 flush 判定（来自 QueueManager，不在这里重算）。"""
-        st = _settings(request)
-        r = _repo(request)
-        from ..pipeline.queue import QueueManager
+    async def queues_page(request: Request) -> Response:
+        """旧入口：队列判定已并进流水线的看板视图。
 
-        ctx = _ctx_of(request.app)
-        qm = QueueManager(ctx)
-        decisions = {
-            q.value: {
-                "should_flush": (d := qm.should_flush(q)).should_flush,
-                "reason": d.reason,
-                "done_count": d.done_count,
-            }
-            for q in QueueName
-        }
-        agg = _aggregates_of(request.app)
-        queues = (agg or {}).get("queues")
-        if queues is None:
-            queues = queue_panel(r, st)
-        return templates.TemplateResponse(
-            request,
-            "queues.html",
-            _page_context(
-                request,
-                nav="queues",
-                queues=queues,
-                decisions=decisions,
-                # 明细统计就是面板里那份 counts（同一口径）——不再为它单开一次
-                # ``queue_stats`` 查询。
-                stats={q["name"]: q["counts"] for q in queues},
-                jobs=request.app.state.jobs.to_dict(),
-            ),
-        )
+        保留这一条**重定向**而不是直接删掉：`/queues` 出现在文档、书签和别人的脚本里，
+        404 掉会让人以为功能没了。真正的内容现在在 `/pipeline` 的看板里（同一份部件）。
+        """
+        return RedirectResponse("/pipeline", status_code=307)
 
 def _register_web_jobs(app: FastAPI, templates: Jinja2Templates) -> None:
     """任务列表页 + 任务详情页。"""
 
     @app.get("/jobs", response_class=HTMLResponse)
-    async def jobs_page(request: Request) -> HTMLResponse:
-        """任务页：作业历史（含日志）。提交入口在总览的控制面板。
+    async def jobs_page(request: Request) -> Response:
+        """旧入口：任务面板已并进「状态页」。
 
-        ``writer`` 必须一起传：这张表只列**从网页提交的作业**，而正在写的很可能是常驻服务的
-        定时轮次。真机实测就卡在这个缝里——角标说「写操作进行中」，这一页却空空如也，用户既
-        不知道是谁在写、也取消不了。页面靠 ``writer.kind`` 把两者分开说清楚。
+        保留重定向而不是删掉：`/jobs` 在文档、书签与脚本里都有，404 掉会让人以为功能没了。
+        真正的内容现在在 `/status`（同一份 `_jobs_panel.html` 部件）。
+        任务**详情**页 `/jobs/{id}` 不变——那是独立的深链，不该跟着列表页一起消失。
         """
-        return templates.TemplateResponse(
-            request,
-            "jobs.html",
-            _page_context(
-                request,
-                nav="jobs",
-                jobs=request.app.state.jobs.to_dict(),
-                writer=writer_panel(_settings(request)),
-            ),
-        )
+        return RedirectResponse("/status", status_code=307)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_detail_page(request: Request, job_id: str) -> HTMLResponse:

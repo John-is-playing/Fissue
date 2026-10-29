@@ -1,0 +1,81 @@
+<div class="panel">
+  <h2>模型参数与计费</h2>
+  <div class="muted small">
+    这一组写覆盖层 <code>{{ view.paths.overlay_expected }}</code>，保存后热重载、立即生效。
+    回填的是**当前生效值**（可能来自 config.yaml 或内置默认值）。
+  </div>
+
+  <h3 class="mt">计费与预算</h3>
+  <div class="kv">
+    <div class="k">输入单价</div>
+    <div class="v">
+      <input type="number" step="0.00001" min="0" style="width:150px" id="overlay-llm-price-in"
+             value="{{ view.effective.llm_tunables.pricing_input_per_1k }}">
+      <span class="muted small">美元 / 1K 输入 token（<code>llm.pricing.input_per_1k</code>）</span>
+    </div>
+    <div class="k">输出单价</div>
+    <div class="v">
+      <input type="number" step="0.00001" min="0" style="width:150px" id="overlay-llm-price-out"
+             value="{{ view.effective.llm_tunables.pricing_output_per_1k }}">
+      <span class="muted small">美元 / 1K 输出 token（<code>llm.pricing.output_per_1k</code>）</span>
+    </div>
+    <div class="k">日 token 上限</div>
+    <div class="v">
+      <input type="number" min="0" style="width:170px" id="overlay-llm-budget-tokens"
+             value="{{ view.effective.llm_tunables.budget_tokens }}">
+      <span class="muted small">每仓库每日累计（<code>llm.budget.daily_tokens_per_repo</code>）；<b>0 = 不限</b></span>
+    </div>
+    <div class="k">日花费上限</div>
+    <div class="v">
+      <input type="number" step="0.01" min="0" style="width:150px" id="overlay-llm-budget-usd"
+             value="{{ view.effective.llm_tunables.budget_usd }}">
+      <span class="muted small">美元 / 仓库 / 日（<code>llm.budget.daily_usd_per_repo</code>）；<b>0 = 不限</b></span>
+    </div>
+    <div class="k">超限即停</div>
+    <div class="v">
+      <label class="inline"><input type="checkbox" id="overlay-llm-hard-stop"
+        {{ 'checked' if view.effective.llm_tunables.budget_hard_stop }}> <code>llm.budget.hard_stop</code></label>
+      <div class="muted small">关掉 = 超预算只告警、不中断调用（告警会出现在「状态监测」页）。</div>
+    </div>
+  </div>
+
+  <h3 class="mt">生成参数</h3>
+  <div class="kv">
+    <div class="k">temperature</div>
+    <div class="v">
+      <input type="number" step="0.05" min="0" max="2" style="width:120px" id="overlay-llm-temperature"
+             value="{{ view.effective.llm_tunables.temperature }}">
+      <span class="muted small">0~2（<code>llm.temperature</code>）</span>
+    </div>
+    <div class="k">单次上限</div>
+    <div class="v">
+      <input type="number" min="1" style="width:140px" id="overlay-llm-max-tokens"
+             value="{{ view.effective.llm_tunables.max_tokens }}">
+      <span class="muted small"><code>max_tokens</code>；推理模型的 reasoning 会吃掉大半预算，别调太小</span>
+    </div>
+    <div class="k">截断加码上限</div>
+    <div class="v">
+      <input type="number" min="1" style="width:140px" id="overlay-llm-ceiling"
+             value="{{ view.effective.llm_tunables.max_tokens_ceiling }}">
+      <span class="muted small"><code>max_tokens_ceiling</code>（被长度截断时翻倍重试，但不越过它）</span>
+    </div>
+    <div class="k">并发</div>
+    <div class="v">
+      <input type="number" min="1" style="width:120px" id="overlay-llm-concurrency"
+             value="{{ view.effective.llm_tunables.concurrency }}">
+      <span class="muted small">同时在跑的 LLM 请求数（<code>llm.concurrency</code>）</span>
+    </div>
+    <div class="k">大模型超时</div>
+    <div class="v">
+      <input type="number" min="1" style="width:120px" id="overlay-llm-timeout"
+             value="{{ view.effective.llm_tunables.timeout_seconds }}">
+      <span class="muted small">秒（<code>llm.timeout_seconds</code>）</span>
+    </div>
+    <div class="k">重试次数</div>
+    <div class="v">
+      <input type="number" min="0" style="width:120px" id="overlay-llm-retries"
+             value="{{ view.effective.llm_tunables.max_retries }}">
+      <span class="muted small">次（<code>llm.max_retries</code>）</span>
+    </div>
+  </div>
+</div>

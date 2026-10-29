@@ -1,0 +1,36 @@
+<div class="panel">
+  <h2>AI 模型</h2>
+  {% set llm_key = by_key.get('FISSUE_LLM_API_KEY') %}
+  <div class="kv">
+    <div class="k">API Key</div>
+    <div class="v">
+      <input type="password" id="env-FISSUE_LLM_API_KEY" style="width:320px"
+             placeholder="{{ llm_key.value if llm_key and llm_key.set else '未配置（必填）' }}">
+      <label class="inline"><input type="checkbox" id="clear-FISSUE_LLM_API_KEY"> 清空</label>
+      {% if llm_key and llm_key.set %}<span class="tag status-pr_created">已配置</span>
+      {% else %}<span class="tag status-failed">未配置</span>{% endif %}
+    </div>
+
+    <div class="k">端点</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_BASE_URL" style="width:420px"
+             value="{{ by_key.get('FISSUE_LLM_BASE_URL').value if by_key.get('FISSUE_LLM_BASE_URL') else '' }}"
+             placeholder="https://api.deepseek.com/v1">
+      <span class="muted small">当前生效：<code>{{ view.effective.llm_base_url }}</code></span></div>
+
+    <div class="k">主模型</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_MODEL" style="width:240px"
+             value="{{ by_key.get('FISSUE_LLM_MODEL').value if by_key.get('FISSUE_LLM_MODEL') else '' }}"
+             placeholder="{{ view.effective.llm_model }}">
+      <span class="muted small">当前生效：<code>{{ view.effective.llm_model }}</code></span></div>
+
+    <div class="k">备用模型</div>
+    <div class="v"><input type="text" id="env-FISSUE_LLM_FALLBACK_MODEL" style="width:240px"
+             value="{{ by_key.get('FISSUE_LLM_FALLBACK_MODEL').value if by_key.get('FISSUE_LLM_FALLBACK_MODEL') else '' }}"
+             placeholder="留空则不降级"></div>
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testLlm()">测试连通</button>
+    <span class="muted small">会真的发一次最小请求（花几个 token）。key 错、模型名错、端点错都会当场暴露。</span>
+    <span id="llm-result" class="small"></span>
+  </div>
+</div>

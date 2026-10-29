@@ -1,0 +1,91 @@
+<div class="panel">
+  <h2>Web 与访问控制</h2>
+  <div class="kv">
+    <div class="k">监听地址</div>
+    <div class="v"><input type="text" id="env-FISSUE_WEB_HOST" style="width:200px"
+             value="{{ by_key.get('FISSUE_WEB_HOST').value if by_key.get('FISSUE_WEB_HOST') else '' }}"
+             placeholder="{{ view.effective.web_host }}"> <span class="warn small">改了要重启</span></div>
+
+    <div class="k">端口</div>
+    <div class="v"><input type="number" id="env-FISSUE_WEB_PORT" style="width:120px"
+             value="{{ by_key.get('FISSUE_WEB_PORT').value if by_key.get('FISSUE_WEB_PORT') else '' }}"
+             placeholder="{{ view.effective.web_port }}"> <span class="warn small">改了要重启</span></div>
+
+    <div class="k">会话鉴权</div>
+    <div class="v">
+      <label class="inline">
+        <input type="checkbox" id="overlay-auth-enabled" {{ 'checked' if view.effective.auth_enabled }}>
+        启用会话鉴权（<code>web.auth.enabled</code>）
+      </label>
+      {% if view.effective.auth_enabled %}<span class="tag status-pr_created">已启用</span>
+      {% else %}<span class="tag failed">已关闭</span>{% endif %}
+      <div class="muted small">
+        关掉它**不等于**「谁都能进」：那时只靠下面的可信网段与本机回环放行，其它来源一律被拒。
+        没有管理员账号时，请到 <a href="/login">/login</a> 用引导口令完成初始化。
+      </div>
+    </div>
+
+    <div class="k">可信内网</div>
+    <div class="v">
+      <textarea id="overlay-trusted" rows="3" style="width:320px" spellcheck="false"
+                placeholder="192.168.1.0/24">{{ view.effective.trusted_networks_text }}</textarea>
+      <div class="muted small">
+        每行一个 CIDR（<code>web.trusted_networks</code>）。落在这些网段里的来源
+        <b>视为等同回环</b>（免登录、可写配置）——这是「内网直接用浏览器访问」的正路。
+        判定只看真实对端地址，<b>不信任</b> <code>X-Forwarded-For</code>；
+        挂在反向代理后面时请把代理所在网段写进来。要单机就写 <code>/32</code>，别写裸地址。
+      </div>
+    </div>
+
+    <div class="k">会话时长</div>
+    <div class="v">
+      <input type="number" id="overlay-session-ttl" min="1" style="width:120px"
+             value="{{ view.effective.session_ttl_minutes }}">
+      <span class="muted small">分钟（<code>web.auth.session_ttl_minutes</code>）。过期即需重新登录。</span>
+    </div>
+
+    <div class="k">安全 cookie</div>
+    <div class="v">
+      <label class="inline">
+        <input type="checkbox" id="overlay-secure-cookie" {{ 'checked' if view.effective.secure_cookie }}>
+        <code>web.auth.secure_cookie</code>
+      </label>
+      <div class="muted small">
+        反向代理已提供 <b>HTTPS</b> 时才打开。纯 HTTP 下打开它，浏览器会直接丢弃会话
+        cookie——表现是「登录了，但下一步又要求登录」。
+      </div>
+    </div>
+
+    <div class="k">失败上限</div>
+    <div class="v">
+      <input type="number" id="overlay-max-failures" min="1" style="width:120px"
+             value="{{ view.effective.login_max_failures }}">
+      <span class="muted small">连续失败多少次后开始指数退避锁定（<code>web.auth.login_max_failures</code>）。</span>
+    </div>
+
+    <div class="k">只读模式</div>
+    <div class="v">
+      {% if view.effective.read_only %}<span class="tag stale">已开启</span>{% else %}<span class="tag">关闭</span>{% endif %}
+      <span class="muted small">由 config.yaml 的 <code>web.read_only</code> 控制：管的是「要不要去平台上打标签/提 PR」，与下面这条互不影响。</span>
+    </div>
+
+    <div class="k">远程改配置</div>
+    <div class="v">
+      <label class="inline">
+        <input type="checkbox" id="overlay-allow-remote" {{ 'checked' if view.effective.allow_remote_config_write }}>
+        强制允许非本机来源改写配置（<code>web.allow_remote_config_write</code>）
+      </label>
+      <div class="muted small">
+        默认关闭：只有本机回环（或已开鉴权并带对口令）才能改配置。打开它 = 本机以外也能改密钥，
+        仅建议在完全可信的内网里自用。
+      </div>
+    </div>
+  </div>
+
+  <div class="row mt">
+    <span class="muted small">改完记得点上方的「保存设置」——这里不放第二个按钮，免得你以为
+      这一页有「各自保存」。</span>
+    <span class="muted small">密钥留空 = 不改动；勾「清空」= 移除**本层**的设置
+      （若 config.yaml 里也写同一个键，它会接着生效——「来源」列表里看得到谁在生效）。</span>
+  </div>
+</div>

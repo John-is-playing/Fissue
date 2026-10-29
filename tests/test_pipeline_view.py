@@ -315,3 +315,42 @@ def test_stage_label_covers_special_buckets() -> None:
     assert stage_label(DONE) == "已出结论"
     assert stage_label(STUCK) == "需人工"
     assert stage_label("no-such-stage") == "no-such-stage"
+
+
+# ---------------------------------------------------------------------------
+# 阶段 → 状态集合（给 /items?stage=... 用）
+# ---------------------------------------------------------------------------
+
+
+def test_statuses_of_stage_covers_all_states_in_that_stage() -> None:
+    """阶段是**状态的分组**，一个阶段含多个状态（"待验证"含 evaluated/verifier_ready/verifying）。"""
+    from fissue.web.pipeline import statuses_of_stage
+
+    assert set(statuses_of_stage("evaluate")) == {ItemStatus.NEW, ItemStatus.CLASSIFIED}
+    assert set(statuses_of_stage("verify")) == {
+        ItemStatus.EVALUATED,
+        ItemStatus.VERIFIER_READY,
+        ItemStatus.VERIFYING,
+    }
+    assert set(statuses_of_stage("judge")) == {ItemStatus.QUEUED, ItemStatus.VERIFIED}
+    assert set(statuses_of_stage("fix")) == {ItemStatus.FIX_QUEUED, ItemStatus.FIXING}
+    assert set(statuses_of_stage("pr")) == {ItemStatus.PR_CREATED}
+    assert set(statuses_of_stage(DONE)) == {ItemStatus.LABELED, ItemStatus.SKIPPED}
+    assert set(statuses_of_stage(STUCK)) == {ItemStatus.NEEDS_MANUAL, ItemStatus.FAILED}
+
+
+def test_statuses_of_stage_partitions_all_states() -> None:
+    """各阶段的状态集合必须**恰好**瓜分所有状态——少一个就会有条目从筛选里消失。"""
+    from fissue.web.pipeline import statuses_of_stage
+
+    keys = [k for k, _ in STAGES] + [DONE, STUCK]
+    covered: set[ItemStatus] = set()
+    for key in keys:
+        covered |= set(statuses_of_stage(key))
+    assert covered == set(ItemStatus), covered ^ set(ItemStatus)
+
+
+def test_statuses_of_stage_unknown_key_is_empty() -> None:
+    from fissue.web.pipeline import statuses_of_stage
+
+    assert statuses_of_stage("no-such-stage") == []

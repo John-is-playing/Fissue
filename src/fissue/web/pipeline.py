@@ -112,6 +112,23 @@ def stage_label(key: str) -> str:
     return dict(STAGES).get(key, key)
 
 
+def statuses_of_stage(key: str) -> list[ItemStatus]:
+    """阶段键 → 落在该阶段的**所有状态**。
+
+    给 ``/items?stage=...`` 用：阶段是状态的**分组**，不是某一个状态，所以直接拿
+    ``_STAGE_OF`` 反查不够——一个阶段里通常有好几个状态（"待评测"含 new 与
+    classified，"待验证"含 evaluated / verifier_ready / verifying）。
+
+    反查表由 ``_STAGE_OF`` **派生**，不另写一份——两份映射迟早会对不上，而对不上的
+    后果是「页面上说 12 条，点进去只有 3 条」。
+    """
+    if key == DONE:
+        return [s for s, stage in _STAGE_OF.items() if stage == DONE]
+    if key == STUCK:
+        return [s for s, stage in _STAGE_OF.items() if stage == STUCK]
+    return [s for s, stage in _STAGE_OF.items() if stage == key]
+
+
 def stage_states(status: ItemStatus) -> list[str]:
     """六个阶段各自的呈现状态，供泳道画点。
 

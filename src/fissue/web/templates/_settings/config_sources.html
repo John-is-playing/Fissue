@@ -1,0 +1,31 @@
+<div class="panel">
+  <h2>配置来源</h2>
+  <div class="kv">
+    <div class="k">config.yaml</div>
+    <div class="v">{% if view.paths.config %}<code>{{ view.paths.config }}</code>{% else %}<span class="muted">（不存在，用内置默认值）</span>{% endif %}</div>
+    <div class="k">覆盖层</div>
+    <div class="v"><code>{{ view.paths.overlay_expected }}</code>
+      {% if not view.paths.overlay %}<span class="muted small">（还没生成）</span>{% endif %}</div>
+    <div class="k">.env</div>
+    <div class="v">{% if view.paths.env %}<code>{{ view.paths.env }}</code>{% else %}<span class="muted">（不存在）</span>{% endif %}</div>
+  </div>
+
+  {% if view.overlay_content %}
+  <div class="mt"><b>覆盖层里现在有什么</b><pre>{{ view.overlay_content | tojson(indent=2) }}</pre></div>
+  {% endif %}
+
+  <details class="mt">
+    <summary class="muted">每个配置项由哪一层提供（点开）</summary>
+    <div class="table-scroll mt">
+    <table>
+      <thead><tr><th>配置路径</th><th>来源</th></tr></thead>
+      <tbody>
+      {% for path, source in view.sources.items() %}
+      <tr><td><code>{{ path }}</code></td>
+        <td><span class="tag {{ 'tier1' if source == 'env' else '' }}">{{ source }}</span></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+</div>

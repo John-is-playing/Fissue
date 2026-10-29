@@ -28,16 +28,16 @@
     </div>
 
     {# 导航按「干活 → 观测 → 配置」三组排：
-       * 干活：流水线（新首页）、条目、队列 —— 日常真正要动的三件事；
-       * 观测：任务、状态、总览 —— 出问题或想知道「在不在跑」时才看；
+       * 干活：流水线（首页，含队列判定与批量操作）、条目；
+       * 观测：状态（含任务与日志）、总览 —— 出问题或想知道「在不在跑」时才看；
        * 配置：仓库、设置、向导、Key —— 一次性动作，放最后。
-       之前这九项平铺成一列，最常用的「一条卡在哪」反而没有入口。 #}
+       「队列」与「任务」原先各占一格，现已分别并进流水线与状态：
+       队列判定就在看板里做决定，任务就是「状态」要回答的那件事。
+       旧地址 `/queues` / `/jobs` 保留重定向，书签不会失效。 #}
     <nav class="nav">
       <a href="/pipeline" class="{{ 'on' if nav == 'pipeline' }}">流水线</a>
       <a href="/items" class="{{ 'on' if nav == 'items' }}">条目</a>
-      <a href="/queues" class="{{ 'on' if nav == 'queues' }}">队列</a>
       <div class="nav-sep"></div>
-      <a href="/jobs" class="{{ 'on' if nav == 'jobs' }}">任务</a>
       <a href="/status" class="{{ 'on' if nav == 'status' }}">状态</a>
       <a href="/" class="{{ 'on' if nav == 'overview' }}">总览</a>
       <div class="nav-sep"></div>

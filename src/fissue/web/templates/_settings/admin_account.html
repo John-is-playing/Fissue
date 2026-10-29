@@ -1,0 +1,112 @@
+<div class="panel">
+  <h2>管理员账号（{{ view.auth.username or view.auth.admin_name or '未创建' }}）</h2>
+  {% if not view.auth.provisioned %}
+  <div class="alert info">
+    <span class="a-level">还没账号</span>
+    <div>
+      <div>服务端尚未创建管理员账号。</div>
+      <div class="small muted">
+        请在运行服务的机器上打开 <a href="/login">/login</a> 完成初始化；
+        从网络访问需要控制台打印的一次性引导口令。
+      </div>
+    </div>
+  </div>
+  {% else %}
+  <div class="kv">
+    <div class="k">两步验证</div>
+    <div class="v">
+      {% if view.auth.two_factor %}<span class="tag status-pr_created">已开启</span>
+      {% else %}<span class="tag none">未开启</span>{% endif %}
+      <span class="muted small">TOTP（RFC 6238）。开启后登录要多输一次 6 位验证码。</span>
+    </div>
+
+    <div class="k">会话</div>
+    <div class="v">
+      <span>{{ view.auth.sessions }} 个活跃会话</span>
+      <span class="muted small">改口令会踢掉除当前之外的其它会话。</span>
+    </div>
+
+    <div class="k">API Key</div>
+    <div class="v">
+      <span>{{ view.auth.api_keys }} 把有效</span>
+      <a class="small" href="/api-keys">管理 →</a>
+    </div>
+  </div>
+
+  <h3 class="mt">改口令</h3>
+  <div class="kv">
+    <div class="k">当前口令</div>
+    <div class="v"><input type="password" id="pw-current" autocomplete="current-password" style="width:260px"></div>
+    <div class="k">新口令</div>
+    <div class="v">
+      <input type="password" id="pw-new" autocomplete="new-password" style="width:260px">
+      <span class="muted small">至少 8 位。</span>
+    </div>
+  </div>
+  <div class="row mt">
+    <button type="button" class="primary" id="pw-save">修改口令</button>
+    <span id="pw-result" class="small"></span>
+  </div>
+
+  <h3 class="mt">两步验证</h3>
+  <div id="tfa-off" {% if view.auth.two_factor %}hidden{% endif %}>
+    <div class="row">
+      <button type="button" id="tfa-enroll">生成密钥并绑定</button>
+      <span class="muted small">先生成密钥，再用一次有效验证码确认——不确认不会生效。</span>
+    </div>
+    <div id="tfa-enroll-box" hidden>
+      <div class="kv mt">
+        <div class="k">扫码</div>
+        <div class="v">
+          {# 二维码是**服务端**用纯标准库现算的（web/qr.py），不经任何外部服务——
+             把 TOTP 密钥交给第三方生成图片等于把二次验证的密钥交出去。 #}
+          <div id="tfa-qr" class="qr-box"></div>
+          <div class="muted small">用认证器 App 扫这张图（Google Authenticator / Aegis / 1Password…）。</div>
+        </div>
+        <div class="k">手抄也行</div>
+        <div class="v">
+          <div>密钥：<code class="secret" id="tfa-secret"></code></div>
+          <div class="mt">otpauth：<code class="secret" id="tfa-uri"></code></div>
+          <div class="muted small">
+            在不能扫的机器上（比如正在看终端的那台）把密钥手抄进 App，效果一样。
+            刷新本页二维码**不会变**（同一把待确认的密钥会重新画出来）。
+          </div>
+        </div>
+      </div>
+      <div class="row mt">
+        <input type="text" id="tfa-activate-code" inputmode="numeric" placeholder="6 位验证码" style="width:160px">
+        <button type="button" class="primary" id="tfa-activate">确认开启</button>
+        <span class="muted small">填 App 里显示的 6 位码确认——不确认不会生效。</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="tfa-on" {% if not view.auth.two_factor %}hidden{% endif %}>
+    <div class="kv">
+      <div class="k">关闭 2FA</div>
+      <div class="v">
+        <input type="password" id="tfa-off-password" placeholder="当前口令" style="width:200px">
+        <input type="text" id="tfa-off-code" inputmode="numeric" placeholder="6 位验证码" style="width:140px">
+        <button type="button" class="danger" id="tfa-disable">关闭</button>
+      </div>
+      <div class="k">恢复码</div>
+      <div class="v">
+        <input type="password" id="tfa-recovery-password" placeholder="当前口令" style="width:200px">
+        <button type="button" id="tfa-recovery">重新生成恢复码</button>
+        <div class="muted small">旧的恢复码会全部作废；新码只显示一次。</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tfa-codes" hidden>
+    <div class="alert info mt">
+      <span class="a-level">只显示一次</span>
+      <div>
+        <div>请立刻抄下来（每个只能用一次）：</div>
+        <pre id="tfa-code-list"></pre>
+      </div>
+    </div>
+  </div>
+  <div id="tfa-result" class="small mt"></div>
+  {% endif %}
+</div>

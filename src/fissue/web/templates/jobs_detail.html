@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Fissue · 任务 {{ job.id }}{% endblock %}
 {% block heading %}任务详情{% endblock %}
-{% block subtitle %}<a href="/jobs">← 返回任务列表</a>{% endblock %}
+{% block subtitle %}<a href="/status">← 返回任务列表</a>{% endblock %}
 
 {% block header_extra %}
   {% set cls = 'ok' if job.status == 'done' else ('bad' if job.status == 'failed' else ('stale' if job.status == 'canceled' else 'unknown')) %}

@@ -1583,3 +1583,94 @@ def test_pipeline_page_has_batch_entry_per_column(client, repo) -> None:  # noqa
     assert 'data-kind="verify"' in html
     assert 'data-kind="flush"' in html
     assert 'data-kind="fix"' in html
+
+
+def test_items_page_filters_by_stage(client, repo) -> None:  # noqa: ANN001
+    """`?stage=verify` 要筛出该阶段的**所有**状态（evaluated/verifier_ready/verifying）。
+
+    阶段是状态的分组，不是一个状态——只认一个状态会让「页脚说 12 条、实际只有 3 条」。
+    """
+    from fissue.models import ItemStatus, Platform, RawItem
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    for index, status in enumerate(
+        [ItemStatus.EVALUATED, ItemStatus.VERIFYING, ItemStatus.QUEUED, ItemStatus.NEW]
+    ):
+        item = RawItem(
+            platform=Platform.GITHUB,
+            repo="psf/requests",
+            number=800 + index,
+            item_type=ItemType.ISSUE,
+            title=f"阶段筛选测试 {index}",
+            body="复现",
+        )
+        repo.upsert_item(rid, item)
+        repo.set_item_status(item.key, status)
+
+    html = client.get("/items", params={"stage": "verify"}).text
+    assert "阶段筛选测试 0" in html
+    assert "阶段筛选测试 1" in html
+    assert "阶段筛选测试 2" not in html, "queued 属于裁决阶段，不该出现在待验证里"
+    assert "阶段筛选测试 3" not in html
+
+
+def test_items_page_filters_by_lane(client, repo) -> None:  # noqa: ANN001
+    """`?lane=pr-bug` 只给 PR·BUG 那条流水线上的条目。"""
+    from fissue.models import ItemStatus, Platform, RawItem
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    pr_item = RawItem(
+        platform=Platform.GITHUB,
+        repo="psf/requests",
+        number=810,
+        item_type=ItemType.PR,
+        title="PR 流水线测试",
+        body="改动",
+    )
+    repo.upsert_item(rid, pr_item)
+    repo.set_item_status(pr_item.key, ItemStatus.QUEUED, category=Category.BUG)
+
+    issue_item = RawItem(
+        platform=Platform.GITHUB,
+        repo="psf/requests",
+        number=811,
+        item_type=ItemType.ISSUE,
+        title="Issue 流水线测试",
+        body="复现",
+    )
+    repo.upsert_item(rid, issue_item)
+    repo.set_item_status(issue_item.key, ItemStatus.QUEUED, category=Category.BUG)
+
+    html = client.get("/items", params={"lane": "pr-bug"}).text
+    assert "PR 流水线测试" in html
+    assert "Issue 流水线测试" not in html
+
+
+def test_items_page_reports_invalid_stage_without_crashing(client) -> None:  # noqa: ANN001
+    """非法 stage 要在页面上提示，而不是 500 或悄悄忽略。"""
+    html = client.get("/items", params={"stage": "no-such-stage"}).text
+    assert "stage 取值非法" in html
+
+
+def test_pipeline_kanban_link_points_at_working_filter(client, repo) -> None:  # noqa: ANN001
+    """看板格子里的「看条目」链接要真的能筛出东西——这是上一版留下的无效链接。"""
+    from fissue.models import ItemStatus, Platform, RawItem
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    item = RawItem(
+        platform=Platform.GITHUB,
+        repo="psf/requests",
+        number=820,
+        item_type=ItemType.ISSUE,
+        title="看板跳转测试",
+        body="复现",
+    )
+    repo.upsert_item(rid, item)
+    repo.set_item_status(item.key, ItemStatus.QUEUED, category=Category.BUG)
+
+    pipeline_html = client.get("/pipeline").text
+    # 模板里 `&` 是**字面文本**（不是变量），Jinja 不会转义它 —— 所以渲染出来就是 `&`。
+    assert 'href="/items?lane=issue-bug&stage=judge"' in pipeline_html
+
+    items_html = client.get("/items", params={"lane": "issue-bug", "stage": "judge"}).text
+    assert "看板跳转测试" in items_html

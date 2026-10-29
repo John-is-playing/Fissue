@@ -470,6 +470,7 @@ class Repository:
         category: Category | None = None,
         priority: Priority | None = None,
         query: str | None = None,
+        statuses: Sequence[ItemStatus] | None = None,
         limit: int = 100,
         offset: int = 0,
         order_by: str = "updated_at",
@@ -483,6 +484,7 @@ class Repository:
             category=category,
             priority=priority,
             query=query,
+            statuses=statuses,
         )
         col = ITEM_SORT_COLUMNS.get(order_by, ItemRow.updated_at)
         stmt = stmt.order_by(col.desc() if desc else col.asc()).limit(limit).offset(offset)
@@ -690,6 +692,7 @@ class Repository:
         category: Category | None = None,
         priority: Priority | None = None,
         query: str | None = None,
+        statuses: Sequence[ItemStatus] | None = None,
     ) -> int:
         """当前筛选条件下的**总数**，与 :meth:`list_items` 同口径。
 
@@ -706,6 +709,7 @@ class Repository:
             category=category,
             priority=priority,
             query=query,
+            statuses=statuses,
         )
         with self.db.session() as s:
             return int(s.scalar(stmt) or 0)
@@ -1478,6 +1482,7 @@ class Repository:
         category: Category | None = None,
         priority: Priority | None = None,
         query: str | None = None,
+        statuses: Sequence[ItemStatus] | None = None,
     ) -> list[str]:
         """只取 key（不构造领域对象）。
 
@@ -1492,6 +1497,7 @@ class Repository:
             category=category,
             priority=priority,
             query=query,
+            statuses=statuses,
         )
         with self.db.session() as s:
             return [str(k) for k in s.scalars(stmt)]
@@ -1524,6 +1530,7 @@ class Repository:
         category: Category | None = None,
         priority: Priority | None = None,
         query: str | None = None,
+        statuses: Sequence[ItemStatus] | None = None,
     ) -> dict[str, Any]:
         """概览计数走**聚合查询**（一行 GROUP BY），不把条目对象加载进内存。
 
@@ -1542,6 +1549,7 @@ class Repository:
             category=category,
             priority=priority,
             query=query,
+            statuses=statuses,
         )
         stmt = stmt.group_by(ItemRow.item_type, ItemRow.category, ItemRow.priority, ItemRow.status)
         by_type: dict[str, int] = {}
@@ -1575,6 +1583,7 @@ class Repository:
         category: Category | None = None,
         priority: Priority | None = None,
         query: str | None = None,
+        statuses: Sequence[ItemStatus] | None = None,
     ) -> Select:
         """条目查询的公共过滤——**唯一的一份口径**。
 
@@ -1586,12 +1595,18 @@ class Repository:
         ``query`` 是模糊搜索（标题 / 正文 / 作者）。通配符要转义：``_`` 和 ``%`` 在 LIKE 里
         有特殊含义，而 ``get_bool``、``snake_case`` 这类含下划线的词恰是最常见的搜索词，
         不转义就会变成「任意单字符」，搜出大量无关条目。
+
+        ``statuses`` 是**状态集合**（一组状态而非一个）：流水线视图按「阶段」分组，
+        而一个阶段里通常有好几个状态（"待验证"含 evaluated / verifier_ready / verifying）。
+        它与 ``status`` 互斥——两个都给时以 ``statuses`` 为准（更具体的那个）。
         """
         if repo_slug:
             stmt = stmt.where(ItemRow.repo_slug == repo_slug)
         if item_type:
             stmt = stmt.where(ItemRow.item_type == item_type.value)
-        if status:
+        if statuses:
+            stmt = stmt.where(ItemRow.status.in_([s.value for s in statuses]))
+        elif status:
             stmt = stmt.where(ItemRow.status == status.value)
         if category:
             stmt = stmt.where(ItemRow.category == category.value)

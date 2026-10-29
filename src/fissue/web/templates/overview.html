@@ -68,7 +68,7 @@
       <tbody>
       {% for q in queues %}
         <tr>
-          <td><a href="/queues"><code>{{ q.name }}</code></a></td>
+          <td><a href="/pipeline"><code>{{ q.name }}</code></a></td>
           <td class="num">{{ q.pending }}</td>
           <td class="num">{{ q.waiting }}</td>
           <td class="num muted">{{ q.flush_size }}</td>
@@ -196,7 +196,7 @@
   {% else %}
   <div class="muted">还没有任务记录。上面的控制面板可以手动发起一轮。</div>
   {% endfor %}
-  <div class="mt"><a href="/jobs" class="small">全部任务 →</a></div>
+  <div class="mt"><a href="/status" class="small">全部任务 →</a></div>
 </div>
 
 <div class="panel">

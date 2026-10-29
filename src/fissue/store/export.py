@@ -363,6 +363,7 @@ def summarize(
     category: Category | None = None,
     priority: Priority | None = None,
     query: str | None = None,
+    statuses: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """概览统计。
 
@@ -371,6 +372,10 @@ def summarize(
     互相矛盾，Markdown 的「概览」与「明细」条数也对不上——外部读者据此会得出错误结论。
     ``item_type`` / ``priority`` / ``query`` 同理：看板按它们筛了列表，概览卡片就必须跟着动，
     否则顶上写着「共 300 条」、底下却是 12 条搜索结果。
+
+    ``statuses`` 是**状态集合**（流水线视图按阶段分组，一个阶段含多个状态）：它与
+    ``status`` 互斥，以 ``statuses`` 为准。不接它就会出现「按阶段筛出 12 条、卡片却写
+    全仓库 300 条」——正是本函数开头要消灭的那种矛盾。
     """
     # 计数走聚合查询，平均分只需要 key：原先 list_items(limit=100000) 会把十万条领域对象
     # （含标签、正文元数据）全加载进内存，只为数几个数。
@@ -382,6 +387,8 @@ def summarize(
         "priority": priority,
         "query": query,
     }
+    if statuses:
+        filters["statuses"] = statuses
     stats = repo.item_stats(**filters)
     keys = repo.item_keys(**filters)
 

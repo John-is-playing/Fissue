@@ -1,0 +1,29 @@
+<div class="panel">
+  <h2>代码托管平台 Token</h2>
+  <table>
+    <thead><tr><th>平台</th><th>Token</th><th>状态</th><th></th></tr></thead>
+    <tbody>
+    {% for key, plat in [('FISSUE_GITHUB_TOKEN','github'), ('FISSUE_GITEE_TOKEN','gitee'), ('FISSUE_ATOMGIT_TOKEN','atomgit'), ('FISSUE_GITLAB_TOKEN','gitlab')] %}
+      {% set it = by_key.get(key) %}
+      <tr>
+        <td>{{ plat }}</td>
+        <td>
+          <input type="password" id="env-{{ key }}" style="width:300px"
+                 placeholder="{{ it.value if it and it.set else '未配置' }}">
+          <label class="inline"><input type="checkbox" id="clear-{{ key }}"> 清空</label>
+        </td>
+        <td>{% if it and it.set %}<span class="tag status-pr_created">已配置</span>
+            {% else %}<span class="tag none">未配置</span>{% endif %}</td>
+        <td>
+          <button type="button" data-act="test-platform" data-platform="{{ plat }}">校验</button>
+          <span id="plat-{{ plat }}" class="small muted"></span>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="muted small mt">
+    留空 = 匿名访问（只能读公开仓库，限流很紧）；自动修复要提 PR，必须有写权限。
+    校验会问平台「我是谁」，能验出无效或越权的令牌。
+  </div>
+</div>

@@ -594,15 +594,27 @@ def test_repo_row_buttons_are_wired_through_data_attributes(
 
 
 def test_queue_flush_buttons_carry_the_queue_name(settings: Settings, client: Any) -> None:
-    """队列页的按行 flush 按钮走 data-*，值从按钮自己身上读。
+    """队列的按行 flush 按钮走 data-*，值从按钮自己身上读。
 
     「旧写法不复存在」由源码护栏负责（`test_templates_never_interpolate_into_inline_event_attributes`）：
     页面文本里可能因为注释/脚本而出现相近的字符串，在渲染结果上做**否定断言**只会误伤自己。
+
+    队列判定已并进**流水线看板**（`/queues` 保留重定向），按钮形态与那一页其它动作统一成
+    `data-act="job" data-kind="flush"`——两套处理器各认一种，合并后必然有一半点了没反应。
     """
-    html = client.get("/queues").text
-    assert 'data-act="flush"' in html
+    html = client.get("/pipeline").text
+    assert 'data-act="job" data-kind="flush"' in html
     assert 'data-queue="verify"' in html and 'data-queue="fix_bug"' in html
     assert 'data-force="true"' in html and 'data-force="false"' in html
+
+
+def test_old_queue_and_job_entries_redirect(settings: Settings, client: Any) -> None:
+    """旧入口保留重定向：文档、书签、别人的脚本里都有这两个地址。
+
+    404 掉会让人以为功能没了；重定向则既保住旧链接，又把入口收到新位置。
+    """
+    assert client.get("/queues", follow_redirects=False).status_code == 307
+    assert client.get("/jobs", follow_redirects=False).status_code == 307
 
 
 def test_item_page_action_buttons_call_named_functions(settings: Settings, client: Any) -> None:
@@ -695,8 +707,15 @@ def test_settings_page_keeps_the_save_button_always_visible(settings: Settings, 
     html = client.get("/settings").text
     assert 'id="save-bar"' in html, "保存条必须常驻"
     assert 'id="dirty-hint"' in html
-    assert "beforeunload" in html, "带着未保存的改动离开时应当拦一下"
-    assert "markDirty" in html
+    # 设置页的逻辑已拆到 static/settings.js（原先内联在模板里，320 行占全页四成）。
+    # 离页拦截与脏标记在那里——断言随之改查那个文件，**意图不变**：
+    # 带着未保存的改动离开时必须拦一下。
+    assert "settings.js" in html, "设置页必须加载它的脚本"
+    from fissue.web.app import STATIC_DIR
+
+    js = (STATIC_DIR / "settings.js").read_text(encoding="utf-8")
+    assert "beforeunload" in js, "带着未保存的改动离开时应当拦一下"
+    assert "markDirty" in js
     # 只留**一个**保存按钮：两个会让人以为各面板能分别保存
     assert html.count("saveSettings()") >= 1
     assert html.count(">保存设置</button>") == 1, "保存按钮不该出现两次"
@@ -892,10 +911,16 @@ def test_frontend_guards_for_sidebar_and_polling(client: Any) -> None:
     assert "function schedule(" in status_page, "轮询要有单链调度器"
     assert "setTimeout(function () { tick(false); }" not in status_page, "又出现自我续期的链了"
 
-    for path in ("/jobs", "/"):
-        page = client.get(path).text
-        assert "读不到任务状态" in page, f"{path} 轮询失败时应当明说，而不是静默停住"
-        assert "catch (e) { return; }" not in page
+    # 读不到状态时**必须明说**，不能静默停住（页面会永远停在「正在运行」）。
+    # 「任务」已并进状态页（`/jobs` 保留重定向），所以这里查合并后的两个位置：
+    #   * `/status` 用自己的「读取失败」文案；
+    #   * `/`（总览的任务面板）用「读不到任务状态」。
+    assert "读取失败" in status_page, "状态页轮询失败时应当明说"
+    assert "catch (e) { return; }" not in status_page
+
+    overview_page = client.get("/").text
+    assert "读不到任务状态" in overview_page, "总览轮询失败时应当明说，而不是静默停住"
+    assert "catch (e) { return; }" not in overview_page
 
 
 def test_repo_purge_is_scoped_by_slug_and_platform(client: Any) -> None:

@@ -1,0 +1,22 @@
+<div class="panel">
+  <h2>数据库</h2>
+  <div class="kv">
+    <div class="k">连接串</div>
+    <div class="v">
+      {# 连接串按**密钥**处理：它里面常带口令（`postgresql+psycopg://user:pw@host/db`）。
+         原先这里是 `type="text"` 且把值原样回填，等于把口令铺在页面上；现在与其它密钥一致：
+         框内为空、只显示掩码占位，留空 = 不改动、要清空请勾「清空」。 #}
+      {% set db_item = by_key.get('FISSUE_DATABASE_URL') %}
+      <input type="password" id="env-FISSUE_DATABASE_URL" style="width:460px"
+             placeholder="{{ db_item.value if db_item and db_item.set else 'sqlite:///E:/Fissue/fissue.db' }}">
+      <label class="inline"><input type="checkbox" id="clear-FISSUE_DATABASE_URL"> 清空</label>
+      {% if db_item and db_item.set %}<span class="tag status-pr_created">已配置</span>{% endif %}
+      <div class="muted small">当前生效：<code>{{ view.effective.database }}</code>（口令已遮）</div>
+    </div>
+  </div>
+  <div class="row mt">
+    <button type="button" onclick="testDb()">测试连接</button>
+    <span class="muted small">会真的连一次并建表（表已存在是空操作）。</span>
+    <span id="db-result" class="small"></span>
+  </div>
+</div>

@@ -127,7 +127,7 @@
         <div class="pipe-cell-lane">{{ cell.lane_label }}</div>
         <div class="pipe-cell-count">{{ cell.count }}</div>
         {% if cell.count %}
-        <a class="small" href="/items?f_category=&f_status=&lane={{ cell.lane }}&stage={{ column.key }}">看条目</a>
+        <a class="small" href="/items?lane={{ cell.lane }}&stage={{ column.key }}">看条目</a>
         {% endif %}
       </div>
       {% endfor %}
@@ -146,6 +146,14 @@
       {% endif %}
     </div>
     {% endfor %}
+  </div>
+
+  {# 队列判定并进看板：原先它是独立的一页（/queues），而「该不该把攒着的条目交模型定论」
+     恰恰是看板这一屏要做的决定——放在另一个页面等于让人凭记忆切换。
+     表格本身在 _queue_panel.html，与队列页共用同一份（两份会漂移）。 #}
+  <div class="panel mt">
+    <h2>队列：该不该交模型定论</h2>
+    {% include "_queue_panel.html" %}
   </div>
 </section>
 
@@ -253,7 +261,9 @@
       if (kind === "fix") params.dry_run = btn.dataset.dryrun === "1";
       if (kind === "flush") {
         params.queue = btn.dataset.queue || "verify";
-        params.force = true;
+        // 「按判定刷」与「强制刷」是**两个**动作：一律传 true 会让「按判定刷」
+        // 变成同一个东西，而那正是「该刷吗」这一列存在的意义所在。
+        params.force = btn.dataset.force === "true";
       }
       btn.disabled = true;
       runJob(kind, params);

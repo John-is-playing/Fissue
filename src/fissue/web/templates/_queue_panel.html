@@ -1,0 +1,57 @@
+{# 队列判定表：「该不该把攒着的条目交模型定论」。
+ #
+ # 流水线看板与队列页**共用这一份**：两处各拼一遍，迟早出现「看板说该刷、队列页说
+ # 不用刷」——而 flush 会真调 LLM 出结论、并往平台上打标签，口径不一致的代价不是刷新
+ # 一下就抹掉的。
+ #
+ # 「该不该 flush」只读服务端的 `QueueManager.should_flush`，页面**不重算**（同一个理由：
+ # 第二份实现必然漂移）。
+ #
+ # 调用方需提供：`queues`（queue_panel 的结果）与 `decisions`（每个队列的判定）。
+ #}
+<div class="table-scroll">
+  <table>
+    <thead><tr><th>队列</th><th>该刷吗</th><th>依据</th><th class="num">待定论</th>
+      <th>状态明细</th><th></th></tr></thead>
+    <tbody>
+    {% for q in queues %}
+      {% set d = decisions.get(q.name, {}) %}
+      <tr>
+        <td><code>{{ q.name }}</code></td>
+        <td>
+          {% if d.should_flush %}<span class="tag status-pr_created">是</span>
+          {% else %}<span class="tag none">否</span>{% endif %}
+        </td>
+        <td class="muted small">{{ d.reason or '—' }}</td>
+        <td class="num">{{ d.done_count if d.done_count is not none else q.waiting }}</td>
+        <td class="muted small">
+          {% for k, v in q.counts.items() %}{{ k }} {{ v }}{% if not loop.last %} · {% endif %}{% else %}—{% endfor %}
+        </td>
+        <td>
+          {% if not read_only %}
+          {# 值一律走 data-*：onclick 里插 tojson 会被双引号截断（按钮静默失效）。
+             形态与流水线页其它按钮统一（data-act="job" + data-kind）：两套处理器各认一种，
+             合并到同一页后必然有一半按钮点了没反应。 #}
+          <button type="button" class="ghost small" data-act="job" data-kind="flush" data-queue="{{ q.name }}" data-force="false">按判定刷</button>
+          <button type="button" class="ghost small" data-act="job" data-kind="flush" data-queue="{{ q.name }}" data-force="true">强制刷</button>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<div class="muted small mt">
+  为什么这里不自己算「能不能刷」：那个判定只有一份实现
+  （<code>QueueManager.should_flush</code>，看数量阈值与空闲时长）。页面另算一份，两份迟早
+  不一致——而 flush 会真的调 LLM 出结论、并往平台上打标签。
+</div>
+
+{# 阈值单列一行：它解释上面那列「该刷吗」是**按什么**判断的。
+   原先这在独立的一页里，合并后不能丢——否则「为什么它不是该刷」就无从解释。 #}
+<div class="muted small mt">
+  阈值：
+  {% for q in queues %}
+  <code>{{ q.name }}</code> 攒够 {{ q.flush_size }} 条或空闲 {{ q.idle_flush_seconds }}s{% if not loop.last %} · {% endif %}
+  {% endfor %}
+</div>

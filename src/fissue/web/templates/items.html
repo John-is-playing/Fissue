@@ -62,6 +62,24 @@
       {% endfor %}
     </select>
   </label>
+  {# 阶段与流水线：看板格子点进来的筛选维度。阶段是**状态的分组**（"待验证"含
+     evaluated / verifier_ready / verifying），与上面的「状态」互斥——两个都填时以阶段为准。 #}
+  <label class="inline">阶段
+    <select name="stage">
+      <option value="">全部</option>
+      {% for key, label in stage_options %}
+      <option value="{{ key }}" {% if filters.stage == key %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="inline">流水线
+    <select name="lane">
+      <option value="">全部</option>
+      {% for key, label in lane_options %}
+      <option value="{{ key }}" {% if filters.lane == key %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
   <label class="inline">搜索
     <input type="search" name="q" value="{{ filters.q }}" placeholder="标题 / 正文 / 作者" style="width:180px">
   </label>

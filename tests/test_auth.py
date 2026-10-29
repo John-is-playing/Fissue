@@ -790,8 +790,14 @@ def test_settings_page_has_the_qr_container(settings: Settings, db: Database) ->
         html = local.get("/settings").text
         assert 'id="tfa-qr"' in html
         assert "手抄也行" in html
-        assert "2fa/pending" in html, "刷新后要能把待确认的密钥捞回来"
+        # 「刷新后要能把待确认的密钥捞回来」的实现已随设置页逻辑一起拆到
+        # static/settings.js —— 断言随之改查那个文件，**意图不变**。
+        from fissue.web.app import STATIC_DIR
+
+        js = (STATIC_DIR / "settings.js").read_text(encoding="utf-8")
+        assert "2fa/pending" in js, "刷新后要能把待确认的密钥捞回来"
         assert "qrcode" not in html.lower(), "不该引入任何第三方二维码脚本"
+        assert "qrcode" not in js.lower(), "不该引入任何第三方二维码脚本"
 
 
 def test_password_change_kicks_other_sessions(settings: Settings, db: Database) -> None:

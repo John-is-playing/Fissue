@@ -1,17 +1,16 @@
-{% extends "base.html" %}
-{% block title %}Fissue · 任务{% endblock %}
-{% block heading %}任务{% endblock %}
-{% block subtitle %}作业历史与日志；提交入口在「总览」的控制面板{% endblock %}
+{# 任务面板：写闸门持有者 + 当前作业 + 历史。
+ #
+ # 原来它是独立的一页（`/jobs`）。合并进「状态」页是因为两者回答的是**同一个问题**
+ # ——「服务现在在干什么、有没有卡住」。分两页时，用户看到「写操作进行中」的角标，
+ # 却要在另一个页面才知道是谁在写。
+ #
+ # 调用方需提供：`jobs`（作业注册表的 to_dict）与 `writer`（写闸门持有者）。
+ # 只读页（read_only）不渲染任何操作按钮。
+ #}
 
-{% block header_extra %}
-  <span class="sub">{{ jobs.jobs | length }} 条</span>
-{% endblock %}
-
-{% block content %}
-
-{# 「写操作进行中」但本表看不到对应的作业——这是真机踩到的困惑点：角标说有活在干，这一页
-   却空空如也，用户既不知道是谁在写、也取消不了。原因很明确：**本表只列从网页提交的作业**，
-   而常驻服务自己的定时轮次不在其中。这里把它点明，并按种类给出不同的话。 #}
+{# 「写操作进行中」但本表看不到对应的作业——这是真机踩到的困惑点：角标说有活在干，
+   这张表却空空如也，用户既不知道是谁在写、也取消不了。原因很明确：**本表只列从网页
+   提交的作业**，而常驻服务自己的定时轮次不在其中。这里把它点明，并按种类给出不同的话。 #}
 {% if writer and writer.busy and writer.kind != 'job' %}
 <div class="alert info">
   <span class="a-level">不在本表</span>
@@ -68,7 +67,7 @@
 {% endif %}
 
 <div class="panel">
-  <h2>历史</h2>
+  <h2>任务历史</h2>
   {% for j in jobs.jobs %}
   {% set cls = 'ok' if j.status == 'done' else ('bad' if j.status == 'failed' else ('stale' if j.status == 'canceled' else 'unknown')) %}
   <div class="job">
@@ -94,53 +93,8 @@
     还没有任务记录。到<a href="/">总览</a>的控制面板可以发起：检索 / 评测 / 验证 / 修复 / flush。
   </div>
   {% endfor %}
+  <div class="muted small mt">
+    作业表是**进程内**的：重启服务后历史清空，且只在单个 uvicorn worker 下成立
+    （<code>fissue web</code> 与 <code>fissue serve --with-web</code> 都是单进程）。
+  </div>
 </div>
-
-<div class="muted small">
-  作业表是**进程内**的：重启服务后历史清空，且只在单个 uvicorn worker 下成立
-  （<code>fissue web</code> 与 <code>fissue serve --with-web</code> 都是单进程）。
-</div>
-
-{% endblock %}
-
-{% block scripts %}
-<script>
-  // 有任务在跑时把进度刷新出来；没有就不轮询。
-  var current = {{ (jobs.current.id if jobs.current else '') | tojson }};
-  if (current) {
-    (async function loop() {
-      // 读不到状态 **不等于** 任务跑完了：服务重启、任务被清理、网络抖动都会走到这里。
-      // 原先这里捕获后直接 return，于是页面永远停在「正在运行」——重启服务之后回来
-      // 看就是这样，像是在骗人。现在退避重试几次，仍然读不到就直说。
-      var job = null;
-      for (var attempt = 0; attempt < 4; attempt++) {
-        try {
-          job = await Fissue.api('/jobs/' + current, {silent: true});
-          break;
-        } catch (e) {
-          if (attempt === 3) {
-            var dead = document.getElementById('cur-progress');
-            if (dead) {
-              dead.innerHTML = '<span class="bad">读不到任务状态（服务可能重启过，或这条任务已被清理）：' +
-                Fissue.escapeHtml(e.message) + '</span>';
-            }
-            return;
-          }
-          await new Promise(function (r) { setTimeout(r, 1000 * (attempt + 1)); });
-        }
-      }
-      var p = document.getElementById('cur-progress');
-      if (p) p.textContent = job.progress || '';
-      var log = document.getElementById('cur-log');
-      if (log) log.textContent = (job.log || []).join('\n');
-      if (job.live) {
-        setTimeout(loop, 1500);
-      } else {
-        Fissue.toast('任务已结束：' + job.status, job.status === 'done' ? 'ok' : 'bad',
-                     {detail: job.error || job.result, timeout: 0});
-        setTimeout(function () { location.reload(); }, 1200);
-      }
-    })();
-  }
-</script>
-{% endblock %}
