@@ -1421,12 +1421,59 @@ def _register_web(app: FastAPI, settings: Settings, templates: Jinja2Templates) 
     按域拆开注册（原先是一个 333 行的单函数）：总览 / 条目 / 状态与队列 / 任务 /
     配置页 / 条目详情。切分只按域移动代码，**注册顺序保持原样**。
     """
+    _register_web_pipeline(app, templates)
     _register_web_overview(app, templates)
     _register_web_items(app, templates)
     _register_web_status(app, templates)
     _register_web_jobs(app, templates)
     _register_web_config(app, templates)
     _register_web_item_detail(app, templates)
+
+
+def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
+    """流水线主页：漏斗 / 看板 / 泳道三视图，共用同一份计数。
+
+    这三张视图回答的是同一个问题的三个侧面——「现在跑到哪、卡在哪」：
+    漏斗看**全量吞吐**、看板看**各阶段积压与批量操作**、泳道看**单条进度**。
+    计数一律来自 :meth:`Repository.pipeline_summary` 的一条 ``GROUP BY``，不在前端各算各的。
+    """
+
+    @app.get("/pipeline", response_class=HTMLResponse)
+    async def pipeline_page(
+        request: Request,
+        repo_slug: str | None = Query(None, description="只看某个仓库"),
+    ) -> HTMLResponse:
+        from ..models import ItemStatus as _ItemStatus
+        from . import pipeline as view
+
+        r = _repo(request)
+        model = view.summarize(r.pipeline_summary(repo_slug=repo_slug))
+
+        # 泳道行：直接取最近的一批条目，由视图模型负责「卡住的排最前」。
+        rows = view.swimlane_rows(r.list_items(repo_slug=repo_slug, limit=120), limit=60)
+        # 卡点清单单独再取：泳道只显示前 60 条，而「有哪些卡住了」不该被截断。
+        stuck_items = r.list_items(
+            repo_slug=repo_slug, status=_ItemStatus.NEEDS_MANUAL, limit=50
+        ) + r.list_items(repo_slug=repo_slug, status=_ItemStatus.FAILED, limit=50)
+        stuck = sorted(
+            (view.item_row(item) for item in stuck_items),
+            key=lambda row: row["updated_at"] or "",
+            reverse=True,
+        )
+
+        return templates.TemplateResponse(
+            request,
+            "pipeline.html",
+            _page_context(
+                request,
+                nav="pipeline",
+                view=model,
+                rows=rows,
+                stuck=stuck,
+                stages=list(view.STAGES),
+                repo_filter=repo_slug or "",
+            ),
+        )
 
 
 def _register_web_overview(app: FastAPI, templates: Jinja2Templates) -> None:
@@ -1761,6 +1808,18 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
         evaluation = r.latest_evaluation(key)
         runs = r.verifier_runs(key, limit=20)
         verifier = r.latest_verifier(key)
+
+        from . import pipeline as pipe
+
+        # 阶段进度由**同一个**纯函数算（与流水线主页共用口径）：
+        # 详情页自己再推一遍「走到哪了」，迟早会与主页对不上。
+        stages = [
+            {"key": stage_key, "label": stage_label, "state": state}
+            for (stage_key, stage_label), state in zip(
+                pipe.STAGES, pipe.stage_states(item.status), strict=True
+            )
+        ]
+
         return templates.TemplateResponse(
             request,
             "item.html",
@@ -1770,6 +1829,7 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
                 # `comment_thread` 有内容——详情页因此能看到 Issue 正文与讨论。
                 data=exp.item_to_dict(item, evaluation, batch=r.latest_batch_conclusion(key)),
                 item=item,
+                stages=stages,
                 evaluation=evaluation,
                 conclusion=r.latest_batch_conclusion(key),
                 verifier=verifier[1] if verifier else None,

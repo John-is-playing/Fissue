@@ -1,0 +1,277 @@
+{% extends "base.html" %}
+{# 流水线主页：一条条目的进度被画成「阶段」，三种视图共用同一份计数。
+ #
+ # 为什么是三种而不是一种：它们回答不同的问题——
+ #   漏斗 = 全量吞吐（哪一段在掉队）  看板 = 各阶段积压与批量操作  泳道 = 单条走到哪
+ # 计数全部由服务端 web/pipeline.py 算好（一条 GROUP BY），前端只负责画。
+ # 切换状态存 localStorage：用户选过一次，下次进来还是那个视图。
+ #}
+
+{% block title %}流水线 · Fissue{% endblock %}
+{% block heading %}流水线{% endblock %}
+{% block subtitle %}
+  从抓取到提 PR 的六个阶段 · 卡住的共 {{ view.totals.stuck }} 条
+{% endblock %}
+
+{% block header_extra %}
+  {% if repo_filter %}
+  <a class="small" href="/pipeline">清除仓库筛选</a>
+  {% endif %}
+  <button type="button" class="ghost small" id="pipe-refresh">刷新</button>
+{% endblock %}
+
+{% block wrap_class %}wide{% endblock %}
+
+{% block content %}
+
+{# 摘要：# 一眼看清总量与卡点。卡点数放最后但加粗——它是这个页面存在的首要理由。 #}
+<div class="cards">
+  <div class="card">
+    <div class="k">条目总数</div>
+    <div class="v">{{ view.totals.items }}</div>
+  </div>
+  <div class="card">
+    <div class="k">在途</div>
+    <div class="v">{{ view.totals.active }}</div>
+  </div>
+  <div class="card">
+    <div class="k">已出结论</div>
+    <div class="v">{{ view.totals.done }}</div>
+  </div>
+  <div class="card {% if view.totals.stuck %}warn{% endif %}">
+    <div class="k">需人工</div>
+    <div class="v">{{ view.totals.stuck }}</div>
+  </div>
+</div>
+
+{# 卡点清单常驻：这是用户「打开页面第一眼要找的东西」。
+   不放进任何视图内部——切换视图不该把最重要的信息切走。 #}
+{% if stuck %}
+<section class="pipe-stuck">
+  <h2>需要你处理的 <span class="tag bad">{{ stuck | length }}</span></h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>条目</th><th>状态</th><th>优先级</th><th>更新时间</th><th>动作</th></tr>
+      </thead>
+      <tbody>
+        {% for row in stuck %}
+        <tr>
+          <td>
+            <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
+            <div class="small muted">{{ row.title | truncate(70) }}</div>
+          </td>
+          <td><span class="tag bad">{{ row.status }}</span>
+            {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
+          </td>
+          <td class="small">{{ row.priority or '—' }}</td>
+          <td class="small muted">{{ (row.updated_at or '')[:16] | replace('T', ' ') }}</td>
+          <td class="pipe-acts">
+            <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
+            <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
+{# 视图切换：分段控件，存 localStorage。 #}
+<div class="pipe-modes" role="tablist">
+  <button type="button" data-mode="funnel">漏斗</button>
+  <button type="button" data-mode="kanban">看板</button>
+  <button type="button" data-mode="swimlane">泳道</button>
+</div>
+
+{# ---------- 视图一：漏斗（全量吞吐） ---------- #}
+<section class="pipe-view" data-view="funnel" hidden>
+  <p class="small muted">
+    每一行是「当前停在/经过这一阶段」的条目数。比例相对条目总数——一眼看出哪一段在掉队。
+  </p>
+  <div class="pipe-funnel">
+    {% for stage in view.stages %}
+    <div class="pipe-funnel-row" data-stage="{{ stage.key }}">
+      <div class="pipe-funnel-label">{{ stage.label }}</div>
+      <div class="pipe-funnel-track" title="{{ stage.count }} 条（{{ stage.pct }}%）">
+        <span class="pipe-funnel-fill" style="width: {{ stage.pct }}%"></span>
+      </div>
+      <div class="pipe-funnel-count">
+        <b>{{ stage.count }}</b> <span class="small muted">{{ stage.pct }}%</span>
+      </div>
+    </div>
+    {% endfor %}
+    <div class="pipe-funnel-foot">
+      <span class="small muted">
+        另有「已出结论」{{ view.totals.done }} 条（等开发者）、「需人工」{{ view.totals.stuck }} 条。
+      </span>
+    </div>
+  </div>
+</section>
+
+{# ---------- 视图二：看板（各阶段积压 + 批量操作） ---------- #}
+<section class="pipe-view" data-view="kanban" hidden>
+  <p class="small muted">
+    列 = 阶段，行 = 流水线。点格子看那一类条目；格子里可以批量发起动作。
+  </p>
+  <div class="pipe-kanban">
+    {% for column in view.columns %}
+    <div class="pipe-col" data-stage="{{ column.key }}">
+      <div class="pipe-col-head">
+        <span>{{ column.label }}</span>
+        <span class="tag {{ 'bad' if column.key == 'stuck' else '' }}">{{ column.total }}</span>
+      </div>
+      {% for cell in column.cells %}
+      <div class="pipe-cell {% if cell.count == 0 %}empty{% endif %}">
+        <div class="pipe-cell-lane">{{ cell.lane_label }}</div>
+        <div class="pipe-cell-count">{{ cell.count }}</div>
+        {% if cell.count %}
+        <a class="small" href="/items?f_category=&f_status=&lane={{ cell.lane }}&stage={{ column.key }}">看条目</a>
+        {% endif %}
+      </div>
+      {% endfor %}
+      {% if column.total %}
+      <div class="pipe-col-acts">
+        {% if column.key == 'evaluate' %}
+        <button type="button" class="ghost small" data-act="job" data-kind="evaluate">批量评测</button>
+        {% elif column.key == 'verify' %}
+        <button type="button" class="ghost small" data-act="job" data-kind="verify">批量验证</button>
+        {% elif column.key == 'judge' %}
+        <button type="button" class="ghost small" data-act="job" data-kind="flush" data-queue="verify">批量定论</button>
+        {% elif column.key == 'fix' %}
+        <button type="button" class="ghost small" data-act="job" data-kind="fix" data-dryrun="1">试跑修复</button>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+{# ---------- 视图三：泳道（单条进度） ---------- #}
+<section class="pipe-view" data-view="swimlane" hidden>
+  <p class="small muted">
+    每条一行，横向是六个阶段。● 已完成 · ◐ 进行中 · ○ 排队等这一步 · · 还没轮到 · ? 卡住了（不知道死在哪步）。
+  </p>
+  <div class="table-scroll">
+    <table class="pipe-swim">
+      <thead>
+        <tr>
+          <th>条目</th>
+          {% for key, label in stages %}<th class="pipe-dot-head">{{ label }}</th>{% endfor %}
+          <th>状态</th>
+          <th>动作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr class="{% if row.stalled %}stalled{% endif %}">
+          <td>
+            <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
+            <div class="small muted">{{ row.title | truncate(60) }}</div>
+          </td>
+          {% for state in row.states %}
+          <td class="pipe-dot-cell">
+            <span class="pipe-dot {{ state }}" title="{{ state }}">{{ {'done':'●','active':'◐','pending':'○','waiting':'·','unknown':'?'}[state] }}</span>
+          </td>
+          {% endfor %}
+          <td>
+            <span class="tag {{ 'bad' if row.stalled else ('stale' if row.status in ('failed','needs_manual') else '') }}">{{ row.status }}</span>
+            {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
+          </td>
+          <td class="pipe-acts">
+            <a class="small" href="/item/{{ row.key | urlencode }}">详情</a>
+            {% if row.stage in ('evaluate', 'stuck') %}
+            <button type="button" class="ghost small" data-act="job" data-kind="evaluate" data-keys="{{ row.key }}"
+                    title="对这一条重新评测">重评</button>
+            {% endif %}
+            {% if row.stage in ('verify', 'judge') %}
+            <button type="button" class="ghost small" data-act="job" data-kind="verify" data-keys="{{ row.key }}"
+                    title="对这一条重新生成验证器并执行">重验</button>
+            {% endif %}
+            {% if row.stage in ('fix', 'stuck') %}
+            <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}"
+                    title="不管评测结论，直接推进修复流程">强制修</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not rows %}
+        <tr><td colspan="{{ stages | length + 3 }}" class="muted">还没有条目。先去「运行」页发起一次扫描。</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var KEY = "fissue.pipeline.mode";
+  var MODES = ["funnel", "kanban", "swimlane"];
+
+  function applyMode(mode) {
+    if (MODES.indexOf(mode) < 0) mode = "kanban";
+    MODES.forEach(function (m) {
+      var view = document.querySelector('[data-view="' + m + '"]');
+      if (view) view.hidden = (m !== mode);
+      var btn = document.querySelector('[data-mode="' + m + '"]');
+      if (btn) btn.classList.toggle("on", m === mode);
+    });
+    try { localStorage.setItem(KEY, mode); } catch (e) { /* 隐私模式下写不了，忽略 */ }
+  }
+
+  var saved = "kanban";
+  try { saved = localStorage.getItem(KEY) || "kanban"; } catch (e) { /* 同上 */ }
+  applyMode(saved);
+
+  document.querySelectorAll("[data-mode]").forEach(function (btn) {
+    btn.addEventListener("click", function () { applyMode(btn.dataset.mode); });
+  });
+
+  document.getElementById("pipe-refresh").addEventListener("click", function () {
+    window.location.reload();
+  });
+
+  // 作业类动作：evaluate / verify / fix / flush 都走 runJob（有进度、不阻塞页面）。
+  function runJob(kind, params) {
+    if (!window.Fissue || !window.Fissue.runJob) return;
+    window.Fissue.runJob(kind, params, { autoReload: true });
+  }
+
+  document.addEventListener("click", async function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-act]") : null;
+    if (!btn) return;
+
+    if (btn.dataset.act === "job") {
+      var kind = btn.dataset.kind;
+      var params = {};
+      if (btn.dataset.keys) params.keys = [btn.dataset.keys];
+      if (kind === "fix") params.dry_run = btn.dataset.dryrun === "1";
+      if (kind === "flush") {
+        params.queue = btn.dataset.queue || "verify";
+        params.force = true;
+      }
+      btn.disabled = true;
+      runJob(kind, params);
+      return;
+    }
+
+    if (btn.dataset.act === "force") {
+      var key = btn.dataset.key;
+      var ok = await window.Fissue.confirm(
+        "强制修复这一条？",
+        "不管评测结论（分类 / 刷量 / 优先级 / 裁决）如何，都推进修复流程并真提 PR。" +
+        "已在修复中或已提 PR 的条目会保持原状。"
+      );
+      if (!ok) return;
+      btn.disabled = true;
+      runJob("force", { keys: [key] });
+    }
+  });
+})();
+</script>
+{% endblock %}

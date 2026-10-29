@@ -470,3 +470,126 @@ dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin
   .kv { grid-template-columns: 96px 1fr; }
   .card { min-width: 104px; padding: 10px 12px; }
 }
+
+/* --------------------------------------------------------------------------
+ * 流水线视图（web/templates/pipeline.html）
+ *
+ * 三张视图共用同一份计数（服务端 web/pipeline.py 算好）。色卡沿用状态徽标那一套：
+ * 同一种状态在两处显示成两种颜色，人会以为它们不是一回事。
+ * -------------------------------------------------------------------------- */
+.wrap.wide { max-width: none; }
+.card.warn { border-color: var(--warn); }
+.card.warn .v { color: var(--warn); }
+
+/* 视图切换：分段控件。默认视图存 localStorage，选过一次就记住。 */
+.pipe-modes {
+  display: inline-flex; margin-bottom: 14px; border: 1px solid var(--line);
+  border-radius: var(--radius-sm); overflow: hidden;
+}
+.pipe-modes button {
+  background: var(--panel); border: none; border-right: 1px solid var(--line);
+  padding: 6px 16px; font-size: 13px; color: var(--muted); cursor: pointer;
+}
+.pipe-modes button:last-child { border-right: none; }
+.pipe-modes button:hover { color: var(--fg); }
+.pipe-modes button.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+
+.pipe-view { margin-bottom: 24px; }
+
+/* ---------- 漏斗：全量吞吐 ---------- */
+.pipe-funnel { display: flex; flex-direction: column; gap: 9px; }
+.pipe-funnel-row { display: grid; grid-template-columns: 56px 1fr 96px; gap: 12px; align-items: center; }
+.pipe-funnel-label { font-size: 13px; color: var(--muted); }
+.pipe-funnel-track {
+  height: 22px; background: var(--panel2); border-radius: 6px; overflow: hidden;
+  border: 1px solid var(--line);
+}
+.pipe-funnel-fill {
+  display: block; height: 100%; min-width: 2px;
+  background: linear-gradient(90deg, #2f5fa8, var(--accent));
+}
+.pipe-funnel-count { text-align: right; font-variant-numeric: tabular-nums; }
+.pipe-funnel-foot { margin-top: 4px; }
+
+/* ---------- 看板：各阶段积压 ---------- */
+.pipe-kanban {
+  display: grid; grid-template-columns: repeat(6, minmax(150px, 1fr));
+  gap: 10px; overflow-x: auto; padding-bottom: 4px;
+}
+.pipe-col {
+  display: flex; flex-direction: column; gap: 8px; padding: 10px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+}
+.pipe-col-head {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 13px; font-weight: 600;
+}
+.pipe-cell {
+  padding: 8px 9px; background: var(--panel2);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+/* 空格子只留轮廓：满屏同等强度的方块，眼睛找不到「有东西的那几格」。 */
+.pipe-cell.empty { opacity: .3; }
+.pipe-cell-lane { font-size: 11px; color: var(--muted); }
+.pipe-cell-count { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.pipe-col-acts { margin-top: auto; padding-top: 6px; }
+
+/* ---------- 泳道：单条进度 ---------- */
+.pipe-swim .pipe-dot-head { text-align: center; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.pipe-dot-cell { text-align: center; }
+.pipe-dot { font-size: 15px; line-height: 1; color: var(--none); }
+.pipe-dot.done { color: var(--ok); }
+.pipe-dot.active { color: var(--accent); }
+.pipe-dot.pending { color: var(--t1); }
+.pipe-dot.waiting { color: var(--none); opacity: .45; }
+.pipe-dot.unknown { color: var(--bad); }
+/* 卡住的整行染色：扫读时不必逐行看状态徽标。 */
+tr.stalled td { background: rgba(255, 107, 107, .06); }
+.pipe-acts { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* ---------- 卡点区 ---------- */
+.pipe-stuck { margin-bottom: 22px; }
+.pipe-stuck h2 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+
+@media (max-width: 1100px) {
+  .pipe-kanban { grid-template-columns: repeat(6, minmax(132px, 1fr)); }
+}
+
+/* --------------------------------------------------------------------------
+ * 条目详情的垂直时间线（web/templates/item.html）
+ *
+ * 为什么竖着排：横向流水线在「六个阶段 + 每段都要展示证据」时宽度根本不够，
+ * 而详情页恰恰是看证据的地方。竖排让每一段都能带说明与按钮，且阅读顺序就是处理顺序。
+ * -------------------------------------------------------------------------- */
+.tl-panel .tl { list-style: none; margin: 0; padding: 0; position: relative; }
+/* 连接线画在 li 的左侧，用伪元素而不是额外 DOM：阶段数量变化时不用改结构。 */
+.tl-panel .tl::before {
+  content: ""; position: absolute; left: 11px; top: 8px; bottom: 8px;
+  width: 2px; background: var(--line);
+}
+.tl-step { position: relative; display: flex; gap: 12px; padding: 0 0 16px 0; }
+.tl-step:last-child { padding-bottom: 0; }
+.tl-dot {
+  flex: none; width: 24px; height: 24px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; line-height: 1; background: var(--panel2);
+  border: 2px solid var(--line); color: var(--muted); position: relative; z-index: 1;
+}
+.tl-step.done .tl-dot { border-color: var(--ok); color: var(--ok); }
+.tl-step.active .tl-dot { border-color: var(--accent); color: var(--accent); }
+.tl-step.pending .tl-dot { border-color: var(--t1); color: var(--t1); }
+/* 未开始的整段压暗：时间线的重点是「现在在哪」，不是六个都同等重要。 */
+.tl-step.waiting { opacity: .55; }
+.tl-step.unknown .tl-dot { border-color: var(--bad); color: var(--bad); }
+
+.tl-body { flex: 1; min-width: 0; }
+.tl-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.tl-evidence { font-size: 13px; margin-bottom: 6px; }
+.tl-evidence > * { margin-right: 6px; }
+.tl-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+
+@media (max-width: 760px) {
+  .tl-step { gap: 9px; }
+  .tl-dot { width: 20px; height: 20px; font-size: 11px; }
+  .tl-panel .tl::before { left: 9px; }
+}

@@ -1368,6 +1368,28 @@ class Repository:
                 entry["oldest_at"] = oldest
         return out
 
+    def pipeline_summary(self, *, repo_slug: str | None = None) -> list[tuple[str, str, str, int]]:
+        """流水线视图的计数：按 ``(item_type, category, status)`` 分组，**一条查询**。
+
+        为什么不逐状态各查一次：四种类型 × 三种分类 × 十四个状态，逐条数就是上百次往返，
+        远程 PostgreSQL 上仅首屏渲染就掉到秒级（``queue_panel_summary`` 踩过同一个坑）。
+        一条 GROUP BY 顺带把三视图的口径也统一了——它们全从这份结果派生。
+
+        :return: ``[(item_type, category, status, count), ...]``
+        """
+        stmt = (
+            select(ItemRow.item_type, ItemRow.category, ItemRow.status, func.count())
+            .group_by(ItemRow.item_type, ItemRow.category, ItemRow.status)
+        )
+        if repo_slug:
+            stmt = stmt.where(ItemRow.repo_slug == repo_slug)
+        with self.db.session() as s:
+            rows = s.execute(stmt).all()
+        return [
+            (str(item_type), str(category), str(status), int(count))
+            for item_type, category, status, count in rows
+        ]
+
     def save_batch_conclusion(
         self,
         item_key: str,

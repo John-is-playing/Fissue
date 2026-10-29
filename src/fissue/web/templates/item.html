@@ -11,20 +11,100 @@
 
 {% block content %}
 
+{# 垂直时间线：把「这条走到哪了、这一步的证据是什么、我能做什么」按阶段归拢。
+ #
+ # 原先顶部是一排八个按钮（批准修复 / 确认合并 / 重评 / 重验 / 强制 / 取消强制 / 删除），
+ # 用户得先自己判断「我现在该点哪个」——而判断依据散在下方的六个面板里。现在按钮挂在
+ # **它所属的阶段**上：走到哪一步，就在那一步旁边给动作。
+ # 阶段进度与流水线主页共用同一个纯函数（web/pipeline.py），不各推一遍。
+ #}
+{% set state_label = {'done': '已完成', 'active': '进行中', 'pending': '排队中',
+                      'waiting': '未开始', 'unknown': '卡住'} %}
+
+<div class="panel tl-panel">
+  <h2>流水线进度</h2>
+  <ol class="tl">
+    {% for stage in stages %}
+    <li class="tl-step {{ stage.state }}">
+      <span class="tl-dot" aria-hidden="true">{{ {'done':'✓','active':'◐','pending':'○','waiting':'·','unknown':'?'}[stage.state] }}</span>
+      <div class="tl-body">
+        <div class="tl-head">
+          <b>{{ stage.label }}</b>
+          <span class="tag {{ 'bad' if stage.state == 'unknown' else ('stale' if stage.state in ('pending','active') else '') }}">{{ state_label[stage.state] }}</span>
+        </div>
+
+        <div class="tl-evidence">
+          {% if stage.key == 'capture' %}
+            {{ data.comments }} 条评论{% if data.body %} · 有正文{% else %} · 无正文{% endif %}
+            {% if data.degraded %}<span class="warn"> · 数据残缺：{{ data.degraded | join('；') }}</span>{% endif %}
+          {% elif stage.key == 'evaluate' %}
+            {% if evaluation %}
+              <span class="tag {{ evaluation.category.value }}">{{ evaluation.category.value }}</span>
+              <span class="tag {{ evaluation.priority.value }}">{{ evaluation.priority.value }}</span>
+              <span class="small muted">真实性 {{ evaluation.authenticity }} · 重要性 {{ evaluation.importance }} · 难度 {{ evaluation.difficulty }}</span>
+              <div class="small muted">{{ evaluation.summary | truncate(110) }}</div>
+            {% else %}<span class="muted">尚未评测</span>{% endif %}
+          {% elif stage.key == 'verify' %}
+            {% if verifier %}
+              <span class="tag">{{ verifier.kind.value }}</span>
+              <code class="small">{{ verifier.command or '（清单型，无命令）' }}</code>
+              {% if runs %}
+                {% set last = runs[0] %}
+                <span class="small {{ 'ok' if last.outcome.value == 'pass' else 'bad' }}">最近一次：{{ last.outcome.value }}</span>
+              {% endif %}
+              {% if regression %}
+                <span class="small {{ 'ok' if regression.status == 'pass' else ('bad' if regression.status == 'fail' else 'muted') }}">· 回归门 {{ regression.status }}</span>
+              {% endif %}
+            {% else %}<span class="muted">尚未生成验证器</span>{% endif %}
+          {% elif stage.key == 'judge' %}
+            {% if conclusion %}
+              <span class="tag">{{ conclusion.verdict }}</span>
+              <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
+              <div class="small muted">{{ conclusion.reason | truncate(110) }}</div>
+            {% else %}<span class="muted">尚未批量定论（等队列攒够或用「批量定论」）</span>{% endif %}
+          {% elif stage.key == 'fix' %}
+            {% if fixes %}
+              {% set f = fixes[0] %}
+              <span class="tag {{ 'ok' if f.outcome.value == 'success' else 'bad' }}">{{ f.outcome.value }}</span>
+              <span class="small muted">{{ f.rounds }} 轮{% if f.branch %} · <code>{{ f.branch }}</code>{% endif %}</span>
+              {% if f.error %}<div class="small bad">{{ f.error | truncate(120) }}</div>{% endif %}
+            {% else %}<span class="muted">尚未尝试自动修复</span>{% endif %}
+          {% elif stage.key == 'pr' %}
+            {% set pr = fixes | selectattr('pr_url') | list %}
+            {% if pr %}
+              <a href="{{ pr[0].pr_url }}" target="_blank" rel="noopener">#{{ pr[0].pr_number }} ↗</a>
+            {% else %}<span class="muted">尚未提 PR</span>{% endif %}
+          {% endif %}
+        </div>
+
+        {% if not read_only %}
+        <div class="tl-acts">
+          {% if stage.key == 'evaluate' %}
+            <button class="ghost small" onclick="reEval()">重新深度评测</button>
+          {% elif stage.key == 'verify' %}
+            <button class="ghost small" onclick="reVerify()">重新验证</button>
+          {% elif stage.key == 'fix' %}
+            <button class="small" onclick="approveFix()">批准自动修复（提交 PR）</button>
+            {% if data.type == 'issue' %}
+            <button class="ghost small" onclick="forceFix()">强制修复</button>
+            {% if data.force_fix %}<button class="ghost small" onclick="unforceFix()">取消强制</button>{% endif %}
+            {% endif %}
+          {% elif stage.key == 'pr' %}
+            <button class="ghost small" onclick="approveMerge()">确认可合并（打标签）</button>
+          {% endif %}
+        </div>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ol>
+</div>
+
 {% if not read_only %}
-{# 操作走 /jobs/{kind}：拿 job id 后轮询进度，不再是一个同步 fetch 干等 + alert 弹 JSON。 #}
+{# 破坏性操作单独放、措辞写明「本地数据 / 不可撤销」：它不属于任何阶段，
+   混进时间线里容易被当成下一步的正常动作。 #}
 <div class="row mb">
-  <button class="danger" onclick="approveFix()">批准自动修复（提交 PR）</button>
-  <button onclick="approveMerge()">确认可合并（打标签）</button>
-  <button onclick="reEval()">重新深度评测</button>
-  <button onclick="reVerify()">重新验证</button>
-  {% if data.type == 'issue' %}
-  {# 强制修复：PR 没有自动修复流程，不给入口。已强制的条目旁边给「取消」。 #}
-  <button onclick="forceFix()">强制修复</button>
-  {% if data.force_fix %}<button onclick="unforceFix()">取消强制</button>{% endif %}
-  {% endif %}
-  {# 破坏性操作放在行尾、且措辞写明「本地数据 / 不可撤销」，别和上面那几个常用动作混在一起。 #}
-  <button class="danger" onclick="deleteItem()">删除本地数据</button>
+  <button class="danger" onclick="deleteItem()">删除本地数据（不可撤销）</button>
 </div>
 {% endif %}
 

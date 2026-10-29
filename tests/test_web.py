@@ -16,8 +16,10 @@ from fissue.models import (
     DimensionScore,
     Evaluation,
     ItemStatus,
+    ItemType,
     Platform,
     Priority,
+    RawItem,
     RepoRef,
     Scores,
     VerifierKind,
@@ -1506,3 +1508,78 @@ def test_round_job_cancel_requests_stop_of_the_round(client) -> None:  # noqa: A
     # ROUNDS 里没有真实在跑的轮次 → 应如实 409，而不是假装取消了
     r = client.post(f"/api/v1/jobs/{job.id}/cancel")
     assert r.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# 流水线主页（漏斗 / 看板 / 泳道三视图）
+# ---------------------------------------------------------------------------
+
+
+def test_pipeline_page_renders_three_views(client) -> None:  # noqa: ANN001
+    """三张视图都要在页面上——切换只是显隐，不是在服务端换渲染。"""
+    html = client.get("/pipeline").text
+    for mode in ("funnel", "kanban", "swimlane"):
+        assert f'data-view="{mode}"' in html, mode
+        assert f'data-mode="{mode}"' in html, mode
+
+
+def test_pipeline_page_shows_stage_labels(client) -> None:  # noqa: ANN001
+    """六个阶段的标签要出现，否则漏斗只剩数字。"""
+    html = client.get("/pipeline").text
+    for label in ("抓取", "评测", "验证", "裁决", "修复", "提 PR"):
+        assert label in html, label
+
+
+def test_pipeline_page_lists_item_in_swimlane(client, sample_issue) -> None:  # noqa: ANN001
+    """条目要出现在泳道里，并且链到它的详情页。"""
+    html = client.get("/pipeline").text
+    escaped = sample_issue.key.replace(":", "%3A").replace("/", "%2F")
+    assert sample_issue.key in html or escaped in html
+
+
+def test_pipeline_page_surfaces_stuck_items(client, repo, sample_issue) -> None:  # noqa: ANN001
+    """卡住的条目要单独列出——这是用户打开页面第一眼要找的东西。"""
+    from fissue.models import ItemStatus
+
+    repo.set_item_status(sample_issue.key, ItemStatus.NEEDS_MANUAL)
+    html = client.get("/pipeline").text
+    assert "需要你处理的" in html
+    assert "needs_manual" in html
+
+
+def test_pipeline_page_filters_by_repo(client) -> None:  # noqa: ANN001
+    """带上 repo_slug 只数那个仓库；不认识的仓库给出空视图而不是 500。"""
+    ok = client.get("/pipeline", params={"repo_slug": "psf/requests"})
+    assert ok.status_code == 200
+    other = client.get("/pipeline", params={"repo_slug": "nobody/nothing"})
+    assert other.status_code == 200
+    assert "还没有条目" in other.text
+
+
+def test_pipeline_page_has_batch_entry_per_column(client, repo) -> None:  # noqa: ANN001
+    """每个**非空**阶段列都要有对应的批量入口（否则「批量审核」这条路断了）。
+
+    空格子刻意不给按钮：点一下什么也不会发生，比没有按钮更让人困惑。
+    """
+    from fissue.models import ItemStatus, Platform
+
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    for index, status in enumerate(
+        [ItemStatus.NEW, ItemStatus.EVALUATED, ItemStatus.QUEUED, ItemStatus.FIX_QUEUED]
+    ):
+        item = RawItem(
+            platform=Platform.GITHUB,
+            repo="psf/requests",
+            number=900 + index,
+            item_type=ItemType.ISSUE,
+            title=f"批量入口测试 {index}",
+            body="复现",
+        )
+        repo.upsert_item(rid, item)
+        repo.set_item_status(item.key, status)
+
+    html = client.get("/pipeline").text
+    assert 'data-kind="evaluate"' in html
+    assert 'data-kind="verify"' in html
+    assert 'data-kind="flush"' in html
+    assert 'data-kind="fix"' in html
