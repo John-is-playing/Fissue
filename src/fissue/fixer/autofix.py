@@ -490,21 +490,8 @@ class AutoFixer:
         # 策略闸门：只有 BUG 类、优先级 tier1/tier2 才修。
         # 强制修复的条目由人拍板「要修」：评测缺失 / 优先级 / 刷量三道闸不再拦它；
         # 验证器闸门**保留**（见下）——没有验证器，修复结果无从判定，强也强不了。
-        evaluation = self.ctx.repo.latest_evaluation(item.key)
-        if evaluation is None and not item.force_fix:
-            return self._skip(item, "缺少评测结果")
-        if item.item_type is not ItemType.ISSUE and self.settings.fix_policy.only_issues:
-            return self._skip(item, "策略只自动修复 Issue")
-        if item.priority not in (Priority.TIER1, Priority.TIER2) and not item.force_fix:
-            return self._skip(item, f"优先级为 {item.priority.value}，不自动修复")
-        if (
-            evaluation is not None
-            and evaluation.spam.suspicious
-            and not item.force_fix
-        ):
-            return self._skip(item, "疑似刷量/重复，不自动修复")
-        if self._has_open_attempt(item.key):
-            return self._skip(item, "已存在修复尝试，跳过以免重复提 PR")
+        if (reason := self._policy_gate(item)) is not None:
+            return self._skip(item, reason)
 
         verifier = self.ctx.repo.latest_verifier(item.key)
         if verifier is None:
@@ -524,140 +511,22 @@ class AutoFixer:
             # 1) Agent 循环修复。之后三条关：
             #    * 完整 F2P / 既有测试回归门失败 → 带反馈重跑（`auto_fix.regression_retries`）
             #    * 自动评审给出 critical/major → 带评审意见重跑（`auto_fix.review_rounds`）
-            retries_limit = max(0, int(self.settings.auto_fix.regression_retries))
-            review_limit = max(0, int(self.settings.auto_fix.review_rounds))
-            reviewer = None if review_limit <= 0 else PatchReviewer(self.ctx.llm, self.settings)
-            prior_failure: str | None = None
-            used_regression = 0
-            used_review = 0
-            for _ in range(retries_limit + review_limit + 1):
-                attempt, trace = await self.agent.run(
-                    item=item,
-                    workspace=workspace,
-                    spec=spec,
-                    repo_context=repo_context,
-                    verifier_id=verifier_id,
-                    max_rounds=max_rounds,
-                    prior_failure=prior_failure,
-                )
-                # 这里**不再**把 trace.usage 记一次账：Agent 每一轮的调用都已经由
-                # `LLMClient` 的 usage_sink 逐次写进 llm_usage（purpose=`agent@<仓库>`），
-                # 再把整次尝试的累加量写一行 `agent` 等于把同一批 token 记两遍。
-                # 实测：那批汇总行让全表用量虚高 14.6%，而 `llm.budget` 的每日闸门正是
-                # 按这张表算的——虚高会让它在没超预算时提前硬停。
-
-                if attempt.outcome is not FixOutcome.SUCCESS:
-                    return await self._handle_failure(item, attempt, trace, spec)
-
-                # 快照必须在进沙盒那两步**之前**抓：回归门会临时挪走工作区的测试文件再还原，
-                # 之后的工作区就不再稳定了（评审只吃这份副本，所以它能并行）。
-                snapshot_diff = workspace.diff()
-                snapshot_files = self._snapshot_changed(workspace)
-                review_task: asyncio.Task[ReviewResult] | None = None
-                if reviewer is not None:
-                    review_task = asyncio.create_task(
-                        reviewer.review(
-                            item=item,
-                            spec=spec,
-                            diff=snapshot_diff,
-                            changed_files=snapshot_files,
-                            repo_context=repo_context,
-                        )
-                    )
-
-                # 2) 提 PR 前的权威复核（防止 Agent 自说自话）：
-                #    可执行型 → 完整 F2P；清单型 → LLM 在修复工作区上逐条重判。
-                if spec.kind is VerifierKind.CHECKLIST:
-                    final = await self._judge_checklist_on_fix(
-                        item, workspace, spec, verifier_id, repo_context
-                    )
-                else:
-                    ctx_verify = VerifyContext(
-                        workspace=workspace,
-                        item=item,
-                        spec=spec,
-                        repo_slug=repo_cfg.slug,
-                        test_hint=repo_cfg.test_hint,
-                    )
-                    final = await self.ctx.verifier.verify_fix(
-                        ctx_verify, verifier_id=verifier_id
-                    )
-                f2p_ok = final.f2p_satisfied or not self.settings.verifier.require_f2p
-
-                # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
-                # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
-                # 与上一步**串行**：两者都跑在同一个工作区上，并着跑必然互相踩。
-                reg_ok, reg_why = await self._run_regression_gate(
-                    item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
-                    verifier_id=verifier_id,
-                )
-
-                # 评审判定在这儿汇合——它从快照开始跑，通常已经跑完，等它几乎不花时间。
-                review = (await review_task) if review_task is not None else None
-                if review is not None:
-                    trace.review.extend(review.summary_lines())
-                    if review.dropped:
-                        trace.note(f"    评审丢弃 {len(review.dropped)} 条（引用不实或越界）")
-
-                problems: list[str] = []
-                if not f2p_ok:
-                    gate_label = (
-                        "最终清单判定未通过"
-                        if spec.kind is VerifierKind.CHECKLIST
-                        else "最终 F2P 未通过"
-                    )
-                    problems.append(f"{gate_label}：{final.conclusion}")
-                if not reg_ok:
-                    problems.append(f"回归门未通过：{reg_why}")
-                if review is not None and review.blocking:
-                    problems.append(review.feedback())
-                blocking = [] if review is None else review.blocking
-
-                if not problems:
-                    break                      # 三关全过 → 继续 diff / 提 PR
-
-                # 还有余额就带着反馈返修：F2P/回归门用各自的预算，评审用评审预算。
-                if (not f2p_ok or not reg_ok) and used_regression < retries_limit:
-                    used_regression += 1
-                elif blocking and used_review < review_limit:
-                    used_review += 1
-                else:
-                    # 余额用尽：把这些意见原样交给人工（含评审的原文片段，便于直接按图索骥）。
-                    attempt.outcome = FixOutcome.NEEDS_MANUAL
-                    attempt.error = "；".join(problems)[:2000]
-                    return await self._handle_failure(
-                        item, attempt, trace, spec, regression_note=attempt.error
-                    )
-                prior_failure = _retry_feedback("\n\n".join(problems))
-                log.warning(
-                    "%s：带着反馈重跑修复（第 %d 次）",
-                    item.key, used_regression + used_review + 1,
-                )
+            attempt, trace, final = await self._repair_loop(
+                item=item,
+                workspace=workspace,
+                spec=spec,
+                repo_cfg=repo_cfg,
+                verifier_id=verifier_id,
+                repo_context=repo_context,
+                max_rounds=max_rounds,
+            )
+            if attempt.outcome is not FixOutcome.SUCCESS:
+                return attempt
 
             attempt.diff = attempt.diff or workspace.diff()
 
             if dry_run:
-                path = self.pr_creator._save_patch(item, attempt.diff)
-                attempt.outcome = FixOutcome.NEEDS_MANUAL
-                attempt.dry_run = True
-                attempt.patch_path = path
-                attempt.pr_url = None
-                attempt.error = "dry-run：仅产出补丁，未提交 PR"
-                # dry-run 这条路**不写人工报告**（那只在 needs_manual 时走），而它恰恰是人看补丁的
-                # 入口——评审的非阻断意见在这里丢掉，就等于这一步白评。所以落到补丁旁边的旁挂文件，
-                # 并逐条 warning（控制台里也看得见）。
-                if trace.review:
-                    for line in trace.review:
-                        log.warning("自动评审 %s：%s", item.key, line)
-                    review_path = Path(path).with_suffix(".review.txt")
-                    review_path.write_text("\n".join(trace.review) + "\n", encoding="utf-8")
-                    attempt.error += f"｜自动评审意见见 {review_path}"
-                self.ctx.repo.save_fix_attempt(attempt)
-                # 干跑没产出 PR，条目等于还没修：放回待修队列，否则一趟 dry-run
-                # 就把待修队列消费掉（条目会卡在 fixing/needs_manual），
-                # 之后去掉 --dry-run 的真跑反而取不到任何候选。
-                self.ctx.repo.set_item_status(item.key, ItemStatus.FIX_QUEUED)
-                return attempt
+                return self._finish_dry_run(item, attempt, trace)
 
             # 3) 提交 PR
             attempt = await self.pr_creator.submit(
@@ -955,6 +824,201 @@ class AutoFixer:
         return str(report_path)
 
     # -- 内部 -------------------------------------------------------------
+
+    async def _repair_loop(
+        self,
+        *,
+        item: RawItem,
+        workspace: RepoWorkspace,
+        spec: VerifierSpec,
+        repo_cfg: RepoConfig,
+        verifier_id: int | None,
+        repo_context: str,
+        max_rounds: int | None,
+    ) -> tuple[FixAttempt, AgentTrace, VerifierResult]:
+        """Agent 修复循环 + 三道闸门判定。
+
+        返回 ``(attempt, trace, final)``；``final`` 是最后一轮的权威复核结论
+        （清单型逐条判定 / 可执行型 F2P）。**失败收场时 ``attempt.outcome`` 已不是
+        SUCCESS**，调用方据此提前返回，不会去读那时尚无意义的 ``final``。
+
+        三道关：
+
+        * 完整 F2P / 既有测试回归门失败 → 带反馈重跑（``auto_fix.regression_retries``）
+        * 自动评审给出 critical/major → 带评审意见重跑（``auto_fix.review_rounds``）
+        """
+        retries_limit = max(0, int(self.settings.auto_fix.regression_retries))
+        review_limit = max(0, int(self.settings.auto_fix.review_rounds))
+        reviewer = None if review_limit <= 0 else PatchReviewer(self.ctx.llm, self.settings)
+        prior_failure: str | None = None
+        used_regression = 0
+        used_review = 0
+        attempt = FixAttempt(item_key=item.key)
+        trace = AgentTrace()
+        final = VerifierResult(kind=spec.kind)
+        for _ in range(retries_limit + review_limit + 1):
+            attempt, trace = await self.agent.run(
+                item=item,
+                workspace=workspace,
+                spec=spec,
+                repo_context=repo_context,
+                verifier_id=verifier_id,
+                max_rounds=max_rounds,
+                prior_failure=prior_failure,
+            )
+            # 这里**不再**把 trace.usage 记一次账：Agent 每一轮的调用都已经由
+            # `LLMClient` 的 usage_sink 逐次写进 llm_usage（purpose=`agent@<仓库>`），
+            # 再把整次尝试的累加量写一行 `agent` 等于把同一批 token 记两遍。
+            # 实测：那批汇总行让全表用量虚高 14.6%，而 `llm.budget` 的每日闸门正是
+            # 按这张表算的——虚高会让它在没超预算时提前硬停。
+
+            if attempt.outcome is not FixOutcome.SUCCESS:
+                return (
+                    await self._handle_failure(item, attempt, trace, spec),
+                    trace,
+                    final,
+                )
+
+            # 快照必须在进沙盒那两步**之前**抓：回归门会临时挪走工作区的测试文件再还原，
+            # 之后的工作区就不再稳定了（评审只吃这份副本，所以它能并行）。
+            snapshot_diff = workspace.diff()
+            snapshot_files = self._snapshot_changed(workspace)
+            review_task: asyncio.Task[ReviewResult] | None = None
+            if reviewer is not None:
+                review_task = asyncio.create_task(
+                    reviewer.review(
+                        item=item,
+                        spec=spec,
+                        diff=snapshot_diff,
+                        changed_files=snapshot_files,
+                        repo_context=repo_context,
+                    )
+                )
+
+            # 提 PR 前的权威复核（防止 Agent 自说自话）：
+            # 可执行型 → 完整 F2P；清单型 → LLM 在修复工作区上逐条重判。
+            verdict: VerifierResult
+            if spec.kind is VerifierKind.CHECKLIST:
+                verdict = await self._judge_checklist_on_fix(
+                    item, workspace, spec, verifier_id, repo_context
+                )
+            else:
+                ctx_verify = VerifyContext(
+                    workspace=workspace,
+                    item=item,
+                    spec=spec,
+                    repo_slug=repo_cfg.slug,
+                    test_hint=repo_cfg.test_hint,
+                )
+                verdict = await self.ctx.verifier.verify_fix(
+                    ctx_verify, verifier_id=verifier_id
+                )
+            final = verdict
+            f2p_ok = verdict.f2p_satisfied or not self.settings.verifier.require_f2p
+
+            # 既有测试回归门（fix 阶段）：F2P 只证明目标用例被修好，证明不了
+            # 「没弄坏别的」。strict 下 base 绿而 fix 红 → 拒绝本次修复。
+            # 与上一步**串行**：两者都跑在同一个工作区上，并着跑必然互相踩。
+            reg_ok, reg_why = await self._run_regression_gate(
+                item=item, workspace=workspace, spec=spec, repo_cfg=repo_cfg,
+                verifier_id=verifier_id,
+            )
+
+            # 评审判定在这儿汇合——它从快照开始跑，通常已经跑完，等它几乎不花时间。
+            review = (await review_task) if review_task is not None else None
+            if review is not None:
+                trace.review.extend(review.summary_lines())
+                if review.dropped:
+                    trace.note(f"    评审丢弃 {len(review.dropped)} 条（引用不实或越界）")
+
+            problems: list[str] = []
+            if not f2p_ok:
+                gate_label = (
+                    "最终清单判定未通过"
+                    if spec.kind is VerifierKind.CHECKLIST
+                    else "最终 F2P 未通过"
+                )
+                problems.append(f"{gate_label}：{final.conclusion}")
+            if not reg_ok:
+                problems.append(f"回归门未通过：{reg_why}")
+            if review is not None and review.blocking:
+                problems.append(review.feedback())
+            blocking = [] if review is None else review.blocking
+
+            if not problems:
+                break                      # 三关全过 → 继续 diff / 提 PR
+
+            # 还有余额就带着反馈返修：F2P/回归门用各自的预算，评审用评审预算。
+            if (not f2p_ok or not reg_ok) and used_regression < retries_limit:
+                used_regression += 1
+            elif blocking and used_review < review_limit:
+                used_review += 1
+            else:
+                # 余额用尽：把这些意见原样交给人工（含评审的原文片段，便于直接按图索骥）。
+                attempt.outcome = FixOutcome.NEEDS_MANUAL
+                attempt.error = "；".join(problems)[:2000]
+                return (
+                    await self._handle_failure(
+                        item, attempt, trace, spec, regression_note=attempt.error
+                    ),
+                    trace,
+                    final,
+                )
+            prior_failure = _retry_feedback("\n\n".join(problems))
+            log.warning(
+                "%s：带着反馈重跑修复（第 %d 次）",
+                item.key, used_regression + used_review + 1,
+            )
+
+        return attempt, trace, final
+
+    def _finish_dry_run(self, item: RawItem, attempt: FixAttempt, trace: AgentTrace) -> FixAttempt:
+        """干跑收场：只落补丁，不提 PR，并把条目放回待修队列。"""
+        path = self.pr_creator._save_patch(item, attempt.diff)
+        attempt.outcome = FixOutcome.NEEDS_MANUAL
+        attempt.dry_run = True
+        attempt.patch_path = path
+        attempt.pr_url = None
+        attempt.error = "dry-run：仅产出补丁，未提交 PR"
+        # dry-run 这条路**不写人工报告**（那只在 needs_manual 时走），而它恰恰是人看补丁的
+        # 入口——评审的非阻断意见在这里丢掉，就等于这一步白评。所以落到补丁旁边的旁挂文件，
+        # 并逐条 warning（控制台里也看得见）。
+        if trace.review:
+            for line in trace.review:
+                log.warning("自动评审 %s：%s", item.key, line)
+            review_path = Path(path).with_suffix(".review.txt")
+            review_path.write_text("\n".join(trace.review) + "\n", encoding="utf-8")
+            attempt.error += f"｜自动评审意见见 {review_path}"
+        self.ctx.repo.save_fix_attempt(attempt)
+        # 干跑没产出 PR，条目等于还没修：放回待修队列，否则一趟 dry-run
+        # 就把待修队列消费掉（条目会卡在 fixing/needs_manual），
+        # 之后去掉 --dry-run 的真跑反而取不到任何候选。
+        self.ctx.repo.set_item_status(item.key, ItemStatus.FIX_QUEUED)
+        return attempt
+
+    def _policy_gate(self, item: RawItem) -> str | None:
+        """策略闸门：不该修就返回理由（``None`` = 放行）。
+
+        强制修复的条目由人拍板「要修」，所以「评测缺失 / 优先级 / 刷量」三道闸对
+        ``force_fix`` 的条目不拦；但「已有成功尝试」那一条**照样拦**——那意味着已经
+        提过 PR，再修一遍只会撞已有分支。
+        """
+        evaluation = self.ctx.repo.latest_evaluation(item.key)
+        if evaluation is None and not item.force_fix:
+            return "缺少评测结果"
+        if item.item_type is not ItemType.ISSUE and self.settings.fix_policy.only_issues:
+            return "策略只自动修复 Issue"
+        if item.priority not in (Priority.TIER1, Priority.TIER2) and not item.force_fix:
+            return f"优先级为 {item.priority.value}，不自动修复"
+        if (
+            evaluation is not None
+            and evaluation.spam.suspicious
+            and not item.force_fix
+        ):
+            return "疑似刷量/重复，不自动修复"
+        if self._has_open_attempt(item.key):
+            return "已存在修复尝试，跳过以免重复提 PR"
+        return None
 
     def _skip(self, item: RawItem, reason: str) -> FixAttempt:
         log.info("跳过自动修复 %s：%s", item.key, reason)

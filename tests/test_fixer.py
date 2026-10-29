@@ -202,35 +202,6 @@ def _stub_patch_reviewer(monkeypatch):
     monkeypatch.setattr(PatchReviewer, "review", _no_findings)
 
 
-@pytest.fixture
-def fixer_ctx(settings, repo):
-    """构造一个只够跑策略闸门的 AutoFixer 上下文。"""
-    import asyncio
-
-    from fissue.ai.client import LLMClient
-    from fissue.ai.evaluator import Evaluator
-    from fissue.pipeline.context import RuntimeContext
-    from fissue.sandbox.forwarder import SandboxManager
-    from fissue.verifier.generator import VerifierGenerator
-    from fissue.verifier.regression import RegressionGate
-    from fissue.verifier.runner import VerifierRunner
-
-    c = RuntimeContext.__new__(RuntimeContext)
-    object.__setattr__(c, "settings", settings)
-    object.__setattr__(c, "db", repo.db)
-    object.__setattr__(c, "repo", repo)
-    object.__setattr__(c, "_adapters", {})
-    object.__setattr__(c, "_lock", asyncio.Lock())
-    llm = LLMClient(settings.llm)
-    object.__setattr__(c, "llm", llm)
-    object.__setattr__(c, "sandbox", SandboxManager(settings.sandbox, force_inline=True))
-    object.__setattr__(c, "evaluator", Evaluator(llm, repo, settings))
-    object.__setattr__(c, "generator", VerifierGenerator(llm, settings))
-    object.__setattr__(c, "verifier", VerifierRunner(c.sandbox, repo, settings, client=llm))
-    object.__setattr__(c, "regression_gate", RegressionGate(c.sandbox, repo, settings))
-    return c
-
-
 def _register(repo, item: RawItem) -> None:
     rid = repo.ensure_repo(RepoRef(platform=item.platform, owner="psf", name="requests"))
     repo.upsert_item(rid, item)

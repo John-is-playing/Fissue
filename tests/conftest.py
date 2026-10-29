@@ -234,6 +234,39 @@ def stub_llm() -> StubLLM:
     return StubLLM()
 
 
+@pytest.fixture
+def fixer_ctx(settings, repo):
+    """构造一个只够跑策略闸门与提 PR 路径的 AutoFixer 上下文。
+
+    放在 conftest 而不是 test_fixer.py：pytest 的**模块级**夹具不跨文件共享，而
+    PRCreator 的推送路径测试（tests/test_autofix_push.py）也要用它。
+    """
+    import asyncio
+
+    from fissue.ai.client import LLMClient
+    from fissue.ai.evaluator import Evaluator
+    from fissue.pipeline.context import RuntimeContext
+    from fissue.sandbox.forwarder import SandboxManager
+    from fissue.verifier.generator import VerifierGenerator
+    from fissue.verifier.regression import RegressionGate
+    from fissue.verifier.runner import VerifierRunner
+
+    c = RuntimeContext.__new__(RuntimeContext)
+    object.__setattr__(c, "settings", settings)
+    object.__setattr__(c, "db", repo.db)
+    object.__setattr__(c, "repo", repo)
+    object.__setattr__(c, "_adapters", {})
+    object.__setattr__(c, "_lock", asyncio.Lock())
+    llm = LLMClient(settings.llm)
+    object.__setattr__(c, "llm", llm)
+    object.__setattr__(c, "sandbox", SandboxManager(settings.sandbox, force_inline=True))
+    object.__setattr__(c, "evaluator", Evaluator(llm, repo, settings))
+    object.__setattr__(c, "generator", VerifierGenerator(llm, settings))
+    object.__setattr__(c, "verifier", VerifierRunner(c.sandbox, repo, settings, client=llm))
+    object.__setattr__(c, "regression_gate", RegressionGate(c.sandbox, repo, settings))
+    return c
+
+
 @pytest.fixture(scope="session")
 def event_loop():
     loop = asyncio.new_event_loop()
