@@ -1,3 +1,16 @@
+# 更新日志
+
+本文件记录 Fissue 的重要变更。
+
+格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
+版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+> **关于版本**：`v1.0.0` 是首个正式版本，`pyproject.toml` 同步为 `1.0.0`。
+> 在此之前 `main` 上沉淀过一批预发布快照（`rel/v1.0.0-b1…b10`、`rel/v1.0.1-a1`/`a2`），
+> 其中的 `b1` 与 `b9` 另出过 Release；本节即这批快照累积后的收口。
+
+---
+
 ## [1.2.0-b2] - 2026-10-29
 
 > **预发布快照**：`rel/v1.2.0-b2`（做法同 `v1.1.0-b1…b4`：不动 `pyproject.toml` 与
