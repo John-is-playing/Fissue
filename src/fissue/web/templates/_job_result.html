@@ -1,0 +1,44 @@
+{# 作业结果：一句话结论 + 关键数字 + 逐条明细，原始数据折叠在最后。
+ #
+ # 原先模板直接 `{{ job.result | tojson(indent=2) }}`——技术上没丢信息，但没人愿意为
+ # 「这次扫描新增了几条」去读一段 JSON。摘要在 `web/job_results.py` 里算（纯函数、有单测），
+ # 这里只负责画。
+ #
+ # 调用方需提供：`job`（含 kind / status / result）。
+ #}
+{% if job.result and job.status == 'done' %}
+{% set s = job_result_summary(job.kind, job.result) %}
+<div class="j-result">
+  <div class="j-result-head">
+    <span class="tag {{ 'ok' if s.tone == 'ok' else ('bad' if s.tone == 'bad' else 'stale') }}">{{ {'ok': '完成', 'warn': '注意', 'bad': '异常'}[s.tone] }}</span>
+    <span class="j-result-text">{{ s.headline }}</span>
+  </div>
+
+  {% if s.facts %}
+  <div class="j-facts">
+    {% for label, value in s.facts %}
+    <span class="j-fact"><b>{{ value }}</b> {{ label }}</span>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if s.rows %}
+  <div class="table-scroll">
+    <table class="j-result-table">
+      <thead><tr>{% for col in s.columns %}<th>{{ col }}</th>{% endfor %}</tr></thead>
+      <tbody>
+        {% for row in s.rows %}
+        <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {# 原始数据折叠保留：排查时要看原样，删掉反而碍事。默认收起，不占版面。 #}
+  <details class="j-raw">
+    <summary class="small muted">原始数据</summary>
+    <pre class="muted">{{ job.result | tojson(indent=2) }}</pre>
+  </details>
+</div>
+{% endif %}

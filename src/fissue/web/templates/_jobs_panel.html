@@ -68,25 +68,28 @@
 
 <div class="panel">
   <h2>任务历史</h2>
-  {% for j in jobs.jobs %}
-  {% set cls = 'ok' if j.status == 'done' else ('bad' if j.status == 'failed' else ('stale' if j.status == 'canceled' else 'unknown')) %}
+  {# 循环变量叫 `job`（不是 `j`）：下面的 `_job_result.html` 靠这个名字取数据。
+     include 只是「把那段模板插进来」，不传参——两处名字不一致会直接 UndefinedError，
+     而且是页面 500 而不是悄悄少一块。 #}
+  {% for job in jobs.jobs %}
+  {% set cls = 'ok' if job.status == 'done' else ('bad' if job.status == 'failed' else ('stale' if job.status == 'canceled' else 'unknown')) %}
   <div class="job">
     <div class="j-head">
-      <span class="j-kind">{{ j.kind }}</span>
-      <span class="tag {{ cls }}">{{ j.status }}</span>
-      <span class="tag">{{ j.id }}</span>
-      <span class="muted small">{{ j.duration_seconds }}s</span>
-      <span class="muted small">{{ (j.created_at or '')[:19].replace('T', ' ') }}</span>
+      <span class="j-kind">{{ job.kind }}</span>
+      <span class="tag {{ cls }}">{{ job.status }}</span>
+      <span class="tag">{{ job.id }}</span>
+      <span class="muted small">{{ job.duration_seconds }}s</span>
+      <span class="muted small">{{ (job.created_at or '')[:19].replace('T', ' ') }}</span>
       <span class="spacer"></span>
-      <a class="small" href="/jobs/{{ j.id }}">详情</a>
-      {% if j.live and not read_only %}
-      <button class="danger" data-act="cancel-job" data-job="{{ j.id }}">{{ '停止这一轮' if j.kind == 'round' else '取消' }}</button>
+      <a class="small" href="/jobs/{{ job.id }}">详情</a>
+      {% if job.live and not read_only %}
+      <button class="danger" data-act="cancel-job" data-job="{{ job.id }}">{{ '停止这一轮' if job.kind == 'round' else '取消' }}</button>
       {% endif %}
-      <span class="muted small">{{ j.params }}</span>
+      <span class="muted small">{{ job.params }}</span>
     </div>
-    {% if j.error %}<pre class="{{ 'bad' if j.status == 'failed' else 'muted' }}">{{ j.error }}</pre>{% endif %}
-    {% if j.log %}<pre>{{ j.log | join('\n') }}</pre>{% endif %}
-    {% if j.result and j.status == 'done' %}<pre class="muted">{{ j.result | tojson(indent=2) }}</pre>{% endif %}
+    {% if job.error %}<pre class="{{ 'bad' if job.status == 'failed' else 'muted' }}">{{ job.error }}</pre>{% endif %}
+    {% if job.log %}<pre>{{ job.log | join('\n') }}</pre>{% endif %}
+    {% include "_job_result.html" %}
   </div>
   {% else %}
   <div class="muted">

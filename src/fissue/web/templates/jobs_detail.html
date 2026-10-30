@@ -32,7 +32,7 @@
   {% endif %}
   {% if job.result and job.status == 'done' %}
   <h3 class="mt">结果</h3>
-  <pre class="muted">{{ job.result | tojson(indent=2) }}</pre>
+  {% include "_job_result.html" %}
   {% endif %}
 </div>
 

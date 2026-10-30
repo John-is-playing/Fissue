@@ -611,3 +611,38 @@ tr.stalled td { background: rgba(255, 107, 107, .06); }
 .more-filters .filters {
   border-top: 1px solid var(--line); padding-top: 12px;
 }
+
+/* --------------------------------------------------------------------------
+ * 作业结果摘要（web/templates/_job_result.html）
+ *
+ * 原先结果是一坨原始 JSON 直接铺在页面上。现在先给一句话结论与关键数字，
+ * 逐条明细表在中间，原始数据折到最后——排查时才展开。
+ * -------------------------------------------------------------------------- */
+.j-result {
+  margin-top: 8px; padding: 10px 12px;
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.j-result-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.j-result-text { font-weight: 600; }
+
+.j-facts { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; }
+.j-fact { font-size: 12px; color: var(--muted); }
+.j-fact b {
+  font-size: 15px; color: var(--fg); margin-right: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+.j-result-table { margin-top: 8px; font-size: 12px; }
+.j-result-table th {
+  font-weight: 600; color: var(--muted); text-align: left;
+  white-space: nowrap;
+}
+.j-result-table td { vertical-align: top; }
+
+/* 原始数据默认收起：它在，但不占版面。 */
+.j-raw { margin-top: 8px; }
+.j-raw > summary { cursor: pointer; user-select: none; }
+.j-raw > summary::before { content: "▸ "; }
+.j-raw[open] > summary::before { content: "▾ "; }
+.j-raw pre { max-height: 320px; overflow: auto; }

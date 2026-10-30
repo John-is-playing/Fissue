@@ -1702,3 +1702,57 @@ def test_pipeline_page_renders_totals_as_numbers(client) -> None:  # noqa: ANN00
     m = re.search(r"条目总数\s*</div>\s*<div class=\"v\">([^<]*)</div>", html)
     assert m, "没找到「条目总数」那张卡的数值节点"
     assert m.group(1).strip().isdigit(), f"条目总数不是数字：{m.group(1)!r}"
+
+
+def test_status_page_renders_a_readable_job_result(client) -> None:  # noqa: ANN001
+    """已完成作业的结果要渲染成**人话**，不是一坨原始 JSON。
+
+    这条守的是一个真发生过的 500：`_jobs_panel.html` 的循环变量叫 `j`，而新加的结果
+    部件用 `job` —— include 不传参，名字对不上直接 `UndefinedError`，整页 500。当时的
+    单测全绿，因为没人渲染过带结果的作业。
+
+    顺带钉住「可读」本身：页面上要有一句结论和一个关键数字，原始 JSON 只出现在折叠区。
+    """
+    from fissue.web import jobs as jobs_mod
+
+    registry = client.app.state.jobs
+    job = jobs_mod.Job(id="done1", kind="scan")
+    job.status = jobs_mod.DONE
+    job.result = {"fetched": 5, "created": 2, "updated": 1, "unchanged": 2, "error": None}
+    registry._jobs["done1"] = job
+    try:
+        r = client.get("/status")
+        assert r.status_code == 200, r.text
+        html = r.text
+
+        # 结论句与关键数字（不是 JSON）
+        assert "抓取完成" in html
+        assert "<b>2</b> 新增" in html
+
+        # 原始数据仍然保留（排查要用），但它被收进折叠区、排在摘要之后——
+        # 不能直接铺在正文里。这里断言的是**顺序**，而不是「不存在」：
+        # 删掉原始数据反而碍事，收起来才是对的。
+        assert "原始数据" in html
+        assert html.index("原始数据") < html.index('"unchanged": 2'), (
+            "原始 JSON 排到了摘要前面（或漏进了正文）"
+        )
+        assert "<details" in html
+    finally:
+        registry._jobs.pop("done1", None)
+
+
+def test_job_detail_page_renders_the_same_result_summary(client) -> None:  # noqa: ANN001
+    """详情页与列表页共用同一个结果部件——两处各写一份必然漂移。"""
+    from fissue.web import jobs as jobs_mod
+
+    registry = client.app.state.jobs
+    job = jobs_mod.Job(id="done2", kind="flush")
+    job.status = jobs_mod.DONE
+    job.result = {"results": [{"queue": "verify", "flushed": 3, "conclusions": 3, "error": None}]}
+    registry._jobs["done2"] = job
+    try:
+        r = client.get("/jobs/done2")
+        assert r.status_code == 200, r.text
+        assert "刷出 3 条结论" in r.text
+    finally:
+        registry._jobs.pop("done2", None)

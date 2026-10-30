@@ -43,6 +43,7 @@ from ..models import Category, ItemStatus, ItemType, Platform, Priority, QueueNa
 from .auth import AUTH_PREFIX, page_guard_middleware
 from .auth import register as register_auth
 from .hooks import parse_event, signature_ok
+from .job_results import summarize_result
 from .jobs import Job, JobRegistry
 from .markdown import render_job_event
 from .status import collect as collect_status
@@ -209,6 +210,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+    # 作业结果的「可读化」是一个纯函数（web/job_results.py）：模板里直接调用，
+    # 不必每个路由各自把摘要塞进上下文——任务面板与任务详情页两处都要用。
+    templates.env.globals["job_result_summary"] = summarize_result
     application.state.templates = templates
     # 进程启动时刻：状态页显示「已运行多久」。放在这里而不是 lifespan 里，是因为
     # `_ensure_state` 那条兜底路径（测试用 TestClient 不做上下文管理器）不会跑 lifespan，
