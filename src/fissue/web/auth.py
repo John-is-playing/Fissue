@@ -22,10 +22,8 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -61,7 +59,7 @@ from ..auth import (
     verify_totp,
 )
 from ..auth.files import bootstrap_token_path
-from ..config import Settings, _read_env_file
+from ..config import Settings
 from ..logging_setup import get_logger
 from ..store.tables import AuthUserRow
 
@@ -77,8 +75,6 @@ COOKIE_NAME = "fissue_session"
 #: 是可配的业务 API 版本前缀，且 `api.enabled=false` 时业务 API 干脆不注册——
 #: 那时登录要是跟着一起消失，页面就永远进不去了。
 AUTH_PREFIX = "/api/auth"
-#: 旧口令环境变量名（只用于一次性迁移，不再是配置项）。
-LEGACY_TOKEN_ENV = "FISSUE_API_TOKEN"
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 #: 口令最短长度。8 位是「别再设 123456」的底线；真正防爆破靠的是退避锁定。
@@ -338,16 +334,6 @@ def _identity_of_key(request: Request, token: str) -> Identity | None:
             and verify_token(secret, candidate.key_hash)
         ):
             row = candidate
-    else:
-        # 兼容垫片（docs/AUTH.md §7）：旧 FISSUE_API_TOKEN 被导入成 prefix="legacy" 的一条。
-        # 形状不像 `fissue_<prefix>_<secret>` 的令牌才走这里——两条路径互不干扰。
-        legacy = store.key_by_prefix(LEGACY_KEY_PREFIX)
-        if (
-            legacy is not None
-            and legacy.revoked_at is None
-            and verify_token(token, legacy.key_hash)
-        ):
-            row = legacy
     if row is None:
         return None
     store.mark_key_used(row.id)
@@ -564,10 +550,6 @@ class ApiKeyIn(BaseModel):
     name: str = "默认"
 
 
-class LegacyTokenIn(BaseModel):
-    token: str = Field(default="", repr=False)
-
-
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
@@ -658,45 +640,6 @@ def _too_many_attempts(seconds: int) -> HTTPException:
         detail=f"尝试过于频繁：已连续失败多次，请 {seconds} 秒后再试。",
         headers={"Retry-After": str(seconds)},
     )
-
-
-def _read_legacy_token(settings: Settings) -> str:
-    """旧 ``FISSUE_API_TOKEN`` 的值（进程环境 > .env）。只为一次性迁移而读。"""
-    value = (os.environ.get(LEGACY_TOKEN_ENV) or "").strip()
-    if value:
-        return value
-    for source in (settings.env_source, settings.env_path):
-        if not source:
-            continue
-        path = Path(source)
-        if not path.exists():
-            continue
-        token = (_read_env_file(path).get(LEGACY_TOKEN_ENV) or "").strip()
-        if token:
-            return token
-    return ""
-
-
-def migrate_legacy_token(settings: Settings, store: AuthStore) -> bool:
-    """把旧口令一次性导入成一条 API Key（docs/AUTH.md §7）。
-
-    只在「设了旧口令」且「表里一把 Key 都没有」时做一次。导入后旧口令照旧能当 Bearer 用
-    （校验走 `_identity_of_key` 的 legacy 分支），用户在页面上建好正式 Key、把这条吊销，
-    它才真正失效。**这是一条兼容垫片，后续版本会移除。**
-    """
-    token = _read_legacy_token(settings)
-    if not token or store.key_count() > 0:
-        return False
-    store.create_key(
-        name="旧口令（自动迁移）", prefix=LEGACY_KEY_PREFIX, key_hash=hash_token(token)
-    )
-    log.info(
-        "已把 %s 导入为一条 API Key（prefix=%s）。"
-        "建议在「API Key」页新建一把正式 Key 后吊销这条兼容项。",
-        LEGACY_TOKEN_ENV,
-        LEGACY_KEY_PREFIX,
-    )
-    return True
 
 
 def warn_if_unprovisioned(settings: Settings, store: AuthStore) -> str:
@@ -1105,27 +1048,6 @@ def _register_api_keys(app: FastAPI) -> None:
         log.info("已吊销 API Key：id=%s", key_id)
         return {"ok": True, "keys": [_key_payload(row) for row in store.list_keys()]}
 
-    # -- 旧口令迁移 ------------------------------------------------------
-
-    @app.post(f"{prefix}/legacy-token")
-    async def import_legacy_token(
-        request: Request, body: LegacyTokenIn, identity: Annotated[Identity, Depends(REQUIRE_AUTH)]
-    ) -> dict[str, Any]:
-        """把一把旧风格的明文口令手工导入成 API Key（自动迁移没赶上的场合）。"""
-        _acting_admin(request, identity)
-        token = body.token.strip()
-        if not token:
-            raise HTTPException(status_code=400, detail="口令为空。")
-        store = store_of(request)
-        if any(row.prefix == LEGACY_KEY_PREFIX for row in store.list_keys()):
-            raise HTTPException(
-                status_code=409, detail="已经导入过一条旧口令了；请先吊销它再重新导入。"
-            )
-        row = store.create_key(
-            name="旧口令（手工导入）", prefix=LEGACY_KEY_PREFIX, key_hash=hash_token(token)
-        )
-        return {**_key_payload(row), "note": "旧口令现在可作为 Bearer 使用。"}
-
 def _register_api_keys_page(app: FastAPI) -> None:
     """API Key 页面。"""
 
@@ -1199,7 +1121,6 @@ __all__ = [
     "SOURCE_TRUSTED",
     "bearer_token",
     "enforce_csrf",
-    "migrate_legacy_token",
     "page_guard_middleware",
     "peer_host",
     "register",

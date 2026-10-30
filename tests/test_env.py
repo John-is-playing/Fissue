@@ -185,8 +185,9 @@ def test_legacy_api_token_is_no_longer_a_config_item(tmp_path: Path) -> None:
     它已被会话 + API Key 整体替换（docs/AUTH.md §2 决策 3）。这里钉住两件事：
 
     * 留着旧口令不会让加载失败（老部署升级上来时 .env 里还有它——这是常态）；
-    * 但它也**不会**再被读成配置——`APIConfig` 里既没有 `token` 也没有 `auth_required`，
-      唯一的去处是启动时那条一次性迁移垫片（`web.auth.migrate_legacy_token`）。
+    * 但它也**不会**再被读成配置——`APIConfig` 里既没有 `token` 也没有 `auth_required`；
+      而 v1.3.0 起连一次性迁移垫片也没了（`web.auth.migrate_legacy_token` 已删除），
+      旧口令在系统里**没有任何去处**。
     """
     env = _write(tmp_path / ".env", "FISSUE_API_TOKEN=s3cret\n")
     s = load_settings(None, env, overrides=BASE_OVERRIDES)

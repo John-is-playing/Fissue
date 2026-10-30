@@ -519,20 +519,50 @@ class FixPolicyConfig(BaseModel):
     #   dual       —— 难度与重要性各自判档，取**更严**的一档（双阈值）。
     #   custom     —— 由 ``custom_tier`` 指定的用户函数判定；此时各 tier 的
     #                 ``min_importance`` 不再参与计算。
+    #   percentile —— 按**批次内分位**定档：难度仍是硬门槛，但「重要性够不够」
+    #                 不再看绝对分数，而看它在本批候选里排第几。模型的
+    #                 importance 评分会密集落在某个区间（实测 62~82），而绝对
+    #                 门槛正压在这段分布的右端时，单次评分抖动就能让同一条目在
+    #                 tier1/tier2 之间来回跳——分位让跨运行稳定的是**比例**。
+    #                 候选不足 ``percentile_min_batch`` 条时退回 importance 策略。
     tier_strategy: str = "importance"
     # 用户判定函数路径，支持 ``pkg.mod:func`` 与 ``pkg.mod.func`` 两种写法。
     # 签名 ``func(difficulty, importance, policy) -> str``，返回值接受
     # ``tier1`` / ``tier2`` / ``none``（大小写不敏感）。
     custom_tier: str | None = None
 
+    # ---- percentile 策略专用 -------------------------------------------
+    #: 批内候选里占比前多少进 tier1（其余进 tier2）。0.5 = 前一半。
+    #: 只决定**标签**：tier1/tier2 都进修复队列，取悦阈值没有意义。
+    tier1_share: float = 0.5
+    #: 候选少于此数时分位没有统计意义，整批退回 importance 策略。
+    percentile_min_batch: int = 3
+
     @field_validator("tier_strategy")
     @classmethod
     def _check_tier_strategy(cls, v: str) -> str:
-        allowed = {"importance", "dual", "custom"}
+        allowed = {"importance", "dual", "custom", "percentile"}
         if v not in allowed:
             raise ConfigError(
-                f"fix_policy.tier_strategy 只接受 importance|dual|custom，当前为 {v!r}"
+                "fix_policy.tier_strategy 只接受 importance|dual|custom|percentile，"
+                f"当前为 {v!r}"
             )
+        return v
+
+    @field_validator("tier1_share")
+    @classmethod
+    def _check_tier1_share(cls, v: float) -> float:
+        # 0 或 1 都退化：0 让 tier1 永远为空，1 让所有候选都成 tier1——
+        # 后者等于取消分档，却让人以为还在分位。
+        if not 0.0 < v < 1.0:
+            raise ConfigError(f"fix_policy.tier1_share 必须在 (0, 1) 之间，当前为 {v!r}")
+        return v
+
+    @field_validator("percentile_min_batch")
+    @classmethod
+    def _check_percentile_min_batch(cls, v: int) -> int:
+        if v < 1:
+            raise ConfigError(f"fix_policy.percentile_min_batch 至少为 1，当前为 {v!r}")
         return v
 
     @model_validator(mode="after")
@@ -745,7 +775,8 @@ class APIConfig(BaseModel):
 
     这里**曾有** ``auth_required`` 与 ``token``（单一全局 Bearer 口令）。它们已被
     `web.auth` + 会话/API Key 整体替换（docs/AUTH.md §2 决策 3）——不再是两套机制并存。
-    旧口令可被一次性导入为一条 API Key，见 `fissue.web.auth.migrate_legacy_token`。
+    旧口令（``FISSUE_API_TOKEN``）已随 v1.3.0 的兼容垫片一并移除：它不再被导入成
+    API Key，也不再能当 Bearer 用。要访问 API 请在「API Key」页新建一把。
     """
 
     enabled: bool = True
@@ -1209,9 +1240,10 @@ def load_settings(
     if legacy_keys:
         logging.getLogger(__name__).warning(
             "配置里的 %s 已不再是配置项：单一访问口令机制已被**会话 + API Key** 整体替换"
-            "（见 docs/AUTH.md），它们会被忽略。若 .env 里还留着 FISSUE_API_TOKEN，"
-            "启动时会自动把它导入成一条 API Key（prefix=legacy）——到「API Key」页新建一把"
-            "正式 Key 并吊销它即可。",
+            "（见 docs/AUTH.md），它们会被忽略。.env 里若还留着 FISSUE_API_TOKEN，"
+            "它同样只被忽略——到 Web 的「API Key」页新建一把 Key（或 `fissue auth key create`）"
+            "再把它从 .env 删掉。若表里还有 prefix=legacy 的历史 Key，它已经不再能当 Bearer 用，"
+            "在「API Key」页吊销即可。",
             "、".join(sorted(legacy_keys)),
         )
 

@@ -172,7 +172,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 启动时确保表存在，并持有数据库连接
         from ..store.db import build_database
         from ..store.repository import Repository
-        from .auth import AuthStore, migrate_legacy_token, warn_if_unprovisioned
+        from .auth import AuthStore, warn_if_unprovisioned
 
         database = build_database(st)
         database.create_all()
@@ -192,11 +192,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.stats_cache = stats_cache
         stats_cache.start()
         app.state.jobs.on_complete = stats_cache.bump
-        # 鉴权是**启动期**就要就位的：旧口令一次性迁移（docs/AUTH.md §7），
-        # 以及「还没有管理员账号」时生成引导口令并打印（§3.4）。
-        # 两件都放在这里而不是请求期：它们每次进程启动只该发生一次。
+        # 鉴权是**启动期**就要就位的：还没有管理员账号时生成引导口令并打印（§3.4）。
+        # 放在这里而不是请求期：它每次进程启动只该发生一次。
         store = AuthStore(database)
-        migrate_legacy_token(st, store)
         warn_if_unprovisioned(st, store)
         log.info("Web/API 已就绪（只读=%s，API 前缀=%s）", st.web.read_only, st.api.prefix)
         yield

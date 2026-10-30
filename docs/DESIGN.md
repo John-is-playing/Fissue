@@ -270,3 +270,9 @@ PostgreSQL 服务于生产 / 多机并发，已在本机完成**真实部署验�
 
 **调整自动修复策略**：`config.yaml` 的 `fix_policy`（准入阈值）与
 `auto_fix`（护栏、提 PR 方式、失败处置）。
+
+分档（tier1 / tier2）由 `fix_policy.tier_strategy` 决定：默认 `importance`（绝对门槛），
+另有 `dual`（两维取严）、`custom`（用户函数）与 `percentile`（批内分位）。
+分位策略是为「模型评分密集、绝对门槛压在分布右端」的部署准备的：它让**容量占比**稳定，
+但**不**消除近分条目之间的成员翻转——夹具的逐条期望表因此只在 `importance` 下可比，
+实测与取舍见 `BENCHMARK.md` §4.7.1 / §4.7.2。

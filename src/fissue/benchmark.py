@@ -129,6 +129,10 @@ def config_fingerprint(settings: Any) -> dict[str, Any]:
             "tier1_min_importance": settings.fix_policy.tier1.min_importance,
             "tier1_max_difficulty": settings.fix_policy.tier1.max_difficulty,
             "tier2_min_importance": settings.fix_policy.tier2.min_importance,
+            # percentile 策略下真正决定档位的是这两个；缺了它们，
+            # 「同一 commit 两次跑分档位不同」就没法解释。
+            "tier1_share": settings.fix_policy.tier1_share,
+            "percentile_min_batch": settings.fix_policy.percentile_min_batch,
             "only_issues": settings.fix_policy.only_issues,
         },
         "sandbox": {

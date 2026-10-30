@@ -149,10 +149,9 @@ fissue db init && fissue db check
 > * **MySQL**：已在 Docker 的 `mysql:8.0` 上验证**建表 / 读写 / 队列 / 抓取链路**
 >   （`tests/test_store_mysql.py` 是可复跑的真机用例，按 `FISSUE_TEST_MYSQL_URL` 启用；
 >   核对内容包括 MEDIUMTEXT 长文本、640 键列与 3072 字节索引上限、`SKIP LOCKED` 队列领取、
->   naive 时间戳相减、`information_schema` 补列迁移），并真跑过 `fetch → status/report`。
->   尚未在 MySQL 上跑的只有**模型链路与沙盒修复**（评测 / 验证 / 自动修复）——
->   它们与数据库后端无关，但你要在 MySQL 上正式用，建议自己再跑一轮
->   `fetch → eval → verify → fix`。
+>   naive 时间戳相减、`information_schema` 补列迁移），并**跑通了完整链路**
+>   `db init → fetch → eval → verify → flush → fix`：评测结论、验证器运行（base/fix +
+>   回归门）、flush 打标与修复 Agent（2 轮产出补丁）都在该后端上真跑过。
 >
 > 两者验证的都是**部署与并发路径**，各夹具的跑分数字仍全部来自 SQLite，**别混读**。
 
@@ -471,7 +470,7 @@ fissue fetch --repo psf/requests --limit 1
 | `FISSUE_GITEE_TOKEN` | | 空 | Gitee 访问 |
 | `FISSUE_ATOMGIT_TOKEN` | | 空 | AtomGit 访问 |
 | `FISSUE_GITLAB_TOKEN` | | 空 | GitLab 访问 |
-| ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：单一访问口令被会话 + API Key 替换（见 [AUTH.md](./AUTH.md)）。留着旧值不会报错，启动时会自动导入成一条 API Key（prefix=`legacy`） |
+| ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：单一访问口令被会话 + API Key 替换（见 [AUTH.md](./AUTH.md)）。旧口令既不再被导入、也不能当 Bearer 用（兼容垫片于 v1.3.0 移除）；表里遗留的 `prefix=legacy` Key 到「API Key」页吊销即可 |
 | `FISSUE_WEB_HOST` | | `127.0.0.1` | 监听地址 |
 | `FISSUE_WEB_PORT` | | `8000` | 监听端口 |
 | `FISSUE_SANDBOX_RUNNER_SOCKET` | | 空（inline） | 沙盒转发组件 socket |

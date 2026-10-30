@@ -76,7 +76,8 @@
 
 - `FISSUE_API_TOKEN` / `api.token` / `api.auth_required` **已不再是配置项**。鉴权改为
   **会话登录 + 多 API Key + 可信内网**（见 [Web 与 REST API](Web-and-API.md#3-鉴权) 与 [docs/AUTH.md](../AUTH.md)）。
-  若环境里仍留着旧口令，**启动时会自动把它导入成一条 API Key**（`prefix=legacy`），到「API Key」页吊销并改用正式 Key 即可。
+  旧口令的兼容垫片也已在 **v1.3.0 移除**：它不再被导入成 Key、也不能当 Bearer 用；
+  表里遗留的 `prefix=legacy` 行到「API Key」页吊销即可。
 
 ---
 
@@ -226,14 +227,20 @@
 | `fix_policy.tier2.max_difficulty` | `40` | 难度低 + 重要性低 |
 | `fix_policy.tier2.min_importance` | `0` | 同上 |
 | `fix_policy.only_issues` | `true` | 仅对 Issue 自动修复；PR 交开发者手动合并 |
-| `fix_policy.tier_strategy` | `importance` | `importance / dual / custom`，见下 |
+| `fix_policy.tier_strategy` | `importance` | `importance / dual / custom / percentile`，见下 |
 | `fix_policy.custom_tier` | `null` | 仅 `custom` 需要，如 `"myproj.policy:tier_of"` |
+| `fix_policy.tier1_share` | `0.5` | 仅 `percentile`：批内候选里占比前多少进 tier1，须在 (0, 1) |
+| `fix_policy.percentile_min_batch` | `3` | 仅 `percentile`：候选少于此数不算分位 |
 
-`tier_strategy` 三档：
+`tier_strategy` 四档：
 
 - `importance`（默认）：难度是硬门槛，`min_importance` 区分 tier1/tier2。
 - `dual`：难度与重要性各自判档，取**更严**的一档（适合给 tier1 更紧的难度门槛）。
 - `custom`：由 `custom_tier` 指定的用户函数判定；此时各 tier 的 `min_importance` **不生效**。
+- `percentile`：难度仍是硬门槛，但「重要性够不够」改看**批内排名**（前 `tier1_share` 进 tier1）。
+  适合「模型评分密集、又不想反复调阈值」的部署；代价是 tier 成员仍会在近分条目之间翻
+  （切点落在分布最密处），且**夹具的逐条期望表不再可比**——详见
+  [基准 §4.7.2](../../BENCHMARK.md#472-分位策略复测2026-10-30占比稳了成员仍会翻)。
 
 自定义函数签名 `func(difficulty, importance, policy) -> str`，支持 `pkg.mod:func` 与 `pkg.mod.func` 两种写法，
 返回值接受 `"tier1" / "tier2" / "none"`（大小写不敏感）或 `fissue.models.Priority`。

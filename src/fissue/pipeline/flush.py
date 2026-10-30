@@ -244,8 +244,15 @@ class FlushProcessor:
 
         from ..ai.evaluator import compute_priority
 
+        policy = self.settings.fix_policy
+        if policy.tier_strategy == "percentile":
+            # 分位档位是**整批**算出来再回写的，逐条重算会把它抹成单条退化口径
+            # （一律 tier2），于是「报告里 tier1、实际派发 tier2」两套口径打架。
+            # 这里直接采信已定档的结论。
+            return ev.priority
+
         rule = compute_priority(
-            ev, category=ev.category, policy=self.settings.fix_policy, item_type=item_type
+            ev, category=ev.category, policy=policy, item_type=item_type
         )
         if rule is not fallback:
             log.debug("派发优先级以规则为准 %s：模型 %s → 规则 %s", key, fallback.value, rule.value)

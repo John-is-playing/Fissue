@@ -180,8 +180,55 @@ class EvalStage:
 
         for r in await asyncio.gather(*(one(i) for i in items)):
             result.add(r)
+        self._resolve_percentile_tiers(result)
         log.info(result.summary)
         return result
+
+    def _resolve_percentile_tiers(self, result: BatchResult) -> None:
+        """``tier_strategy=percentile`` 时按本批分位定档并回写。
+
+        评测是逐条跑的，而分位必须看整批——所以档位只能在批次结束后定：
+        这里是唯一同时握有「本批所有 importance」与落库通道的地方。
+        候选不足 ``percentile_min_batch`` 条时不做任何事，各条保留单条口径
+        （``compute_priority`` 给的 tier2），等同于退回绝对阈值的保守侧。
+        """
+        policy = self.settings.fix_policy
+        if policy.tier_strategy != "percentile":
+            return
+        from ..ai.evaluator import resolve_percentile_tiers
+        from ..models import Priority
+
+        rows: list[tuple[str, int, int]] = []
+        targets: dict[str, Any] = {}
+        for r in result.results:
+            ev = r.evaluation
+            # priority=none 说明它已在别的闸门被挡下（非 bug / 刷量 / 非 Issue / 难度超标），
+            # 分位不该把它重新捞回来。
+            if ev is None or ev.priority is Priority.NONE:
+                continue
+            rows.append((r.key, ev.difficulty, ev.importance))
+            targets[r.key] = ev
+
+        tiers = resolve_percentile_tiers(rows, policy)
+        if not tiers:
+            if rows:
+                log.info(
+                    "分位定档跳过：本批候选 %d 条 < percentile_min_batch=%d，保留保守档位",
+                    len(rows),
+                    policy.percentile_min_batch,
+                )
+            return
+
+        changed = 0
+        for key, priority in tiers.items():
+            ev = targets[key]
+            if ev.priority is priority:
+                continue
+            log.info("分位定档 %s：%s → %s", key, ev.priority.value, priority.value)
+            ev.priority = priority
+            self.ctx.repo.set_latest_evaluation_priority(key, priority)
+            changed += 1
+        log.info("分位定档完成：候选 %d 条，改动 %d 条", len(rows), changed)
 
     def _similar_pool(self, batch: Sequence[RawItem]) -> list[RawItem]:
         """本批条目 + 同仓库已入库条目，作为重复检测的候选池。

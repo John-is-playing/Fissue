@@ -125,13 +125,17 @@ Token 权限最小集：`repo`（GitHub / Gitee / AtomGit）/ `api`（GitLab）�
 ```bash
 FISSUE_WEB_HOST=127.0.0.1
 FISSUE_WEB_PORT=8000
-FISSUE_API_TOKEN=            # 留空=不鉴权（仅本地）；填了则自动开启鉴权
+# 鉴权不在 .env 里配：口令与 API Key 都存在数据库（见 docs/AUTH.md）。
+# 首次部署在浏览器打开 /login，用启动时打印的引导口令创建管理员；
+# 给脚本/CI 用则在「API Key」页（或 `fissue auth key create`）生成 Key。
 ```
 
-> ⚠️ **挂了反向代理就必须填 `FISSUE_API_TOKEN`**。启动检查只能看**绑定地址**，看不见代理——
+> ⚠️ **挂了反向代理就必须开鉴权并显式声明反代**。启动检查只能看**绑定地址**，看不见代理——
 > 「绑 `127.0.0.1` + 同机 nginx 转出去」同样等于把无鉴权的写控制面
-> （`/api/v1/queues/flush`、`/api/v1/actions/*`）对外开放。未开鉴权时，带转发头或来自
-> 非回环地址的写请求会被 403，但那只是补刀：**边界始终是令牌**。
+> （`/api/v1/queues/flush`、`/api/v1/actions/*`）对外开放。要么把代理网段写进
+> `web.trusted_networks`，要么打开 `web.trust_proxy` **并**填 `web.trusted_proxies`
+> （两条缺一不可）。未声明时，带转发头或来自非回环地址的写请求会被 403，
+> 但那只是补刀：**边界始终是登录会话 / API Key**。
 
 ---
 

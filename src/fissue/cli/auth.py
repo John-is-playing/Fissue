@@ -227,24 +227,3 @@ def key_revoke(
     if not store.revoke_key(key_id):
         _fail(f"没有这把 Key，或它已经被吊销：id={key_id}")
     _ok(f"已吊销：id={key_id}")
-
-
-@key_app.command("import-legacy")
-def key_import_legacy(
-    config: str | None = CONFIG_OPT,
-    env: str | None = ENV_OPT,
-    verbose: bool = VERBOSE_OPT,
-    token: str = typer.Option(
-        ..., "--token", help="旧口令明文（FISSUE_API_TOKEN 那个值）", hide_input=True
-    ),
-) -> None:
-    """把一把旧风格口令导入成 API Key（兼容垫片，见 docs/AUTH.md §7）。"""
-    from ..auth import LEGACY_KEY_PREFIX, hash_token
-
-    _, _, store = _store(config, env, verbose=verbose)
-    if any(row.prefix == LEGACY_KEY_PREFIX for row in store.list_keys()):
-        _fail("已经导入过一条旧口令了；请先吊销它（auth key list / auth key revoke）再导入。")
-    row = store.create_key(
-        name="旧口令（CLI 导入）", prefix=LEGACY_KEY_PREFIX, key_hash=hash_token(token.strip())
-    )
-    _ok(f"已导入：id={row.id}，现在它可以作为 Bearer 使用")

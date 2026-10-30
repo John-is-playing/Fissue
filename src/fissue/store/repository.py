@@ -885,7 +885,29 @@ class Repository:
             out.setdefault(row.item_key, _evaluation_to_domain(row))
         return out
 
-    # -- 验证器 -----------------------------------------------------------
+    def set_latest_evaluation_priority(self, item_key: str, priority: Priority) -> bool:
+        """改写条目**最近一次**评测的档位，返回是否真的改到了。
+
+        用途只有一个：``fix_policy.tier_strategy=percentile`` 的批内分位定档——
+        评测是逐条跑的，而分位必须等整批结束才知道第几名，于是先落库、再回写。
+
+        只动最新那条评测记录：更早的记录是历史结论，改它等于伪造过去；
+        条目上的 ``priority`` 同步更新，否则报告与派发会读两套口径。
+        """
+        with self.db.session() as s:
+            row = s.scalar(
+                select(EvaluationRow)
+                .where(EvaluationRow.item_key == item_key)
+                .order_by(EvaluationRow.created_at.desc(), EvaluationRow.id.desc())
+                .limit(1)
+            )
+            if row is None:
+                return False
+            row.priority = priority.value
+            s.execute(
+                update(ItemRow).where(ItemRow.key == item_key).values(priority=priority.value)
+            )
+        return True
 
     def save_verifier(self, item_key: str, spec: VerifierSpec, *, rounds: int = 1) -> int:
         with self.db.session() as s:

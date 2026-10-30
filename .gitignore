@@ -59,3 +59,10 @@ build/
 .vscode/
 .tmphelp
 .atomcode
+
+# 宣传物料（易拉宝 HTML / 构建脚本 / 导出 PNG / G-Star 动图）
+# 它们是一次性的线下物料，不进版本库；但**必须**被忽略而不是留在未跟踪状态——
+# `fissue bench capture` 用 `git status --porcelain` 判「工作区是否干净」，
+# 未跟踪文件也会把基线标成「不可复现」（见 src/fissue/benchmark.py::git_state）。
+banner/
+src/atomgit/*.gif

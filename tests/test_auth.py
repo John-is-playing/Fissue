@@ -1118,64 +1118,41 @@ def test_created_key_actually_works(settings: Settings, db: Database) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_env_token_is_imported_and_usable(
-    tmp_path: Path, settings: Settings, db: Database
-) -> None:
-    from fissue.auth.crypto import LEGACY_KEY_PREFIX
-    from fissue.web.auth import migrate_legacy_token
+def test_legacy_token_shim_is_gone(tmp_path: Path, settings: Settings, db: Database) -> None:
+    """兼容垫片已随 v1.3.0 移除：旧口令不再被自动导入，也不再能当 Bearer 用。
 
-    # 顺手把混用两个库的坑钉住：这份配置必须指向**夹具那个库**，
-    # 否则迁移写进 A 库、请求读 B 库，用例会以「导入成功但令牌不认」的面目失败。
-    settings = _settings_with_env(tmp_path, db_url=str(settings.database.url))
-    store = _store(db)
-    _make_admin(db)          # 有管理员才谈得上「身份不认」= 401（没有账号时是 403 引导）
-    assert migrate_legacy_token(settings, store) is True
-    assert [k.prefix for k in store.list_keys()] == [LEGACY_KEY_PREFIX]
-
-    with TestClient(create_app_for(settings), client=REMOTE) as remote:
-        headers = {"Authorization": "Bearer legacy-token-value"}
-        assert remote.get("/api/v1/stats", headers=headers).status_code == 200
-        store.revoke_key(store.key_by_prefix(LEGACY_KEY_PREFIX).id)  # type: ignore[union-attr]
-        assert remote.get("/api/v1/stats", headers=headers).status_code == 401
-
-
-def test_legacy_migration_runs_only_once(tmp_path: Path, db: Database) -> None:
-    from fissue.web.auth import migrate_legacy_token
-
-    settings = _settings_with_env(tmp_path)
-    store = _store(db)
-    assert migrate_legacy_token(settings, store) is True
-    assert migrate_legacy_token(settings, store) is False, "表里已经有 Key，就不再导入"
-
-
-def test_no_legacy_token_means_no_import(tmp_path: Path, db: Database) -> None:
-    from fissue.web.auth import migrate_legacy_token
-
-    settings = _settings_with_env(tmp_path, token="")
-    assert migrate_legacy_token(settings, _store(db)) is False
-    assert _store(db).key_count() == 0
-
-
-def _settings_with_env(
-    tmp_path: Path, *, token: str = "legacy-token-value", db_url: str | None = None
-) -> Settings:
-    """一份带 ``FISSUE_API_TOKEN`` 的 .env 的配置。
-
-    ``db_url`` 用来指向**调用方那个库**（通常是 ``db`` 夹具）：迁移写库与请求读库必须是同一个
-    文件，否则用例会以「导入成功但令牌不认」的面目失败——那种失败很容易被误读成迁移逻辑坏了。
+    垫片留着只有一种后果：一条**永不过期**的明文口令绕过 Key 的吊销与审计。
+    所以移除要一起钉三件事——启动不导入、校验不认、端点不存在——否则
+    「代码删了但旧行还能用」这种半移除状态最难发现。
     """
+    import pytest
+
+    with pytest.raises(ImportError):
+        # 已删除的符号必须真的不存在（导入本身就要抛）
+        from fissue.web.auth import migrate_legacy_token  # noqa: F401
+
+    store = _store(db)
+    _make_admin(db)
     cfg = _write_cfg(
         tmp_path,
         {
-            "database": {"url": db_url or f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}"},
+            "database": {"url": str(settings.database.url)},
             "llm": {"api_key": "k", "model": "m", "base_url": "https://llm.invalid/v1"},
             "web": {"host": "0.0.0.0"},
             "notify": {"enabled": False},
         },
     )
     env = tmp_path / "legacy.env"
-    env.write_text(f"FISSUE_API_TOKEN={token}\n", encoding="utf-8")
-    return load_settings(cfg, env)
+    env.write_text("FISSUE_API_TOKEN=legacy-token-value\n", encoding="utf-8")
+    st = load_settings(cfg, env)
+
+    # 启动（create_app）不再把 .env 里的旧口令写进表
+    with TestClient(create_app_for(st), client=REMOTE) as remote:
+        assert store.key_count() == 0
+        headers = {"Authorization": "Bearer legacy-token-value"}
+        assert remote.get("/api/v1/stats", headers=headers).status_code == 401
+        # 手工导入端点也一并不存在
+        assert remote.post("/api/auth/legacy-token", json={"token": "x"}).status_code in (404, 405)
 
 
 def test_data_dir_keeps_auth_secrets_out_of_config(settings: Settings) -> None:

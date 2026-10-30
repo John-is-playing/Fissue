@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import importlib
+import math
 import re as _re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -301,6 +302,54 @@ def _tier_by_dual(difficulty: int, importance: int, t1: FixTier, t2: FixTier) ->
     return d if _TIER_ORDER[d] >= _TIER_ORDER[i] else i
 
 
+def _tier_by_percentile(difficulty: int, importance: int, t1: FixTier, t2: FixTier) -> Priority:
+    """分位策略的**单条**退化口径：难度是硬门槛，档位一律先记 tier2。
+
+    真正的档位要等整批评测结束、由 :func:`resolve_percentile_tiers` 定。单条
+    调用（评测途中、批内候选不足、或别处只拿一条答案时）取保守值 tier2：
+    宁可先标「低优先」，也不要把一条还没跟同批比过的条目吹成 tier1。
+    """
+    if difficulty <= t2.max_difficulty:
+        return Priority.TIER2
+    return Priority.NONE
+
+
+def resolve_percentile_tiers(
+    rows: Sequence[tuple[str, int, int]],
+    policy: FixPolicyConfig,
+) -> dict[str, Priority]:
+    """按**批次内分位**给候选条目定档（``tier_strategy: percentile``）。
+
+    ``rows`` 为 ``(key, difficulty, importance)``，且**只放已通过其它闸门的候选**
+    （bug / 非刷量 / Issue）——它不重新判定这些条件。
+
+    为什么要分位：模型的 importance 评分在同一批里密集落在某个区间（实测
+    62~82），而绝对门槛（如 80）正好压在这段分布的右端。此时「哪几条过线」
+    取决于单次评分抖动，不是条目本身的差别——于是偏差清单每次运行都在变。
+    改成批内排名后，跨运行稳定的是**比例**而不是绝对分数。
+
+    候选不足 ``percentile_min_batch`` 条时返回空字典，调用方退回绝对阈值：
+    三两条样本里算分位只会把偶然当规律。
+    """
+    t1_max = policy.tier1.max_difficulty
+    t2_max = policy.tier2.max_difficulty
+    pool = [(key, d, imp) for key, d, imp in rows if d <= t2_max]
+    if len(pool) < policy.percentile_min_batch:
+        return {}
+
+    # 重要性降序；同分按 key 排，保证同一批数据每次算出同一结果（可复现）。
+    pool.sort(key=lambda r: (-r[2], r[0]))
+    keep = max(1, math.ceil(len(pool) * policy.tier1_share))
+
+    out: dict[str, Priority] = {}
+    for i, (key, difficulty, _imp) in enumerate(pool):
+        if i < keep and difficulty <= t1_max:
+            out[key] = Priority.TIER1
+        else:
+            out[key] = Priority.TIER2
+    return out
+
+
 @lru_cache(maxsize=32)
 def _load_custom_tier(path: str) -> Callable[..., Any] | None:
     """按 ``pkg.mod:func`` / ``pkg.mod.func`` 加载用户判定函数；失败返回 None。"""
@@ -390,6 +439,9 @@ def compute_priority(
         return _tier_by_importance(difficulty, importance, t1, t2)
     if policy.tier_strategy == "dual":
         return _tier_by_dual(difficulty, importance, t1, t2)
+    if policy.tier_strategy == "percentile":
+        # 档位由整批的分位定（见 resolve_percentile_tiers）；这里只判「够不够候选」
+        return _tier_by_percentile(difficulty, importance, t1, t2)
     return _tier_by_importance(difficulty, importance, t1, t2)
 
 

@@ -301,6 +301,83 @@ def test_compute_priority_dual_strategy_takes_stricter_tier() -> None:
     assert compute_priority(ev(10, 10), category=Category.BUG, policy=policy) is Priority.NONE
 
 
+def test_percentile_strategy_ranks_within_batch() -> None:
+    """percentile 策略：档位由**批内排名**定，不再看绝对重要性分数。
+
+    实测里模型的 importance 密集落在 62~82、而绝对门槛 80 正压在右端，
+    单次评分抖动就能让同一条目跨线；分位让跨运行稳定的是比例。
+    """
+    from fissue.ai.evaluator import resolve_percentile_tiers
+
+    policy = FixPolicyConfig(tier_strategy="percentile")
+    policy.tier1_share = 0.5
+    policy.percentile_min_batch = 3
+    policy.tier1.max_difficulty = policy.tier2.max_difficulty = 40
+
+    rows = [
+        ("a", 10, 82),
+        ("b", 10, 78),
+        ("c", 10, 74),
+        ("d", 10, 66),
+        ("e", 10, 62),
+    ]
+    tiers = resolve_percentile_tiers(rows, policy)
+    # ceil(5 * 0.5) = 3 条进 tier1，其余 tier2
+    assert tiers == {
+        "a": Priority.TIER1,
+        "b": Priority.TIER1,
+        "c": Priority.TIER1,
+        "d": Priority.TIER2,
+        "e": Priority.TIER2,
+    }
+
+    # 同样这 5 条整体平移（分数全降 30），档位**一个都不变**——
+    # 这正是绝对阈值做不到的：门槛 80 下它们会全部落到 tier2。
+    shifted = [(k, d, imp - 30) for k, d, imp in rows]
+    assert resolve_percentile_tiers(shifted, policy) == tiers
+
+    # 难度仍是硬门槛：超出 tier2 的候选不参与，tier1 的难度门槛也不放宽
+    hard = [("a", 10, 90), ("b", 10, 85), ("c", 50, 99), ("d", 10, 70)]
+    got = resolve_percentile_tiers(hard, policy)
+    assert "c" not in got, "难度超 tier2 门槛的条目不该被分位捞回来"
+    assert got["a"] is Priority.TIER1
+
+
+def test_percentile_strategy_small_batch_falls_back_to_conservative_tier() -> None:
+    """候选不足 min_batch 时不算分位，各条保留单条口径的保守值 tier2。"""
+    from fissue.ai.evaluator import resolve_percentile_tiers
+    from fissue.models import DimensionScore, Evaluation, Scores
+
+    policy = FixPolicyConfig(tier_strategy="percentile")
+    policy.percentile_min_batch = 3
+    policy.tier1.max_difficulty = policy.tier2.max_difficulty = 40
+
+    assert resolve_percentile_tiers([("a", 10, 99), ("b", 10, 98)], policy) == {}
+
+    def ev(diff: int, imp: int) -> Evaluation:
+        return Evaluation(scores=Scores(difficulty=DimensionScore(score=diff),
+                                        importance=DimensionScore(score=imp)))
+
+    # 单条调用没有批内参照 → tier2（宁可先标低优先，也不吹成 tier1）
+    assert compute_priority(ev(10, 99), category=Category.BUG, policy=policy) is Priority.TIER2
+    # 难度超门槛仍然是 none：分位只改「重要性怎么用」，不放宽难度
+    assert compute_priority(ev(80, 99), category=Category.BUG, policy=policy) is Priority.NONE
+
+
+def test_fix_policy_percentile_params_are_validated() -> None:
+    """分位参数写错要在加载期挡下，而不是跑起来才发现档位没在分。"""
+    import pytest
+
+    from fissue.errors import ConfigError
+
+    assert FixPolicyConfig(tier_strategy="percentile").tier_strategy == "percentile"
+    for bad in (0.0, 1.0, 1.5, -0.2):
+        with pytest.raises(ConfigError):
+            FixPolicyConfig(tier1_share=bad)
+    with pytest.raises(ConfigError):
+        FixPolicyConfig(percentile_min_batch=0)
+
+
 def test_compute_priority_custom_strategy_uses_user_function(tmp_path, monkeypatch) -> None:
     """custom 策略由用户函数判定，且重要性门槛参数**不生效**。"""
     from fissue.models import DimensionScore, Evaluation, Scores

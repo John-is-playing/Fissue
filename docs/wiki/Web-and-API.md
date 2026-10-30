@@ -99,7 +99,6 @@ fissue auth status
 fissue auth set-password
 fissue auth reset                  # 清 2FA / 重置口令
 fissue auth key list|create|revoke
-fissue auth key import-legacy
 ```
 
 理由很简单：能改口令的接口本身要求先登录，而 WebUI 正是你进不去的那一侧。
@@ -202,7 +201,6 @@ GET  /api/auth/api-keys                 列出（只回 prefix/名称/时间）
 POST /api/auth/api-keys                创建（仅此一次回明文）
 POST /api/auth/api-keys/{id}/revoke    吊销
 GET  /api-keys                          管理页（列表 / 创建 / 吊销；已并入左侧导航）
-POST /api/auth/legacy-token            把旧口令手工导入成一条 API Key（兼容垫片，后续版本移除）
 ```
 
 ---

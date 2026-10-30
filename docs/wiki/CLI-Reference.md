@@ -25,7 +25,7 @@
 | `fissue web` | Web 工作台 + REST API |
 | `fissue sandbox serve` / `fissue sandbox check` | 起沙盒转发组件 / 检查沙盒环境是否就绪 |
 | `fissue bench` | 跑分基线：`capture` 冻结 / `diff` 逐项对比 / `list` 列出 |
-| `fissue auth` | 本机自救：`status / set-password / reset / key list|create|revoke|import-legacy` |
+| `fissue auth` | 本机自救：`status / set-password / reset / key list|create|revoke` |
 
 ---
 
@@ -183,7 +183,6 @@ fissue auth status
 fissue auth set-password
 fissue auth reset                     # 清 2FA / 重置口令
 fissue auth key list|create|revoke
-fissue auth key import-legacy
 ```
 
 界面上进不去时的**本机自救通道**（口令忘了、手机丢了、Key 全吊销）。

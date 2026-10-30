@@ -243,7 +243,21 @@ fix_policy:
   #     门槛（如 tier1.max_difficulty: 20、tier2.max_difficulty: 40）。
   #   custom —— 由 custom_tier 指定的用户函数判定；此时各 tier 的
   #     min_importance **不生效**（分档完全交给你的函数）。
+  #   percentile —— 按**批次内分位**定档：难度仍是硬门槛，但「重要性够不够」
+  #     不看绝对分数，而看它在本批候选里排第几（前 tier1_share 进 tier1）。
+  #     为什么要它：模型的 importance 评分会密集落在某个区间（实测 62~82），
+  #     绝对门槛正压在这段分布的右端时，单次评分抖动就能让同一条目在
+  #     tier1/tier2 之间来回跳——分位让跨运行稳定的是**比例**而不是绝对分数。
+  #     候选不足 percentile_min_batch 条时不计算分位，退回保守的 tier2。
   tier_strategy: importance
+
+  # 仅 tier_strategy=percentile 时生效：
+  #   tier1_share —— 批内候选里占比前多少进 tier1，必须在 (0, 1) 之间（0.5 = 前一半）。
+  #   percentile_min_batch —— 候选少于此数不算分位（三两条样本里算分位只是把偶然当规律）。
+  # 注意：tier1/tier2 **都进修复队列**，只差标签与派发先后——调这两个值不会
+  #      让「本该修的」变成不修，也不会相反。
+  # tier1_share: 0.5
+  # percentile_min_batch: 3
 
   # tier_strategy=custom 时的判定函数，支持 pkg.mod:func 与 pkg.mod.func 两种写法。
   # 签名：func(difficulty, importance, policy) -> str

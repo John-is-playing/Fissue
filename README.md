@@ -81,7 +81,7 @@ Fissue 把这一整套「分诊（triage）→ 验证 → 修复」流程自动�
 | 交付形态 | CLI + Web 仪表盘 + REST API + 常驻服务 |
 | 抓取平台 | GitHub · Gitee · AtomGit · GitLab（含自建实例） |
 | AI | 任意 OpenAI 兼容端点（DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM…） |
-| 存储 | SQLite（默认，零依赖）· PostgreSQL / MySQL（可选，需显式配置；PostgreSQL 已完成**真实部署验证**，见 `BENCHMARK.md` §5）；可导出 JSON / Markdown |
+| 存储 | SQLite（默认，零依赖）· PostgreSQL / MySQL（可选，需显式配置；**两个网络后端都做过真机验证**：PostgreSQL 是真实部署，MySQL 在 Docker `mysql:8.0` 上跑通了 `db init → fetch → eval → verify → flush → fix`，见 `BENCHMARK.md` §5）；可导出 JSON / Markdown |
 | 沙盒 | Docker：禁网、限 CPU/内存/PID/时长、非 root、只读根、只挂隔离工作区、转发组件通道 |
 | 配置 | `.env`（密钥）+ `config.yaml`（业务配置） |
 
