@@ -536,6 +536,79 @@ def test_gitlab_project_id_encoding(gl) -> None:
     assert gl._pid(RepoRef(platform=Platform.GITLAB, owner="a b", name="c")) == "a%20b%2Fc"
 
 
+# -- 诊断用的擦除方法（`fissue platforms doctor` 的写探测靠它们清场） --------
+#
+# 这三个方法在 GitLab 上**不能照抄 base 的默认实现**：base 按 GitHub/v5 的
+# `/repos/{owner}/{name}` 写，而 GitLab 一切都在 `/projects/{id}` 下，标签移除还是
+# `PUT + remove_labels` 的语义。形状猜错时的表现是「写进去、删不掉」——那会让体检命令
+# 报「建 + 删均通过」而仓库里留着痕迹，所以每条 URL 都得钉住。
+
+
+@respx.mock
+async def test_gitlab_delete_repo_label_uses_project_path(gl) -> None:
+    pid = "psf%2Frequests"
+    route = respx.delete(f"{GL}/projects/{pid}/labels/fissue-doctor-probe").mock(
+        return_value=httpx.Response(204)
+    )
+
+    await gl.delete_repo_label(REPO, "fissue-doctor-probe")
+
+    assert route.called, "应当按项目 id 路径删仓库标签"
+
+
+@respx.mock
+async def test_gitlab_remove_label_uses_remove_labels_semantics(gl) -> None:
+    """GitLab 移除标签是 ``PUT`` 条目 + ``remove_labels``，不是 DELETE 子资源。"""
+    import json
+
+    pid = "psf%2Frequests"
+    route = respx.put(f"{GL}/projects/{pid}/issues/5").mock(
+        return_value=httpx.Response(200, json={})
+    )
+
+    await gl.remove_label(REPO, 5, "fissue-doctor-probe")
+
+    assert route.called
+    body = json.loads(route.calls[0].request.content)
+    assert body == {"remove_labels": "fissue-doctor-probe"}
+
+
+@respx.mock
+async def test_gitlab_delete_comment_by_body_deletes_only_exact_match(gl) -> None:
+    """按正文**逐字**定位：对不上的评论一条都不能动（维护者的评论不是我们的痕迹）。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/issues/5/notes").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {"id": 11, "body": "维护者的评论"},
+                {"id": 12, "body": "探测评论（本命令会自动删除）"},
+            ],
+        )
+    )
+    deleted = respx.delete(f"{GL}/projects/{pid}/issues/5/notes/12").mock(
+        return_value=httpx.Response(204)
+    )
+
+    assert await gl.delete_comment_by_body(REPO, 5, "探测评论（本命令会自动删除）") is True
+    assert deleted.called
+
+
+@respx.mock
+async def test_gitlab_delete_comment_by_body_without_match_deletes_nothing(gl) -> None:
+    """找不到就**什么都不删**并返回 False：宁可留一条痕迹并报出来，也不能误删。"""
+    pid = "psf%2Frequests"
+    respx.get(f"{GL}/projects/{pid}/issues/5/notes").mock(
+        return_value=httpx.Response(200, json=[{"id": 11, "body": "维护者的评论"}])
+    )
+    deleted = respx.delete(url__regex=rf"{GL}/projects/{pid}/issues/5/notes/.*").mock(
+        return_value=httpx.Response(204)
+    )
+
+    assert await gl.delete_comment_by_body(REPO, 5, "我的探测评论") is False
+    assert not deleted.called, "没有匹配正文时不该发任何删除请求"
+
+
 @respx.mock
 async def test_gitlab_fetch_issue_and_mr(gl) -> None:
     pid = "psf%2Frequests"

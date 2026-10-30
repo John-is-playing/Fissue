@@ -47,6 +47,119 @@ from .main import (
 
 #: 写探测用的标签名。刻意带 ``doctor`` 字样，好让误留的痕迹一眼能认出来。
 PROBE_LABEL = "fissue-doctor-probe"
+#: 推分支探测用的分支名。带 ``doctor`` 字样，误留时一眼能认出来。
+PROBE_BRANCH = "fissue-doctor-probe"
+
+
+def _cleanup_workspace(ws: Any) -> None:
+    """删掉探测用的工作副本（含 mkdtemp 出来的外层临时目录）。
+
+    ``ws.cleanup()`` 只删 ``<mkdtemp>/repo``，外层目录会留下——一次探测漏一个临时目录，
+    在常跑自检的机器上就会堆起来。
+    """
+    import shutil
+
+    root = getattr(ws, "root", None)
+    try:
+        ws.cleanup()
+    finally:
+        parent = getattr(root, "parent", None)
+        if parent is not None and getattr(parent, "name", "").startswith("fissue-repo-"):
+            shutil.rmtree(parent, ignore_errors=True)
+
+
+async def _probe_clone(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]:
+    """克隆探测：**只读**，但它是 ``verify`` / ``fix`` 的第一道门。
+
+    这一项最有前车之鉴：私有仓库克隆曾经因为「克隆从不递令牌 + ``GIT_ASKPASS=echo``」
+    必然失败，而公开夹具一直匿名可克隆，于是这个缺陷在四套夹具上从没露过头
+    （见 BENCHMARK §4.15）。克隆是唯一能无副作用验出这类问题的探测。
+    """
+    import asyncio
+
+    from ..workspace import RepoWorkspace
+
+    slug = f"{ref.owner}/{ref.name}"
+    url = adapter.clone_url(ref, use_token=False)
+
+    def work(use_token: str) -> str:
+        ws = RepoWorkspace.clone(url, slug=slug, token=use_token, depth=1)
+        try:
+            return f"克隆成功，分支 {ws.current_branch()}"
+        finally:
+            _cleanup_workspace(ws)
+
+    try:
+        detail = await asyncio.to_thread(work, token)
+        return {"repo": slug, "probe": "只读/克隆", "result": "✅", "detail": detail}
+    except Exception as exc:
+        err = _brief(exc)
+        # 失败之后**必须再问一句「换成匿名呢」**：这决定了锅在谁那边。
+        #   * 匿名也失败 → 私有仓库，而令牌没有项目权限（平台侧配置问题）
+        #   * 匿名反而成功 → 仓库是公开的，那问题就在**我们传凭据这一步**
+        # 这两种原因的处理方式完全相反，混成一句「克隆失败」等于把人引向错误方向——
+        # 而「只报现象不分辨原因」正是这个命令存在的理由之外最该避免的事。
+        hint = "；匿名克隆同样失败 → 私有仓库需要令牌带项目（projects）权限"
+        if token:
+            try:
+                await asyncio.to_thread(work, "")
+                hint = "；但**匿名克隆反而成功** → 问题在凭据传递（带令牌反而被拒），不是权限"
+            except Exception:
+                pass
+        return {
+            "repo": slug,
+            "probe": "只读/克隆",
+            "result": "❌",
+            "detail": err + hint,
+        }
+
+
+async def _probe_push(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]:
+    """推分支探测：``fix`` 的产出就靠这一步。
+
+    只推一个空提交的探测分支，推成功立刻删远端分支。推送凭据的递法（不带令牌的 URL +
+    子进程环境变量 + 凭据助手）与生产路径完全一致——所以这里通了，``fix`` 的推送基本就通。
+    """
+    import asyncio
+
+    from ..workspace import RepoWorkspace
+
+    slug = f"{ref.owner}/{ref.name}"
+    url = adapter.clone_url(ref, use_token=False)
+
+    def work() -> str:
+        ws = RepoWorkspace.clone(url, slug=slug, token=token, depth=1)
+        pushed = False
+        try:
+            if not ws.checkout(PROBE_BRANCH, create=True):
+                raise RuntimeError("建探测分支失败")
+            if not ws.write(".fissue-doctor-probe", "probe\n"):
+                raise RuntimeError("写探测文件失败")
+            ws.stage_all()
+            commit = ws.commit("chore: fissue platforms doctor 探测提交（可删）")
+            if not commit.ok:
+                raise RuntimeError(f"提交失败：{ws.sanitize(commit.stderr)[:160]}")
+            result = ws.push(url, PROBE_BRANCH, token=token)
+            if not result.ok:
+                raise RuntimeError(f"推送失败：{ws.sanitize(result.stderr)[:200]}")
+            pushed = True
+            return "推 + 删远端分支均通过"
+        finally:
+            # 无论成败都尝试删远端分支：半路失败时它可能已经被推上去了
+            deleted = ws.delete_remote_branch(url, PROBE_BRANCH, token=token)
+            _cleanup_workspace(ws)
+            if pushed and not deleted.ok:
+                raise RuntimeError(
+                    f"探测分支已推上但删不掉，请手动删除 {PROBE_BRANCH}："
+                    f"{ws.sanitize(deleted.stderr)[:160]}"
+                )
+
+    try:
+        detail = await asyncio.to_thread(work)
+        return {"repo": slug, "probe": "写/推分支", "result": "✅", "detail": detail}
+    except Exception as exc:
+        return {"repo": slug, "probe": "写/推分支", "result": "❌", "detail": _brief(exc)}
+
 
 
 def _display(ok: bool | None) -> str:
@@ -234,6 +347,7 @@ async def _run(
     *,
     write: bool,
     number: str | None,
+    probe_push: bool,
 ) -> list[dict[str, Any]]:
     from ..platforms.registry import build_adapter
 
@@ -261,8 +375,13 @@ async def _run(
 
             read_rows = await _probe_read(adapter, ref)
             rows.extend(read_rows)
-            # 只读都不通就别往写里撞：那只会把「没有权限」重复报四遍。
-            if write and all(r["result"] != "❌" for r in read_rows):
+            read_ok = all(r["result"] != "❌" for r in read_rows)
+
+            # 克隆：只读，所以不需要 --write。它验的是 `verify` / `fix` 的第一道门。
+            if read_ok:
+                rows.append(await _probe_clone(adapter, ref, token))
+
+            if write and read_ok:
                 rows.extend(await _probe_write(adapter, ref, number))
             elif write:
                 rows.append(
@@ -273,6 +392,40 @@ async def _run(
                         "detail": "跳过：只读探测就没通，写探测没有意义",
                     }
                 )
+
+            # 推分支：默认不探，因为它会在远端短暂留下一个分支。
+            if probe_push and read_ok:
+                rows.append(await _probe_push(adapter, ref, token))
+            elif probe_push:
+                rows.append(
+                    {
+                        "repo": f"{ref.platform.value}:{ref.owner}/{ref.name}",
+                        "probe": "写/推分支",
+                        "result": "－",
+                        "detail": "跳过：只读探测就没通",
+                    }
+                )
+            else:
+                rows.append(
+                    {
+                        "repo": f"{ref.platform.value}:{ref.owner}/{ref.name}",
+                        "probe": "写/推分支",
+                        "result": "－",
+                        "detail": "未探测：加 --probe-push 才做（会在远端短暂留一个分支）",
+                    }
+                )
+
+            # 建 PR：刻意不探测。它要留一条「需人处理」的 PR（关闭 + 删源分支），
+            # 代价明显高于收益——推分支通过之后，剩下的失败点只有平台侧的参数形状，
+            # 那个用一次真 `fissue fix --dry-run` 之外没有太好的替代品。
+            rows.append(
+                {
+                    "repo": f"{ref.platform.value}:{ref.owner}/{ref.name}",
+                    "probe": "写/建 PR",
+                    "result": "－",
+                    "detail": "刻意不探测：会留下需人关闭的 PR，代价高于收益（推送通过即已覆盖主要风险）",
+                }
+            )
     finally:
         for adapter in adapters.values():
             # 关不掉连接不该影响体检结论（进程结束前 OS 会收回），但也不该静默——
@@ -294,11 +447,18 @@ def doctor(
     number: str | None = typer.Option(
         None, "--number", help="写探测针对的 Issue 编号（Gitee 是字符串，如 IKM265）"
     ),
+    probe_push: bool = typer.Option(
+        False,
+        "--probe-push",
+        help="探测推送权限（克隆 → 推探测分支 → 删远端分支；会在远端短暂留一个分支）",
+    ),
     json_out: bool = JSON_OPT,
 ) -> None:
     """体检各平台：令牌是否有效、只读链路是否通、写操作到底能做什么。
 
-    默认**只读**。加 ``--write`` 才会做写探测，且每一项都在结束后自动清理痕迹。
+    默认**只读**（克隆也是只读，所以无需开关）。``--write`` 才做写探测，
+    ``--probe-push`` 才验推送权限；每一项都在结束后自动清理痕迹。
+
     退出码：有探测失败为 1，否则 0（「跳过」不算失败）。
     """
     try:
@@ -308,7 +468,13 @@ def doctor(
             fail("没有可体检的仓库：配置里没有启用仓库，也没给 --repo")
             return
         rows = run_async(
-            _run(settings, targets, write=write, number=(number or None))
+            _run(
+                settings,
+                targets,
+                write=write,
+                number=(number or None),
+                probe_push=probe_push,
+            )
         )
     except FissueError as exc:
         fail(str(exc))

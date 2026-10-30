@@ -148,7 +148,7 @@ fissue web
 | `fissue report` | 生成 Markdown/JSON 报告 |
 | `fissue export` | 导出全量数据 |
 | `fissue status` | 查看当前状态：条目统计、队列情况、模型用量、沙盒可用性 |
-| `fissue platforms doctor` | **平台能力体检**：这套令牌 + 这个仓库到底能做什么（只读 / 打标签 / 建评论 / 建分支）。默认只读，`--write` 才做写探测且痕迹自动清理 |
+| `fissue platforms doctor` | **平台能力体检**：这套令牌 + 这个仓库到底能做什么——只读、克隆、打标签、建评论、推分支。只读与克隆默认就跑，`--write` / `--probe-push` 才做写探测且痕迹自动清理 |
 | `fissue serve` | 常驻服务：增量扫描 + 队列调度 + 阈值通知（**也含验证**；`--with-web` 同进程带起 Web/API，`--once` 只跑一轮） |
 | `fissue web` | Web 工作台 + REST API：总览 / 条目 / 队列 / 任务 / 监控仓库 / 状态监测 / 初始化向导 / 设置 |
 | `fissue sandbox serve` | 起沙盒转发组件（宿主侧常驻，沙盒执行的唯一通道）；`fissue sandbox check` 检查沙盒环境是否就绪 |

@@ -91,6 +91,37 @@ jobs:
         # 「看不见的跳过」和「真的通过」在 CI 里长得一样，所以要让它留在日志里。
         run: python -m pytest -q -p no:cacheprovider
 
+  sandbox-docker:
+    name: sandbox (docker)
+    runs-on: ubuntu-24.04
+    # 为什么要单独一个任务：默认套件承诺**完全离线**，于是 `sandbox.runtime=docker`
+    # 那条路径在其它 job 里**一次都不会执行**——测试对 Docker 全是打桩。而挂载构造、
+    # `--user` 跟随宿主、`--read-only`、`--network none` 这些参数写错了，单测照样全绿。
+    # 本项目反复吃过「只有真机才照得出来」的亏（PostgreSQL / MySQL / Gitee 写操作 /
+    # 私有仓库克隆），最该真机验证的沙盒隔离不该再靠打桩。
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 预拉基础镜像
+        # 显式拉一次：失败信息会明确落在这一步，而不是混在某个用例的 stderr 里。
+        # 用小镜像（alpine）是刻意的——这一层验的是隔离参数，不是验证器生态。
+        run: docker pull "${FISSUE_TEST_DOCKER_IMAGE:-alpine:3.20}"
+
+      - name: 跑真容器用例
+        env:
+          FISSUE_TEST_DOCKER: "1"
+        run: python -m pytest -q -p no:cacheprovider tests/test_sandbox_docker.py
+
   lint:
     name: ruff + mypy
     runs-on: ubuntu-24.04

@@ -564,6 +564,34 @@ class RepoWorkspace:
         result.stderr = self.sanitize(result.stderr)
         return result
 
+    def delete_remote_branch(self, url: str, branch: str, *, token: str = "") -> GitResult:
+        """删除远端分支。
+
+        用途只有一个：``fissue platforms doctor --probe-push`` 推完探测分支后清场。
+        因此它刻意**不做**「分支不存在时也当成功」的伪宽容——调用方要知道真实结果。
+
+        令牌递法与 :meth:`push` / :meth:`clone` 完全一致：**不带令牌的 URL** + 子进程环境
+        变量 + 凭据助手，令牌既不进命令行也不写进 git 配置。
+        """
+        cred, extra_env = self._git_credential_args(token)
+        result = self._git(
+            [
+                "git",
+                *cred,
+                "push",
+                "--quiet",
+                "--no-verify",
+                url,
+                "--delete",
+                f"refs/heads/{branch}",
+            ],
+            timeout=120,
+            extra_env=extra_env,
+        )
+        result.stdout = self.sanitize(result.stdout)
+        result.stderr = self.sanitize(result.stderr)
+        return result
+
     def clone_url_of(self, clone_url: str, dest_name: str) -> RepoWorkspace:  # pragma: no cover
         """从当前工作区复制一份（多分支并行验证用）。"""
         target = self.root.parent / dest_name

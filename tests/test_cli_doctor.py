@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,8 +19,11 @@ from typer.testing import CliRunner
 
 import fissue.cli  # noqa: F401  —— 触发命令注册
 from fissue.cli.doctor import (
+    PROBE_BRANCH,
     PROBE_LABEL,
     _display,
+    _probe_clone,
+    _probe_push,
     _probe_read,
     _probe_write,
     _resolve_targets,
@@ -60,6 +64,12 @@ class _FakeAdapter:
         self.calls.append(name)
         if name in self.fail:
             raise self.fail[name]
+
+    def clone_url(self, _repo: RepoRef, *, use_token: bool = False) -> str:  # noqa: ARG002
+        # 真实实现返回**不带令牌**的 URL（令牌另由 clone 的 token 参数传），
+        # 替身照这个形状给，免得把「URL 里塞令牌」这种更糟的写法固化进测试。
+        self.calls.append("clone_url")
+        return "https://example.invalid/psf/requests.git"
 
     async def whoami(self) -> str:
         self._record("whoami")
@@ -258,3 +268,158 @@ def test_doctor_is_registered_under_platforms() -> None:
     assert result.exit_code == 0, result.output
     assert "--write" in result.output
     assert "--number" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 克隆与推分支探测
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorkspace:
+    """克隆/推送探测用的工作副本替身（不碰 git、不联网）。"""
+
+    instances: list[_FakeWorkspace] = []
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.root = Path("/tmp/fissue-repo-fake/repo")
+        self.cleaned = False
+        _FakeWorkspace.instances.append(self)
+
+    @classmethod
+    def install(cls, monkeypatch: pytest.MonkeyPatch, *, fail_tokens: set[str] | None = None) -> None:
+        """把 ``RepoWorkspace.clone`` 换成本替身。
+
+        ``fail_tokens`` 里的令牌值会触发克隆失败——用来模拟「私有仓库 / 权限不对」，
+        并且能按令牌区分成功与失败，这正是「匿名重试」要判断的东西。
+        """
+        bad = fail_tokens or set()
+        cls.instances = []
+
+        def fake_clone(_url: str, *, slug: str = "", token: str = "", depth: int = 1):  # noqa: ARG001
+            if token in bad:
+                raise RuntimeError("remote: The token is not authorized to access this project")
+            return cls()
+
+        from fissue.workspace import RepoWorkspace
+
+        monkeypatch.setattr(RepoWorkspace, "clone", classmethod(lambda c, *a, **k: fake_clone(*a, **k)))
+
+    # -- 被探测代码用到的方法 -------------------------------------------
+    def current_branch(self) -> str:
+        return "main"
+
+    def cleanup(self) -> None:
+        self.cleaned = True
+
+    def checkout(self, ref: str, *, create: bool = False) -> bool:  # noqa: ARG002
+        self.calls.append("checkout")
+        return True
+
+    def write(self, rel: str, content: str) -> Path:  # noqa: ARG002
+        self.calls.append("write")
+        return self.root / rel
+
+    def stage_all(self) -> bool:
+        self.calls.append("stage_all")
+        return True
+
+    def commit(self, message: str, **_kw: Any) -> Any:  # noqa: ARG002
+        self.calls.append("commit")
+        return _result(ok=True)
+
+    def push(self, url: str, branch: str, **_kw: Any) -> Any:  # noqa: ARG002
+        self.calls.append("push")
+        return _result(ok=True)
+
+    def delete_remote_branch(self, url: str, branch: str, **_kw: Any) -> Any:  # noqa: ARG002
+        self.calls.append("delete_remote_branch")
+        return _result(ok=True)
+
+    def sanitize(self, text: str) -> str:
+        return text
+
+
+def _result(*, ok: bool, stderr: str = "") -> Any:
+    from fissue.workspace import GitResult
+
+    return GitResult(ok=ok, returncode=0 if ok else 1, stdout="", stderr=stderr)
+
+
+@pytest.mark.asyncio
+async def test_probe_clone_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeWorkspace.install(monkeypatch)
+    row = await _probe_clone(_FakeAdapter(), REF, "tok")
+    assert row["result"] == "✅"
+    assert "克隆成功" in row["detail"]
+    assert _FakeWorkspace.instances[0].cleaned is True, "探测完必须清理工作副本"
+
+
+@pytest.mark.asyncio
+async def test_probe_clone_blames_credentials_when_anonymous_works(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带令牌被拒、匿名反而成功 → 锅在**我们传凭据**这一步，不是令牌权限。
+
+    这两种原因的处理方式完全相反（一个去查代码、一个去平台开权限），
+    所以命令必须自己分辨，而不是只丢一句「克隆失败」。
+    """
+    _FakeWorkspace.install(monkeypatch, fail_tokens={"bad-token"})
+    row = await _probe_clone(_FakeAdapter(), REF, "bad-token")
+    assert row["result"] == "❌"
+    assert "问题在凭据传递" in row["detail"]
+
+
+@pytest.mark.asyncio
+async def test_probe_clone_blames_token_scope_when_anonymous_also_fails(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """带令牌与匿名都失败 → 私有仓库，令牌缺项目权限（平台侧配置问题）。"""
+    fake = _FakeWorkspace()
+    fake.current_branch = lambda: "main"  # type: ignore[method-assign]
+
+    from fissue.workspace import RepoWorkspace
+
+    def always_fail(_cls, _url, **_kw):  # noqa: ANN001, ARG001
+        raise RuntimeError("remote: The token is not authorized to access this project")
+
+    monkeypatch.setattr(RepoWorkspace, "clone", classmethod(always_fail))
+    row = await _probe_clone(_FakeAdapter(), REF, "tok")
+    assert row["result"] == "❌"
+    assert "projects" in row["detail"]
+
+
+@pytest.mark.asyncio
+async def test_probe_push_deletes_the_probe_branch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """推分支探测必须自清：推成功之后一定删远端分支。
+
+    留一条 ``fissue-doctor-probe`` 在别人仓库里，比不探测更糟——探测的价值是
+    「不留痕迹地知道能做什么」。
+    """
+    _FakeWorkspace.install(monkeypatch)
+    row = await _probe_push(_FakeAdapter(), REF, "tok")
+
+    assert row["result"] == "✅", row
+    calls = _FakeWorkspace.instances[0].calls
+    assert "push" in calls and "delete_remote_branch" in calls
+    assert calls.index("delete_remote_branch") > calls.index("push")
+    assert _FakeWorkspace.instances[0].cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_probe_push_reports_when_branch_cannot_be_deleted(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """推上去了却删不掉 → 必须报失败并点名分支，不能报「通过」。"""
+    _FakeWorkspace.install(monkeypatch)
+    ws_cls = _FakeWorkspace
+
+    def bad_delete(self, _url, _branch, **_kw):  # noqa: ANN001, ARG002
+        self.calls.append("delete_remote_branch")
+        return _result(ok=False, stderr="permission denied")
+
+    monkeypatch.setattr(ws_cls, "delete_remote_branch", bad_delete)
+    row = await _probe_push(_FakeAdapter(), REF, "tok")
+
+    assert row["result"] == "❌"
+    assert "fissue-doctor-probe" in row["detail"] or PROBE_BRANCH in row["detail"]

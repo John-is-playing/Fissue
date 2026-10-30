@@ -52,13 +52,20 @@ ruff format --check src tests
 
 ## 3. CI
 
-`.github/workflows/ci.yml`，三个 job，**都阻断**（无 `continue-on-error`）：
+`.github/workflows/ci.yml`，四个 job，**都阻断**（无 `continue-on-error`）：
 
 | job | 内容 |
 |---|---|
 | `pytest (py3.10 / py3.12 / py3.14)` | 矩阵取**最低支持版本** `3.10`、一个现代版本 `3.12`，以及本机实测跑通全量的 `3.14`；`python -m pytest -q -p no:cacheprovider` |
 | `pytest (windows)` | `windows-2022` 上跑同一套离线用例（单个 Python 版本，不跑覆盖率） |
+| `sandbox (docker)` | 设 `FISSUE_TEST_DOCKER=1`，跑 `tests/test_sandbox_docker.py`——真容器用例 |
 | `ruff + mypy` | `python -m ruff check src tests` 与 `python -m mypy src/fissue tests` |
+
+**为什么有真容器任务**：默认套件承诺完全离线，于是 `sandbox.runtime=docker` 那条路径在其它
+job 里**一次都不会执行**（测试对 Docker 全是打桩）。而挂载构造、`--user` 跟随宿主、
+`--read-only`、`--network none` 这些参数写错了，单测照样全绿。这个项目反复吃过
+「只有真机才照得出来」的亏（PostgreSQL / MySQL / Gitee 写操作 / 私有仓库克隆），
+最该真机验证的隔离路径不该再靠打桩。
 
 **为什么有 Windows 任务**：代码里有成片的 Windows 专属分支（`sandbox` 的 inline 回退、
 命名管道路径、`os.name == "nt"` 守卫、路径分隔符处理），它们**在 ubuntu 上一条都不会被执行**。

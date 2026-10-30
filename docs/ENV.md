@@ -263,6 +263,7 @@ FISSUE_GITLAB_TOKEN=
 | `404` `project or enterprise`（**建** Issue / **改** Issue） | **Gitee 特有，原因未定位**：读接口、git 推送、打标签、建评论、仓库级写都正常，只有**创建/更新 Issue 对象本身**这两个动作被拒。已排除「令牌作用域」与「仓库可见性」（换新令牌、公开库与私有库同样 404，均为实测）。详见 `BENCHMARK.md` §4.16 |
 | `400` `Problems parsing JSON`（**写** 标签） | 这是**请求体形状**问题，不是平台限制：Gitee 的 `POST /issues/{n}/labels` 只认**裸 JSON 数组** `["a"]`，发 `{"labels": ["a"]}` 就会报这句。v1.3.0-b2 起适配器已按平台分派形状（`v5.item_label_body`），正常情况下不该再出现——再见到它，先查体形状而不是猜权限 |
 | `403` 打标签失败 | Token 缺写权限（只勾了只读） |
+| `403` 克隆私有仓库：`The token is not authorized to access this project` | **Gitee 特有**：私人令牌需要带**项目（projects）**权限，`issue` 权限不够——API 读与打标签能通，git over HTTPS 却会被拒。用 `fissue platforms doctor -r gitee:owner/repo` 复核：它会在失败后重试匿名克隆，从而区分「令牌缺项目权限」与「凭据传递有问题」 |
 | `触发限流` | 未配 Token 或调用过密 |
 
 ---
