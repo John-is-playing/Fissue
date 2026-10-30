@@ -119,8 +119,9 @@ fissue db check                    # 验证连通
 
 > **SQLite vs PostgreSQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
 > 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表）。
-> 注意 PG 后端**未在真跑里被测量过**（见 [BENCHMARK.md §5 尚未测量](../BENCHMARK.md#5-尚未测量)），
-> 生产使用前请把它当作「尚未测量」的部分。
+> PG 后端已完成**真实部署验证**（`1.1.0-b4`：`db init` / `db check` / 全量单测 / 服务启动与
+> 页面实测均在该后端上跑过，见 [BENCHMARK.md §5](../BENCHMARK.md#5-尚未测量)）；
+> 但要注意验证的是**部署与并发路径**，跑分数字仍全部来自 SQLite。
 
 ---
 

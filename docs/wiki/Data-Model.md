@@ -78,8 +78,10 @@
 FISSUE_DATABASE_URL=sqlite:///./data/fissue.db
 ```
 
-> ⚠️ **PostgreSQL 后端未在真跑里用过**——开发期全程 SQLite。生产 / 多机建议用 PG，
-> 但请把它当作**尚未测量**的部分（见[基准与可信度](Benchmark.md#5-尚未测量)）。
+> ✅ **PostgreSQL 后端已完成真实部署验证**（`1.1.0-b4`）：`db init` / `db check` / 全量单测 /
+> 服务启动与页面实测均在该后端上跑过，远端 PG 上看板页面切换亦已实测提速。
+> 它验证的是**部署与并发路径**；[基准与可信度](Benchmark.md#5-尚未测量) 里各夹具的跑分
+> 数字仍全部来自 SQLite。
 
 ---
 

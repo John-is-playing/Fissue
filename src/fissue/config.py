@@ -70,8 +70,9 @@ class AppConfig(BaseModel):
 class DatabaseConfig(BaseModel):
     #: 默认走 **SQLite**（零依赖、随包可用，且是开发期与测试真正跑过的那条路）。
     #: PostgreSQL 仍是**生产/多机**的推荐选择，但它是显式 opt-in——见 `_check_url` 与
-    #: `docs/ENV.md`：默认值不该是一个「从未真跑过」的后端（`BENCHMARK.md` §5 记录过
-    #: PostgreSQL 后端未在真跑里用过）。文件落在 `./data/` 下，目录由 store/db.py 建。
+    #: `docs/ENV.md`：默认值不该替用户选一个需要自建服务的后端，零依赖必须是开箱默认。
+    #: （PostgreSQL 本身并非未验证：`1.1.0-b4` 已完成真实部署验证，见 `BENCHMARK.md` §5。）
+    #: 文件落在 `./data/` 下，目录由 store/db.py 建。
     url: str = "sqlite:///./data/fissue.db"
     echo: bool = False
     pool_size: int = 5
