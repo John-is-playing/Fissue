@@ -1,6 +1,6 @@
 [project]
 name = "fissue"
-version = "1.1.0"
+version = "1.2.0"
 description = "Fissue - 从 GitHub/Gitee/AtomGit/GitLab 检索 Issue/PR，用 AI 大模型评测真实性/重要性/可行性/PR 质量，并在沙盒中自动验证与修复"
 readme = "README.md"
 requires-python = ">=3.10"
