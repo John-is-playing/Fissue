@@ -26,9 +26,44 @@ log = get_logger(__name__)
 #: 会挡住写者的提交，一超过 5s 写者就失败。这里把超时明确调到 30s 并开 WAL。
 SQLITE_BUSY_TIMEOUT_SECONDS = 30.0
 
-#: PostgreSQL 的连接超时（秒）。psycopg 直接认 ``connect_timeout``。
-#: 见 `Database.__init__`：非 sqlite 才用得上。
-POSTGRES_CONNECT_TIMEOUT_SECONDS = 10
+#: 网络型后端（PostgreSQL / MySQL）的连接超时（秒）。
+#:
+#: psycopg 与 pymysql 都直接认 ``connect_timeout`` 这个名字（语义一致：秒）。
+#: 见 `Database.__init__`：只有 sqlite 用不上它。
+DB_CONNECT_TIMEOUT_SECONDS = 10
+
+
+def force_fix_migration(dialect: str) -> tuple[str | None, str]:
+    """``items.force_fix`` 补列在各方言上的 ``(探针 SQL, ALTER SQL)``。
+
+    探针为 ``None`` 表示「这个方言一条语句就够」——PostgreSQL 的
+    ``ADD COLUMN IF NOT EXISTS`` 本身幂等，先查一遍只是多一次往返。
+    其余方言返回一条**只查一列**的探针：结果集按「是否出现 ``force_fix``」判断
+    （见 :meth:`Database._migrate_items_force_fix`），所以 SQLite 用的是
+    ``pragma_table_info`` 表值函数（返回一行一列 ``name``），而不是
+    ``PRAGMA table_info``——后者的第一列是 ``cid``，无法与列名比对。
+
+    为什么把这几个字符串抽成纯函数：这是全项目**唯一**必须有方言差异的 DDL。
+    抽出来就能用单测钉住三种写法，而不必真的起三个数据库；写错方言（比如给
+    MySQL 发 ``ADD COLUMN IF NOT EXISTS``）会在真机第一次 `db init` 时才炸。
+    """
+    if dialect == "postgresql":
+        return None, (
+            "ALTER TABLE items ADD COLUMN IF NOT EXISTS force_fix BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    if dialect == "mysql":
+        # MySQL 既没有 ADD COLUMN IF NOT EXISTS，也没有 PRAGMA table_info；
+        # 表结构只能问 information_schema（DATABASE() = 当前库）。
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'items'",
+            "ALTER TABLE items ADD COLUMN force_fix BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+    # 兜底按 SQLite 写：内存测试库与将来的其它方言都落到这里。
+    return (
+        "SELECT name FROM pragma_table_info('items')",
+        "ALTER TABLE items ADD COLUMN force_fix BOOLEAN NOT NULL DEFAULT 0",
+    )
 
 
 def ensure_sqlite_parent_dir(url: str) -> None:
@@ -69,7 +104,7 @@ class Database:
             kwargs.update(pool_size=pool_size, max_overflow=max_overflow, pool_recycle=1800)
             # 连接超时：不给的话，一个不可路由的 PG 地址会一直等到操作系统的默认超时
             # （几十秒到两分钟），而「测试连接」按钮与初始化向导都直接连它——用户是站在页面前等的。
-            kwargs["connect_args"] = {"connect_timeout": POSTGRES_CONNECT_TIMEOUT_SECONDS}
+            kwargs["connect_args"] = {"connect_timeout": DB_CONNECT_TIMEOUT_SECONDS}
         else:
             kwargs["connect_args"] = {
                 "check_same_thread": False,
@@ -150,23 +185,28 @@ class Database:
 
         ``create_all`` 只建缺失的表、**不改**已存在的表——常驻服务的库是长跑的，
         不加这一刀，旧库上任何带这列的查询都会 ``no such column`` 直接崩。
-        SQLite 用 PRAGMA 查列再 ALTER；PostgreSQL 原生支持 ``ADD COLUMN IF NOT EXISTS``。
-        全新库（列已随 create_all 建出）两条路径都是空操作。
+
+        三种语法各不相同，所以按方言分派（判定在 :func:`force_fix_migration` 里，
+        是纯函数、可单测）：
+
+        * PostgreSQL：原生支持 ``ADD COLUMN IF NOT EXISTS``，一条语句搞定；
+        * MySQL：**不支持** ``IF NOT EXISTS``，也没有 ``PRAGMA``，先查
+          ``information_schema.columns`` 再 ``ALTER``；
+        * SQLite：先查 ``PRAGMA table_info`` 再 ``ALTER``。
+
+        全新库（列已随 create_all 建出）三条路径都是空操作。
         """
+        probe, alter = force_fix_migration(self.engine.dialect.name)
         with self.engine.begin() as conn:
-            if conn.dialect.name == "postgresql":
-                conn.execute(
-                    text(
-                        "ALTER TABLE items ADD COLUMN IF NOT EXISTS "
-                        "force_fix BOOLEAN NOT NULL DEFAULT FALSE"
-                    )
-                )
-            else:
-                cols = {row[1] for row in conn.execute(text("PRAGMA table_info(items)"))}
-                if "force_fix" not in cols:
-                    conn.execute(
-                        text("ALTER TABLE items ADD COLUMN force_fix BOOLEAN NOT NULL DEFAULT 0")
-                    )
+            if probe is None:
+                conn.execute(text(alter))
+                return
+            # 探针语句要么返回「列名」列表，要么返回「有没有」——两种都只看第一列，
+            # 于是统一按 ``是否出现 force_fix`` 判断，不必为每种方言各写一个分支。
+            found = {str(row[0]).lower() for row in conn.execute(text(probe))}
+            if "force_fix" in found:
+                return
+            conn.execute(text(alter))
 
     def has_schema(self) -> bool:
         """表是否已存在（用于给用户提示「请先执行 fissue db init」）。"""

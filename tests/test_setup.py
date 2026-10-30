@@ -678,6 +678,9 @@ def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
         "web.auth.secure_cookie",
         "web.auth.login_max_failures",
         "web.trusted_networks",
+        # 反代部署：开关与代理网段要一起能改（只改一层等于没配）
+        "web.trust_proxy",
+        "web.trusted_proxies",
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
         "llm.budget.daily_tokens_per_repo",

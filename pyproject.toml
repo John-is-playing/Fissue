@@ -34,6 +34,10 @@ dependencies = [
     # 代码里**没有** `import psycopg`，但它是必需的：SQLAlchemy 按 URL 里的 dialect
     # 动态加载驱动（`postgresql+psycopg://`），静态扫描看不见它。
     "psycopg[binary]>=3.1",
+    # 同理，MySQL 走 `mysql+pymysql://`——`import pymysql` 同样不存在于代码里。
+    # 纯 Python、无编译依赖，随包装上，「填了连接串就能用」才成立（否则要在
+    # 加载期报「驱动不可用」，与「零依赖开箱」的默认值不冲突：默认仍是 SQLite）。
+    "pymysql>=1.1",
     "typer>=0.12",
     "rich>=13.7",
     "fastapi>=0.111",

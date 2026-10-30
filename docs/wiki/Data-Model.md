@@ -1,6 +1,8 @@
 # 数据模型
 
-> 存储层：默认 **SQLite**（零依赖），生产 / 多机可换 PostgreSQL；支持导出 JSON / Markdown。
+> 存储层：默认 **SQLite**（零依赖），生产 / 多机可换 PostgreSQL 或 MySQL 8.0+；支持导出 JSON / Markdown。
+> 键列长度取 511 字符（不是更大的 767）：MySQL + utf8mb4 的索引上限是 3072 字节，
+> `uq_item_identity` 是四列复合唯一索引，767 字符单列就 3068 字节、复合必然建不上。
 > 完整细节见 [docs/DESIGN.md §7](../DESIGN.md#7-存储)。
 
 ---

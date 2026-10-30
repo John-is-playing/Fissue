@@ -13,7 +13,49 @@
 
 ## [Unreleased]
 
-> **未发布**：暂无（下一批进行中）。
+> **未发布**：`v1.2.0` 之后的变更。按「为什么」分组。
+
+### 新增 —— MySQL 后端（AtomGit Issue #1）
+
+- **MySQL 8.0+ 后端**：`database.url` 支持 `mysql+pymysql://user:pw@host:3306/db`，
+  与 SQLite / PostgreSQL 同一条 `create_all` + 迁移路径。三处硬约束都按 MySQL 的口径落地：
+  - **键列 767 → 511 字符**：MySQL + utf8mb4 的索引上限是 **3072 字节**，而
+    `uq_item_identity` 是四列复合唯一索引——767 字符单列就占 3068 字节，复合索引必然建不上。
+    511 字符下该索引 2396 字节、`uq_queue_item_pending` 2172 字节，留有余量；
+  - **长文本列落成 `MEDIUMTEXT`**：MySQL 的 `TEXT` 上限只有 **64KB**，而 GitHub 的
+    Issue/PR 正文上限正好是 65536 **字符**（UTF-8 中文一多就超）、沙盒 `stdout`/`stderr`
+    与修复 `diff` 也常有几十 KB。`items.body` / `comments.body` /
+    `verifier_runs.stdout`、`stderr` / `fix_attempts.diff` / `evaluations.summary`
+    在 mysql 方言上用 `MEDIUMTEXT`（16MB），其余方言的 DDL 一个字节都没变；
+  - **删改列没有 `ADD COLUMN IF NOT EXISTS`**：`force_fix` 补列原先只分
+    「PostgreSQL 一条语句」与「其余走 `PRAGMA table_info`」两支，MySQL 两支都不适用
+    （既无 `IF NOT EXISTS`，也无 PRAGMA）——现在按方言分派到 `information_schema.columns`，
+    且这段 SQL 抽成纯函数 `force_fix_migration(dialect)`，用单测钉住三种写法。
+- **`pymysql` 随包声明**（理由与 `psycopg` 相同：SQLAlchemy 按 URL 里的 dialect 动态加载，
+  代码里没有 `import pymysql`；`tests/test_packaging.py` 的豁免名单同步登记）。
+- **离线守卫**：本机没有 MySQL 实例，所以用「三方言 DDL 编译 + 索引字节数 + 长文本类型」
+  三条纯编译期断言钉住可移植性——它们正是「只在真机 `db init` 才炸」的那两类错误。
+  **尚未在真实 MySQL 上跑过全链路**（README / AGENTS 口径已写明），部署者请先自己跑
+  `db init` / `db check` 与一轮 `fetch → eval → verify`。
+- 文档：`docs/ENV.md` 补 MySQL 首次准备（建库语句、utf8mb4、三条硬约束）、
+  `README` / `docs/USAGE.md` / wiki（Deployment / Data-Model / Configuration）与
+  `config.example.yaml` 同步；顺手修掉 wiki 配置表里 `database.url` 默认值写错的那一行
+  （写成了 PostgreSQL 串，实际默认是 SQLite）。
+
+### 新增 —— `web.trust_proxy`：反代部署按真实客户端判定来源
+
+- **`web.trust_proxy` + `web.trusted_proxies`**：挂在反向代理后面时，来源判定不再只能
+  「要么看对端、要么放行整个代理网段」——现在可以按**真实客户端地址**判定，
+  但需要**两层声明同时成立**：开关打开 **且** 请求的直接对端落在 `trusted_proxies` 里。
+  - **只取 `X-Forwarded-For` 的最右一跳**：左侧各段完全由客户端填写（谁都能塞一个
+    `127.0.0.1`），只有紧挨本服务的那个代理追加的那一段可信；顺带支持 `X-Real-IP` 回退，
+    头里是域名/垃圾值时**不采信**（回退对端地址），不做任何猜测；
+  - **只勾开关不填网段 = 加载期报错**：来源一旦被判成回环就**免登录**，
+    而「谁的转发头都信」等于让任何人加一行 `X-Forwarded-For: 127.0.0.1` 跳过全部鉴权；
+  - 引入它的同时**删掉**了 `web/setup.py::_peer_is_loopback`——那是个已无调用点的死函数，
+    留着就是第二套「来源是谁」的口径，而两套口径迟早会给出不同答案；
+  - 设置页「Web 与访问控制」新增该组（开关 + 代理网段），覆盖层白名单同步；
+    拒绝文案与 `docs/AUTH.md` §6 / §12、`docs/wiki/Security.md` 的「尚未实现」一并收口。
 
 ## [1.2.0] - 2026-10-30
 

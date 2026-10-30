@@ -49,6 +49,10 @@ _EXEMPT = {
         "必需但无法静态发现：SQLAlchemy 按 URL 里的 dialect 动态加载驱动"
         "（postgresql+psycopg://），代码里没有 `import psycopg`"
     ),
+    "pymysql": (
+        "同上：MySQL 走 mysql+pymysql://，由 SQLAlchemy 按 dialect 动态加载，"
+        "代码里没有 `import pymysql`"
+    ),
     "jinja2": "由 fastapi.templating.Jinja2Templates 使用，代码里不直接 import",
     "pytest-asyncio": "pytest 插件：靠 entry point 加载（asyncio_mode=auto），代码里不 import",
     "pytest-cov": "pytest 插件：靠 entry point 加载（--cov 参数），代码里不 import",

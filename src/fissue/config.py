@@ -100,7 +100,8 @@ class DatabaseConfig(BaseModel):
             raise ConfigError(
                 "database.url 看起来是**页面上显示的脱敏值**（含 •）——那是用来确认「填的是哪一条」的，"
                 "不是真实连接串。请填真实值，例如 "
-                "sqlite:////绝对路径/xxx.db 或 postgresql+psycopg://user:pw@host:5432/dbname"
+                "sqlite:////绝对路径/xxx.db、postgresql+psycopg://user:pw@host:5432/dbname "
+                "或 mysql+pymysql://user:pw@host:3306/dbname"
             )
         # 延迟导入：config 是热点路径（每条命令都走），没必要在模块级拉起 sqlalchemy。
         from sqlalchemy.engine import make_url
@@ -110,9 +111,10 @@ class DatabaseConfig(BaseModel):
         except Exception as exc:
             raise ConfigError(
                 f"database.url 不是合法的连接串：{exc}。"
-                "常用两种写法：SQLite 用 sqlite:////绝对路径/文件.db（注意**四个斜杠**，"
+                "常用三种写法：SQLite 用 sqlite:////绝对路径/文件.db（注意**四个斜杠**，"
                 "写成 sqlite:///home/... 会把 /home/... 当成相对路径）；"
-                "PostgreSQL 用 postgresql+psycopg://user:password@host:5432/dbname"
+                "PostgreSQL 用 postgresql+psycopg://user:password@host:5432/dbname；"
+                "MySQL 用 mysql+pymysql://user:password@host:3306/dbname（需 MySQL 8.0+）"
             ) from exc
         try:
             parsed.get_dialect()
@@ -120,7 +122,8 @@ class DatabaseConfig(BaseModel):
             # 驱动名写错（`postgresql+psycopgg`）或该驱动没装，同样是「一路写到 .env、重启才炸」。
             raise ConfigError(
                 f"database.url 的驱动不可用：{parsed.drivername!r}（{exc}）。"
-                "本项目随包提供 PostgreSQL（postgresql+psycopg）与 SQLite（sqlite）两种。"
+                "本项目随包提供 SQLite（sqlite）、PostgreSQL（postgresql+psycopg）"
+                "与 MySQL（mysql+pymysql）三种。"
             ) from exc
         return text
 
@@ -578,6 +581,54 @@ class NotifyConfig(BaseModel):
     events: list[str] = Field(default_factory=list)
 
 
+def _clean_cidr_list(value: list[str], field: str) -> list[str]:
+    """清洗一份 CIDR 列表：去空白、丢空行、逐条校验，**加载期**报错。
+
+    两个字段（``web.trusted_networks`` / ``web.trusted_proxies``）共用同一套规则：
+    它们的语义都是「把某些来源当成可信」，写错的后果也一样——用户以为配了，实际没配上。
+
+    裸地址（``192.168.1.0``）也拒：``ip_network`` 会把它当成 ``/32``，用户想圈一个网段、
+    实际只放行一台机器，而**任何地方都不会提示他**。要单机就写 ``192.168.1.5/32``。
+    """
+    cleaned: list[str] = []
+    for raw in value:
+        text = str(raw).strip()
+        if not text:
+            continue
+        if "/" not in text:
+            raise ConfigError(
+                f"{field} 里的条目缺少前缀长度：{text!r}。"
+                "请写 CIDR 形式——网段用 192.168.1.0/24，单机用 192.168.1.5/32。"
+            )
+        try:
+            ipaddress.ip_network(text, strict=False)
+        except ValueError as exc:
+            raise ConfigError(
+                f"{field} 里的网段不合法：{text!r}（{exc}）。"
+                "请写 CIDR 形式，例如 192.168.1.0/24 或 10.0.0.0/8。"
+            ) from exc
+        cleaned.append(text)
+    return cleaned
+
+
+def _network_of(
+    host: str, networks: list[str]
+) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """``host`` 落在 ``networks`` 里的哪一段（都不在则 None）。"""
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    for item in networks:
+        try:
+            net = ipaddress.ip_network(item, strict=False)
+        except ValueError:  # pragma: no cover - 构造期已校验过
+            continue
+        if addr.version == net.version and addr in net:
+            return net
+    return None
+
+
 class WebAuthConfig(BaseModel):
     """会话鉴权开关（docs/AUTH.md §6）。
 
@@ -611,7 +662,21 @@ class WebConfig(BaseModel):
     #: 满足「内网直接用浏览器访问」这个诉求，且不用把口令写进浏览器。
     #: 判定只看**真实对端地址**（`request.client.host`），**不信任** `X-Forwarded-For`：
     #: 转发头本身可以被伪造，而「相信转发头」等于把判定权交给任何能构造请求的人。
+    #: 确需在反向代理后面按真实客户端判定时，显式打开下面的 `trust_proxy`
+    #: 并把代理网段写进 `trusted_proxies`（两层声明缺一不可）。
     trusted_networks: list[str] = Field(default_factory=list)
+    #: 是否相信反向代理送来的转发头（`X-Forwarded-For` / `X-Real-IP`）。
+    #:
+    #: **默认关闭**，因为打开它等于把「来源是谁」的判定权交给转发头；而来源一旦被判成
+    #: 回环或可信网段就**免登录**——任何能直连本服务的人只要加一行
+    #: `X-Forwarded-For: 127.0.0.1` 就能绕过全部鉴权。所以打开它必须同时满足：
+    #: ① 本配置项为 true；② 请求的**直接对端**落在 `trusted_proxies` 里。
+    #: 两条都满足时才采信转发头，且只取**最右一跳**（代理自己追加的那个地址）——
+    #: 左侧各段是客户端可以随便写的。
+    trust_proxy: bool = False
+    #: 反向代理自身的网段（CIDR）。`trust_proxy=true` 时**必须**非空，否则加载期直接报错：
+    #: 允许「任何人送来的转发头都信」正是上面描述的那个提权洞，宁可启动失败。
+    trusted_proxies: list[str] = Field(default_factory=list)
     #: 「配置写入」类操作（初始化向导 / 仓库管理 / 设置页）的额外边界。
     #:
     #: 正常路径是：来源在回环/可信网内，或请求已通过会话/API Key 认证。
@@ -637,40 +702,39 @@ class WebConfig(BaseModel):
         用户想圈一个网段，实际只放行了一台机器，而**任何地方都不会提示他**。
         要单机就写 ``192.168.1.5/32``，要把意图写出来。
         """
-        cleaned: list[str] = []
-        for raw in value:
-            text = str(raw).strip()
-            if not text:
-                continue
-            if "/" not in text:
-                raise ConfigError(
-                    f"web.trusted_networks 里的条目缺少前缀长度：{text!r}。"
-                    "请写 CIDR 形式——网段用 192.168.1.0/24，单机用 192.168.1.5/32。"
-                )
-            try:
-                ipaddress.ip_network(text, strict=False)
-            except ValueError as exc:
-                raise ConfigError(
-                    f"web.trusted_networks 里的网段不合法：{text!r}（{exc}）。"
-                    "请写 CIDR 形式，例如 192.168.1.0/24 或 10.0.0.0/8。"
-                ) from exc
-            cleaned.append(text)
-        return cleaned
+        return _clean_cidr_list(value, "web.trusted_networks")
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def _check_trusted_proxies(cls, value: list[str]) -> list[str]:
+        """代理网段同样必须是合法 CIDR；规则与 ``trusted_networks`` 完全一致。"""
+        return _clean_cidr_list(value, "web.trusted_proxies")
+
+    @model_validator(mode="after")
+    def _check_trust_proxy_declaration(self) -> WebConfig:
+        """``trust_proxy=true`` 必须配 ``trusted_proxies``，否则**加载期**就失败。
+
+        为什么这是硬错误而不是警告：来源一旦被判成回环/可信网段就**免登录**，而
+        转发头是任何能构造请求的人都写得出来的。允许「谁的转发头都信」等于给出一条
+        「加一行 `X-Forwarded-For: 127.0.0.1` 就跳过全部鉴权」的路——与其静默开放，
+        不如启动就失败，并把该写什么写清楚。
+        """
+        if self.trust_proxy and not self.trusted_proxies:
+            raise ConfigError(
+                "web.trust_proxy=true 时必须同时配置 web.trusted_proxies（代理自身的网段）。"
+                "否则任何人都能伪造 X-Forwarded-For 把自己说成 127.0.0.1——"
+                "而回环来源是**免登录**的。请写代理所在网段，例如 127.0.0.1/32 或 172.17.0.0/16；"
+                "若你的部署不是「反向代理 + 真实客户端地址」这种形态，就把 trust_proxy 关掉。"
+            )
+        return self
 
     def network_of(self, host: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
         """``host`` 落在哪个可信网段里（不在任何网段则 None）。"""
-        try:
-            addr = ipaddress.ip_address(host)
-        except ValueError:
-            return None
-        for item in self.trusted_networks:
-            try:
-                net = ipaddress.ip_network(item, strict=False)
-            except ValueError:  # pragma: no cover - 构造期已校验过
-                continue
-            if addr.version == net.version and addr in net:
-                return net
-        return None
+        return _network_of(host, self.trusted_networks)
+
+    def proxy_network_of(self, host: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+        """``host`` 是否是本配置承认的反向代理（在 ``trusted_proxies`` 里）。"""
+        return _network_of(host, self.trusted_proxies)
 
 
 class APIConfig(BaseModel):

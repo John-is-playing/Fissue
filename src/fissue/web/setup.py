@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -119,6 +118,10 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset(
         "web.auth.secure_cookie",
         "web.auth.login_max_failures",
         "web.trusted_networks",
+        # 反代部署：两层声明都要能在界面上改（只改一层等于没配——另一层在 config.yaml 里
+        # 可能仍是默认值，而这两者必须同时成立才生效）。
+        "web.trust_proxy",
+        "web.trusted_proxies",
         # -- LLM 计费与预算 --
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
@@ -155,20 +158,6 @@ FORWARD_HEADERS = (
 # ---------------------------------------------------------------------------
 
 
-def _peer_is_loopback(request: Request) -> bool:
-    """来源是不是本机回环。拿不到可解析地址（测试客户端 / UDS）时算 True。
-
-    「不知道对端是谁」不等于「可疑」——与 app.py 的 ``_reject_remote_write`` 同一口径，
-    否则本机正常用法会被一起挡掉。
-    """
-    client = request.client
-    host = (client.host if client else "") or ""
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return True
-
-
 def setup_guard(request: Request, settings: Settings) -> None:
     """配置写入的边界。不通过就 403（并把「怎么才能通过」写清楚）。
 
@@ -182,7 +171,7 @@ def setup_guard(request: Request, settings: Settings) -> None:
     见到转发头就拒，把「静默开放」变成「响亮拒绝」。**这是补刀，不是安全边界**——
     真正的边界是身份本身。
     """
-    from .auth import forwarded_without_declaration, resolve_identity
+    from .auth import client_host, forwarded_without_declaration, resolve_identity
 
     identity = resolve_identity(request)
     hit = forwarded_without_declaration(request, settings, identity)
@@ -194,7 +183,8 @@ def setup_guard(request: Request, settings: Settings) -> None:
                 "但既没有通过认证，也没有声明可信网段。"
                 "在反向代理后面暴露这个控制面等于把「改密钥」的权限一并开放——"
                 "请在 /login 登录（或用 API Key），"
-                "若确实挂在反向代理后面，请把代理/内网网段写进 web.trusted_networks。"
+                "若确实挂在反向代理后面：把代理网段写进 web.trusted_proxies 并打开 web.trust_proxy；"
+                "只是想放行内网，则把内网网段写进 web.trusted_networks。"
             ),
         )
     if identity.trusted_source or identity.authenticated:
@@ -202,10 +192,10 @@ def setup_guard(request: Request, settings: Settings) -> None:
     if settings.web.allow_remote_config_write:
         log.warning(
             "允许未认证的非本机来源改写配置（web.allow_remote_config_write=true），来源：%s",
-            request.client.host if request.client else "未知",
+            client_host(request, settings) or "未知",
         )
         return
-    peer = request.client.host if request.client else "未知"
+    peer = client_host(request, settings) or "未知"
     hint = (
         "请在该机器上访问 /login 完成初始化（尚无管理员账号）。"
         if settings.web.auth.enabled
@@ -505,6 +495,10 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             # settings.web.trusted_networks 给出，页面上的输入框回填的是**生效值**）。
             "trusted_networks": list(settings.web.trusted_networks),
             "trusted_networks_text": "\n".join(settings.web.trusted_networks),
+            # 反代（web.trust_proxy + web.trusted_proxies）：同上，回填**生效值**。
+            "trust_proxy": settings.web.trust_proxy,
+            "trusted_proxies": list(settings.web.trusted_proxies),
+            "trusted_proxies_text": "\n".join(settings.web.trusted_proxies),
             "repos": [r.slug for r in settings.repos],
             # LLM 计费 / 预算 / 生成参数的**生效值**：页面上的输入框按它回填。
             # 为什么必须回填生效值而不是覆盖层里的值：这三处可能来自 config.yaml 或默认值，

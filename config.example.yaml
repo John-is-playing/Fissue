@@ -12,6 +12,8 @@ app:
 # ---------------------------------------------------------------------------
 database:
   url: sqlite:///./data/fissue.db   # 可被 FISSUE_DATABASE_URL 覆盖；生产/多机换 PostgreSQL（先 createdb）
+                                    # 或 MySQL 8.0+：mysql+pymysql://user:pw@host:3306/db?charset=utf8mb4
+                                    # （MySQL 侧字符集须 utf8mb4，细节见 docs/ENV.md 第 2 节）
   echo: false
   pool_size: 5
 

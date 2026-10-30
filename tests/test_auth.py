@@ -447,6 +447,106 @@ def test_forwarded_header_does_not_make_a_remote_peer_trusted(settings: Settings
         assert res.status_code == 401, "转发头不能冒充回环"
 
 
+# ---------------------------------------------------------------------------
+# 反向代理：web.trust_proxy + web.trusted_proxies（两层声明缺一不可）
+# ---------------------------------------------------------------------------
+
+
+def _request(headers: dict[str, str] | None = None, peer: tuple[str, int] = REMOTE):
+    """构造一个最小 Request（只填判定用得到的字段）。"""
+    from starlette.requests import Request
+
+    raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw,
+        "client": peer,
+        "server": ("testserver", 80),
+    }
+    return Request(scope)
+
+
+def test_forwarded_address_takes_only_the_rightmost_hop() -> None:
+    """`X-Forwarded-For` 左侧由客户端随便写，只有最右一跳是代理追加的。
+
+    取错方向的后果不是「少一条日志」，而是**谁都能自称 127.0.0.1**——而回环免登录。
+    """
+    from fissue.web.auth import forwarded_address
+
+    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1, 2.2.2.2, 203.0.113.9"})) == "203.0.113.9"
+    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1:5555"})) == "1.1.1.1"
+    assert forwarded_address(_request({"X-Forwarded-For": "[2001:db8::1]:443"})) == "2001:db8::1"
+    # 头里是垃圾值时回退 X-Real-IP；两者都不可信则空串（宁可「不采信」，不能「猜一个」）
+    assert forwarded_address(_request({"X-Forwarded-For": "不是IP", "X-Real-IP": "198.51.100.7"})) == "198.51.100.7"
+    assert forwarded_address(_request({"X-Forwarded-For": "不是IP", "X-Real-IP": "也不是"})) == ""
+    assert forwarded_address(_request()) == ""
+
+
+def test_forwarded_header_is_only_used_when_the_peer_is_a_declared_proxy(settings: Settings) -> None:
+    """两层声明缺一不可：`trust_proxy=true` **且**直接对端在 `trusted_proxies` 里。"""
+    from fissue.web.auth import client_host
+
+    s = settings.model_copy(deep=True)
+    s.web.trust_proxy = True
+    s.web.trusted_proxies = ["203.0.113.0/24"]
+
+    # 对端正是声明的代理 → 按它追加的那一跳判定
+    assert client_host(_request({"X-Forwarded-For": "1.1.1.1, 192.168.1.50"}), s) == "192.168.1.50"
+    # 对端不在声明里（直连本服务的人）→ 用对端地址，伪造的头一律不认
+    spoof = _request({"X-Forwarded-For": "127.0.0.1"}, peer=("198.51.100.9", 1234))
+    assert client_host(spoof, s) == "198.51.100.9"
+
+    # 开关关掉 → 即便对端是代理也不看头
+    s.web.trust_proxy = False
+    assert client_host(_request({"X-Forwarded-For": "192.168.1.50"}), s) == "203.0.113.9"
+
+
+def test_trust_proxy_without_declared_proxies_is_rejected_at_load_time(tmp_path: Path) -> None:
+    """只勾 `trust_proxy` 不填代理网段 = 「谁的转发头都信」，必须在加载期挡下。
+
+    允许它的后果很具体：任何能直连本服务的人加一行 `X-Forwarded-For: 127.0.0.1`
+    就会被判成回环来源，而回环**免登录**——鉴权等于没有。
+    """
+    cfg = _write_cfg(tmp_path, {"web": {"trust_proxy": True}})
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+    with pytest.raises(ConfigError, match="trusted_proxies"):
+        load_settings(cfg, env)
+
+
+@pytest.mark.parametrize("bad", ["10.0.0.1", "内网", "10.0.0.0/33"])
+def test_invalid_trusted_proxy_is_rejected_at_load_time(tmp_path: Path, bad: str) -> None:
+    cfg = _write_cfg(tmp_path, {"web": {"trust_proxy": True, "trusted_proxies": [bad]}})
+    env = tmp_path / "empty.env"
+    env.write_text("", encoding="utf-8")
+    with pytest.raises(ConfigError, match="trusted_proxies"):
+        load_settings(cfg, env)
+
+
+def test_declared_proxy_makes_the_forwarded_client_trusted(settings: Settings, db: Database) -> None:
+    """声明了反代之后：来自代理的那一跳按真实客户端判定；非代理来源仍然不认头。"""
+    from fissue.web.app import create_app
+
+    _seed_admin(db)
+    s = settings.model_copy(deep=True)
+    s.web.trust_proxy = True
+    s.web.trusted_proxies = ["203.0.113.0/24"]
+
+    with TestClient(create_app(s), client=REMOTE) as via_proxy:
+        res = via_proxy.get("/api/v1/stats", headers={"X-Forwarded-For": "127.0.0.1"})
+        assert res.status_code == 200, "代理说客户端是回环 → 免登录（这是声明过的部署形态）"
+    with TestClient(create_app(s), client=("198.51.100.9", 1234)) as direct:
+        res = direct.get("/api/v1/stats", headers={"X-Forwarded-For": "127.0.0.1"})
+        assert res.status_code == 401, "不是声明的代理送来头 → 不可信，仍须登录"
+
+
 def test_session_authenticates_read_and_needs_csrf_for_write(settings: Settings, db: Database) -> None:
     _seed_admin(db)
     with _client(settings, REMOTE) as remote:

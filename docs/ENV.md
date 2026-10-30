@@ -90,11 +90,15 @@ FISSUE_ENV=/etc/fissue/.env.prod
 | 默认（零依赖） | `sqlite:///./data/fissue.db`（文件落在 `./data/`，父目录会自动创建） |
 | SQLite 绝对路径 | `sqlite:////home/me/fissue.db`（注意 4 个斜杠 = 绝对路径） |
 | PostgreSQL（生产 / 多机，推荐但需自建） | `postgresql+psycopg://用户:密码@主机:5432/库名` |
+| MySQL（8.0+，需自建） | `mysql+pymysql://用户:密码@主机:3306/库名` |
 | 密码含特殊字符 | 需 URL 编码，如 `@` → `%40`，`:` → `%3A` |
 
 ```bash
 # PostgreSQL 示例（换成 PG 时才需要）
 FISSUE_DATABASE_URL=postgresql+psycopg://fissue:my%40pass@localhost:5432/fissue
+
+# MySQL 示例（8.0+；库与库的字符集必须是 utf8mb4）
+FISSUE_DATABASE_URL=mysql+pymysql://fissue:my%40pass@localhost:3306/fissue?charset=utf8mb4
 ```
 
 **不填会怎样**：用内置默认 `sqlite:///./data/fissue.db`——零依赖、开箱即用，
@@ -108,6 +112,24 @@ fissue db init                     # 建表
 fissue db check                    # 验证连通
 ```
 
+**换成 MySQL 时首次准备**：
+
+```sql
+CREATE DATABASE fissue CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+-- 账号按需：CREATE USER 'fissue'@'%' IDENTIFIED BY '...'; GRANT ALL ON fissue.* TO 'fissue'@'%';
+```
+
+```bash
+fissue db init && fissue db check
+```
+
+> MySQL 侧的三条硬约束（实现已按它们落地，换库时别踩）：
+> ① **库/表字符集必须 utf8mb4**，否则中文与 emoji 直接乱码或报错；
+> ② 索引在 utf8mb4 下的上限是 **3072 字节**，所以键列用的是 511 字符（旧值 767 会让
+> 复合唯一索引建不上）；
+> ③ **TEXT 上限只有 64KB**——正文 / 沙盒日志 / 补丁这几列在 MySQL 上落成 `MEDIUMTEXT`。
+> 另外 `8.0` 之前的版本不支持 `FOR UPDATE SKIP LOCKED`，队列并发回收会失效，故要求 8.0+。
+
 **填错了什么表现**：
 
 | 现象 | 原因 | 解决 |
@@ -117,11 +139,15 @@ fissue db check                    # 验证连通
 | `password authentication failed` | 密码错或含特殊字符未编码 | 编码特殊字符 |
 | SQLite `unable to open database file` | 目录不存在 / 路径格式错 | 默认路径会自动建目录；自定义路径请确认父目录存在 |
 
-> **SQLite vs PostgreSQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
-> 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表）。
+> **SQLite vs PostgreSQL / MySQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
+> 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表），
+> **MySQL 8.0+** 是同一类选择（适合已有 MySQL 运维栈的环境）。
 > PG 后端已完成**真实部署验证**（`1.1.0-b4`：`db init` / `db check` / 全量单测 / 服务启动与
 > 页面实测均在该后端上跑过，见 [BENCHMARK.md §5](../BENCHMARK.md#5-尚未测量)）；
-> 但要注意验证的是**部署与并发路径**，跑分数字仍全部来自 SQLite。
+> **MySQL 后端目前只做过离线校验**（三方言 DDL 编译 + 索引宽度 + 迁移 SQL 的单测，
+> 未在真实实例上跑过全链路）——要用它，请先自己跑一遍 `fissue db init` / `db check` 与
+> 一轮 `fetch → eval → verify`。
+> 两者验证的都是**部署与并发路径**，跑分数字仍全部来自 SQLite。
 
 ---
 

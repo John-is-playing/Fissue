@@ -65,6 +65,7 @@ def test_mask_url_empty() -> None:
         ("postgresql+psycopg://u:pw@h/db", "postgresql"),
         ("postgres://h/db", "postgresql"),
         ("mysql://h/db", "mysql"),
+        ("mysql+pymysql://u:pw@h:3306/db", "mysql"),   # 驱动名不该混进「用的是哪种库」的答案
         ("", "unknown"),
     ],
 )

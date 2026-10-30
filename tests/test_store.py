@@ -1410,3 +1410,86 @@ def test_unforce_keeps_other_statuses_and_reports_missing(repo, sample_issue) ->
     assert fresh.status is ItemStatus.LABELED
 
     assert repo.unforce_item("github:psf/requests#404") is None
+
+
+# ---------------------------------------------------------------------------
+# MySQL 方言：DDL 可移植性（离线校验，不需要真 MySQL 服务器）
+# ---------------------------------------------------------------------------
+#
+# 为什么这一组必须存在：MySQL 的两条硬性约束**只在真机 `db init` 时**才会暴露，
+# 而本机没有 MySQL 实例可跑。这两条都能在编译期判出来，所以用「离线编译」钉住。
+
+
+def test_force_fix_migration_sql_differs_by_dialect() -> None:
+    """补列 SQL 按方言分派：MySQL 既没有 ``IF NOT EXISTS``，也没有 ``PRAGMA``。"""
+    from fissue.store.db import force_fix_migration
+
+    pg_probe, pg_alter = force_fix_migration("postgresql")
+    assert pg_probe is None, "PostgreSQL 的 ADD COLUMN IF NOT EXISTS 本身幂等，不必先探针"
+    assert "IF NOT EXISTS" in pg_alter
+
+    my_probe, my_alter = force_fix_migration("mysql")
+    assert my_probe is not None, "MySQL 没有 IF NOT EXISTS，必须先用探针查一次列"
+    assert "information_schema.columns" in my_probe
+    assert "DATABASE()" in my_probe
+    assert "IF NOT EXISTS" not in my_alter, "MySQL 不支持它，发过去是语法错"
+    assert my_alter.startswith("ALTER TABLE items ADD COLUMN force_fix")
+
+    lite_probe, lite_alter = force_fix_migration("sqlite")
+    # 用表值函数而不是 `PRAGMA table_info`：后者第一列是 cid，无法与列名比对。
+    assert lite_probe is not None
+    assert "pragma_table_info" in lite_probe
+    assert lite_alter.startswith("ALTER TABLE items ADD COLUMN force_fix")
+
+
+def test_all_tables_compile_under_mysql_dialect() -> None:
+    """每张表都要能在 mysql 方言下编译出 DDL，且索引宽度不超 utf8mb4 上限。
+
+    钉的是 MySQL 的两条硬约束：
+
+    * ``VARCHAR`` **必须带长度**——裸 ``String`` 会直接 ``CompileError``；
+    * ``utf8mb4`` 下**索引总宽 ≤ 3072 字节**——原来的键列是 767 字符（单列就
+      3068 字节），而 ``uq_item_identity`` 是四列复合唯一索引，一加必然超标。
+    """
+    from sqlalchemy.dialects import mysql
+    from sqlalchemy.schema import CreateTable, UniqueConstraint
+
+    from fissue.store.tables import Base
+
+    dialect = mysql.dialect()
+    for table in Base.metadata.sorted_tables:
+        CreateTable(table).compile(dialect=dialect)
+
+    def width(col) -> int:
+        """索引里这一列占多少字节：带长度的按 4 字节/字符（utf8mb4），其余按 4 字节估。"""
+        return (getattr(col.type, "length", None) or 0) * 4 or 4
+
+    for table in Base.metadata.sorted_tables:
+        for idx in table.indexes:
+            total = sum(width(c) for c in idx.columns)
+            assert total <= 3072, f"{table.name}.{idx.name} 占 {total} 字节，超出 MySQL 上限"
+        for uc in table.constraints:
+            if isinstance(uc, UniqueConstraint):
+                total = sum(width(col) for col in uc.columns)
+                assert total <= 3072, f"{table.name}.{uc.name} 占 {total} 字节，超出 MySQL 上限"
+
+
+def test_mysql_long_text_columns_become_mediumtext() -> None:
+    """正文 / 沙盒日志 / 补丁在 MySQL 上落成 ``MEDIUMTEXT``。
+
+    ``TEXT`` 上限 64KB，而 GitHub 正文上限正好是 **65536 字符**——UTF-8 下中文一多
+    就超，报错发生在写入那一刻，离原因很远。
+    """
+    from sqlalchemy.dialects import mysql
+
+    from fissue.store.tables import CommentRow, FixAttemptRow, ItemRow, VerifierRunRow
+
+    dialect = mysql.dialect()
+    for col in (
+        ItemRow.body,
+        CommentRow.body,
+        VerifierRunRow.stdout,
+        VerifierRunRow.stderr,
+        FixAttemptRow.diff,
+    ):
+        assert col.type.compile(dialect=dialect) == "MEDIUMTEXT"

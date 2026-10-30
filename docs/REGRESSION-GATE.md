@@ -1,7 +1,24 @@
 # 既有测试回归门（Regression Gate）
 
-> **状态：待实现（本文是制作规范，交给实施者执行）。**
+> **状态：已实现**——落在 `verifier/regression.py`（判定纯函数 `judge_regression`）、
+> `pipeline/stages.py`（接入 base / fix 两条流水线）与 `fixer/autofix.py`（拦下后的返修），
+> 配置项是 `verifier.regression_gate` / `regression_command` / `regression_timeout_seconds`
+> 与 `auto_fix.regression_retries`，测试见 `tests/test_regression_gate.py`。
+>
+> 本文**最初是交给实施者的制作规范**（所以 §5「实施环节」与 §6「验收标准」读起来像派工单）。
+> 落地后保留为**设计口径与验收清单**：那些清单仍然有效，但已经不是待办事项了。
+> 与本文的出入见下方「落地对照」。
+>
 > 阅读顺序：先读 [DESIGN.md §4](DESIGN.md#4-验证器与-f2pQ7) 了解 F2P 与验证器体系，再看本文。
+
+## 0. 落地对照（本文写完之后改掉的口径）
+
+| 本文原先的写法 | 实际落地 |
+|---|---|
+| §4.1 默认 `warn`，「先别阻断」 | 默认 **`strict`**。原先担心的大面积误杀已由 `judge_regression` 的安全底线挡住：base 阶段测试不绿、跑不通或超时**一律放行**（本门此时不可信，不据此拒绝）。于是 strict 只在「改之前是绿的、改完之后红了」这一种情形拦人——那正是它该拦的 |
+| §5 环节 3「新增 `RegressionGate` 类」 | 类在 `verifier/regression.py`；**判定**单独抽成纯函数 `judge_regression`，便于不起沙盒直接单测 |
+| （无） | 新增 `auto_fix.regression_retries`（默认 1）：被拦下时把「哪几条既有用例被改坏」喂回 Agent 重试——失败信息本身就是最好的下一步提示，直接收工等于把它扔掉 |
+| （无） | `run_broken_reason` 统一判 `ERROR`：pytest `exit=4` / 目标文件不存在 / conftest 加载失败都算「测试压根没跑」。沙盒镜像不含仓库第三方依赖，仓库 conftest 里 `import yaml` 就能让整轮跑不起来——这种情形**不可归咎于修复**，判成「修复破坏了既有测试」会把已通过的修复送进无意义的返修循环 |
 
 ---
 
@@ -252,7 +269,8 @@ regression_timeout_seconds: int = 900  # 单独预算，通常远大于单测验
 
 ### 6.3 工程要求
 
-- [ ] `pytest -q` 全量通过（当前基线 **362 passed**），且**无新增失败**。
+- [ ] `pytest -q` 全量通过（写本文时基线是 **362 passed**；`v1.2.0` 时全量已到
+      **1482 passed / 7 skipped**），且**无新增失败**。
 - [ ] 新增用例覆盖 §6.1 的全部条目。
 - [ ] 改动文件 `ruff check` **不新增**问题（仓库既有 lint 问题不算）。
 - [ ] 同步更新 `config.example.yaml`、`DESIGN.md`、`USAGE.md`。

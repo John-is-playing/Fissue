@@ -33,6 +33,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -42,6 +43,27 @@ class Base(DeclarativeBase):
 
 def _json_col() -> Mapped[dict]:
     return mapped_column(JSON, default=dict)
+
+
+def _long_text() -> Mapped[str]:
+    """长文本列（正文 / 日志 / 补丁）：MySQL 上必须落成 MEDIUMTEXT。
+
+    为什么不统一用 ``Text``：MySQL 的 ``TEXT`` 上限是 **64KB**，而
+    GitHub 的 Issue/PR 正文上限恰好也是 65536 **字符**——UTF-8 下中文一多就超，
+    报错是 ``Data too long for column 'body'``，且要到真正写入那一刻（抓取完整条之后）
+    才炸。沙盒 ``stdout`` / ``stderr`` 与修复 ``diff`` 同理，几千行输出很容易越过 64KB。
+
+    PostgreSQL 的 ``TEXT`` 与 SQLite 的 ``TEXT`` 都没有这个上限，所以只在 mysql
+    方言上换成 ``MEDIUMTEXT``（16MB）——其余方言的 DDL 一个字节都不变。
+    """
+    return mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql"), default="")
+
+
+#: 键列长度。为什么是 511 而不是更大的 767：MySQL + utf8mb4 的索引上限是 3072 **字节**
+#: （即 767 字符 × 4），而 `uq_item_identity` 是四列复合唯一索引
+#: （platform + repo_slug + number + item_type），各列相加后必须留在 3072 字节内：
+#: 64 + 2044 + 256 + 32 = 2396 字节。原值 767 单列就吃掉 3068 字节，复合索引必然建不上。
+KEY_LEN = 511
 
 
 class RepoRow(Base):
@@ -75,12 +97,12 @@ class ItemRow(Base):
     repo_slug: Mapped[str] = mapped_column(String(511), index=True)
     # 编号存字符串：Gitee 的 Issue 编号是字母编码（`IKKIOZ`），Integer 列放不下语义。
     # 数字平台的编号照样能存（SQLite 会按亲和性处理），键与 URL 都用 f-string 拼，不受影响。
-    number: Mapped[str] = mapped_column(String)
+    number: Mapped[str] = mapped_column(String(64))
     item_type: Mapped[str] = mapped_column(String(8), index=True)     # issue | pr
-    key: Mapped[str] = mapped_column(String(767), unique=True, index=True)
+    key: Mapped[str] = mapped_column(String(KEY_LEN), unique=True, index=True)
 
     title: Mapped[str] = mapped_column(Text, default="")
-    body: Mapped[str] = mapped_column(Text, default="")
+    body: Mapped[str] = _long_text()
     state: Mapped[str] = mapped_column(String(32), default="open", index=True)
     labels: Mapped[list] = mapped_column(JSON, default=list)
     author: Mapped[str] = mapped_column(String(255), default="")
@@ -139,7 +161,7 @@ class CommentRow(Base):
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
     author: Mapped[str] = mapped_column(String(255), default="")
     author_kind: Mapped[str] = mapped_column(String(16), default="unknown")
-    body: Mapped[str] = mapped_column(Text, default="")
+    body: Mapped[str] = _long_text()
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     item: Mapped[ItemRow] = relationship(back_populates="comments")
@@ -152,14 +174,14 @@ class EvaluationRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
 
     scores: Mapped[dict] = _json_col()               # {dim: {score, reason, evidence, confidence}}
     category: Mapped[str] = mapped_column(String(16), default="unknown")
     action: Mapped[str] = mapped_column(String(24), default="triage")
     priority: Mapped[str] = mapped_column(String(16), default="none")
     labels_suggested: Mapped[list] = mapped_column(JSON, default=list)
-    summary: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = _long_text()
     spam: Mapped[dict] = _json_col()
 
     model: Mapped[str] = mapped_column(String(128), default="")
@@ -176,7 +198,7 @@ class VerifierRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), index=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     kind: Mapped[str] = mapped_column(String(16))      # executable | checklist | shell
     name: Mapped[str] = mapped_column(String(255), default="verifier")
     language: Mapped[str] = mapped_column(String(32), default="python")
@@ -202,12 +224,12 @@ class VerifierRunRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     verifier_id: Mapped[int] = mapped_column(ForeignKey("verifiers.id", ondelete="CASCADE"), index=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     stage: Mapped[str] = mapped_column(String(16), index=True)   # base | fix | merged
     outcome: Mapped[str] = mapped_column(String(16), index=True) # pass | fail | error | timeout | skipped
     exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    stdout: Mapped[str] = mapped_column(Text, default="")
-    stderr: Mapped[str] = mapped_column(Text, default="")
+    stdout: Mapped[str] = _long_text()
+    stderr: Mapped[str] = _long_text()
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     f2p_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     artifacts_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -224,7 +246,7 @@ class QueueEntryRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     queue: Mapped[str] = mapped_column(String(16), index=True)   # verify | fix_bug | fix_feature
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending|running|done|failed
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -245,7 +267,7 @@ class BatchConclusionRow(Base):
     __tablename__ = "batch_conclusions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     batch_id: Mapped[str] = mapped_column(String(64), index=True)
     verdict: Mapped[str] = mapped_column(String(24), default="")
     labels: Mapped[list] = mapped_column(JSON, default=list)
@@ -260,13 +282,13 @@ class FixAttemptRow(Base):
     __tablename__ = "fix_attempts"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True)
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     outcome: Mapped[str] = mapped_column(String(16), index=True)
     branch: Mapped[str | None] = mapped_column(String(255), nullable=True)
     fork: Mapped[str | None] = mapped_column(String(511), nullable=True)
     pr_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
     pr_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    diff: Mapped[str] = mapped_column(Text, default="")
+    diff: Mapped[str] = _long_text()
     patch_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     changed_files: Mapped[list] = mapped_column(JSON, default=list)
     rounds: Mapped[int] = mapped_column(Integer, default=0)
@@ -281,7 +303,7 @@ class LLMUsageRow(Base):
     __tablename__ = "llm_usage"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    repo_key: Mapped[str] = mapped_column(String(767), index=True, default="")
+    repo_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True, default="")
     purpose: Mapped[str] = mapped_column(String(48), index=True, default="")   # classify|evaluate|verifier|batch|fix|agent
     model: Mapped[str] = mapped_column(String(128), default="")
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -295,7 +317,7 @@ class ScanRunRow(Base):
     __tablename__ = "scan_runs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    repo_key: Mapped[str] = mapped_column(String(767), index=True)
+    repo_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     fetched: Mapped[int] = mapped_column(Integer, default=0)
@@ -312,7 +334,7 @@ class NotificationRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event: Mapped[str] = mapped_column(String(48), index=True)
-    item_key: Mapped[str] = mapped_column(String(767), index=True, default="")
+    item_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True, default="")
     channel: Mapped[str] = mapped_column(String(32), default="")
     dedup_key: Mapped[str] = mapped_column(String(255), index=True)
     payload: Mapped[dict] = _json_col()

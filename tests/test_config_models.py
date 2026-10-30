@@ -444,6 +444,7 @@ def test_on_failure_rejects_undocumented_values(tmp_path: Path, value: str) -> N
         "",
         "   ",
         "not a url",
+        "mysql+nosuchdriver://u:pw@h:3306/db",       # 驱动名写错：写了 mysql 也得在加载期挡下
     ],
 )
 def test_malformed_database_url_is_rejected_at_load_time(tmp_path: Path, bad: str) -> None:
@@ -470,6 +471,10 @@ def test_malformed_database_url_is_rejected_at_load_time(tmp_path: Path, bad: st
         (
             "postgresql+psycopg://fissue:pw@localhost:5432/fissue",
             "postgresql+psycopg://fissue:pw@localhost:5432/fissue",
+        ),
+        (
+            "mysql+pymysql://fissue:pw@localhost:3306/fissue?charset=utf8mb4",
+            "mysql+pymysql://fissue:pw@localhost:3306/fissue?charset=utf8mb4",
         ),
         ("sqlite:////home/john/my db.db", "sqlite:////home/john/my db.db"),   # 路径里的空格要留着
         ("sqlite:////home/john/x.db   ", "sqlite:////home/john/x.db"),        # 尾随空白要去掉

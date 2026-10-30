@@ -37,6 +37,23 @@
       </div>
     </div>
 
+    <div class="k">反向代理</div>
+    <div class="v">
+      <label class="inline">
+        <input type="checkbox" id="overlay-trust-proxy" {{ 'checked' if view.effective.trust_proxy }}>
+        按真实客户端地址判定来源（<code>web.trust_proxy</code>）
+      </label>
+      <textarea id="overlay-trusted-proxies" rows="2" style="width:320px" spellcheck="false"
+                placeholder="127.0.0.1/32">{{ view.effective.trusted_proxies_text }}</textarea>
+      <div class="muted small">
+        每行一个 CIDR（<code>web.trusted_proxies</code>）= <b>反向代理自身的网段</b>。
+        两项<b>同时</b>满足才采信 <code>X-Forwarded-For</code> 的<b>最右一跳</b>；
+        只勾选不填网段，配置会在加载期直接报错——因为「谁的转发头都信」等于让任何人
+        加一行 <code>X-Forwarded-For: 127.0.0.1</code> 就绕过全部鉴权（回环免登录）。
+        上方「可信内网」填的是<b>客户端</b>网段（放行谁），这里填的是<b>代理</b>网段（信谁的话）。
+      </div>
+    </div>
+
     <div class="k">会话时长</div>
     <div class="v">
       <input type="number" id="overlay-session-ttl" min="1" style="width:120px"

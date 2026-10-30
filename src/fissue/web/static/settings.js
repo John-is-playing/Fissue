@@ -78,6 +78,15 @@
       .filter(function (s) { return s.length > 0; });
     var seen = {};
     nets = nets.filter(function (ip) { if (seen[ip]) return false; seen[ip] = true; return true; });
+    // 代理网段同样按行拆；两项必须一起交——只交其中一项，另一项会退回默认值，
+    // 而「trust_proxy=true 但没有代理网段」在服务端是硬错误（会 400）。
+    var proxies = val("overlay-trusted-proxies").split("\n")
+      .map(function (s) { return s.trim(); })
+      .filter(function (s) { return s.length > 0; });
+    var seenProxy = {};
+    proxies = proxies.filter(function (ip) {
+      if (seenProxy[ip]) return false; seenProxy[ip] = true; return true;
+    });
     return {
       web: {
         allow_remote_config_write: checked("overlay-allow-remote"),
@@ -87,7 +96,9 @@
           secure_cookie: checked("overlay-secure-cookie"),
           login_max_failures: intOr("overlay-max-failures", 5)
         },
-        trusted_networks: nets
+        trusted_networks: nets,
+        trust_proxy: checked("overlay-trust-proxy"),
+        trusted_proxies: proxies
       },
       // 计费 / 预算 / 生成参数：整组一起交（页面上的值是**生效值**回填，所见即所写）。
       // 边界由服务端的 pydantic 约束兜底，这里不做格式判断——写不合法就 400、文件一字不动。

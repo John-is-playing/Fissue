@@ -90,9 +90,9 @@
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `database.url` | `postgresql+psycopg://...` | 可被 `FISSUE_DATABASE_URL` 覆盖 |
+| `database.url` | `sqlite:///./data/fissue.db` | 可被 `FISSUE_DATABASE_URL` 覆盖；可选 PostgreSQL（`postgresql+psycopg://`）或 MySQL 8.0+（`mysql+pymysql://`） |
 | `database.echo` | `false` | 打印 SQL |
-| `database.pool_size` | `5` | 连接池大小 |
+| `database.pool_size` | `5` | 连接池大小（SQLite 不用） |
 
 ### `llm`
 
@@ -271,6 +271,8 @@
 | `web.auth.secure_cookie` | `false` | 反向代理已提供 HTTPS 时置 `true` |
 | `web.auth.login_max_failures` | `5` | 连续失败多少次后指数退避锁定 |
 | `web.trusted_networks` | `[]` | 可信 CIDR（如 `["192.168.1.0/24"]`）——落在其中的来源**视为等同回环** |
+| `web.trust_proxy` | `false` | 是否采信反代转发头；**必须**同时配 `web.trusted_proxies`，否则加载期报错 |
+| `web.trusted_proxies` | `[]` | 反向代理自身的 CIDR（如 `["127.0.0.1/32"]`）；只有这些对端送来的转发头才算数 |
 | `api.enabled` | `true` | 是否注册 REST API |
 | `api.prefix` | `/api/v1` | API 前缀 |
 

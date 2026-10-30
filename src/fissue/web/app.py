@@ -298,7 +298,9 @@ def _reject_proxied_write(request: Request, settings: Settings) -> None:
                 f"拒绝写操作：请求带有反向代理转发头（{'、'.join(hit)}），"
                 "但既没有通过认证，也没有声明可信网段。"
                 "请在 /login 登录（或用 API Key），"
-                "若这个控制面确实挂在反向代理后面，请把代理/内网网段写进 web.trusted_networks。"
+                "若这个控制面确实挂在反向代理后面：把代理网段写进 web.trusted_proxies 并打开 "
+                "web.trust_proxy（此后按真实客户端地址判定）；"
+                "只想放行内网，则把内网网段写进 web.trusted_networks。"
             ),
         )
 
@@ -314,13 +316,12 @@ def _reject_remote_write(request: Request, settings: Settings) -> None:
     拿不到可解析的对端地址时（测试客户端 ``testclient``、Unix socket 等）不在这里判——
     「不知道」不等于「可疑」，不能因此把本机正常用法也拦掉。
     """
-    from .auth import resolve_identity
+    from .auth import client_host, resolve_identity
 
     identity = resolve_identity(request)
     if identity.allowed:
         return
-    client = request.client
-    host = (client.host if client else "") or ""
+    host = client_host(request, settings)
     try:
         addr = ipaddress.ip_address(host)
     except ValueError:
@@ -331,7 +332,8 @@ def _reject_remote_write(request: Request, settings: Settings) -> None:
             detail=(
                 f"拒绝写操作：请求来自 {host}，既不是本机回环/可信网段，也没有通过认证。"
                 "请在该机器上访问 /login 登录（或带上 API Key）；"
-                "若这台机器只有可信网络可达，可把网段写进 web.trusted_networks。"
+                "若这台机器只有可信网络可达，可把网段写进 web.trusted_networks；"
+                "若中间隔着反向代理，见 web.trust_proxy 与 web.trusted_proxies。"
             ),
         )
 

@@ -29,6 +29,7 @@
 | LLM API Key | **必需** | — | 见第 3 节 |
 | Docker | 建议（沙盒验证需要隔离） | `docker info` | 可降级本地执行，但**无隔离** |
 | PostgreSQL | 可选（生产 / 多机推荐；默认用 SQLite） | `psql --version` | 不装也能跑——默认走 SQLite |
+| MySQL | 可选（8.0+；已有 MySQL 运维栈时的同类选择） | `mysql --version` | 不装也能跑——默认走 SQLite；见 `docs/ENV.md` 第 2 节 |
 
 ```bash
 python --version     # 期望 Python 3.10+
@@ -98,6 +99,9 @@ FISSUE_DATABASE_URL=sqlite:///./data/fissue.db
 
 # 生产 / 多机换 PostgreSQL（SQLite 并发写会锁表）
 FISSUE_DATABASE_URL=postgresql+psycopg://fissue:fissue@localhost:5432/fissue
+
+# 或者换 MySQL 8.0+（库与表字符集须 utf8mb4；详见 docs/ENV.md 第 2 节）
+FISSUE_DATABASE_URL=mysql+pymysql://fissue:fissue@localhost:3306/fissue?charset=utf8mb4
 ```
 
 > 换 PostgreSQL 时需先建库：`createdb -U fissue fissue`

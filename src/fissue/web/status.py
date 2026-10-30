@@ -69,6 +69,10 @@ def _backend_of(url: str) -> str:
         return "sqlite"
     if "postgres" in scheme:
         return "postgresql"
+    if "mysql" in scheme:
+        # 页面上显示的名字要能一眼认出后端；`mysql+pymysql` 原样显示会把驱动名
+        # 混进「用的是哪种库」这个问题的答案里。
+        return "mysql"
     return scheme or "unknown"
 
 

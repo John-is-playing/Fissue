@@ -209,13 +209,67 @@ def throttle_of(request: Request) -> LoginThrottle:
 
 
 def peer_host(request: Request) -> str:
+    """**直接对端**的地址（TCP 层连上来的那一跳，不看任何转发头）。"""
     client = request.client
     return (client.host if client else "") or ""
 
 
-def _peer_address(request: Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+def forwarded_address(request: Request) -> str:
+    """从转发头里取出**最右一跳**的地址；取不到返回空串。
+
+    为什么只取最右一跳：``X-Forwarded-For`` 是「客户端, 代理1, 代理2」这样**追加**的，
+    左侧各段完全由客户端自己写（谁都能塞一个 127.0.0.1 进去），只有紧挨着我们的那个
+    代理追加的那一段才可信。多个代理串联时请把**最后一跳**代理写进 ``trusted_proxies``。
+
+    取不到合法 IP（头里是域名、端口、垃圾值）就返回空串，交给调用方回退到对端地址——
+    这里的失败必须是「不采信」，不能是「猜一个」。
+    """
+    raw = request.headers.get("x-forwarded-for", "")
+    if raw:
+        last = raw.split(",")[-1].strip()
+        # 少数代理会写成 `1.2.3.4:5678` / `[::1]:5678`，把端口剥掉再判。
+        if last.startswith("["):
+            last = last[1:].split("]", 1)[0]
+        elif last.count(":") == 1:
+            last = last.split(":", 1)[0]
+        try:
+            return str(ipaddress.ip_address(last))
+        except ValueError:
+            pass
+    real = request.headers.get("x-real-ip", "").strip()
+    if real:
+        try:
+            return str(ipaddress.ip_address(real))
+        except ValueError:
+            return ""
+    return ""
+
+
+def client_host(request: Request, settings: Settings) -> str:
+    """**视为真实客户端**的地址——转发头只在两层声明都满足时才采信。
+
+    判定顺序（缺一不可）：
+
+    1. ``web.trust_proxy`` 打开（部署形态是「反代 + 真实客户端地址」）；
+    2. 请求的**直接对端**落在 ``web.trusted_proxies`` 里（这一跳确实是我们自己的代理）。
+
+    两条都满足才用转发头里的地址；否则一律用对端地址。少了第 2 条的后果很直接：
+    任何人直连本服务、加一行 ``X-Forwarded-For: 127.0.0.1`` 就会被当成回环来源，
+    而回环是**免登录**的——等于鉴权形同虚设。
+    """
+    immediate = peer_host(request)
+    if not settings.web.trust_proxy:
+        return immediate
+    if settings.web.proxy_network_of(immediate) is None:
+        # 这一跳不是我们声明过的代理：它送来的转发头没有意义（很可能是伪造）。
+        return immediate
+    return forwarded_address(request) or immediate
+
+
+def _peer_address(request: Request, settings: Settings | None = None):
+    host = client_host(request, settings) if settings is not None else peer_host(request)
     try:
-        return ipaddress.ip_address(peer_host(request))
+        return ipaddress.ip_address(host)
     except ValueError:
         return None
 
@@ -227,7 +281,7 @@ def source_of(request: Request, settings: Settings) -> tuple[str, str]:
     这与 ``web/app.py`` 里既有的 ``_reject_remote_write`` / ``setup.py::_peer_is_loopback``
     是同一个口径：「不知道对端是谁」不等于「可疑」，拿它去拦会把本机正常用法一起挡掉。
     """
-    addr = _peer_address(request)
+    addr = _peer_address(request, settings)
     if addr is None:
         return SOURCE_LOOPBACK, ""
     if addr.is_loopback:
@@ -293,12 +347,16 @@ def forwarded_without_declaration(
     * 已认证（会话 / API Key）→ 放行：身份是实打实核对过的，经不经代理都无所谓；
     * 声明了 ``web.trusted_networks`` → 放行：这是 docs/AUTH.md §6 给「反代 + 可信网」
       规定的显式配置方式（判定只看真实对端，不信任转发头本身）；
+    * 声明了「反代 + 代理网段」（``web.trust_proxy`` + ``trusted_proxies``，且这一跳
+      确实是那个代理）→ 放行：这种部署下转发头**本来就是**来源判定的一部分；
     * 其余 → 命中转发头就拒，把「静默开放」变成「响亮拒绝」。
 
     必须说清边界：**这是补刀，不是安全边界**。同机代理一个转发头都不设时，它与本机直连
     在协议上无法区分——真正的边界是身份，以及「反代部署要显式声明」这条约定。
     """
     if identity.authenticated or settings.web.trusted_networks:
+        return []
+    if settings.web.trust_proxy and settings.web.proxy_network_of(peer_host(request)) is not None:
         return []
     return [name for name in FORWARD_HEADERS if request.headers.get(name)]
 
