@@ -52,6 +52,11 @@
 
 {% include "_settings/platform_tokens.html" %}
 
+{# 入站 webhook 的签名密钥。与上一块（平台 Token）是**两类不同的密钥**：
+   token 是「我们去调平台」，secret 是「平台来调我们」时的验签凭证。
+   此前它只能手写进 .env，于是「密钥管理」这一页缺了整整一类密钥。 #}
+{% include "_settings/webhook_secrets.html" %}
+
 {% include "_settings/database.html" %}
 
 {% include "_settings/web_access.html" %}

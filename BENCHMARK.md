@@ -341,6 +341,10 @@ ERROR 拉取镜像失败：… context deadline exceeded
 **我们倾向读法 1，但没有把 README 改掉**——因为"期望表"是夹具的规格，
 不该为了让实测好看而修改。这个不一致目前**公开保留**。
 
+> **2026-10-30 复测**：这 5 处**全部转命中**（重要性回落到 62~76），但同一次运行里反向
+> 多出 `#3/#5/#7` 三处偏差——见 [§4.7.1](#471-复测2026-10-30偏差不是一份稳定清单而是阈值边界抖动)。
+> 结论：这是**阈值边界抖动**，不是可勾销的缺陷清单。
+
 ### 4.3 textkit 缺少回归门数据
 
 textkit 跑在回归门功能（`7bddf08`）合入之前，因此没有 `regression:*` 记录。
@@ -453,6 +457,87 @@ E    +  where True = should_retry(ValueError('x'), attempt=2)   # attempts=2，�
 tier1 的实测 < 80（判 tier2）。**方向相反，说明这是阈值标定问题，而非「模型一律偏
 松 / 偏严」。** 与 §4.2 一样，**不改夹具期望表**：期望表是规格，不该为了让实测好看
 而修改。
+
+> **2026-10-30 复测**：仍 4 处未命中，且 `#4` 反向翻成 tier1（重要性 72 → 82）——见
+> [§4.7.1](#471-复测2026-10-30偏差不是一份稳定清单而是阈值边界抖动)。
+
+### 4.7.1 复测（2026-10-30）：偏差**不是**一份稳定清单，而是阈值边界抖动
+
+§4.2 与 §4.7 各自记了「envkit 5 处 / lockkit 4 处」期望偏差，并公开保留。这次用**当前代码 +
+当前配置**在同一套夹具上重跑了一遍（模型 `deepseek-flash`，后端 MySQL 8.0——顺带验证了 MySQL
+链路）。结果**数量级接近，但清单变了**，这一点比原来那 9 条更值得写下来。
+
+**envkit**（README 期望 `#1/#3/#5/#7` = tier1，`#2/#4/#6/#8/#9` = tier2，门槛
+`fix_policy.tier1.min_importance = 80`）：
+
+| # | README 期望 | 本次实测 | 重要性 | 难度 | 与上一轮比 |
+|---|---|---|---|---|---|
+| 1 | tier1 | tier1 | 82 | 22 | ✅ 命中 |
+| 2 | tier2 | tier2 | 76 | 14 | ✅ **由偏差转为命中**（旧值 85） |
+| 3 | tier1 | **tier2** | 75 | 22 | ❌ 反向偏差（旧轮命中） |
+| 4 | tier2 | tier2 | 68 | 18 | ✅ **由偏差转为命中** |
+| 5 | tier1 | **tier2** | 65 | 12 | ❌ 反向偏差（旧轮命中） |
+| 6 | tier2 | tier2 | 70 | 15 | ✅ **由偏差转为命中** |
+| 7 | tier1 | **tier2** | 68 | 20 | ❌ 反向偏差（旧轮命中） |
+| 8 | tier2 | tier2 | 66 | 18 | ✅ **由偏差转为命中** |
+| 9 | tier2 | tier2 | 62 | 15 | ✅ **由偏差转为命中** |
+
+→ 旧轮那 5 处**全部转命中**，却反向多出 3 处（`#3/#5/#7`）：两次都是 5±，但**不是同一批条目**。
+
+**lockkit**（README 期望 `#1/#3/#5/#8` = tier1，`#2/#4/#6/#7/#9` = tier2）：
+
+| # | README 期望 | 本次实测 | 重要性 | 难度 | 与上一轮比 |
+|---|---|---|---|---|---|
+| 1 | tier1 | **tier2** | 74 | 18 | ❌ 与旧轮一致 |
+| 2 | tier2 | tier2 | 76 | 12 | ✅ |
+| 3 | tier1 | **tier2** | 72 | 12 | ❌ 与旧轮一致 |
+| 4 | tier2 | **tier1** | 82 | 12 | ❌ **反向偏差**（旧轮命中，旧值 72） |
+| 5 | tier1 | **tier2** | 62 | 6 | ❌ 与旧轮一致 |
+| 6 | tier2 | tier2 | 68 | 15 | ✅ |
+| 7 | tier2 | tier2 | 76 | 18 | ✅ |
+| 8 | tier1 | **tier2** | 72 | 18 | ❌ 与旧轮一致 |
+| 9 | tier2 | tier2 | 68 | 10 | ✅ |
+
+→ 由 4 处变 5 处，**多出来的那一处是反方向的**（`#4` 的重要性从 72 变成 82，跨过门槛）。
+
+**结论（三句话）**：
+
+1. 两轮的重要性评分都密集落在 **62 ~ 82**，而门槛正好是 **80**——门槛就压在这段分布的右端，
+   单次评分抖动几十分就能跨线。所以「哪几条偏差」会随运行而变，**它不是一份可勾销的缺陷清单**。
+2. 偏差的**功能后果为零**：tier1 与 tier2 都会进入自动修复队列（`fix_candidates` 同时取两档），
+   区别只是标签写成哪一档。两次运行里 9 条「应自动修复」的期望都照常达成。
+3. 因此处置是：**不改夹具期望表**（那是规格，改它只是让实测好看）、**也不调阈值去凑命中**
+   （那只是把抖动搬到另一侧），而是把度量做成可复跑的一段、并公开这份对照。若将来真要
+   让这个区分有行为意义（例如 tier1 自动提 PR、tier2 只产补丁待人工确认），那是产品决策，
+   不是标定修正——届时门槛需要重新定在分布的空隙上，而不是压在密集区里。
+
+**怎么复跑**（本机实测过的命令；`--limit` 要大于条目数，否则抓取会因「数据不完整」而不推进游标）：
+
+```bash
+# 1) 干净库（这里用 Docker MySQL 8.0；SQLite 直接把 FISSUE_DATABASE_URL 换成临时文件即可）
+docker exec fissue-mysql mysql -uroot -p*** -e \
+  "DROP DATABASE IF EXISTS fissue; CREATE DATABASE fissue CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+export FISSUE_DATABASE_URL="mysql+pymysql://fissue:***@127.0.0.1:13306/fissue?charset=utf8mb4"
+fissue db init
+
+# 2) 抓取 + 评测两套夹具
+for repo in envkit lockkit; do
+  fissue fetch --repo John-is-playing/$repo --limit 30
+  fissue eval  --repo John-is-playing/$repo --all
+done
+
+# 3) 逐条对照（重要性 / 难度 / tier）
+SELECT i.repo_slug, i.number,
+       JSON_EXTRACT(e.scores, '$.importance.score') AS imp,
+       JSON_EXTRACT(e.scores, '$.difficulty.score') AS diff,
+       e.priority
+FROM items i JOIN evaluations e ON e.item_id = i.id
+ORDER BY i.repo_slug, CAST(i.number AS UNSIGNED);
+```
+
+> 也注意两个口径细节：PR（`envkit#16/#17/#19/#20`、`lockkit#16-#20`）的 `priority` 恒为
+> `none`——`fix_policy.only_issues=true` 不做 PR 自动修复；`lockkit#11/#13/#14` 等低真实性
+> 条目按规则不修复。
 
 ### 4.8 首次真跑暴露的 7 个缺陷（2026-10-13，均已修复）
 
@@ -744,6 +829,24 @@ Python 项目 `wtk`（均值 / 中位数 / 百分位），**刻意留了一处�
 （带 `#` 报 `Color请输入正确的16进制颜色值`），AtomGit 要**带 `#`**（裸的报
 `Color must be a valid color code`）。所以 v5 的默认 `_create_label`（`color.replace("#","")`）
 对 Gitee 本来就是对的，只有 AtomGit 需要覆写——**同一个字段，两个平台两种口径，谁也别照抄谁**。
+
+**2026-10-30 复核：仍未解决，而且当前环境连复核都做不了**。本机 `.env` 里
+`FISSUE_GITEE_TOKEN` **为空**（令牌早已失效/被清掉），所以这一条既不是「已修好待验证」，
+也不是「验证过没通过」，而是**原因未定位 + 无凭据可复核**。按本项目的约定，平台写操作由人
+执行（agent 不代跑建 Issue / 提 PR 这类动作），因此这里只给出可照做的探测步骤与判据：
+
+| 步骤 | 动作 | 期望 |
+|---|---|---|
+| 1 | 在 Gitee → 设置 → 私人令牌，签发一枚**带 Issue 作用域**的令牌 | — |
+| 2 | `FISSUE_GITEE_TOKEN=<token> fissue fetch --repo <你自己的公开库> --limit 1` | 只读通（200）——用来区分「令牌无效」与「只有条目级写被挡」 |
+| 3 | 用同一枚令牌直接 `POST https://gitee.com/api/v5/repos/<owner>/<repo>/issues`，body `{"title":"写探测（可删除）","body":"probe"}` | 仍 `404 project or enterprise` → 平台限制成立，本条维持「未验证」；`201` → 旧结论过期，须回头重查 `platforms/v5.py` 的条目级写 |
+| 4 | 把状态码、错误体、日期补进本节 | — |
+
+**判据先看状态码再看文案**：`project or enterprise` 只是平台返回的字面，字面不等于因果
+（本节两条假设都已被证伪）。真正能定性的对照只有三种：换令牌、换（公开/私有）仓库、
+换 OAuth 应用令牌。**在那之前，本节结论仍然是「Gitee 条目级写在上游受限、原因未定位」，
+不是「Fissue 的 Gitee 适配器有 bug」**——仓库级写（建分支、提 PR、建仓库标签）在同一次
+实测里是通的。
 
 ---
 

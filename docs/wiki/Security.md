@@ -110,7 +110,9 @@
 - **不要**用 `sandbox.runtime: local`、也不要打开 `sandbox.allow_local_fallback` 处理不可信代码。
 - 用**最小权限** Token：抓取只读即可；仅自动修复需要写权限。
 - 限制 Web 监听地址（默认 `127.0.0.1`）。
-- 用 webhook 时给**每个已启用平台**配 `FISSUE_WEBHOOK_<平台>_SECRET`，且**不要复用 API token 当 webhook 密钥**。
+- 用 webhook 时给**每个已启用平台**配 `FISSUE_WEBHOOK_<平台>_SECRET`（`/settings` 页面里就能填，
+  不必上机器改 `.env`），且**不要复用 API token 当 webhook 密钥**——两者的方向相反：
+  Token 是「Fissue 去调平台」，Secret 是「平台来调 Fissue」时的验签凭证。
 - webhook 必须能被**平台服务器**访问到：只绑回环、或反代不放行 `/api/v1/webhooks/*` 都会让推送永远到不了。
 - 定期轮换平台 Token 与 LLM Key。
 

@@ -53,6 +53,9 @@
 | `FISSUE_WEBHOOK_GITEE_SECRET` | Gitee webhook 密码 | — | 同上 |
 | `FISSUE_WEBHOOK_ATOMGIT_SECRET` | AtomGit webhook 密钥 | — | 同上 |
 | `FISSUE_WEBHOOK_GITLAB_SECRET` | GitLab Secret token | — | 同上 |
+
+> 上表里带「密钥 / Token / Secret」的键都能在 **`/settings` 页面**改写（写入 `.env`，留空 = 不改动，
+> 勾「清空」= 移除本层设置）。页面只回「已配置 / 未配置」与掩码，**不回显原值**。
 | `FISSUE_LABEL_CACHE_TTL` | 仓库标签列表的进程内缓存秒数（等价 `platforms.label_cache_ttl_seconds`，`0` = 不缓存） | `600` | 否 |
 | `FISSUE_WEB_HOST` | Web/API 绑定地址 | `127.0.0.1` | 否 |
 | `FISSUE_WEB_PORT` | Web/API 端口 | `8000` | 否 |

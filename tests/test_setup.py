@@ -395,6 +395,27 @@ def test_settings_page_masks_secrets_and_never_echoes_them(
     assert "sk-super-secret-value" not in page
 
 
+def test_webhook_secret_is_managed_like_any_other_key(settings: Settings, client: Any) -> None:
+    """入站 webhook 的签名密钥曾是「密钥管理」唯一漏掉的一类密钥。
+
+    它此前只能手写进 .env，而它恰恰是 webhook 端点**唯一**的身份证明（该端点不带 bearer
+    鉴权）。既然页面已经能改平台 Token 与 LLM Key，就不该把它留在机器上。
+    """
+    page = client.get("/settings").text
+    assert 'id="env-FISSUE_WEBHOOK_GITHUB_SECRET"' in page, "设置页得有这一格"
+    assert 'id="env-FISSUE_WEBHOOK_ENABLED"' in page
+
+    r = client.put("/api/v1/settings", json={"env": {"FISSUE_WEBHOOK_GITHUB_SECRET": "whsec-abc123"}})
+    assert r.status_code == 200
+
+    data = client.get("/api/v1/settings").json()
+    item = next(i for i in data["env_items"] if i["key"] == "FISSUE_WEBHOOK_GITHUB_SECRET")
+    assert item["set"] is True
+    # 与其它密钥同口径：页面只回掩码，绝不回显原值
+    assert "whsec-abc123" not in str(data)
+    assert "whsec-abc123" not in client.get("/settings").text
+
+
 def test_blank_secret_means_leave_unchanged(settings: Settings, client: Any) -> None:
     """留空 = 不改动。
 

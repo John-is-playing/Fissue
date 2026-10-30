@@ -78,6 +78,14 @@ ENV_WRITABLE: dict[str, str] = {
     "FISSUE_GITEE_TOKEN": "Gitee Token",
     "FISSUE_ATOMGIT_TOKEN": "AtomGit Token",
     "FISSUE_GITLAB_TOKEN": "GitLab Token",
+    # 入站 webhook 的签名密钥与 API token 是**两回事**（docs/wiki/Security.md 明确要求别混用）：
+    # token 是我们去调平台，secret 是平台来调我们时用来验签的。它此前只能在 .env 里手写，
+    # 于是「密钥管理」这一页缺了整整一类密钥——而它恰恰是 webhook 端点唯一的身份证明。
+    "FISSUE_WEBHOOK_GITHUB_SECRET": "GitHub webhook 签名密钥",
+    "FISSUE_WEBHOOK_GITEE_SECRET": "Gitee webhook 签名密钥",
+    "FISSUE_WEBHOOK_ATOMGIT_SECRET": "AtomGit webhook 签名密钥",
+    "FISSUE_WEBHOOK_GITLAB_SECRET": "GitLab webhook 签名密钥",
+    "FISSUE_WEBHOOK_ENABLED": "启用入站 webhook（true/false）",
     "FISSUE_DATABASE_URL": "数据库连接串",
     "FISSUE_WEB_HOST": "监听地址",
     "FISSUE_WEB_PORT": "监听端口",
@@ -92,6 +100,11 @@ SECRET_KEYS: frozenset[str] = frozenset(
         "FISSUE_GITEE_TOKEN",
         "FISSUE_ATOMGIT_TOKEN",
         "FISSUE_GITLAB_TOKEN",
+        # webhook 签名密钥：页面同样不能回显原值——它等同于「能给我们的端点发消息」的凭证。
+        "FISSUE_WEBHOOK_GITHUB_SECRET",
+        "FISSUE_WEBHOOK_GITEE_SECRET",
+        "FISSUE_WEBHOOK_ATOMGIT_SECRET",
+        "FISSUE_WEBHOOK_GITLAB_SECRET",
         # 连接串也算密钥：`postgresql+psycopg://user:pw@host/db` 的 pw 明文在里面。
         # 同一批代码在 status.py 里专门写了 `mask_url` 去遮它，而设置页曾经把它**原样回显**
         # 给浏览器（含口令）——等于一边遮一边漏。

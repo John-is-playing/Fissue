@@ -42,6 +42,55 @@
   `config.example.yaml` 同步；顺手修掉 wiki 配置表里 `database.url` 默认值写错的那一行
   （写成了 PostgreSQL 串，实际默认是 SQLite）。
 
+### 文档 —— Gitee 条目级写的边界写清（仍未验证）
+
+- `BENCHMARK.md` §4.16 补一段复核说明：本机 `FISSUE_GITEE_TOKEN` 为空，所以这一条现在**连复核
+  都做不了**——它不是「已修好待验证」，也不是「验证过没通过」，而是**上游受限 + 原因未定位**。
+  同时给出可照做的人工探测步骤与判据（只读先通 → 同令牌直接 POST 建 Issue → **先看状态码再看
+  文案**），并明确「平台写操作由人执行，agent 不代跑」；README 的对应条目同步改准。
+
+
+
+- **重跑测量**（2026-10-30，`deepseek-flash`，后端 Docker MySQL 8.0）：`envkit` 上次记录的
+  5 处偏差（`#2/#4/#6/#8/#9` 期望 tier2、实测 tier1）**全部转命中**（重要性回落到 62~76），
+  但同一次运行里反向多出 `#3/#5/#7` 三处；`lockkit` 由 4 处变 5 处，多出来的 `#4`
+  是反方向的（重要性 72 → 82，跨过门槛翻成 tier1）。
+- **结论**：两次运行的重要性评分都密集落在 **62~82**，而 `fix_policy.tier1.min_importance`
+  正是 **80**——门槛压在分布右端，单次评分抖动就能跨线。所以「哪几条偏差」会随运行变化，
+  **它不是可勾销的缺陷清单**；功能后果仍为零（tier1/tier2 都进修复队列，只差标签）。
+- **处置**：不改夹具期望（期望表是规格，改它只是让实测好看）、不调阈值去凑命中（只是把抖动
+  搬到另一侧）；改为把逐条对照与**可复跑的验证命令**写进 `BENCHMARK.md` §4.7.1，
+  README / wiki 的口径从「公开保留 9 处不一致」改成「边界抖动 + 指向复测」。
+
+### 新增 —— MySQL 真机验证（Docker 实例，补齐「只有离线校验」的口径）
+
+- **MySQL 8.0 真机跑通**：`docker run mysql:8.0`（utf8mb4 字符集）上实际执行了
+  `fissue db init` / `db check`，建出来的 DDL 与预期一致——`body` 落成 `MEDIUMTEXT`、
+  `key`/`number` 是 `varchar(511)`/`varchar(64)`、复合唯一索引 `uq_item_identity` 建成
+  （2396 字节 < 3072 上限）、表字符集 `utf8mb4_unicode_ci`。
+- **新增 `tests/test_store_mysql.py`（按 `FISSUE_TEST_MYSQL_URL` 启用，未设则全部 skip）**：
+  把只有 MySQL 才照得出来的风险点钉成可复跑用例——长文本列类型与索引宽度（真机查
+  `information_schema`）、**超过 64KB 的正文与评论往返**（10 万字符中文）、
+  队列领取走 `FOR UPDATE SKIP LOCKED`、**naive 时间戳与 aware `_now()` 相减不炸**、
+  **补列迁移在 MySQL 上走 `information_schema` 分支**。
+- **真实抓取链路**：在 MySQL 上跑 `fissue fetch --repo John-is-playing/textkit` 入库 7 条、
+  `fissue status` / `fissue report` 正常出报告——JSON 列、评论、增量游标都过了一遍。
+- 文档口径更新：`docs/ENV.md` 不再写「MySQL 未在真实实例上跑过全链路」，
+  改为「已在 Docker 的 MySQL 8.0 上验证建表 / 读写 / 队列 / 抓取链路；**跑分数字仍来自 SQLite**」。
+
+### 变更 —— 密钥管理补齐 webhook 签名密钥
+
+- **webhook 签名密钥进设置页**（`FISSUE_WEBHOOK_{GITHUB,GITEE,ATOMGIT,GITLAB}_SECRET`
+  与 `FISSUE_WEBHOOK_ENABLED`）：它们此前只能手写进 `.env`，而 `FISSUE_WEBHOOK_*_SECRET`
+  恰恰是入站 webhook 端点**唯一**的身份证明（该端点不带 bearer 鉴权）。现在与平台 Token
+  同口径管理：写 `.env`、留空 = 不改动、勾「清空」= 移除，页面**只回「已配置 / 未配置」与掩码**。
+  面板里显式写明「这不是平台 Token」——两者方向相反（Token 是我们去调平台，Secret 是平台来调
+  我们时验签的），填错的表现是「对方推来的事件全部 401」。
+- **修掉 `web/app.py` 里过期的「仓库与密钥管理界面尚未实现」**：仓库页（`/repos`：增 / 改 /
+  启停 / 移出 + 抓取前探测）与密钥面板早已在 `web/setup.py` 落地并有完整单测守着，
+  注释说「尚未实现」只会误导下一个读代码的人；顺手写清真正的写操作闸门是
+  `setup_guard` 与 `web.read_only`。
+
 ### 新增 —— `web.trust_proxy`：反代部署按真实客户端判定来源
 
 - **`web.trust_proxy` + `web.trusted_proxies`**：挂在反向代理后面时，来源判定不再只能
