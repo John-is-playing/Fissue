@@ -13,7 +13,72 @@
 
 ## [Unreleased]
 
-> **未发布**：`v1.2.0` 之后的变更。按「为什么」分组。
+> **未发布**：`v1.3.0-b1` 之后的变更。
+
+---
+
+## [1.3.0-b1] - 2026-10-30
+
+> **预发布快照**：`v1.2.0` 之后的变更，按「为什么」分组。按项目惯例，快照**不动**
+> `pyproject.toml` 与 `__version__`（正式版收口时才升版本号）。
+
+### 新增 —— `fix_policy.tier_strategy: percentile`：把「重要性够不够」换成批内分位
+
+- **分位定档策略**：难度仍是硬门槛，但 tier1/tier2 改由**批内排名**决定
+  （前 `tier1_share` 进 tier1，`percentile_min_batch` 条以下不算分位）。动机来自
+  `BENCHMARK.md` §4.7.1 的实测：模型的 importance 评分密集落在 **62~82**，而默认门槛
+  `min_importance=80` 正压在这段分布的右端——单次评分抖动就能让同一条目跨线，于是
+  「哪几条是偏差」每次运行都在变。
+- **它解决什么、不解决什么都写进了文档**：占比（本批先修几条）稳定了、不需要再对着漂移的
+  分布手工标定阈值；但**近分条目之间的成员翻转仍在**——切点落在分布最密处时，谁进 tier1
+  本质上是掷硬币。2026-10-30 在 Docker MySQL 上连评两遍 envkit：占比两遍都是 2/3，
+  而 `#1`/`#2` 因重要性互换（76/72 → 72/74）换了档。**任何阈值方案都改变不了这一点**，
+  所以文档给出的口径是「用分位时对照占比，不要对照夹具的逐条期望表」。
+- **默认策略不变**（仍是 `importance`），历史基线与夹具期望表的可比性不受影响。
+  基线指纹新增 `tier1_share` / `percentile_min_batch`，换策略或调占比会体现在
+  `bench diff` 的可比性判定里。
+- 分位在**批次结束后**结算（`EvalStage._resolve_percentile_tiers`）：评测逐条跑、
+  分位要看整批，所以先落库再回写最新一条评测的档位（`Repository.set_latest_evaluation_priority`，
+  只改最新记录——改历史等于伪造过去）；`flush` 派发时对分位策略**直接采信已定档结论**，
+  不逐条重算（重算会把它抹成单条退化口径，报告与派发就成了两套口径）。
+
+### 变更 —— 移除旧口令兼容垫片（`FISSUE_API_TOKEN`）
+
+- **垫片已整体移除**：`POST /api/auth/legacy-token`、CLI `fissue auth key import-legacy`、
+  启动时的一次性导入（`migrate_legacy_token`）、以及「形状不像 `fissue_<prefix>_<secret>`
+  就走 legacy 那条」的校验分支，全部删掉。
+- 影响：旧口令**不再能当 Bearer 用**，表里遗留的 `prefix=legacy` 行也勾不住任何请求
+  （它的哈希算的是明文口令，与 Key 的校验路径不同）——到「API Key」页吊销即可。
+  迁移做法：`fissue auth key create` 建一把正式 Key，替换脚本/CI 里的旧口令。
+- 理由：一条垫片等于一条**永不过期、绕过吊销与审计**的明文口令，留着它的成本是永久性的，
+  收益只到升级那一刻。`tests/test_auth.py::test_legacy_token_shim_is_gone` 把
+  「启动不导入 / 校验不认 / 端点不存在」三件事一起钉住，避免留下「代码删了但旧行还能用」的半移除状态。
+
+### 新增 —— Gitee 条目级写探测脚本
+
+- `scripts/probe_gitee_write.py`：把 `BENCHMARK.md` §4.16 那张「只读先通 → 同令牌直接 POST」
+  的判据跑成可复核的一段。默认**只读**，真写必须显式 `--write`，建出 Issue 后**立即自动关闭**；
+  `--label-only` 改测「给条目打标签」。输出**先状态码、后报文**（`404` 与 `403` 的含义完全不同，
+  而 Gitee 有时把权限问题也包成一句 404）。令牌只从 `FISSUE_GITEE_TOKEN` 读，不接受 `--token`。
+- 本次**没有跑真写**：本机 `FISSUE_GITEE_TOKEN` 为空，连只读复核都做不了（脚本按设计挡住了）。
+  按项目约定，平台写操作由人执行。
+
+### 文档 —— MySQL 全链路验证，口径统一
+
+- Docker `mysql:8.0` 上真跑通了 `db init → fetch → eval → verify → flush → fix`
+  （评测结论与验证器运行落库、回归门 pass、flush 打标、修复 Agent 2 轮产出补丁）。
+  `docs/ENV.md` / wiki 部署页 / `README` / `BENCHMARK.md` §5 原先都写着「还没在 MySQL 上跑
+  `eval → verify → fix`」，现按实测改准。
+- 顺带删掉 `CHANGELOG` MySQL 段里那句「尚未在真实 MySQL 上跑过全链路」——它与同一段下面
+  「MySQL 真机验证」小节自相矛盾，读者不知道该信哪个。
+- `docs/USAGE.md` 的鉴权示例还停在「填 `FISSUE_API_TOKEN` 就自动开鉴权」（该机制 1.1.0 就没了），
+  一并改成现行口径（会话登录 + API Key + 反代需显式声明）。
+
+### 杂项 —— 宣传素材不再污染工作区
+
+- `banner/`（易拉宝 HTML + 构建脚本 + 导出 PNG）与 `src/atomgit/*.gif` 写进 `.gitignore`。
+  不只是「不入库」：`fissue bench capture` 用 `git status --porcelain` 判工作区是否干净，
+  **未跟踪文件同样会把基线标成「不可复现」**。
 
 ### 新增 —— MySQL 后端（AtomGit Issue #1）
 
@@ -36,10 +101,8 @@
     且这段 SQL 抽成纯函数 `force_fix_migration(dialect)`，用单测钉住三种写法。
 - **`pymysql` 随包声明**（理由与 `psycopg` 相同：SQLAlchemy 按 URL 里的 dialect 动态加载，
   代码里没有 `import pymysql`；`tests/test_packaging.py` 的豁免名单同步登记）。
-- **离线守卫**：本机没有 MySQL 实例，所以用「三方言 DDL 编译 + 索引字节数 + 长文本类型」
-  三条纯编译期断言钉住可移植性——它们正是「只在真机 `db init` 才炸」的那两类错误。
-  **尚未在真实 MySQL 上跑过全链路**（README / AGENTS 口径已写明），部署者请先自己跑
-  `db init` / `db check` 与一轮 `fetch → eval → verify`。
+- **离线守卫**：用「三方言 DDL 编译 + 索引字节数 + 长文本类型」三条纯编译期断言钉住可移植性
+  ——它们正是「只在真机 `db init` 才炸」的那两类错误。真机链路见下面「MySQL 真机验证」小节。
 - 文档：`docs/ENV.md` 补 MySQL 首次准备（建库语句、utf8mb4、三条硬约束）、
   `README` / `docs/USAGE.md` / wiki（Deployment / Data-Model / Configuration）与
   `config.example.yaml` 同步；顺手修掉 wiki 配置表里 `database.url` 默认值写错的那一行
