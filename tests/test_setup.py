@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -395,23 +396,42 @@ def test_settings_page_masks_secrets_and_never_echoes_them(
     assert "sk-super-secret-value" not in page
 
 
-def test_webhook_secret_is_managed_like_any_other_key(settings: Settings, client: Any) -> None:
-    """入站 webhook 的签名密钥曾是「密钥管理」唯一漏掉的一类密钥。
+def test_every_writable_env_key_has_a_field_and_the_js_collects_generically(
+    settings: Settings, client: Any
+) -> None:
+    """设置页的两条硬约束，合起来才能保证「填了就真会写盘」。
 
-    它此前只能手写进 .env，而它恰恰是 webhook 端点**唯一**的身份证明（该端点不带 bearer
-    鉴权）。既然页面已经能改平台 Token 与 LLM Key，就不该把它留在机器上。
+    回归来源：webhook 密钥面板加了 4 个输入框，但 `settings.js` 的提交逻辑用的是**写死的
+    键名表**，新键不在表里——于是「保存」时一个字段都没提交，页面却照常提示保存成功，
+    `.env` 一字未动（webhook 继续 fail-closed）。这类错只用「字段有 id」的断言是拦不住的。
+
+    所以这里同时钉两件事：
+
+    1. **每个 `ENV_WRITABLE` 键在渲染后的页面里都有对应输入框**（`id="env-<键名>"`）——
+       模板里平台 token / webhook 都是循环生成的，只能渲染后查；
+    2. **JS 侧不维护键名表**：提交逻辑必须靠 `id^='env-'` 扫 DOM。断言 JS 里不出现任何
+       `FISSUE_` 常量，谁再把手写列表加回来，这条会立刻红。
     """
-    page = client.get("/settings").text
-    assert 'id="env-FISSUE_WEBHOOK_GITHUB_SECRET"' in page, "设置页得有这一格"
-    assert 'id="env-FISSUE_WEBHOOK_ENABLED"' in page
+    from fissue.web.setup import ENV_WRITABLE
 
+    page = client.get("/settings").text
+    missing = [key for key in ENV_WRITABLE if f'id="env-{key}"' not in page]
+    assert not missing, f"这些可写键在设置页没有输入框，填了也保存不了：{missing}"
+
+    js = (Path(__file__).resolve().parents[1] / "src/fissue/web/static/settings.js").read_text(
+        encoding="utf-8"
+    )
+    assert "id^='env-'" in js, "提交逻辑必须通用地扫 env- 前缀控件"
+    # 只认「带引号的键名」：`window.FISSUE_SETTINGS` 是变量名，不是写死的键名
+    hardcoded = re.findall(r"""["'](FISSUE_[A-Z0-9_]+)["']""", js)
+    assert not hardcoded, f"JS 里不该再出现写死的环境变量键名（那正是漏配的来源）：{hardcoded}"
+
+    # 密钥仍然只回「已配置」与掩码，绝不回显原值
     r = client.put("/api/v1/settings", json={"env": {"FISSUE_WEBHOOK_GITHUB_SECRET": "whsec-abc123"}})
     assert r.status_code == 200
-
     data = client.get("/api/v1/settings").json()
     item = next(i for i in data["env_items"] if i["key"] == "FISSUE_WEBHOOK_GITHUB_SECRET")
     assert item["set"] is True
-    # 与其它密钥同口径：页面只回掩码，绝不回显原值
     assert "whsec-abc123" not in str(data)
     assert "whsec-abc123" not in client.get("/settings").text
 

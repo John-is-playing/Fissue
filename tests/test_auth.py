@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -452,12 +453,12 @@ def test_forwarded_header_does_not_make_a_remote_peer_trusted(settings: Settings
 # ---------------------------------------------------------------------------
 
 
-def _request(headers: dict[str, str] | None = None, peer: tuple[str, int] = REMOTE):
+def _request(headers: dict[str, str] | None = None, peer: tuple[str, int] = REMOTE, app: Any = None):
     """构造一个最小 Request（只填判定用得到的字段）。"""
     from starlette.requests import Request
 
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
-    scope = {
+    scope: dict[str, Any] = {
         "type": "http",
         "http_version": "1.1",
         "method": "GET",
@@ -470,23 +471,45 @@ def _request(headers: dict[str, str] | None = None, peer: tuple[str, int] = REMO
         "client": peer,
         "server": ("testserver", 80),
     }
+    if app is not None:
+        # `settings_of(request)` 读的是 `request.app.state`，需要 scope 里带上 app
+        scope["app"] = app
     return Request(scope)
 
 
-def test_forwarded_address_takes_only_the_rightmost_hop() -> None:
-    """`X-Forwarded-For` 左侧由客户端随便写，只有最右一跳是代理追加的。
+def test_forwarded_address_skips_our_own_proxies_from_the_right(settings: Settings) -> None:
+    """从右往左跳过**我们声明的代理**，第一个非代理地址才是客户端。
 
-    取错方向的后果不是「少一条日志」，而是**谁都能自称 127.0.0.1**——而回环免登录。
+    回归一条能把公网流量判成回环的路径：`X-Forwarded-For` 由每一跳代理追加自己的直接对端，
+    所以同机双 nginx / cloudflared / `ssh -L` 这类两跳形态下，最右一跳是**上一层代理自己**
+    （常常就是 127.0.0.1）——只取最右一跳就会把公网用户判成回环来源，而回环**免登录**。
     """
     from fissue.web.auth import forwarded_address
 
-    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1, 2.2.2.2, 203.0.113.9"})) == "203.0.113.9"
-    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1:5555"})) == "1.1.1.1"
-    assert forwarded_address(_request({"X-Forwarded-For": "[2001:db8::1]:443"})) == "2001:db8::1"
-    # 头里是垃圾值时回退 X-Real-IP；两者都不可信则空串（宁可「不采信」，不能「猜一个」）
-    assert forwarded_address(_request({"X-Forwarded-For": "不是IP", "X-Real-IP": "198.51.100.7"})) == "198.51.100.7"
-    assert forwarded_address(_request({"X-Forwarded-For": "不是IP", "X-Real-IP": "也不是"})) == ""
-    assert forwarded_address(_request()) == ""
+    s = settings.model_copy(deep=True)
+    s.web.trust_proxy = True
+    s.web.trusted_proxies = ["127.0.0.1/32", "203.0.113.0/24"]
+
+    # 两跳：客户端 → 同机 nginx(127.0.0.1) → 本服务。最右一跳是代理，必须继续往左。
+    assert forwarded_address(_request({"X-Forwarded-For": "198.51.100.7, 127.0.0.1"}), s) == "198.51.100.7"
+    # 三跳：客户端 → 外部代理(203.0.113.x) → 同机代理
+    assert (
+        forwarded_address(_request({"X-Forwarded-For": "198.51.100.7, 203.0.113.5, 127.0.0.1"}), s)
+        == "198.51.100.7"
+    )
+    # 单跳（最常见）：客户端直接由代理追加
+    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1, 198.51.100.9"}), s) == "198.51.100.9"
+    # 端口与 IPv6 写法要能剥
+    assert forwarded_address(_request({"X-Forwarded-For": "1.1.1.1:5555"}), s) == "1.1.1.1"
+    assert forwarded_address(_request({"X-Forwarded-For": "[2001:db8::1]:443"}), s) == "2001:db8::1"
+    # 整条链路都是自己的代理（客户端地址没写进来）→ 不猜，空串（调用方回退对端）
+    assert forwarded_address(_request({"X-Forwarded-For": "127.0.0.1, 203.0.113.5"}), s) == ""
+    # 出现垃圾段 → 整条作废：跳过坏段会让判定左移到攻击者自己写的地址上
+    assert forwarded_address(_request({"X-Forwarded-For": "198.51.100.7, 不是IP"}), s) == ""
+    # 没有 XFF 时才回退 X-Real-IP
+    assert forwarded_address(_request({"X-Real-IP": "198.51.100.7"}), s) == "198.51.100.7"
+    assert forwarded_address(_request({"X-Real-IP": "也不是"}), s) == ""
+    assert forwarded_address(_request(), s) == ""
 
 
 def test_forwarded_header_is_only_used_when_the_peer_is_a_declared_proxy(settings: Settings) -> None:
@@ -545,6 +568,58 @@ def test_declared_proxy_makes_the_forwarded_client_trusted(settings: Settings, d
     with TestClient(create_app(s), client=("198.51.100.9", 1234)) as direct:
         res = direct.get("/api/v1/stats", headers={"X-Forwarded-For": "127.0.0.1"})
         assert res.status_code == 401, "不是声明的代理送来头 → 不可信，仍须登录"
+
+
+def test_throttle_keys_use_the_real_client_behind_a_declared_proxy(
+    settings: Settings, db: Database
+) -> None:
+    """限速的 **IP 维度**必须取真实客户端，而不是代理 IP。
+
+    用对端做键的后果很具体：同一个代理后面的所有人共用一个 IP 桶——一个人试错几次就把
+    其他人一起挡在门外。这里刻意不去断言「换一个来源就能登录成功」：限速还有
+    **用户名维度**（防撞库），锁住 `user:admin` 本来就该挡住所有人——两条维度各管一件事，
+    混在一起断言会把正当行为当成 bug。
+    """
+    from fissue.web.app import create_app
+    from fissue.web.auth import _throttle_keys
+
+    s = settings.model_copy(deep=True)
+    s.web.trust_proxy = True
+    s.web.trusted_proxies = ["203.0.113.0/24"]      # REMOTE 就是这枚「代理」
+    app = create_app(s)
+    app.state.settings = s                          # `settings_of()` 读的就是这里
+    behind_proxy = _request({"X-Forwarded-For": "198.51.100.7"}, app=app)
+    assert _throttle_keys(behind_proxy, "admin")[0] == "ip:198.51.100.7"
+
+    # 开关关掉：转发头不可信，仍按对端分桶
+    plain = settings.model_copy(deep=True)
+    plain_app = create_app(plain)
+    plain_app.state.settings = plain
+    direct = _request({"X-Forwarded-For": "198.51.100.7"}, app=plain_app)
+    assert _throttle_keys(direct, "admin")[0] == "ip:203.0.113.9"
+
+
+def test_session_audit_records_the_real_client_behind_a_declared_proxy(
+    settings: Settings, db: Database
+) -> None:
+    """会话的 `peer_ip` 是审计列，反代部署下要记真实客户端（否则那一列全是代理 IP）。"""
+    from fissue.web.app import create_app
+
+    _seed_admin(db)
+    s = settings.model_copy(deep=True)
+    s.web.trust_proxy = True
+    s.web.trusted_proxies = ["203.0.113.0/24"]
+
+    with TestClient(create_app(s), client=REMOTE) as c:
+        res = c.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "s3cret-pass"},
+            headers={"X-Forwarded-For": "198.51.100.8"},
+        )
+        assert res.status_code == 200, res.text
+
+    sessions = _store(db).list_sessions(limit=10)
+    assert any(row.peer_ip == "198.51.100.8" for row in sessions), "审计列要记真实客户端地址"
 
 
 def test_session_authenticates_read_and_needs_csrf_for_write(settings: Settings, db: Database) -> None:

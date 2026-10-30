@@ -45,25 +45,41 @@ def _json_col() -> Mapped[dict]:
     return mapped_column(JSON, default=dict)
 
 
-def _long_text() -> Mapped[str]:
-    """长文本列（正文 / 日志 / 补丁）：MySQL 上必须落成 MEDIUMTEXT。
+def _long_text(*, nullable: bool = False) -> Mapped[str]:
+    """长文本列（正文 / 日志 / 补丁 / 报错）：MySQL 上必须落成 MEDIUMTEXT。
 
     为什么不统一用 ``Text``：MySQL 的 ``TEXT`` 上限是 **64KB**，而
     GitHub 的 Issue/PR 正文上限恰好也是 65536 **字符**——UTF-8 下中文一多就超，
     报错是 ``Data too long for column 'body'``，且要到真正写入那一刻（抓取完整条之后）
     才炸。沙盒 ``stdout`` / ``stderr`` 与修复 ``diff`` 同理，几千行输出很容易越过 64KB。
 
+    ``error`` / ``reason`` 这类列也要算进来：它们的典型内容就是**长栈回溯或模型整段输出**，
+    超限的后果比丢一条日志严重得多——「记录失败」这一步本身会失败，把整条记录回滚掉。
+
     PostgreSQL 的 ``TEXT`` 与 SQLite 的 ``TEXT`` 都没有这个上限，所以只在 mysql
     方言上换成 ``MEDIUMTEXT``（16MB）——其余方言的 DDL 一个字节都不变。
     """
+    if nullable:
+        return mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql"), nullable=True)
     return mapped_column(Text().with_variant(MEDIUMTEXT(), "mysql"), default="")
 
 
-#: 键列长度。为什么是 511 而不是更大的 767：MySQL + utf8mb4 的索引上限是 3072 **字节**
-#: （即 767 字符 × 4），而 `uq_item_identity` 是四列复合唯一索引
-#: （platform + repo_slug + number + item_type），各列相加后必须留在 3072 字节内：
-#: 64 + 2044 + 256 + 32 = 2396 字节。原值 767 单列就吃掉 3068 字节，复合索引必然建不上。
-KEY_LEN = 511
+#: 键列长度（`items.key` / 各表的 `item_key` / `repo_key`）。
+#:
+#: 本来是 767。压到 640 的原因是 **`uq_queue_item_pending`（queue + item_key + status）
+#: 这条复合唯一索引**：utf8mb4 下索引总宽上限 3072 **字节**，16 + 767 + 16 = 799 字符
+#: × 4 = 3196 字节，MySQL 直接建不上表（`Specified key was too long`）。640 时是
+#: 16 + 640 + 16 = 672 × 4 = 2688 字节，留有余量。
+#:
+#: 为什么不干脆压到 511：`items.key` 是
+#: ``<platform>:<owner>/<name>#<number>`` 拼出来的，按列上限算最坏是
+#: 7 + 1 + 511 + 1 + 64 = **584** 字符——511 会把这个最坏情形压到**超长**，
+#: 在 PostgreSQL 上是「写库失败」，而 SQLite 只会静默存下。640 同时满足两头的上限。
+#:
+#: 注意别把 767 的问题算到 `uq_item_identity` 头上：它是
+#: platform(16) + repo_slug(511) + number(64) + item_type(8) = 599 字符 = 2396 字节，
+#: 里面**没有** 767 的列，从来不超标。
+KEY_LEN = 640
 
 
 class RepoRow(Base):
@@ -203,12 +219,12 @@ class VerifierRow(Base):
     name: Mapped[str] = mapped_column(String(255), default="verifier")
     language: Mapped[str] = mapped_column(String(32), default="python")
     files: Mapped[dict] = _json_col()                  # 相对路径 -> 文件内容
-    command: Mapped[str | None] = mapped_column(Text, nullable=True)
+    command: Mapped[str | None] = _long_text(nullable=True)
     checklist: Mapped[list] = mapped_column(JSON, default=list)
     expect_fail_on_base: Mapped[bool] = mapped_column(Boolean, default=True)
     expect_pass_on_fix: Mapped[bool] = mapped_column(Boolean, default=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=600)
-    notes: Mapped[str] = mapped_column(Text, default="")
+    notes: Mapped[str] = _long_text()
     f2p_satisfied: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     generation_rounds: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -233,7 +249,7 @@ class VerifierRunRow(Base):
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     f2p_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     artifacts_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = _long_text(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
     verifier: Mapped[VerifierRow] = relationship(back_populates="runs")
@@ -252,7 +268,7 @@ class QueueEntryRow(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     payload: Mapped[dict] = _json_col()
     result: Mapped[dict] = _json_col()
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = _long_text(nullable=True)
     enqueued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -272,7 +288,7 @@ class BatchConclusionRow(Base):
     verdict: Mapped[str] = mapped_column(String(24), default="")
     labels: Mapped[list] = mapped_column(JSON, default=list)
     priority: Mapped[str] = mapped_column(String(16), default="none")
-    reason: Mapped[str] = mapped_column(Text, default="")
+    reason: Mapped[str] = _long_text()
     confidence: Mapped[float] = mapped_column(Float, default=0.5)
     model: Mapped[str] = mapped_column(String(128), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
@@ -292,7 +308,7 @@ class FixAttemptRow(Base):
     patch_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     changed_files: Mapped[list] = mapped_column(JSON, default=list)
     rounds: Mapped[int] = mapped_column(Integer, default=0)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = _long_text(nullable=True)
     report_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
@@ -324,7 +340,7 @@ class ScanRunRow(Base):
     created: Mapped[int] = mapped_column(Integer, default=0)
     updated: Mapped[int] = mapped_column(Integer, default=0)
     unchanged: Mapped[int] = mapped_column(Integer, default=0)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = _long_text(nullable=True)
 
 
 class NotificationRow(Base):
@@ -339,7 +355,7 @@ class NotificationRow(Base):
     dedup_key: Mapped[str] = mapped_column(String(255), index=True)
     payload: Mapped[dict] = _json_col()
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
-    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = _long_text(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (UniqueConstraint("dedup_key", name="uq_notification_dedup"),)

@@ -1321,7 +1321,11 @@ class Repository:
             return None
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        return (_now() - ts).total_seconds()
+        # 夹到 0：MySQL 的 ``DATETIME`` 默认是**秒级精度**，写入时对小数秒四舍五入——
+        # 刚写进去的 ``finished_at`` 可能比 ``_now()`` 还"晚"半秒，于是相减得负数。
+        # 年龄为负没有物理意义，而调用方拿它跟超时阈值比较（负值永远不超时），
+        # 不夹的话「刚完成」与「已完成」两种状态在日志里会显示成 ``-0.4s``。
+        return max(0.0, (_now() - ts).total_seconds())
 
     def queue_stats(self) -> dict[str, dict[str, int]]:
         with self.db.session() as s:

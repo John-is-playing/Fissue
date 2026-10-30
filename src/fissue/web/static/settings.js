@@ -19,12 +19,6 @@
   var FISSUE = window.FISSUE || {};
   var AUTH_PREFIX = FISSUE.authPrefix || "/api/auth";
 
-  var SECRETS = ["FISSUE_LLM_API_KEY", "FISSUE_GITHUB_TOKEN", "FISSUE_GITEE_TOKEN",
-                 "FISSUE_ATOMGIT_TOKEN", "FISSUE_GITLAB_TOKEN",
-                 "FISSUE_DATABASE_URL"];     // 连接串内含口令，按密钥处理
-  var PLAIN = ["FISSUE_LLM_BASE_URL", "FISSUE_LLM_MODEL", "FISSUE_LLM_FALLBACK_MODEL",
-               "FISSUE_WEB_HOST", "FISSUE_WEB_PORT"];
-
   function val(id) {
     var el = document.getElementById(id);
     return el ? el.value.trim() : "";
@@ -50,19 +44,32 @@
 
   /** 组装 .env 的改动。
    *
-   * 密钥的规则是**留空 = 不改动**：输入框里是空的（只显示掩码占位符），若把空串当值写下去，
-   * 用户点一次「保存设置」就会把已有的 key 抹掉。要清空必须显式勾「清空」。
+   * **扫 DOM，不维护键名表**。原先这里是 `SECRETS` / `PLAIN` 两张写死的列表，它必须与
+   * 服务端 `ENV_WRITABLE` 手工同步——而它已经漏过一次：webhook 密钥面板渲染了 4 个
+   * `env-FISSUE_WEBHOOK_*_SECRET` 输入框，键名却不在表里，于是「保存」时**一个字段都没提交**，
+   * 页面照常弹「已保存并热重载」。现在凡 id 以 `env-` 开头的控件都按 id 取键名，规则统一：
+   *
+   * * 文本 / 密码框：**留空 = 不改动**（输入框本来只显示掩码占位符，把空串写下去会抹掉已有
+   *   的 key）；要清空必须显式勾 `clear-<键名>` 才会提交空串；
+   * * 复选框：一律提交 `"true"` / `"false"`——按字符串取值（`el.value`）得到的是 `"on"`，
+   *   服务端解析不成布尔，表现就是「取消勾选永远关不掉」。
+   *
+   * 于是「新增一个可写项」= 在模板里加一个 `env-` 开头的控件，不用再回来改这段 JS；
+   * `tests/test_setup.py` 另有一条用例断言**每个 `ENV_WRITABLE` 键都有对应输入框**。
    */
   function envPayload() {
     var out = {};
-    SECRETS.forEach(function (k) {
-      var v = val("env-" + k);
-      if (v) out[k] = v;
-      else if (checked("clear-" + k)) out[k] = "";
-    });
-    PLAIN.forEach(function (k) {
-      var v = val("env-" + k);
-      if (v) out[k] = v;
+    var nodes = document.querySelectorAll("[id^='env-']");
+    Array.prototype.forEach.call(nodes, function (el) {
+      var key = el.id.slice(4);
+      if (!key) return;
+      if (el.type === "checkbox") {
+        out[key] = el.checked ? "true" : "false";
+        return;
+      }
+      var v = (el.value || "").trim();
+      if (v) out[key] = v;
+      else if (checked("clear-" + key)) out[key] = "";
     });
     return out;
   }

@@ -156,7 +156,9 @@ FISSUE_WEBHOOK_GITHUB_SECRET=<GitHub Webhook 里填的 Secret>
 
 - 生产用 **PostgreSQL**（`FISSUE_DATABASE_URL=postgresql+psycopg://...`），先 `createdb -U fissue fissue` 再 `fissue db init`；
   已有 MySQL 运维栈的也可以换 **MySQL 8.0+**（`mysql+pymysql://...?charset=utf8mb4`，库/表字符集须 utf8mb4，
-  索引宽度与长文本列已按 MySQL 的限制落地；目前只做过离线校验，未在真实实例上跑过全链路）。
+  索引宽度与长文本列已按 MySQL 的限制落地）。MySQL 后端已在 Docker `mysql:8.0` 上验证过
+  **建表 / 读写 / 队列 / 抓取链路**（`tests/test_store_mysql.py` 是按 `FISSUE_TEST_MYSQL_URL`
+  启用的真机用例），尚未在 MySQL 上跑的是模型链路与沙盒修复（评测 / 验证 / 自动修复）。
 - 表由 `create_all` 直接建，**不需要迁移脚本**（新增表同理）。
 - 产物件落在 `app.data_dir`（默认 `./data`）：`artifacts/`、`manual/`、`patches/`、`exports/`、`benchmarks/`。
   其中 `data/benchmarks/` 是**唯一进版本库**的子目录。

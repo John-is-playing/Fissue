@@ -171,6 +171,18 @@ FORWARD_HEADERS = (
 # ---------------------------------------------------------------------------
 
 
+def _backend_name(url: str) -> str:
+    """连接串 → 后端名。
+
+    不在这里另写一份判断：`web/status.py::_backend_of` 已经是「状态页显示哪个后端」的
+    唯一口径，复制一份出来迟早会和它对不上（这里原先就是写死的二选一，MySQL 被报成
+    postgresql）。
+    """
+    from .status import _backend_of
+
+    return _backend_of(url)
+
+
 def setup_guard(request: Request, settings: Settings) -> None:
     """配置写入的边界。不通过就 403（并把「怎么才能通过」写清楚）。
 
@@ -661,7 +673,9 @@ def _probe_database_sync(url: str) -> dict[str, Any]:
                 database.engine.dispose()
         return {
             "ok": bool(ok),
-            "backend": "sqlite" if url.startswith("sqlite") else "postgresql",
+            # 后端名只认一份口径（web/status.py 的同名函数）：这里原先写死
+            # `"sqlite" if ... else "postgresql"`，于是 MySQL 在页面上被报成 postgresql。
+            "backend": _backend_name(url),
             "seconds": round((datetime.now(timezone.utc) - started).total_seconds(), 2),
         }
     except Exception as exc:  # noqa: BLE001

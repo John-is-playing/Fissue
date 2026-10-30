@@ -125,8 +125,8 @@ fissue db init && fissue db check
 
 > MySQL 侧的三条硬约束（实现已按它们落地，换库时别踩）：
 > ① **库/表字符集必须 utf8mb4**，否则中文与 emoji 直接乱码或报错；
-> ② 索引在 utf8mb4 下的上限是 **3072 字节**，所以键列用的是 511 字符（旧值 767 会让
-> 复合唯一索引建不上）；
+> ② 索引在 utf8mb4 下的上限是 **3072 字节**，所以键列用的是 640 字符——旧值 767 会让
+> 队列表的复合唯一索引（queue + item_key + status）超限，建表直接失败；
 > ③ **TEXT 上限只有 64KB**——正文 / 沙盒日志 / 补丁这几列在 MySQL 上落成 `MEDIUMTEXT`。
 > 另外 `8.0` 之前的版本不支持 `FOR UPDATE SKIP LOCKED`，队列并发回收会失效，故要求 8.0+。
 
@@ -142,12 +142,19 @@ fissue db init && fissue db check
 > **SQLite vs PostgreSQL / MySQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
 > 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表），
 > **MySQL 8.0+** 是同一类选择（适合已有 MySQL 运维栈的环境）。
-> PG 后端已完成**真实部署验证**（`1.1.0-b4`：`db init` / `db check` / 全量单测 / 服务启动与
-> 页面实测均在该后端上跑过，见 [BENCHMARK.md §5](../BENCHMARK.md#5-尚未测量)）；
-> **MySQL 后端目前只做过离线校验**（三方言 DDL 编译 + 索引宽度 + 迁移 SQL 的单测，
-> 未在真实实例上跑过全链路）——要用它，请先自己跑一遍 `fissue db init` / `db check` 与
-> 一轮 `fetch → eval → verify`。
-> 两者验证的都是**部署与并发路径**，跑分数字仍全部来自 SQLite。
+> 两个网络后端的验证深度不同：
+>
+> * **PostgreSQL**：`1.1.0-b4` 起做过真实部署验证（`db init` / `db check` / 全量单测 /
+>   服务启动与页面实测均在该后端上跑过，见 [BENCHMARK.md §5](../BENCHMARK.md#5-尚未测量)）；
+> * **MySQL**：已在 Docker 的 `mysql:8.0` 上验证**建表 / 读写 / 队列 / 抓取链路**
+>   （`tests/test_store_mysql.py` 是可复跑的真机用例，按 `FISSUE_TEST_MYSQL_URL` 启用；
+>   核对内容包括 MEDIUMTEXT 长文本、640 键列与 3072 字节索引上限、`SKIP LOCKED` 队列领取、
+>   naive 时间戳相减、`information_schema` 补列迁移），并真跑过 `fetch → status/report`。
+>   尚未在 MySQL 上跑的只有**模型链路与沙盒修复**（评测 / 验证 / 自动修复）——
+>   它们与数据库后端无关，但你要在 MySQL 上正式用，建议自己再跑一轮
+>   `fetch → eval → verify → fix`。
+>
+> 两者验证的都是**部署与并发路径**，各夹具的跑分数字仍全部来自 SQLite，**别混读**。
 
 ---
 

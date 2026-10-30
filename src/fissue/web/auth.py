@@ -214,28 +214,51 @@ def peer_host(request: Request) -> str:
     return (client.host if client else "") or ""
 
 
-def forwarded_address(request: Request) -> str:
-    """从转发头里取出**最右一跳**的地址；取不到返回空串。
+def _xff_hops(raw: str) -> list[str]:
+    """把 ``X-Forwarded-For`` 拆成地址列表；**出现无法解析的段就返回空列表**。
 
-    为什么只取最右一跳：``X-Forwarded-For`` 是「客户端, 代理1, 代理2」这样**追加**的，
-    左侧各段完全由客户端自己写（谁都能塞一个 127.0.0.1 进去），只有紧挨着我们的那个
-    代理追加的那一段才可信。多个代理串联时请把**最后一跳**代理写进 ``trusted_proxies``。
-
-    取不到合法 IP（头里是域名、端口、垃圾值）就返回空串，交给调用方回退到对端地址——
-    这里的失败必须是「不采信」，不能是「猜一个」。
+    为什么垃圾值要整条作废、而不是「跳过那一段继续找」：跳过等于让中间某段的垃圾把链路
+    整体左移，攻击者只要塞一个坏段就能让判定落到更左边那个**他自己写**的地址上。
+    前缀（``[2001:db8::1]:443`` / ``1.2.3.4:5678``）会先剥端口再判。
     """
-    raw = request.headers.get("x-forwarded-for", "")
-    if raw:
-        last = raw.split(",")[-1].strip()
-        # 少数代理会写成 `1.2.3.4:5678` / `[::1]:5678`，把端口剥掉再判。
-        if last.startswith("["):
-            last = last[1:].split("]", 1)[0]
-        elif last.count(":") == 1:
-            last = last.split(":", 1)[0]
+    hops: list[str] = []
+    for part in raw.split(","):
+        text = part.strip()
+        if not text:
+            continue
+        if text.startswith("["):
+            text = text[1:].split("]", 1)[0]
+        elif text.count(":") == 1:
+            text = text.split(":", 1)[0]
         try:
-            return str(ipaddress.ip_address(last))
+            hops.append(str(ipaddress.ip_address(text)))
         except ValueError:
-            pass
+            return []
+    return hops
+
+
+def forwarded_address(request: Request, settings: Settings) -> str:
+    """从转发头里取出**真实客户端**地址；取不到返回空串。
+
+    取法**不是**「最右一跳」，而是从右往左、跳过我们声明的代理（``web.trusted_proxies``），
+    第一个不属于代理的地址才是客户端。
+
+    为什么不能只取最右一跳：``X-Forwarded-For`` 是每一跳代理**追加自己的直接对端**，链路形如
+    ``客户端, 代理1, 代理2``。在同机双 nginx / cloudflared / ``ssh -L`` 这类两跳形态下，
+    最右一跳是**上一层代理自己的地址**——它与本服务同机就是 ``127.0.0.1``，被判成回环来源后
+    **免登录**；落在 ``trusted_networks`` 里则可写配置。那正是这个开关本来要堵的提权面。
+
+    ``X-Real-IP`` 只在**没有** XFF 时作为回退（它没有「追加」语义，是代理自己写的单值）：
+    两者都不可信时返回空串，交给调用方回退到对端地址——这里的失败必须是「不采信」。
+    """
+    hops = _xff_hops(request.headers.get("x-forwarded-for", ""))
+    for hop in reversed(hops):
+        if settings.web.proxy_network_of(hop) is not None:
+            continue  # 我们自己声明的代理追加的那一跳：继续往左找
+        return hop
+    if hops:
+        # 整条链路都是声明的代理（客户端地址没被写进来）：不猜，回退对端。
+        return ""
     real = request.headers.get("x-real-ip", "").strip()
     if real:
         try:
@@ -263,7 +286,7 @@ def client_host(request: Request, settings: Settings) -> str:
     if settings.web.proxy_network_of(immediate) is None:
         # 这一跳不是我们声明过的代理：它送来的转发头没有意义（很可能是伪造）。
         return immediate
-    return forwarded_address(request) or immediate
+    return forwarded_address(request, settings) or immediate
 
 
 def _peer_address(request: Request, settings: Settings | None = None):
@@ -278,8 +301,8 @@ def source_of(request: Request, settings: Settings) -> tuple[str, str]:
     """来源本身能不能免身份 → ``(source, 命中的网段)``。
 
     对端地址解析不出来时（测试客户端 ``testclient``、Unix socket）按**回环**处理。
-    这与 ``web/app.py`` 里既有的 ``_reject_remote_write`` / ``setup.py::_peer_is_loopback``
-    是同一个口径：「不知道对端是谁」不等于「可疑」，拿它去拦会把本机正常用法一起挡掉。
+    这与 ``web/app.py::_reject_remote_write`` 是同一个口径：「不知道对端是谁」不等于
+    「可疑」，拿它去拦会把本机正常用法一起挡掉。
     """
     addr = _peer_address(request, settings)
     if addr is None:
@@ -494,7 +517,9 @@ def _issue_session(
         csrf_token=csrf_token,
         ttl_minutes=settings.web.auth.session_ttl_minutes,
         user_agent=request.headers.get("user-agent", ""),
-        peer_ip=peer_host(request),
+        # 审计要记「谁在用」，所以在反代部署（web.trust_proxy）下必须记真实客户端地址；
+        # 记成代理 IP 的话，这一列在反代场景里全是同一个值，等于没有审计价值。
+        peer_ip=client_host(request, settings),
     )
     _set_session_cookie(response, settings, sign_value(session_id, server_secret(request)))
     return csrf_token
@@ -616,8 +641,15 @@ def _check_username(username: str) -> str:
 
 
 def _throttle_keys(request: Request, username: str) -> list[str]:
-    """限速的两个维度：来源 IP + 用户名（见 ``fissue.auth.throttle`` 的说明）。"""
-    return [f"ip:{peer_host(request) or 'unknown'}", f"user:{(username or '').strip().lower()}"]
+    """限速的两个维度：来源 IP + 用户名（见 ``fissue.auth.throttle`` 的说明）。
+
+    来源一律取 :func:`client_host` 而不是直接对端：反代部署下（``web.trust_proxy``）所有
+    请求的对端都是代理，用对端做键会把**全部客户端压进同一个桶**——一个人被锁，所有人一起
+    被锁；反过来，限速也就失去了「按来源分摊」的意义。真实客户端地址在那种部署里是可信的
+    （转发头只在「开关打开 + 对端是声明的代理」时才采信，见 ``client_host``）。
+    """
+    ip = client_host(request, settings_of(request)) or "unknown"
+    return [f"ip:{ip}", f"user:{(username or '').strip().lower()}"]
 
 
 def _too_many_attempts(seconds: int) -> HTTPException:

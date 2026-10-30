@@ -43,12 +43,38 @@ from fissue.models import (
 from fissue.store.db import Database
 from fissue.store.repository import Repository
 
+
+def _db_name(url: str) -> str:
+    """从连接串里取库名（解析不出来就返回空串）。"""
+    if not url:
+        return ""
+    try:
+        from sqlalchemy.engine import make_url
+
+        return make_url(url).database or ""
+    except Exception:  # noqa: BLE001 - 连串都解析不了就当「不是测试库」
+        return ""
+
+
 MYSQL_URL = os.environ.get("FISSUE_TEST_MYSQL_URL", "")
+#: 只有**库名带 test** 才允许跑（夹具会 `drop_all()`）。
+#:
+#: 为什么必须有这道闸：`FISSUE_TEST_MYSQL_URL` 一旦被指向真实库（顺手照抄 `.env` 的
+#: 连接串是最常见的错法），这个夹具会把 `items` / `auth_users` 连同管理员账号与 2FA
+#: 一起删掉——而它发生在 `pytest` 的第一次收集之后，没有任何确认步骤。
+_MYSQL_IS_TEST_DB = "test" in _db_name(MYSQL_URL).lower() if MYSQL_URL else False
 
 pytestmark = [
     pytest.mark.skipif(
         not MYSQL_URL,
         reason="未设置 FISSUE_TEST_MYSQL_URL（真机 MySQL 用例，见本文件头部说明）",
+    ),
+    pytest.mark.skipif(
+        bool(MYSQL_URL) and not _MYSQL_IS_TEST_DB,
+        reason=(
+            "库名里必须带 test（防止对真实库执行 drop_all）："
+            f"当前指向 {_db_name(MYSQL_URL)!r}。请建一个专用测试库，例如 fissue_test"
+        ),
     ),
     # 真机建库 + 大字段往返，比 sqlite 慢一个量级；120s 的默认超时对这里偏紧。
     pytest.mark.timeout(300),
@@ -123,7 +149,7 @@ def test_schema_uses_mysql_safe_types(db: Database) -> None:
         ).all()
 
     assert cols["body"] == ("mediumtext", 16777215), "TEXT 只有 64KB，正文必然装不下"
-    assert cols["key"] == ("varchar", 511)
+    assert cols["key"] == ("varchar", 640)
     assert cols["number"] == ("varchar", 64), "裸 String 在 MySQL 上建表就会 CompileError"
     assert collation.startswith("utf8mb4"), "库/表字符集不是 utf8mb4，中文与 emoji 会乱码"
 
@@ -162,21 +188,26 @@ def test_queue_claim_and_finish_uses_skip_locked(repo: Repository) -> None:
     assert repo.queue_pending_count(QueueName.VERIFY) == 0
 
 
-def test_queue_age_arithmetic_survives_naive_datetimes(repo: Repository, db: Database) -> None:
+def test_oldest_unflushed_age_survives_naive_datetimes(repo: Repository) -> None:
     """MySQL 的 ``DATETIME`` 不存时区：读回来是 naive，与 aware 的 ``_now()`` 相减不能炸。
 
-    凡是算「这条 claim 多久没动」的地方（reclaim / stale 判定）都做这个减法，
-    漏一处就是 ``TypeError: can't subtract offset-naive and offset-aware datetimes``——
-    而它只会在真机上出现，SQLite 存的是同一串带时区的值，永远照不出来。
+    ``oldest_unflushed_age`` 是**唯一**在 Python 里做这个减法的地方（reclaim 把比较放在 SQL
+    里，``queue_stats`` 只做 count）——所以必须真的调它，否则用例只是「跑通了两个不相关的
+    查询」，会给出假信心：漏掉那段 ``tzinfo`` 归一，SQLite 上永远照不出来，真机第一轮
+    空闲超时判定就 ``TypeError``。
     """
     rid = _repo_id(repo)
     item = _issue()
     repo.upsert_item(rid, item)
-    repo.enqueue(QueueName.VERIFY, item.key)
 
-    # 这两个方法都会拿库里的时间戳与当前时间相减
-    assert repo.reclaim_stuck_queue_entries() == []
-    assert repo.queue_stats().get(QueueName.VERIFY.value, {}).get("pending") == 1
+    entry_id = repo.enqueue(QueueName.VERIFY, item.key)
+    assert repo.oldest_unflushed_age(QueueName.VERIFY) is None, "还没完成的条目不该有年龄"
+
+    repo.claim_next(QueueName.VERIFY)
+    repo.finish_queue_entry(entry_id, status="done", result={"ok": True})
+
+    age = repo.oldest_unflushed_age(QueueName.VERIFY)
+    assert age is not None and 0 <= age < 120, f"算出来的年龄不合理：{age!r}"
 
 
 def test_force_fix_column_migration_readds_on_mysql(repo: Repository, db: Database) -> None:

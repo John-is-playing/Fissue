@@ -1,8 +1,9 @@
 # 数据模型
 
 > 存储层：默认 **SQLite**（零依赖），生产 / 多机可换 PostgreSQL 或 MySQL 8.0+；支持导出 JSON / Markdown。
-> 键列长度取 511 字符（不是更大的 767）：MySQL + utf8mb4 的索引上限是 3072 字节，
-> `uq_item_identity` 是四列复合唯一索引，767 字符单列就 3068 字节、复合必然建不上。
+> 键列长度取 640 字符（不是更大的 767）：MySQL + utf8mb4 的索引上限是 3072 字节，
+> 真正超标的是队列表的复合唯一索引（queue + item_key + status，767 时 3196 字节）；
+> 640 既满足这条索引，也覆盖 `items.key` 的最坏长度（`platform:owner/name#number` = 584）。
 > 完整细节见 [docs/DESIGN.md §7](../DESIGN.md#7-存储)。
 
 ---

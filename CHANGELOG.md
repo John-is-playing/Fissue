@@ -19,9 +19,12 @@
 
 - **MySQL 8.0+ 后端**：`database.url` 支持 `mysql+pymysql://user:pw@host:3306/db`，
   与 SQLite / PostgreSQL 同一条 `create_all` + 迁移路径。三处硬约束都按 MySQL 的口径落地：
-  - **键列 767 → 511 字符**：MySQL + utf8mb4 的索引上限是 **3072 字节**，而
-    `uq_item_identity` 是四列复合唯一索引——767 字符单列就占 3068 字节，复合索引必然建不上。
-    511 字符下该索引 2396 字节、`uq_queue_item_pending` 2172 字节，留有余量；
+  - **键列 767 → 640 字符**：MySQL + utf8mb4 的索引上限是 **3072 字节**，真正超标的是
+    **`uq_queue_item_pending`（queue + item_key + status）**这条复合唯一索引：
+    16 + 767 + 16 = 799 字符 = 3196 字节，建表直接报 `Specified key was too long`。
+    640 时是 16 + 640 + 16 = 672 字符 = 2688 字节；同时 `items.key` 的最坏长度
+    （`platform:owner/name#number` = 7+1+511+1+64 = 584）也留在 640 以内——
+    压到 511 会把这个最坏情形压成超长，在 PostgreSQL 上是写库失败、在 SQLite 上则被静默存下。
   - **长文本列落成 `MEDIUMTEXT`**：MySQL 的 `TEXT` 上限只有 **64KB**，而 GitHub 的
     Issue/PR 正文上限正好是 65536 **字符**（UTF-8 中文一多就超）、沙盒 `stdout`/`stderr`
     与修复 `diff` 也常有几十 KB。`items.body` / `comments.body` /
@@ -61,6 +64,44 @@
 - **处置**：不改夹具期望（期望表是规格，改它只是让实测好看）、不调阈值去凑命中（只是把抖动
   搬到另一侧）；改为把逐条对照与**可复跑的验证命令**写进 `BENCHMARK.md` §4.7.1，
   README / wiki 的口径从「公开保留 9 处不一致」改成「边界抖动 + 指向复测」。
+
+### 修复 —— 自查照出来的四个真问题（都是本批自己引入的）
+
+- **设置页的 webhook 密钥「保存了但什么都没写」**：密钥面板加了 4 个输入框，
+  但 `static/settings.js` 的 `.env` 提交逻辑用的是**写死的键名表**，新键不在表里 → 点保存时
+  一个字段都没提交，页面照常弹「已保存并热重载」，`.env` 一字未动、webhook 继续 fail-closed。
+  现在提交逻辑**扫 DOM**（`input[id^="env-"]`）按 id 取键名，复选框明确提交 `true/false`
+  （原先按 `el.value` 取值拿到 `"on"`，取消勾选永远关不掉）；`tests/test_setup.py` 加两条守卫：
+  每个 `ENV_WRITABLE` 键在渲染后的页面里都必须有对应输入框，且 JS 里不许再出现写死的键名。
+- **`trust_proxy` 在多跳反代下会把公网流量判成回环（免登录）**：原先只取 `X-Forwarded-For`
+  **最右一跳**，而该头是每一跳代理追加**自己的直接对端**——同机双 nginx / cloudflared /
+  `ssh -L` 这类两跳形态下，最右一跳是上一层代理（同机即 `127.0.0.1`），于是被判成回环来源。
+  现在从右往左**跳过 `web.trusted_proxies` 里的代理**，第一个非代理地址才是客户端；
+  链路里出现无法解析的段则整条作废（跳过坏段会让判定左移到攻击者自己写的那一格）。
+- **登录限速与会话审计仍按「直接对端」**：`client_host` 只改了身份判定，`_throttle_keys`
+  与 `sessions.peer_ip` 还在用 `peer_host`——反代下所有人共用一个 IP 桶（一个人试错把所有人
+  锁住），审计列也全是代理 IP。两处统一改用真实客户端地址。
+- **`oldest_unflushed_age` 会返回负年龄**：MySQL 的 `DATETIME` 默认秒级精度，写入时对小数秒
+  **四舍五入**，刚写的 `finished_at` 可能比当前时间"晚"半秒，相减得 `-0.39s`。年龄夹到 0
+  ——负值没有物理意义，日志里也不该出现 `-0.4s`。（MySQL 真机用例照出来的，SQLite 上永远看不到。）
+
+其余按自查意见修掉的细节：
+
+- **MySQL 键列长度改为 640**（原 511）：压到 511 会把 `items.key` 的最坏长度
+  （`platform:owner/name#number` = 584）压成超长，在 PostgreSQL 上写库失败。640 同时满足
+  `uq_queue_item_pending`（672 字符 = 2688 字节）与最坏键长；**顺带纠正理由**：真正让 767
+  建不上表的是队列表那条复合唯一索引，不是 `uq_item_identity`（它从没有 767 的列）。
+- **`error` / `reason` / `notes` / `command` 也换成 MySQL 长文本变体**：它们装的就是长栈回溯
+  与模型整段输出，超 64KB 时「记录失败」本身会失败，并回滚整条记录。
+- **`trust_proxy` 的报错文案不再推荐容器内网大网段**：`172.17.0.0/16` 在 Docker `-p` 发布下
+  就是网关地址，照抄等于「谁的转发头都信」——只保留「写你这台反代自己的地址」。
+- **设置页「测试连接」的后端名不再写死二选一**（MySQL 曾被报成 `postgresql`），改为复用
+  `web/status.py` 的唯一口径。
+- **真机用例加防呆**：`tests/test_store_mysql.py` 会对库执行 `drop_all()`，现在要求库名含
+  `test`，否则整组 skip——照抄 `.env` 的连接串跑一次就会把 `items` / `auth_users` 一起清掉。
+- **MySQL 验证状态的口径统一**：`docs/ENV.md` / wiki 部署页原先还写着「只做过离线校验」，
+  与 CHANGELOG 的「已在 Docker MySQL 8.0 上跑通」自相矛盾，现按实测重写。
+- **wiki 配置表被一段 blockquote 从中间截断**（后半张表渲染成裸文本），说明挪到表尾。
 
 ### 新增 —— MySQL 真机验证（Docker 实例，补齐「只有离线校验」的口径）
 

@@ -514,10 +514,11 @@ tier1 的实测 < 80（判 tier2）。**方向相反，说明这是阈值标定�
 **怎么复跑**（本机实测过的命令；`--limit` 要大于条目数，否则抓取会因「数据不完整」而不推进游标）：
 
 ```bash
-# 1) 干净库（这里用 Docker MySQL 8.0；SQLite 直接把 FISSUE_DATABASE_URL 换成临时文件即可）
+# 1) 干净库。**注意用专用测试库**：下面这条 DROP 会清空整个库，
+#    千万别把 .env 里的生产连接串照抄过来。用例还会自己 drop_all 一次。
 docker exec fissue-mysql mysql -uroot -p*** -e \
-  "DROP DATABASE IF EXISTS fissue; CREATE DATABASE fissue CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-export FISSUE_DATABASE_URL="mysql+pymysql://fissue:***@127.0.0.1:13306/fissue?charset=utf8mb4"
+  "DROP DATABASE IF EXISTS fissue_bench; CREATE DATABASE fissue_bench CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+export FISSUE_DATABASE_URL="mysql+pymysql://fissue:***@127.0.0.1:13306/fissue_bench?charset=utf8mb4"
 fissue db init
 
 # 2) 抓取 + 评测两套夹具
