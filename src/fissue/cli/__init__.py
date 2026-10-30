@@ -4,6 +4,7 @@
 """
 
 from . import (
+    doctor,  # noqa: F401,E402  —— 注册 platforms doctor（平台能力体检）
     onboard,  # noqa: F401,E402  —— 注册 onboard（初始化向导）
     ops,  # noqa: F401,E402  —— 注册 report/export/fix/serve/web/status/sandbox
 )

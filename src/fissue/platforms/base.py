@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -130,6 +131,47 @@ class PlatformAdapter(ABC):
     async def fetch_repo_labels(self, repo: RepoRef) -> list[str]:
         """仓库已有标签名列表（用于复用而非新建）。"""
         return []
+
+    # -- 诊断用：写探测必须能自己擦净 -------------------------------------
+    #
+    # 为什么这几个方法放在适配器而不是诊断命令里：URL 形状是**每个平台一套**的知识，
+    # 而它只能有一份来源。写进诊断命令就等于把平台知识复制了第二遍——上一轮 Gitee 的
+    # 「打标签一直是坏的」，正是「形状知识写在两个地方、只改了一处」造成的。
+    #
+    # 默认实现按 GitHub / v5 的公共形状写（两者都是 `/repos/{owner}/{name}`）；
+    # GitLab 用项目 id 路径，所以它覆写这三个方法。
+
+    def _repo_api(self, repo: RepoRef) -> str:
+        """仓库 API 根地址（默认 GitHub / v5 形状）。"""
+        return f"{self.api_base}/repos/{repo.owner}/{repo.name}"
+
+    async def delete_repo_label(self, repo: RepoRef, label: str) -> None:
+        """删除**仓库级**标签（诊断探测后的清场）。"""
+        await self._request("DELETE", f"{self._repo_api(repo)}/labels/{quote(label, safe='')}")
+
+    async def remove_label(self, repo: RepoRef, number: int | str, label: str) -> None:
+        """从**Issue** 上移除一个标签（诊断探测后的清场；PR 不参与探测）。"""
+        await self._request(
+            "DELETE", f"{self._repo_api(repo)}/issues/{number}/labels/{quote(label, safe='')}"
+        )
+
+    async def delete_comment_by_body(self, repo: RepoRef, number: int | str, body: str) -> bool:
+        """删掉正文与给定值**逐字相同**的评论，返回是否删到。
+
+        为什么按正文找而不是靠创建时的返回：各平台 ``comment()`` 的返回值不统一
+        （有的返回对象、有的返回 None，GitLab 用 notes 语义），拿 id 反而要每个平台各写一遍。
+        按正文精确定位对「诊断刚发的那一条」足够可靠，且对不上时**什么都不删**——
+        宁可留一条痕迹并报出来，也不能误删维护者的评论。
+        """
+        data = await self._get(f"{self._repo_api(repo)}/issues/{number}/comments", per_page=100)
+        for comment in data or []:
+            if isinstance(comment, dict) and (comment.get("body") or "") == body:
+                cid = comment.get("id")
+                if cid is None:
+                    continue
+                await self._request("DELETE", f"{self._repo_api(repo)}/issues/comments/{cid}")
+                return True
+        return False
 
     # -- 标签：进程内缓存 + 批量确保 --------------------------------------
 

@@ -17,6 +17,12 @@ name: CI
 # 4) **runner 与 action 都钉住**：`runs-on` 写死 `ubuntu-24.04` 而不是 `ubuntu-latest`
 #    （该标签 2026-10-19 起迁到 Ubuntu 26，钉住可免于镜像漂移带来的意外）；action 用当前
 #    主版本（v4/v5 指向的 Node 20 已被 GitHub 弃用，会被强制跑在 Node 24 上）。
+# 5) **另有一个 Windows 任务**：这不是「顺手多跑一遍」。代码里存在成片的 Windows 专属分支
+#    （`sandbox` 的 inline 回退、命名管道路径、`os.name == "nt"` 守卫、路径分隔符处理），
+#    而它们**在 ubuntu 上一条都不会被执行**。更具体的证据来自 `tests/test_sandbox_forwarder.py`：
+#    AF_UNIX 那几条只能在 POSIX 上真跑，于是本机（Windows）覆盖率天然矮一截；
+#    反过来 Windows 分支也只有 Windows 机器能验。两个平台各补对方的盲区。
+#    只跑测试、不跑覆盖率门槛：覆盖率在 ubuntu 上以单一口径统计，两处各算一套只会互相打架。
 
 on:
   push:
@@ -56,6 +62,34 @@ jobs:
         # 单条用例的硬超时来自 pyproject 的 `[tool.pytest.ini_options].timeout`（120s）。
         # 这里不重复传 --timeout：单一来源，本地 `pytest -q` 与 CI 口径才一致。
         run: python -m pytest -q -p no:cacheprovider --cov=fissue --cov-report=term
+
+  test-windows:
+    name: pytest (windows)
+    # 钉 `windows-2022` 而不是 `windows-latest`：理由同上，避免镜像标签漂移。
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # 只取一个版本：这一任务要回答的是「Windows 分支能不能跑」，不是「各 Python 版本在
+          # Windows 上是否一致」——后者由 ubuntu 矩阵负责。多铺一层只会让 CI 时间翻倍。
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        # Windows runner 的默认 shell 是 pwsh，多行 run 里要用 PowerShell 语法；
+        # 这里刻意只有两条独立命令，两边写法一致，不需要分叉。
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 跑离线单测（不带覆盖率门槛）
+        # 不传 --cov：覆盖率口径只在 ubuntu 上统计（见文件头第 5 条）。
+        # `-p no:cacheprovider` 与 ubuntu 一致，避免 runner 上残留缓存目录。
+        # 注意跳过数会出现在 pytest 的收尾行里（如 `13 passed, 8 skipped`）——
+        # 「看不见的跳过」和「真的通过」在 CI 里长得一样，所以要让它留在日志里。
+        run: python -m pytest -q -p no:cacheprovider
 
   lint:
     name: ruff + mypy

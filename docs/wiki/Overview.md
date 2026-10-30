@@ -107,7 +107,7 @@ Fissue 把「**分诊（triage）→ 验证 → 修复**」整条流程自动化
 
 | 项 | 选型 |
 |---|---|
-| 语言 | Python 3.10+（CI 矩阵：3.10 / 3.12 / 3.14） |
+| 语言 | Python 3.10+（CI 矩阵：3.10 / 3.12 / 3.14 on ubuntu，另有 windows-2022 一份） |
 | 交付形态 | CLI（typer）+ Web（FastAPI + Jinja2）+ REST API + 常驻服务 |
 | 抓取平台 | GitHub · Gitee · AtomGit · GitLab（含自建实例） |
 | AI | 任意 OpenAI 兼容端点（DeepSeek / OpenAI / 通义 / Kimi / 本地 vLLM…） |

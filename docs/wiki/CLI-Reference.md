@@ -25,6 +25,7 @@
 | `fissue web` | Web 工作台 + REST API |
 | `fissue sandbox serve` / `fissue sandbox check` | 起沙盒转发组件 / 检查沙盒环境是否就绪 |
 | `fissue bench` | 跑分基线：`capture` 冻结 / `diff` 逐项对比 / `list` 列出 |
+| `fissue platforms doctor` | **平台能力体检**：令牌是否有效、只读链路是否通、写操作到底能做什么。默认只读，`--write` 才探测写且自动清理痕迹 |
 | `fissue auth` | 本机自救：`status / set-password / reset / key list|create|revoke` |
 
 ---
@@ -186,6 +187,32 @@ fissue auth key list|create|revoke
 ```
 
 界面上进不去时的**本机自救通道**（口令忘了、手机丢了、Key 全吊销）。
+
+### `platforms`
+
+```bash
+# 只读体检（安全）：令牌是否有效、只读链路是否通
+fissue platforms doctor
+fissue platforms doctor -r gitee:owner/repo
+
+# 写探测：会建标签/评论并**自动删除**，需要 --number（Gitee 编号是字符串）
+fissue platforms doctor -r gitee:owner/repo --write --number IKM265
+```
+
+它回答的是「**这套令牌 + 这个仓库到底能做什么**」，一张矩阵打出来：只读（whoami /
+默认分支 / 条目 / 仓库标签）与写（仓库标签、条目打标签、条目评论）。
+
+三态显示：`✅` 通过、`❌` 失败、`－` **没探测**（比如没给 `--number`）。
+三态必须分开——把「跳过」显示成通过，等于把没验过的说成验过了。
+
+- **默认只读**，不加 `--write` 绝不写入；
+- **写探测自清**，且以「痕迹实际还在不在」为准：删不掉会明确写进结果里，
+  而不是因为删除调用没抛异常就宣称干净；
+- 退出码：有探测失败为 `1`（「跳过」不算失败），可直接用在部署自检脚本里。
+
+> 为什么要它：v1.3.0-b2 修掉的那个 Gitee 打标签缺陷，根因是请求体形状发错，而平台报的是
+> `400 Problems parsing JSON`——听上去像「平台不支持这个接口」，于是错误结论在基准文档里
+> 活了半个月。判据该是一条命令能跑出来的东西，不是读文档猜出来的。
 
 ---
 

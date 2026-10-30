@@ -52,12 +52,19 @@ ruff format --check src tests
 
 ## 3. CI
 
-`.github/workflows/ci.yml`，两个 job，**都阻断**（无 `continue-on-error`）：
+`.github/workflows/ci.yml`，三个 job，**都阻断**（无 `continue-on-error`）：
 
 | job | 内容 |
 |---|---|
 | `pytest (py3.10 / py3.12 / py3.14)` | 矩阵取**最低支持版本** `3.10`、一个现代版本 `3.12`，以及本机实测跑通全量的 `3.14`；`python -m pytest -q -p no:cacheprovider` |
+| `pytest (windows)` | `windows-2022` 上跑同一套离线用例（单个 Python 版本，不跑覆盖率） |
 | `ruff + mypy` | `python -m ruff check src tests` 与 `python -m mypy src/fissue tests` |
+
+**为什么有 Windows 任务**：代码里有成片的 Windows 专属分支（`sandbox` 的 inline 回退、
+命名管道路径、`os.name == "nt"` 守卫、路径分隔符处理），它们**在 ubuntu 上一条都不会被执行**。
+反过来，AF_UNIX 那类 POSIX 专属用例在 Windows 上只能 skip。两个平台各自补对方的盲区，
+所以「多跑一遍」不是重复劳动，而是覆盖互相够不到的地方。覆盖率口径只在 ubuntu 上统计，
+两处各算一套只会互相打架。
 
 单条用例有 **120s 硬超时**（`pytest-timeout`，配置在 `pyproject.toml` 的 `[tool.pytest.ini_options].timeout`）：本项目的网络守卫只放行 localhost，而本机代理也恰在 localhost，于是真实网络请求既不被拦下也不被 respx 拦截，只静默重试到超时——表现为 pytest **假死**。有了这条，同样的故障会在 120s 内变成一条明确的 `Timeout`，直接指到卡住的用例。
 

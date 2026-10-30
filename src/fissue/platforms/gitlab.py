@@ -367,6 +367,38 @@ class GitLabAdapter(PlatformAdapter):
 
         await self._request("POST", notes_url, json={"body": body}, probe=_probe)
 
+    # -- 诊断用：写探测后的清场（覆写 base——GitLab 走项目 id 路径） ------
+    #
+    # 默认实现在 base 里按 GitHub / v5 的 `/repos/{owner}/{name}` 写，而 GitLab 的
+    # 一切都在 `/projects/{id or urlencoded path}` 下，标签移除还是 PUT + `remove_labels`
+    # 的语义（不是 DELETE 一个子资源）。三处都得覆写，否则探测会「写进去、删不掉」。
+
+    def _repo_api(self, repo: RepoRef) -> str:
+        return self._project(repo)
+
+    async def delete_repo_label(self, repo: RepoRef, label: str) -> None:
+        await self._request("DELETE", f"{self._project(repo)}/labels/{quote(label, safe='')}")
+
+    async def remove_label(self, repo: RepoRef, number: int | str, label: str) -> None:
+        await self._request(
+            "PUT", f"{self._project(repo)}/issues/{number}", json={"remove_labels": label}
+        )
+
+    async def delete_comment_by_body(self, repo: RepoRef, number: int | str, body: str) -> bool:
+        notes = await self._get(
+            f"{self._project(repo)}/issues/{number}/notes", sort="desc", per_page=100
+        )
+        for note in notes or []:
+            if isinstance(note, dict) and (note.get("body") or "") == body:
+                nid = note.get("id")
+                if nid is None:
+                    continue
+                await self._request(
+                    "DELETE", f"{self._project(repo)}/issues/{number}/notes/{nid}"
+                )
+                return True
+        return False
+
     async def close_item(self, repo: RepoRef, number: int | str, item_type: ItemType = ItemType.ISSUE) -> None:
         segment = "issues" if item_type is ItemType.ISSUE else "merge_requests"
         event = "close" if item_type is ItemType.ISSUE else "close"
