@@ -345,10 +345,25 @@ ERROR 拉取镜像失败：… context deadline exceeded
 > 多出 `#3/#5/#7` 三处偏差——见 [§4.7.1](#471-复测2026-10-30偏差不是一份稳定清单而是阈值边界抖动)。
 > 结论：这是**阈值边界抖动**，不是可勾销的缺陷清单。
 
-### 4.3 textkit 缺少回归门数据
+### 4.3 textkit 的回归门数据：原始跑分为空，2026-10-30 补了 3 条
 
-textkit 跑在回归门功能（`7bddf08`）合入之前，因此没有 `regression:*` 记录。
-它的 5 个 F2P 成立、PR2 被 fix 阶段识破，但**没有经过回归门检验**。
+`textkit` 最早那一轮跑在回归门功能（`7bddf08`）合入**之前**，所以历史记录里一条
+`regression:*` 都没有。它的 5 个 F2P 成立、PR2 被 fix 阶段识破，但那次**确实没经过回归门检验**。
+
+2026-10-30 在 Docker MySQL 8.0 上重跑验证阶段时补上了其中 3 条（`textkit#1` + 两个 PR）：
+
+| 条目 | `regression:base` | `regression:fix` | 耗时 |
+|---|---|---|---|
+| `textkit#1` | pass（exit=0） | pass（exit=0） | 1.6s / 1.6s |
+| `textkit#6` | pass（exit=0） | pass（exit=0） | 2.3s / 1.7s |
+| `textkit#7` | pass（exit=0） | pass（exit=0） | 1.6s / 1.6s |
+
+→ **六次运行全部 pass**，说明「改之前是绿的、改之后还是绿的」这条判据在 textkit 上成立。
+
+**但仍要说清边界**：补的是 **3/7 条**，不是整套夹具。`textkit` 作为**最早一批**夹具，
+它的 tier / F2P 统计仍然来自那个没有回归门的版本；这里补的是「回归门在 textkit 的代码
+形态上能不能跑通」这一个问题，不能反推成「整套 textkit 都过了一遍回归门」。
+要全量补齐，照 §6 的命令重跑一遍 `fissue verify --repo John-is-playing/textkit` 即可。
 
 ### 4.4 textkit 的 18 次 Agent error
 
