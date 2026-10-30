@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{# 任务列表：筛选 + 分页。
+ #
+ # 与「状态」页的分工：状态页回答「**现在**在干什么」（正在运行的作业 + 写闸门持有者），
+ # 这一页回答「历史上都干过什么、结果如何」。作业表是进程内的，常驻服务每跑一轮就登记
+ # 一条，一天几百条——不分页的话「找上周那次失败的扫描」只能靠翻。
+ #}
+
+{% block title %}任务 · Fissue{% endblock %}
+{% block heading %}任务{% endblock %}
+{% block subtitle %}
+  共 {{ jobs.total }} 条记录{% if jobs.total %} · 当前 {{ pager.span }}{% endif %}
+{% endblock %}
+
+{% block header_extra %}
+  <button type="button" class="ghost small" id="jobs-refresh">刷新</button>
+{% endblock %}
+
+{% block content %}
+
+{# 写闸门被「表外的进程」占着时要说清楚——否则用户只看到角标亮着、表里空空。 #}
+{% include "_job_writer_alert.html" %}
+
+{# 正在运行的作业置顶：它最需要被看见（能取消、能看进度）。 #}
+{% include "_job_current.html" %}
+
+<div class="panel">
+  {# 筛选：种类与状态都从**实际出现过的值**里选，不写死清单——新增作业种类时
+     写死的下拉会漏掉它，而用户看到的会是「筛不到刚跑的那条」。 #}
+  <form class="filters" method="get">
+    <label class="inline">种类
+      <select name="kind">
+        <option value="">全部</option>
+        {% for k in jobs.kinds %}
+        <option value="{{ k }}" {% if filters.kind == k %}selected{% endif %}>{{ k }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="inline">状态
+      <select name="status">
+        <option value="">全部</option>
+        {% for s in jobs.statuses %}
+        <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="inline">每页
+      <input type="number" name="per_page" value="{{ filters.per_page }}" min="1" max="200" style="width:80px">
+    </label>
+    <button type="submit" class="primary">筛选</button>
+    <a href="/jobs"><button type="button" class="ghost">重置</button></a>
+  </form>
+
+  <h2 class="mt">任务历史</h2>
+  {% for job in jobs["items"] %}
+  {% include "_job_row.html" %}
+  {% else %}
+  <div class="muted">
+    {% if filters.kind or filters.status %}
+    这个筛选下没有记录。<a href="/jobs">清除筛选</a>
+    {% else %}
+    还没有任务记录。到<a href="/">总览</a>的控制面板可以发起：检索 / 评测 / 验证 / 修复 / flush。
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  {% if jobs.total %}
+  {% include "_pagination.html" %}
+  {% endif %}
+
+  <div class="muted small mt">
+    作业表是**进程内**的：重启服务后历史清空，且只在单个 uvicorn worker 下成立
+    （<code>fissue web</code> 与 <code>fissue serve --with-web</code> 都是单进程）。
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  document.getElementById("jobs-refresh").addEventListener("click", function () {
+    window.location.reload();
+  });
+})();
+</script>
+{% endblock %}

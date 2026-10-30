@@ -211,6 +211,45 @@ class JobRegistry:
         jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
         return jobs[:limit]
 
+    def page(
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 20,
+        kind: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """分页取历史作业。
+
+        为什么分页而不是「最近 N 条」：作业表是进程内的，常驻服务每跑一轮就登记一条，
+        一天下来几百条。全堆一页时「找上周那次失败的扫描」只能靠翻，而分页 + 筛选是
+        最省事、也最不会出错的做法。
+
+        **越界页夹回合法范围**而不是报错或返回空：删掉中间几条后原来的第 3 页可能只剩
+        2 页，此时报 404 或给一片空白都像「数据没了」，夹回末页最接近用户的预期。
+        """
+        jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        if kind:
+            jobs = [j for j in jobs if j.kind == kind]
+        if status:
+            jobs = [j for j in jobs if j.status == status]
+
+        total = len(jobs)
+        per = max(1, int(per_page))
+        pages = max(1, (total + per - 1) // per)      # 空结果也算 1 页
+        cur = min(max(1, int(page)), pages)
+        start = (cur - 1) * per
+        return {
+            "items": [j.to_dict() for j in jobs[start : start + per]],
+            "total": total,
+            "page": cur,
+            "pages": pages,
+            "per_page": per,
+            # 供筛选下拉列出「实际出现过的种类/状态」——写死一份清单会在新增种类时漏掉。
+            "kinds": sorted({j.kind for j in self._jobs.values()}),
+            "statuses": sorted({j.status for j in self._jobs.values()}),
+        }
+
     def current(self) -> Job | None:
         """仍在跑的作业（至多一个）。"""
         live = [j for j in self._jobs.values() if j.live]

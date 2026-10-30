@@ -1,0 +1,34 @@
+{# 分页控件（数据由 web/paging.py 的 build_pager 算好）。
+ #
+ # 调用方需提供 `pager`。只有一页时整体不渲染：一个「1」加两个灰按钮纯属噪音。
+ # 页码链接里带着当前筛选参数（由 build_pager 拼好）——只拼 `?page=N` 会让翻页
+ # 悄悄丢掉筛选条件，用户以为筛选被重置了。
+ #}
+{% if pager and pager.show %}
+<nav class="pager" aria-label="分页">
+  <span class="pager-span muted small">{{ pager.span }}</span>
+  <span class="pager-links">
+    {% if pager.prev_url %}
+    <a class="pager-btn" href="{{ pager.prev_url }}" rel="prev">‹ 上一页</a>
+    {% else %}
+    <span class="pager-btn disabled">‹ 上一页</span>
+    {% endif %}
+
+    {% for link in pager.links %}
+      {% if link.gap %}
+      <span class="pager-gap muted">…</span>
+      {% elif link.current %}
+      <span class="pager-btn on" aria-current="page">{{ link.n }}</span>
+      {% else %}
+      <a class="pager-btn" href="{{ link.url }}">{{ link.n }}</a>
+      {% endif %}
+    {% endfor %}
+
+    {% if pager.next_url %}
+    <a class="pager-btn" href="{{ pager.next_url }}" rel="next">下一页 ›</a>
+    {% else %}
+    <span class="pager-btn disabled">下一页 ›</span>
+    {% endif %}
+  </span>
+</nav>
+{% endif %}

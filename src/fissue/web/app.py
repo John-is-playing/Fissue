@@ -1791,14 +1791,46 @@ def _register_web_jobs(app: FastAPI, templates: Jinja2Templates) -> None:
     """任务列表页 + 任务详情页。"""
 
     @app.get("/jobs", response_class=HTMLResponse)
-    async def jobs_page(request: Request) -> Response:
-        """旧入口：任务面板已并进「状态页」。
+    async def jobs_page(
+        request: Request,
+        kind: str | None = Query(None, description="按作业种类筛"),
+        status: str | None = Query(None, description="按状态筛"),
+        page: int = Query(1, ge=1),
+        per_page: int = Query(20, ge=1, le=200),
+    ) -> HTMLResponse:
+        """任务列表：筛选 + 分页。
 
-        保留重定向而不是删掉：`/jobs` 在文档、书签与脚本里都有，404 掉会让人以为功能没了。
-        真正的内容现在在 `/status`（同一份 `_jobs_panel.html` 部件）。
-        任务**详情**页 `/jobs/{id}` 不变——那是独立的深链，不该跟着列表页一起消失。
+        为什么单独一页而不是塞在状态页里：作业表是进程内的，常驻服务每跑一轮就登记一条，
+        一天下来几百条。全堆在状态页上时，「找上周那次失败的扫描」只能靠翻——而状态页
+        要回答的是「**现在**在干什么」，不是「历史上都干过什么」。
         """
-        return RedirectResponse("/status", status_code=307)
+        from .paging import build_pager
+
+        registry = request.app.state.jobs
+        data = registry.page(page=page, per_page=per_page, kind=kind, status=status)
+        pager = build_pager(
+            page=data["page"],
+            pages=data["pages"],
+            total=data["total"],
+            per_page=data["per_page"],
+            base_path="/jobs",
+            # 翻页要带着筛选条件，否则点「下一页」筛选就没了——用户以为被重置。
+            params={"kind": kind, "status": status,
+                    "per_page": per_page if per_page != 20 else None},
+        )
+        return templates.TemplateResponse(
+            request,
+            "jobs.html",
+            _page_context(
+                request,
+                nav="jobs",
+                jobs=data,
+                pager=pager,
+                current=registry.current().to_dict() if registry.current() else None,
+                writer=writer_panel(_settings(request)),
+                filters={"kind": kind or "", "status": status or "", "per_page": per_page},
+            ),
+        )
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_detail_page(request: Request, job_id: str) -> HTMLResponse:

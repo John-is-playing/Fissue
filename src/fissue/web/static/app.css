@@ -646,3 +646,31 @@ tr.stalled td { background: rgba(255, 107, 107, .06); }
 .j-raw > summary::before { content: "▸ "; }
 .j-raw[open] > summary::before { content: "▾ "; }
 .j-raw pre { max-height: 320px; overflow: auto; }
+
+/* --------------------------------------------------------------------------
+ * 分页控件（web/templates/_pagination.html）
+ *
+ * 只在一页以上时才渲染：一个「1」加两个灰按钮纯属噪音。
+ * -------------------------------------------------------------------------- */
+.pager {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-top: 14px;
+  padding-top: 12px; border-top: 1px solid var(--line);
+}
+.pager-span { white-space: nowrap; }
+.pager-links { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.pager-btn {
+  min-width: 30px; padding: 4px 9px; text-align: center;
+  font-size: 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--line); background: var(--panel2);
+  color: var(--fg); text-decoration: none; font-variant-numeric: tabular-nums;
+}
+a.pager-btn:hover { border-color: var(--accent); color: var(--accent); }
+.pager-btn.on {
+  background: var(--accent); border-color: var(--accent);
+  color: var(--accent-ink); font-weight: 600;
+}
+/* 边界处的「上一页/下一页」是 span 不是 a，必须显式压暗并去掉指针——
+   否则它会看起来和可点的按钮一样，点了没反应。 */
+.pager-btn.disabled { opacity: .4; cursor: default; }
+.pager-gap { padding: 0 2px; }

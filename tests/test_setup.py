@@ -608,13 +608,18 @@ def test_queue_flush_buttons_carry_the_queue_name(settings: Settings, client: An
     assert 'data-force="true"' in html and 'data-force="false"' in html
 
 
-def test_old_queue_and_job_entries_redirect(settings: Settings, client: Any) -> None:
-    """旧入口保留重定向：文档、书签、别人的脚本里都有这两个地址。
+def test_old_queue_entry_redirects_and_jobs_is_its_own_page(settings: Settings, client: Any) -> None:
+    """两个旧入口现在走不同的路——按各自的事实断言。
 
-    404 掉会让人以为功能没了；重定向则既保住旧链接，又把入口收到新位置。
+    * `/queues`：队列判定已并进流水线看板，保留 **307 重定向**（文档、书签、脚本里都有
+      这个地址，404 掉会让人以为功能没了）。
+    * `/jobs`：又独立出来了。作业表一天几百条，塞回状态页会把「现在卡没卡」淹掉，
+      所以它自己带筛选与分页；这里必须 **200**。
     """
     assert client.get("/queues", follow_redirects=False).status_code == 307
-    assert client.get("/jobs", follow_redirects=False).status_code == 307
+    jobs_page = client.get("/jobs", follow_redirects=False)
+    assert jobs_page.status_code == 200, "/jobs 现在是独立页面，不该再重定向"
+    assert "任务历史" in jobs_page.text
 
 
 def test_item_page_action_buttons_call_named_functions(settings: Settings, client: Any) -> None:

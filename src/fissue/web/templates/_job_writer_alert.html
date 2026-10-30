@@ -1,0 +1,38 @@
+{# 「写操作进行中」但作业表里看不到对应的作业——真机踩到的困惑点：角标说有活在干，
+   这张表却空空如也，用户既不知道是谁在写、也取消不了。原因很明确：**作业表只列从网页
+   提交的作业**，而常驻服务自己的定时轮次不在其中。这里把它点明，并按种类给出不同的话。
+
+   调用方需提供 `writer`（写闸门持有者）。
+#}
+{% if writer and writer.busy and writer.kind != 'job' %}
+<div class="alert info">
+  <span class="a-level">不在本表</span>
+  <div>
+    <div>
+      正在写的是 <b>{{ writer.kind_label }}</b>：<code>{{ writer.who }}</code>{% if writer.seconds is not none %}（已跑 {{ writer.seconds | round | int }} 秒）{% endif %}
+    </div>
+    <div class="small muted">
+      {% if writer.kind == 'round' %}
+      上面这条是常驻服务自己调度的轮次；它已**登记为任务**（类型 <code>round</code>）进入下方任务列表，
+      实时进度（LLM 输出、工具动作）可在它的「详情」页查看，也可以就地停掉。
+      {% elif writer.kind == 'cli' %}
+      它是**另一个进程**在写（命令行或另一个服务）。本进程看不到它的进度，也无法从页面取消——
+      要等它结束，或先停掉那个进程。
+      {% else %}
+      它是网页上刚发起的一次写操作（例如 flush、批准提 PR）。等它跑完即可；只有长任务才会登记成作业。
+      {% endif %}
+    </div>
+    {% if writer.kind == 'round' %}
+    {# 只有常驻轮次能就地停：那份 task 在本进程里。跨进程的轮次（kind=cli）停不了，
+       所以那条分支不给按钮——给一个按下去只会 409 的按钮，比不给更糟。 #}
+    <div class="row mt">
+      <button class="danger" type="button" data-act="stop-round">停止这一轮</button>
+      <span class="small muted">
+        会在最近的等待点中断它：正在进行的**单条**操作（例如正在建 PR）可能只完成一半。
+        停的只是这一轮，服务本身与之后按间隔的轮次照常。
+      </span>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}

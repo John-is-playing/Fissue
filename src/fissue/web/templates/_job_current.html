@@ -1,0 +1,26 @@
+{# 正在运行的作业（至多一个）。
+
+   调用方需提供 `current`（作业 dict 或 None）。运行中由页面脚本就地刷新
+   `#cur-progress` / `#cur-log`——不再自建一份 DOM，否则两处渲染会不一致。
+#}
+{% if current %}
+<div class="panel">
+  <h2>正在运行</h2>
+  <div class="job">
+    <div class="j-head">
+      <span class="spinner"></span>
+      <span class="j-kind">{{ current.kind }}</span>
+      <span class="tag status-queued">{{ current.status }}</span>
+      <span class="tag">{{ current.id }}</span>
+      <span class="muted small">{{ current.duration_seconds }}s</span>
+      {% if not read_only %}
+      <span class="spacer"></span>
+      <button class="danger" data-act="cancel-job" data-job="{{ current.id }}">取消任务</button>
+      {% endif %}
+      <a class="small" href="/jobs/{{ current.id }}">详情 →</a>
+    </div>
+    <div class="progress-line" id="cur-progress">{{ current.progress }}</div>
+    {% if current.log %}<pre id="cur-log">{{ current.log | join('\n') }}</pre>{% endif %}
+  </div>
+</div>
+{% endif %}

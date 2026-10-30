@@ -1,0 +1,25 @@
+{# 单条历史作业。列表页（分页）与状态页（最近几条）共用，
+   避免两处各写一份导致展示漂移。
+
+   调用方需提供 `job`（作业 dict）。
+   `_job_result.html` 靠 `job` 这个名字取数据——include 不传参，名字必须一致。
+#}
+{% set cls = 'ok' if job.status == 'done' else ('bad' if job.status == 'failed' else ('stale' if job.status == 'canceled' else 'unknown')) %}
+<div class="job">
+  <div class="j-head">
+    <span class="j-kind">{{ job.kind }}</span>
+    <span class="tag {{ cls }}">{{ job.status }}</span>
+    <span class="tag">{{ job.id }}</span>
+    <span class="muted small">{{ job.duration_seconds }}s</span>
+    <span class="muted small">{{ (job.created_at or '')[:19].replace('T', ' ') }}</span>
+    <span class="spacer"></span>
+    <a class="small" href="/jobs/{{ job.id }}">详情</a>
+    {% if job.live and not read_only %}
+    <button class="danger" data-act="cancel-job" data-job="{{ job.id }}">{{ '停止这一轮' if job.kind == 'round' else '取消' }}</button>
+    {% endif %}
+    <span class="muted small">{{ job.params }}</span>
+  </div>
+  {% if job.error %}<pre class="{{ 'bad' if job.status == 'failed' else 'muted' }}">{{ job.error }}</pre>{% endif %}
+  {% if job.log %}<pre>{{ job.log | join('\n') }}</pre>{% endif %}
+  {% include "_job_result.html" %}
+</div>
