@@ -1129,7 +1129,7 @@ def test_legacy_token_shim_is_gone(tmp_path: Path, settings: Settings, db: Datab
 
     with pytest.raises(ImportError):
         # 已删除的符号必须真的不存在（导入本身就要抛）
-        from fissue.web.auth import migrate_legacy_token  # noqa: F401
+        from fissue.web.auth import migrate_legacy_token  # type: ignore[attr-defined]  # noqa: F401
 
     store = _store(db)
     _make_admin(db)
