@@ -410,6 +410,17 @@ class V5Adapter(PlatformAdapter):
     #: 已经确认不可用的平台直接把这里置 ``False``，一次都不浪费。
     item_label_endpoint_usable: bool = True
 
+    #: ``POST /issues/{n}/labels`` 的请求体形状。
+    #:
+    #: * ``"dict"``（默认）—— ``{"labels": ["a", "b"]}``；
+    #: * ``"list"`` —— 裸数组 ``["a", "b"]``。
+    #:
+    #: 这个区分是真写逼出来的：Gitee 的同一端点对 ``{"labels": [...]}`` 回
+    #: ``400 Problems parsing JSON``，换成裸数组立刻 ``201``（2026-10-30 在私有靶子上实测，
+    #: 见 BENCHMARK.md §4.16）。形状猜错时它**不是报「字段不认识」而是报「JSON 解析失败」**，
+    #: 于是很容易被误读成「平台不支持条目级写」——这个误判在本项目里活了半个月。
+    item_label_body: str = "dict"
+
     async def _patch_labels_union(
         self, repo: RepoRef, number: int | str, labels: list[str], item_type: ItemType
     ) -> None:
@@ -441,8 +452,14 @@ class V5Adapter(PlatformAdapter):
             await self._patch_labels_union(repo, number, labels, item_type)
             return
         try:
-            # v5：Issue 与 PR 的标签都通过 issues 端点操作
-            await self._post(f"{self._repo_api(repo)}/issues/{number}/labels", {"labels": labels})
+            # v5：Issue 与 PR 的标签都通过 issues 端点操作。
+            # 体形状按平台分派：猜错的表现是「JSON 解析失败」，而不是「字段不认识」。
+            url = f"{self._repo_api(repo)}/issues/{number}/labels"
+            if self.item_label_body == "list":
+                params = self._auth_params()
+                await self._request("POST", url, json=list(labels), params=params or None)
+            else:
+                await self._post(url, {"labels": labels})
         except RateLimitError:
             raise
         except PlatformError as exc:

@@ -26,8 +26,10 @@
 | AtomGit | 「访问令牌」勾 read_repository / write_repository / issues / pull_requests |
 | GitLab | 「Access Token」勾 `api`（或 `read_api` + `write_repository`） |
 
-> ⚠️ 已测事实：四平台**只读**链路全部跑通；**写操作** GitHub / 极狐 GitLab / AtomGit 已验证，
-> **Gitee 写操作未验证**（建 Issue 被平台限制挡住）。加新适配器时，只读可先跑通、写操作请显式标注验证状态。
+> ⚠️ 已测事实：四平台**只读**链路全部跑通；**写操作** GitHub / 极狐 GitLab / AtomGit 已验证。
+> **Gitee**：打标签与建评论是通的，只有「建 Issue / 改 Issue」两个动作 404（原因未定位，
+> 见 [基准](Benchmark.md#5-尚未测量)）。加新适配器时，只读可先跑通、**写操作请逐条标注验证状态**，
+> 并且注意请求体形状——发错形状时平台常报「解析失败」而不是「字段不认识」，很容易被误读成「不支持」。
 
 ---
 

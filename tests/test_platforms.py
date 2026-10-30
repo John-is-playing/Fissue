@@ -465,6 +465,31 @@ async def test_atomgit_pr_line_counts_are_summed_from_files(atomgit) -> None:
 
 
 @respx.mock
+async def test_gitee_item_labels_post_a_bare_array(gitee) -> None:
+    """Gitee 的条目级打标签只能发**裸 JSON 数组**。
+
+    实测（2026-10-30，私有靶子 `ccqtp/fissue-write-probe` 的 `#IKM265`）：
+    ``{"labels": ["x"]}`` → ``400 Problems parsing JSON``；``["x"]`` → ``201``。
+
+    这条为什么值得单独钉：形状发错时平台报的是「JSON 解析失败」，**不是**「字段不认识」，
+    于是很容易被读成「这个平台不支持条目级写」——本项目的 BENCHMARK 就曾这么记了半个月。
+    所以这里断言的是**请求体的类型**（list 而非 dict），而不只是「请求发出去了」。
+    """
+    import json
+
+    route = respx.post(f"{GITEE}/repos/psf/requests/issues/1/labels").mock(
+        return_value=httpx.Response(201, json=[])
+    )
+
+    await gitee.add_labels(REPO, 1, ["fissue", "ai-generated"])
+
+    assert route.called, "应当调用条目级标签端点"
+    body = json.loads(route.calls[0].request.content)
+    assert isinstance(body, list), f"Gitee 只认裸数组，实际发的是 {type(body).__name__}"
+    assert body == ["fissue", "ai-generated"]
+
+
+@respx.mock
 async def test_v5_label_and_comment_paths(gitee) -> None:
     respx.get(f"{GITEE}/repos/psf/requests/labels").mock(return_value=httpx.Response(200, json=[]))
     create = respx.post(f"{GITEE}/repos/psf/requests/labels").mock(return_value=httpx.Response(201, json={}))

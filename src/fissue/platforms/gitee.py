@@ -17,3 +17,11 @@ class GiteeAdapter(V5Adapter):
     web_host = "gitee.com"
     use_query_token = True
     pr_segment = "pulls"
+
+    #: Gitee 的 ``POST /issues/{n}/labels`` **只认裸 JSON 数组**。
+    #:
+    #: 实测（2026-10-30，私有靶子 `ccqtp/fissue-write-probe`，`#IKM265`）：
+    #: ``{"labels": ["x"]}`` → ``400 Problems parsing JSON``；``["x"]`` → ``201``。
+    #: 在此之前本项目一直按 dict 形状发，于是「打标签失败」被记成「Gitee 不支持条目级写」，
+    #: 而真相是**形状发错了**——同一个端点换个体就是通的。见 BENCHMARK.md §4.16。
+    item_label_body = "list"

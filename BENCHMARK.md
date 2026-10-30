@@ -892,39 +892,70 @@ Python 项目 `wtk`（均值 / 中位数 / 百分位），**刻意留了一处�
 `Color must be a valid color code`）。所以 v5 的默认 `_create_label`（`color.replace("#","")`）
 对 Gitee 本来就是对的，只有 AtomGit 需要覆写——**同一个字段，两个平台两种口径，谁也别照抄谁**。
 
-**2026-10-30 复核：仍未解决，而且当前环境连复核都做不了**。本机 `.env` 里
-`FISSUE_GITEE_TOKEN` **为空**（令牌早已失效/被清掉），所以这一条既不是「已修好待验证」，
-也不是「验证过没通过」，而是**原因未定位 + 无凭据可复核**。按本项目的约定，平台写操作由人
-执行（agent 不代跑建 Issue / 提 PR 这类动作），因此这里只给出可照做的探测步骤与判据：
+**2026-10-30 复核：拿新令牌在私有靶子上重跑，范围比原先记的窄得多**。
 
-| 步骤 | 动作 | 期望 |
+靶子是本节的私有仓库 `ccqtp/fissue-write-probe`，令牌为该账号新签发的私人令牌（只读先通：
+`GET /repos/…` → 200）。逐条打下来，**被拒的只有「创建 / 更新 Issue 对象本身」那两个端点**：
+
+| 操作 | 状态码 | 结论 |
 |---|---|---|
-| 1 | 在 Gitee → 设置 → 私人令牌，签发一枚**带 Issue 作用域**的令牌 | — |
-| 2 | `FISSUE_GITEE_TOKEN=<token> fissue fetch --repo <你自己的公开库> --limit 1` | 只读通（200）——用来区分「令牌无效」与「只有条目级写被挡」 |
-| 3 | 用同一枚令牌直接 `POST https://gitee.com/api/v5/repos/<owner>/<repo>/issues`，body `{"title":"写探测（可删除）","body":"probe"}` | 仍 `404 project or enterprise` → 平台限制成立，本条维持「未验证」；`201` → 旧结论过期，须回头重查 `platforms/v5.py` 的条目级写 |
-| 4 | 把状态码、错误体、日期补进本节 | — |
+| `GET /issues/{n}` | 200 | 通（用来区分「读都不通」与「只有写被挡」） |
+| `POST /issues`（JSON / 表单 / 原文 body / 带 `labels`，四种形状） | **404 `project or enterprise`** | ❌ 拒 |
+| `PATCH /issues/{n}`（JSON / 查询参数 / `state=closed`，三种形状） | **404 `project or enterprise`** | ❌ 拒 |
+| `POST /issues/{n}/labels`（JSON 数组） | **201** | ✅ **通** |
+| `POST /issues/{n}/comments` | **201** | ✅ 通 |
+| `POST /labels`（仓库级，颜色用**裸**十六进制） | **201** | ✅ 通 |
 
-**判据先看状态码再看文案**：`project or enterprise` 只是平台返回的字面，字面不等于因果
-（本节两条假设都已被证伪）。真正能定性的对照只有三种：换令牌、换（公开/私有）仓库、
-换 OAuth 应用令牌。**在那之前，本节结论仍然是「Gitee 条目级写在上游受限、原因未定位」，
-不是「Fissue 的 Gitee 适配器有 bug」**——仓库级写（建分支、提 PR、建仓库标签）在同一次
-实测里是通的。
+→ 结论要改口径：**不是「Gitee 的条目级写一律被拒」，而是「建/改 Issue 这两个动作被平台拒」**。
+打标签、建评论、仓库级标签在同一次实测里都是通的。这直接影响能力盘点：
 
-**上面那张步骤表已经写成脚本**：`scripts/probe_gitee_write.py`（v1.3.0 新增）。它把「只读先通 →
-再试一笔真写」串成一段，**先打状态码再打报文**，并且默认只读：真写必须显式 `--write`，
-建出 Issue 后**立即自动关闭**，不会在仓库里留垃圾。
+- **`flush` 打标签在 Gitee 上是可用的**（`v5.add_labels` 走的正是 `POST /issues/{n}/labels`；
+  它的 `_patch_labels_union` 兜底反而会撞 404，所以那条兜底在 Gitee 上不该被触发）；
+- **建 PR / 建分支不受影响**（仓库级，§4.16 早已验过）；
+- 真正做不了的是「**建 Issue**」「**改 Issue 正文 / 状态**」——也就是「用 Fissue 往 Gitee 反向
+  建单」和「自动关闭/改标记」这两件事。
+
+**同时纠正旧记录，而且这条旧记录错得有价值**：本节早先写「`POST /issues/{n}/labels` 七种形状
+全试过、一律 `400 Problems parsing JSON`」。本次逐形状重打，发现**关键在于体形状本身**：
+
+| 请求体 | 结果 |
+|---|---|
+| `{"labels": ["fissue-probe"]}` | **400 `Problems parsing JSON`** |
+| `["fissue-probe"]`（裸数组） | **201**，标签真的加上了 |
+
+也就是说：**这半个月记下的「Gitee 不支持条目级写」，其实是我们把请求体发错了形状**。
+那句报错说的是「JSON 解析失败」，而不是「字段不认识」——正是这种措辞把误判引到了「平台限制」
+而不是「我们发错了」。**代码已修**（`v5.item_label_body` / `GiteeAdapter.item_label_body = "list"`），
+并加了守卫用例 `tests/test_platforms.py::test_gitee_item_labels_post_a_bare_array`（断言的是
+`isinstance(body, list)`，不只断言「请求发出去了」）。
+
+**能力盘点因此要改**：
+
+- **`flush` 打标签在 Gitee 上现在是通的**（走 `POST /issues/{n}/labels` + 裸数组）；
+  `_patch_labels_union` 那条兜底在 Gitee 上会撞 404，所以**不该被触发**——修好形状后它确实不触发；
+- **建 PR / 建分支**不受影响（仓库级，§4.16 早前已验）；
+- 真正做不了的只剩「**建 Issue**」「**改 Issue 正文 / 状态**」两个动作（`POST /issues` 与
+  `PATCH /issues/{n}` 一律 404），也就是「用 Fissue 往 Gitee 反向建单」和「自动关闭/改标记」。
+
+**仍未定位的是「为什么单单建/改 Issue 这两个端点 404」**：错误体给的是 `project or enterprise`
+字样，但字面不等于因果（令牌作用域、仓库可见性两条假设都已被证伪，这次连私有仓库也试了）。
+未验方向只剩「条目级**对象写**是否只对企业版/第三方应用令牌开放」。
+
+**探测脚本**：`scripts/probe_gitee_write.py`（v1.3.0 新增）把上面这套判据跑成可复核的一段，
+默认只读、真写需显式 `--write`、输出**先状态码后报文**。本次实测用的就是它加同一组 API 探测。
 
 ```bash
-# 只读探测（安全）：确认令牌与仓库可见性没问题
-python scripts/probe_gitee_write.py --repo <owner>/<repo>
-
-# 真写探测：建一条 Issue 随即关闭；--label-only 则改测「给条目打标签」
-python scripts/probe_gitee_write.py --repo <owner>/<repo> --write
-python scripts/probe_gitee_write.py --repo <owner>/<repo> --write --label-only --number 1
+python scripts/probe_gitee_write.py --repo <owner>/<repo>                       # 只读
+python scripts/probe_gitee_write.py --repo ccqtp/fissue-write-probe --write     # 建 Issue（会撞 404）
+python scripts/probe_gitee_write.py --repo ccqtp/fissue-write-probe \\
+    --write --label-only --number IKM265                                        # 打标签（会 201）
 ```
 
-脚本自己从 `FISSUE_GITEE_TOKEN`（环境或 `.env`）取令牌，**不接受 `--token`**——令牌不进命令行。
-跑完把状态码、报文、日期补进本节即可。
+> 注意 Gitee 的条目编号是**字符串**（如 `IKM265`），不是整数——`--number` 因此按字符串收。
+> 这一点也解释了 §4.13 里那个「编号映射」坑：拿整数去比，永远对不上。
+>
+> 探测会留下真实痕迹，脚本已尽量自清（建出 Issue 会立即关闭）。本次复核留下的一个仓库标签、
+> 一个条目标签与一条评论，均已删除并复核归零。
 
 ---
 

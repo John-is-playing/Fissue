@@ -390,7 +390,7 @@ class PlatformAdapter(ABC):
         url: str,
         *,
         params: dict[str, Any] | None = None,
-        json: dict[str, Any] | None = None,
+        json: dict[str, Any] | list[Any] | None = None,
         data: Any = None,
         headers: dict[str, str] | None = None,
         expect_json: bool = True,

@@ -15,6 +15,24 @@
 
 > **未发布**：`v1.3.0` 之后的变更。
 
+### 修复 —— Gitee 打标签其实一直是坏的：请求体形状发错了
+
+- **`POST /issues/{n}/labels` 只认裸 JSON 数组**。实测（2026-10-30，私有靶子
+  `ccqtp/fissue-write-probe` 的 `#IKM265`）：`{"labels": ["x"]}` → `400 Problems parsing JSON`；
+  `["x"]` → **201**，标签真的加上。
+- 为什么这条藏了这么久：平台报的是「**JSON 解析失败**」，而不是「字段不认识」——这种措辞把人
+  引向「平台不支持条目级写」，而不是「我们发错了形状」。于是 `BENCHMARK.md` 里「Gitee 的条目级
+  写一律被拒」这个结论活了半个月，而真相是**只差一个请求体的类型**。
+- 改法：`v5.item_label_body` 按平台分派体形状，`GiteeAdapter` 置 `"list"`；并加守卫用例
+  `tests/test_platforms.py::test_gitee_item_labels_post_a_bare_array`——它断言的是
+  `isinstance(body, list)`，**不是**「请求发出去了」，否则把形状改回 dict 也照样过。
+- 能力盘点随之修正：Gitee 上 **`flush` 打标签现在是通的**（`_patch_labels_union` 那条兜底会撞
+  404，修好形状后不会被触发），**建评论也通**；真正做不到的只剩「**建 Issue**」与
+  「**改 Issue 正文 / 状态**」（`POST /issues`、`PATCH /issues/{n}` 一律 404，原因仍未定位）。
+  README / wiki（Overview / Benchmark / Extending）与 `BENCHMARK.md` §4.16 的口径同步改准。
+- `scripts/probe_gitee_write.py` 一并修正：`--number` 改收**字符串**（Gitee 的编号是 `IKM265`
+  这种形状，按 int 收根本传不进去），打标签改发裸数组。探测痕迹已清理并复核归零。
+
 ---
 
 ## [1.3.0] - 2026-10-30

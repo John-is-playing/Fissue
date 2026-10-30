@@ -22,7 +22,7 @@
     python scripts/probe_gitee_write.py --repo John-is-playing/textkit --write
 
     # 3) 换个写法复核：不建 Issue，只给一条已有条目打标签
-    python scripts/probe_gitee_write.py --repo John-is-playing/textkit --write --label-only --number 1
+    python scripts/probe_gitee_write.py --repo <owner>/<repo> --write --label-only --number IKM265
 
 令牌取 ``FISSUE_GITEE_TOKEN``（进程环境或 ``.env``）。不要把它写进命令行——
 本脚本自己读环境，不接受 ``--token``。
@@ -88,7 +88,10 @@ def judge(status: int) -> str:
     if status == 403:
         return "无权限（令牌 scope 或仓库授权问题）"
     if status == 404:
-        return "平台侧拒绝（与已记录的 `404 project or enterprise` 同形：需对比下面只读那一步的结果）"
+        return (
+            "平台侧拒绝（`project or enterprise`）。已知：建/改 Issue 会 404，"
+            "而打标签、建评论、仓库级标签是通的（BENCHMARK §4.16）"
+        )
     if status == 429:
         return "限流（隔几分钟再试，别加大频率）"
     return f"未归类（HTTP {status}）"
@@ -98,11 +101,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Gitee 条目级写操作探测")
     parser.add_argument("--repo", required=True, help="owner/name，如 John-is-playing/textkit")
     parser.add_argument("--write", action="store_true", help="真的执行写（默认只读）")
-    parser.add_argument("--number", type=int, help="已有 Issue/PR 编号（配合 --label-only）")
+    # Gitee 的条目编号是**字符串**（如 `IKM265`），不是整数——按 int 收会把真实编号
+    # 直接拒掉，也会让人误以为「编号映射」是另一个坑（见 BENCHMARK §4.13 / §4.16）。
+    parser.add_argument("--number", help="已有 Issue/PR 编号（配合 --label-only；字符串，如 IKM265）")
     parser.add_argument(
         "--label-only",
         action="store_true",
-        help="只探测「给条目打标签」这一种写（不建 Issue，需要 --number）",
+        help="只探测「给条目打标签」这一种写（实测可用；不建 Issue，需要 --number）",
     )
     parser.add_argument("--keep", action="store_true", help="创建成功后**不**自动关闭（默认会关掉）")
     args = parser.parse_args(argv)
@@ -135,7 +140,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.label_only:
             print(f"\n[2/3] 写：给 #{args.number} 打一个探测标签（issues/{args.number}/labels）")
             url = f"{api}/issues/{args.number}/labels"
-            r = client.post(url, params=params, json={"labels": ["fissue-probe"]})
+            # 裸数组：Gitee 只认这个形状。发 {"labels": [...]} 会得到
+            # 400 Problems parsing JSON——那句报错说的是「JSON 解析失败」，不是「字段不认识」。
+            r = client.post(url, params=params, json=["fissue-probe"])
             print(f"      HTTP {r.status_code}　{judge(r.status_code)}")
             print(f"      报文：{brief(r.text)}")
             failures += 0 if r.status_code < 300 else 1
