@@ -43,6 +43,29 @@ llm:
     output_per_1k: 0.00028
 
 # ---------------------------------------------------------------------------
+# EdgeJev / Jev System One（可选旁路打分器）
+#
+# 本地部署的 Jev 协议服务（https://github.com/yzfly/edgejev），只有
+# POST /v1/systemone，只做「强类型决策」（选项 / 分档 / 概率 / 置信度），
+# 不能替代上面的 llm（主模型走 /chat/completions）。启用后对指定数值维度
+# 做独立打分，按 relation 与主模型合并；连不上或置信度不足时自动回退并写告警。
+# ---------------------------------------------------------------------------
+edgejev:
+  enabled: false                        # 本地服务起好后再置 true
+  base_url: http://127.0.0.1:8009
+  model: jev-latest
+  api_key: ""                           # 本地服务一般留空；官方托管才需要
+  timeout_seconds: 20
+  max_retries: 2
+  dimensions: [feasibility, difficulty, pr_quality]
+  # second_opinion=保留主模型结论、分歧时告警 | weighted=按 weight 加权
+  # replace=直接用 EdgeJev 分数 | shadow=只记录不改结论
+  relation: second_opinion
+  weight: 0.4                           # 仅 weighted 模式生效
+  min_confidence: 0.15                  # 低于此值该维度回退主模型结论
+  divergence_threshold: 25              # 仅 second_opinion 模式生效
+
+# ---------------------------------------------------------------------------
 # 仓库列表（Q6: 允许多仓库，首期先跑单仓库——只留一条即可）
 # ---------------------------------------------------------------------------
 repos:

@@ -450,6 +450,10 @@ class Evaluation(BaseModel):
     completion_tokens: int = 0
     cost_usd: float = 0.0
     created_at: datetime = Field(default_factory=utcnow)
+    #: 评测过程中的告警（如 EdgeJev 不可达 / 置信度不足而降级），供人复核。
+    alerts: list[str] = Field(default_factory=list)
+    #: 旁路打分器的原始读数（当前为 EdgeJev 的 answers），仅记录、不参与主结论。
+    edgejev: dict[str, Any] | None = None
 
     # 便捷访问
     @property

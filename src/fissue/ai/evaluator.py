@@ -37,6 +37,7 @@ from ..models import (
 from ..store.repository import Repository
 from . import prompts
 from .client import LLMClient, Usage, clamp01, clamp_score
+from .system_one import EdgeJevAdvisor
 
 log = get_logger(__name__)
 
@@ -123,6 +124,24 @@ def parse_dimension(raw: Any) -> DimensionScore | None:
         evidence = []
     confidence = clamp01(raw.get("confidence", 0.5))
     return DimensionScore(score=score, reason=reason, evidence=evidence, confidence=confidence)
+
+
+def _make_edgejev_usage_sink(repo: Repository):
+    """EdgeJev 用量写库回调（本地模型成本恒 0，但 token 用量仍记录）。"""
+
+    def sink(usage: Usage) -> None:
+        kind, _, repo_slug = (usage.purpose or "").partition(":")
+        repo.record_usage(
+            repo_key=repo_slug,
+            purpose=kind or "edgejev",
+            model=usage.model,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            cost_usd=usage.cost_usd,
+            success=usage.success,
+        )
+
+    return sink
 
 
 def _repo_from_entries(entries: Sequence[dict[str, Any]]) -> str:
@@ -496,6 +515,27 @@ class Evaluator:
         self.settings = settings
         self.cfg = settings.evaluation
         self.cls_cfg = settings.classification
+        self._advisor: EdgeJevAdvisor | None = None
+
+    # -- 旁路打分器（EdgeJev） --------------------------------------------
+
+    def _edgejev_advisor(self) -> EdgeJevAdvisor | None:
+        """按需构造 EdgeJev 顾问；未启用时返回 None（零开销）。"""
+        if not self.settings.edgejev.enabled:
+            return None
+        if self._advisor is None:
+            self._advisor = EdgeJevAdvisor(
+                self.settings.edgejev,
+                usage_sink=_make_edgejev_usage_sink(self.repo),
+            )
+        return self._advisor
+
+    async def _apply_edgejev(self, item: RawItem, evaluation: Evaluation) -> None:
+        """调用旁路打分器；失败已在内部降级为告警，不影响主流程。"""
+        advisor = self._edgejev_advisor()
+        if advisor is None:
+            return
+        await advisor.advise(item, evaluation)
 
     # -- 分类 -------------------------------------------------------------
 
@@ -542,6 +582,9 @@ class Evaluator:
         evaluation.category = category  # 以分类阶段结论为准
         # 模型常把重复对象只写进 reasons 文字，导致 duplicate_of 恒为空、跳不到条目
         evaluation.spam = backfill_duplicate_of(evaluation.spam, exclude=item.number)
+        # 旁路打分必须在算优先级**之前**：weighted / replace 会改可行性、难度，
+        # 而这两项直接决定 tier1/tier2。放在后面等于融合白做。
+        await self._apply_edgejev(item, evaluation)
         evaluation.priority = compute_priority(
             evaluation,
             category=category,

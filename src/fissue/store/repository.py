@@ -207,6 +207,8 @@ def _evaluation_to_domain(row: EvaluationRow) -> Evaluation:
         completion_tokens=row.completion_tokens or 0,
         cost_usd=row.cost_usd or 0.0,
         created_at=row.created_at,
+        alerts=list((row.extras or {}).get("alerts") or []),
+        edgejev=(row.extras or {}).get("edgejev"),
     )
 
 
@@ -829,6 +831,10 @@ class Repository:
                 labels_suggested=list(evaluation.labels_suggested),
                 summary=evaluation.summary,
                 spam=evaluation.spam.model_dump(mode="json"),
+                extras={
+                    "alerts": list(evaluation.alerts),
+                    "edgejev": evaluation.edgejev,
+                },
                 model=evaluation.model,
                 prompt_tokens=evaluation.prompt_tokens,
                 completion_tokens=evaluation.completion_tokens,

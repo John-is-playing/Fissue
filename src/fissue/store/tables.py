@@ -200,6 +200,8 @@ class EvaluationRow(Base):
     labels_suggested: Mapped[list] = mapped_column(JSON, default=list)
     summary: Mapped[str] = _long_text()
     spam: Mapped[dict] = _json_col()
+    #: 附加信息：评测告警与旁路打分器（EdgeJev）读数。``{"alerts": [...], "edgejev": {...}}``
+    extras: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     model: Mapped[str] = mapped_column(String(128), default="")
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)

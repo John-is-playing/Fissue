@@ -185,6 +185,62 @@ class LLMConfig(BaseModel):
         return f"{base}/chat/completions"
 
 
+class EdgeJevConfig(BaseModel):
+    """本地 EdgeJev / Jev System One 决策模型（``POST /v1/systemone``）。
+
+    它不是聊天模型：只接受 ``state`` + ``questions``，返回强类型的选项 / 分档 /
+    概率 / 置信度。因此**不能**替换 ``llm``（主模型走 ``/chat/completions``），
+    只能作为数值维度的旁路打分器接入 ``ai/evaluator.py``。
+
+    ``relation`` 决定它与主模型评分的关系（四种模式都可配置）：
+
+    * ``second_opinion``（默认）——两边都算，主模型结论不变；分歧超过
+      ``divergence_threshold`` 时写一条告警供人复核；
+    * ``weighted``——按 ``weight`` 对主模型与 EdgeJev 的分数加权融合；
+    * ``replace``——该维度直接用 EdgeJev 分档换算成 0-100；
+    * ``shadow``——只记录，完全不影响结论（用于先观察再决定）。
+
+    任何模式下，连不上、返回结构异常或置信度低于 ``min_confidence`` 都会**回退**
+    到主模型结论，并把降级原因写进 ``Evaluation.alerts``——绝不静默吞掉。
+    """
+
+    enabled: bool = False
+    base_url: str = "http://127.0.0.1:8009"
+    model: str = "jev-latest"
+    api_key: str = Field(default="", repr=False)
+    timeout_seconds: int = Field(default=20, ge=1)
+    max_retries: int = Field(default=2, ge=1)
+    #: 接入哪些维度（``feasibility`` / ``difficulty`` / ``pr_quality``）。
+    dimensions: list[str] = Field(
+        default_factory=lambda: ["feasibility", "difficulty", "pr_quality"]
+    )
+    relation: str = "second_opinion"        # second_opinion | weighted | replace | shadow
+    weight: float = Field(default=0.4, ge=0.0, le=1.0)   # weighted 模式下 EdgeJev 的权重
+    min_confidence: float = Field(default=0.15, ge=0.0, le=1.0)
+    divergence_threshold: int = Field(default=25, ge=0, le=100)
+
+    @property
+    def systemone_url(self) -> str:
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1/systemone"):
+            return base
+        return f"{base}/v1/systemone"
+
+    @model_validator(mode="after")
+    def _validate_relation(self) -> EdgeJevConfig:
+        allowed = {"second_opinion", "weighted", "replace", "shadow"}
+        if self.relation not in allowed:
+            raise ConfigError(
+                f"edgejev.relation 只能是 {'/'.join(sorted(allowed))}，当前为 {self.relation!r}"
+            )
+        unknown = [d for d in self.dimensions if d not in ("feasibility", "difficulty", "pr_quality")]
+        if unknown:
+            raise ConfigError(
+                f"edgejev.dimensions 含有不支持的维度：{unknown}（可选 feasibility / difficulty / pr_quality）"
+            )
+        return self
+
+
 class RepoConfig(BaseModel):
     platform: Platform
     owner: str
@@ -863,6 +919,7 @@ class Settings(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    edgejev: EdgeJevConfig = Field(default_factory=EdgeJevConfig)
     repos: list[RepoConfig] = Field(default_factory=list)
     classification: ClassificationConfig = Field(default_factory=ClassificationConfig)
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
@@ -1046,6 +1103,19 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
         llm["model"] = v
     if v := env_of("LLM_FALLBACK_MODEL"):
         llm["fallback_model"] = v
+
+    # EdgeJev / Jev System One（本地决策模型；容器里也常靠环境变量注入）
+    ej = merged.setdefault("edgejev", {})
+    if v := env_of("EDGEJEV_ENABLED"):
+        ej["enabled"] = v.strip().lower() in ("1", "true", "yes", "on")
+    if v := env_of("EDGEJEV_BASE_URL"):
+        ej["base_url"] = v
+    if v := env_of("EDGEJEV_API_KEY"):
+        ej["api_key"] = v
+    if v := env_of("EDGEJEV_MODEL"):
+        ej["model"] = v
+    if v := env_of("EDGEJEV_RELATION"):
+        ej["relation"] = v
 
     # 平台 token
     tokens = merged.setdefault("tokens", {})

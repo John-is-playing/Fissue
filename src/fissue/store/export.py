@@ -165,6 +165,8 @@ def item_to_dict(
             "labels_suggested": evaluation.labels_suggested,
             "summary": evaluation.summary,
             "spam": evaluation.spam.model_dump(mode="json"),
+            "alerts": evaluation.alerts,
+            "edgejev": evaluation.edgejev,
             "model": evaluation.model,
             "tokens": {
                 "prompt": evaluation.prompt_tokens,

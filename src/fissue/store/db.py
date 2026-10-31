@@ -66,6 +66,27 @@ def force_fix_migration(dialect: str) -> tuple[str | None, str]:
     )
 
 
+def evaluation_extras_migration(dialect: str) -> tuple[str | None, str]:
+    """``evaluations.extras`` 补列在各方言上的 ``(探针 SQL, ALTER SQL)``。
+
+    这一列承载评测告警与旁路打分器读数（见 ``ai/system_one.py``）。与其它补列
+    同一套口径；这里刻意**不加 NOT NULL**——MySQL 8 之前不允许给 JSON 列设默认值，
+    而 ORM 侧该列本来就是可选的。
+    """
+    if dialect == "postgresql":
+        return None, "ALTER TABLE evaluations ADD COLUMN IF NOT EXISTS extras JSON"
+    if dialect == "mysql":
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'evaluations'",
+            "ALTER TABLE evaluations ADD COLUMN extras JSON",
+        )
+    return (
+        "SELECT name FROM pragma_table_info('evaluations')",
+        "ALTER TABLE evaluations ADD COLUMN extras JSON",
+    )
+
+
 def llm_usage_estimated_migration(dialect: str) -> tuple[str | None, str]:
     """``llm_usage.estimated`` 补列在各方言上的 ``(探针 SQL, ALTER SQL)``。
 
@@ -186,6 +207,7 @@ class Database:
         # 否则旧库上任何带新列的查询都会 no such column（树莓派部署时实炸过）。
         self._migrate_items_force_fix()
         self._migrate_llm_usage_estimated()
+        self._migrate_evaluation_extras()
         self._schema_ready = True
         log.info("数据库表已就绪：%s", self._safe_url())
 
@@ -202,6 +224,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._migrate_items_force_fix()
         self._migrate_llm_usage_estimated()
+        self._migrate_evaluation_extras()
         self._schema_ready = True
         log.debug("数据库表已确保存在：%s", self._safe_url())
 
@@ -232,6 +255,11 @@ class Database:
         """
         probe, alter = llm_usage_estimated_migration(self.engine.dialect.name)
         self._apply_column_migration(probe, alter, "estimated")
+
+    def _migrate_evaluation_extras(self) -> None:
+        """给旧库补 ``evaluations.extras`` 列（理由与 ``force_fix`` 相同）。"""
+        probe, alter = evaluation_extras_migration(self.engine.dialect.name)
+        self._apply_column_migration(probe, alter, "extras")
 
     def _apply_column_migration(self, probe: str | None, alter: str, column: str) -> None:
         """按「探针查一列 → 缺了再 ALTER」执行一次补列（全新库是空操作）。"""

@@ -226,6 +226,29 @@ python -c "from fissue import net; print(net.ca_bundle_hint())"
 > 证书错误是**确定性**的，Fissue 会立即失败并给出上述方案，而不是白等 4 轮退避；其它网络抖动
 > （超时、连接重置）仍正常重试。
 
+### 3.8 `FISSUE_EDGEJEV_*` —— EdgeJev 旁路打分器（可选）
+
+EdgeJev（[yzfly/edgejev](https://github.com/yzfly/edgejev)）是本地部署的 Jev / System One
+服务，只提供 `POST /v1/systemone`，**不能替代** `llm`（主模型走 `/chat/completions`）。
+启用后它会独立给 `feasibility` / `difficulty` / `pr_quality` 打分，按 `edgejev.relation`
+与主模型融合；连不上、返回结构异常或置信度低于 `min_confidence` 时**回退主模型结论**，
+原因写进该条评测的告警字段。
+
+| 变量 | 必需 | 说明 |
+|---|---|---|
+| `FISSUE_EDGEJEV_ENABLED` | | `1` / `true` 启用；默认关闭 |
+| `FISSUE_EDGEJEV_BASE_URL` | | 默认 `http://127.0.0.1:8009`（只用 `/v1/systemone`） |
+| `FISSUE_EDGEJEV_API_KEY` | | 本地服务一般留空；要鉴权时填 |
+| `FISSUE_EDGEJEV_MODEL` | | 默认 `jev-latest`，需与本地加载的模型名一致 |
+| `FISSUE_EDGEJEV_RELATION` | | `second_opinion`（默认）/ `weighted` / `replace` / `shadow` |
+
+只有这 5 项能走环境变量。`dimensions`、`weight`、`min_confidence`、
+`divergence_threshold`、`timeout_seconds`、`max_retries` 只能在 `config.yaml` 的
+`edgejev` 段里改（见 `config.example.yaml`）。
+
+**填错表现**：`/health` 通但评测里全是告警 → 检查 `model` 名；报「连接失败」→
+服务没起或端口不对。用 `fissue eval --limit 1 --verbose` 查看每次调用的请求与告警。
+
 ## 4. 完整变量清单
 
 | 变量 | 必需 | 默认 | 作用 |
@@ -235,6 +258,7 @@ python -c "from fissue import net; print(net.ca_bundle_hint())"
 | `FISSUE_LLM_BASE_URL` | | config.yaml 值 | 模型端点 |
 | `FISSUE_LLM_MODEL` | | config.yaml 值 | 模型名 |
 | `FISSUE_LLM_FALLBACK_MODEL` | | 无 | 降级模型 |
+| `FISSUE_EDGEJEV_ENABLED` / `_BASE_URL` / `_API_KEY` / `_MODEL` / `_RELATION` | | 关闭 / `http://127.0.0.1:8009` / 空 / `jev-latest` / `second_opinion` | 旁路打分器（见 3.8） |
 | `FISSUE_GITHUB_TOKEN` / `GITEE` / `ATOMGIT` / `GITLAB` | | 空 | 平台访问 |
 | ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：被会话 + API Key 替换（垫片于 v1.3.0 移除）。遗留的 `prefix=legacy` Key 到「API Key」页吊销 |
 | `FISSUE_WEB_HOST` | | `127.0.0.1` | 监听地址 |

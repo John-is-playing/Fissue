@@ -212,6 +212,43 @@ notify:
 
 ---
 
+### 4.7 EdgeJev 旁路打分器（可选）
+
+项目可以额外接一个**本地**的 Jev / System One 服务
+（[yzfly/edgejev](https://github.com/yzfly/edgejev)），让它独立给
+`feasibility` / `difficulty` / `pr_quality` 打分，再按 `relation` 与主模型融合。
+
+它不是主模型的替代品：协议只有 `POST /v1/systemone`（强类型决策：选项 / 分档 /
+概率 / 置信度），没有 `/chat/completions`，也不支持流式。
+
+```yaml
+edgejev:
+  enabled: true                     # 本地服务起好后再开
+  base_url: http://127.0.0.1:8009
+  model: jev-latest                 # 与本地加载的模型名一致
+  dimensions: [feasibility, difficulty, pr_quality]   # Issue 上会自动剔除 pr_quality
+  relation: second_opinion          # 见下表
+  weight: 0.4                       # 仅 weighted 用
+  min_confidence: 0.15              # 低于此值该维回退主模型
+  divergence_threshold: 25          # 仅 second_opinion 用
+```
+
+| `relation` | 行为 |
+|---|---|
+| `second_opinion` | 保留主模型分数；两者相差 ≥ `divergence_threshold` 时写告警 |
+| `weighted` | `主模型 * (1 - weight) + EdgeJev * weight` |
+| `replace` | 该维度直接采用 EdgeJev 换算分 |
+| `shadow` | 只记录 EdgeJev 读数，完全不影响结论（先观察再切换的推荐姿势） |
+
+融合发生在算优先级**之前**，所以 `weighted` / `replace` 改的可行性、难度会真正影响
+tier1/tier2 分档。任何模式下，连接失败、返回结构异常或置信度不足都**回退主模型结论**，
+原因写进该条评测的 `alerts`（`fissue export` 的 JSON 里可见）。
+
+建议先用 `shadow` 跑一轮，比对 `edgejev.answers` 与主模型分数是否合理，再切
+`second_opinion` 或 `weighted`。
+
+---
+
 ## 5. 沙盒镜像
 
 镜像预装 Python / Node / Go / Java / Rust 测试框架，避免每次验证联网装依赖（容器默认禁网）。

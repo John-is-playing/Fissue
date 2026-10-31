@@ -209,6 +209,42 @@
   </div>
   {% endif %}
   <div class="mt"><b>结论：</b>{{ evaluation.summary }}</div>
+
+  {# 旁路打分器的读数与告警：只在启用过 EdgeJev 或确有降级时出现。
+     `relation=shadow` 时分数不会被改动，这里必须让人看清「读了什么、有没有被采用」，
+     否则页面上只能看到主模型结论，无法判断旁路到底跑没跑。 #}
+  {% if evaluation.edgejev or evaluation.alerts %}
+  <div class="mt">
+    <b>EdgeJev 旁路读数</b>
+    {% if evaluation.edgejev %}
+    <span class="muted small">
+      模型 {{ evaluation.edgejev.get('model', '-') }} · 融合模式 {{ evaluation.edgejev.get('relation', '-') }}
+      {% if evaluation.edgejev.get('relation') == 'shadow' %}（仅记录，不改结论）{% endif %}
+    </span>
+    <table class="small">
+      <thead><tr><th>维度</th><th>档位</th><th>置信度</th><th>是否采用</th></tr></thead>
+      <tbody>
+      {% for name, ans in (evaluation.edgejev.get('answers') or {}).items() %}
+        <tr>
+          <td>{{ name }}</td>
+          <td class="mono">
+            {% if ans.get('score') is not none %}
+              {{ '%.2f' % ans.get('score') }} / {{ (ans.get('legend') | length - 1) if ans.get('legend') else '-' }}
+            {% else %}-{% endif %}
+          </td>
+          <td class="mono">{{ '%.2f' % (ans.get('confidence') or 0) }}</td>
+          <td>{{ '已采用' if name in (evaluation.edgejev.get('applied') or []) else '未采用' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+    {% for a in evaluation.alerts %}
+    <div class="small bad">⚠️ {{ a }}</div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   <div class="muted small mt">
     模型 {{ evaluation.model }} · tokens 入 {{ evaluation.prompt_tokens }} / 出 {{ evaluation.completion_tokens }}
     · 约 ${{ '%.5f' % evaluation.cost_usd }}
