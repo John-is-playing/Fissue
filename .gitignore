@@ -70,3 +70,6 @@ build/
 # 未跟踪文件也会把基线标成「不可复现」（见 src/fissue/benchmark.py::git_state）。
 banner/
 src/atomgit/*.gif
+
+# Temporary
+temp/

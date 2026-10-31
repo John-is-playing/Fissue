@@ -66,6 +66,10 @@ def _guard_connect(self: socket.socket, address: Any) -> Any:  # noqa: ANN401
     respx 在 httpx 的 transport 层拦截，**不会**走到这里，所以被 mock 的
     请求不受影响；只有「忘了 mock」的真实外连才会触发。
     """
+    # AF_UNIX 连的是本地 socket 文件，不是网络；宿主↔沙盒通道正靠它真跑，
+    # 拦下来只会把「本地 IPC」误判成外连（Windows 没有 AF_UNIX，故用 getattr）。
+    if getattr(socket, "AF_UNIX", None) is not None and self.family == socket.AF_UNIX:
+        return _REAL_CONNECT(self, address)
     if _host_of(address) in _ALLOWED_HOSTS:
         return _REAL_CONNECT(self, address)
     raise RealNetworkAccessError(

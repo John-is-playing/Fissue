@@ -17,6 +17,7 @@ import socket
 import stat
 import threading
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,9 @@ def _posix(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_loopback_skipped_off_posix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """非 POSIX 直接回退临时目录，且**不尝试**创建镜像文件。"""
-    monkeypatch.setattr(os, "name", "nt")
+    # 只把 forwarder 模块看到的 os 假成 nt：直接改全局 os.name 会让 pathlib 在同一
+    # 进程里也切成 WindowsPath，POSIX 上就再也建不出真实路径（这条用例跑不起来）。
+    monkeypatch.setattr("fissue.sandbox.forwarder.os", types.SimpleNamespace(name="nt"))
     cfg = SandboxConfig(enabled=True, mounts=SandboxMountConfig(type="loopback", size_mb=64))
     ws = Workspace(cfg, label="t")
     root = ws.create()
