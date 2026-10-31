@@ -537,3 +537,247 @@ def test_requeue_dry_run_changes_nothing(cli_env: dict[str, str]) -> None:
     assert result.exit_code == 0, result.output
     assert "未改动" in result.output
     assert repo.get_item_row(key).status == ItemStatus.FAILED.value, "dry-run 不许动状态"
+
+
+# ---------------------------------------------------------------------------
+# fetch / eval：成功路径与「--json 必须是纯 JSON」
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_reports_stats(cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
+    """fetch 的收尾行要给出四个计数——否则「跑完了但到底有没有新东西」无从判断。"""
+    from fissue.pipeline.fetcher import Fetcher, FetchStats
+
+    async def fake_many(self: Any, repos: Any, **kwargs: Any) -> FetchStats:
+        return FetchStats(repo="2 个仓库", fetched=7, created=3, updated=2, unchanged=2)
+
+    monkeypatch.setattr(Fetcher, "fetch_many", fake_many)
+    result = _run(["fetch", "--full", "--limit", "5"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "拉取 7" in result.output
+    assert "新增 3" in result.output
+    assert "更新 2" in result.output
+    assert "未变 2" in result.output
+
+
+def test_eval_on_empty_repo_says_nothing_to_do(cli_env: dict[str, str]) -> None:
+    _run(["db", "init"], cli_env)
+    result = _run(["eval"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "没有待评测条目" in result.output
+
+
+def test_eval_json_stdout_is_pure_json(
+    cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`eval --json` 的 stdout 必须能被 `json.loads` 直接吃掉。
+
+    回归：摘要原先无条件 `emit(result.summary)`，于是 `--json` 前面多一行中文，
+    消费方拿到的是字符串拼接而不是 JSON——和 `status --json` 已经钉住的口径相反。
+    """
+    from types import SimpleNamespace
+
+    import fissue.pipeline.stages as stages
+
+    repo = _cli_repo(cli_env)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB, repo="psf/requests", number=43,
+            item_type=ItemType.ISSUE, title="另一条", body="b",
+        ),
+    )
+
+    class FakeEvalStage:
+        def __init__(self, ctx: Any) -> None:
+            self.ctx = ctx
+
+        async def run_batch(self, items: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(summary="完成 1 条", results=[])
+
+    monkeypatch.setattr(stages, "EvalStage", FakeEvalStage)
+    result = _run(["eval", "--json"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    # `result.output` 在 Click 8.2+ 会混合 stderr（日志）；机器可读口径看 stdout。
+    assert json.loads(result.stdout) == []
+
+
+# ---------------------------------------------------------------------------
+# force：旁路闸门的手动放行，必须可预览、可撤销、且不误伤 PR
+# ---------------------------------------------------------------------------
+
+
+def test_force_requires_a_key(cli_env: dict[str, str]) -> None:
+    result = _run(["force"], cli_env)
+
+    assert result.exit_code != 0
+    assert "--key" in result.output
+
+
+def test_force_dry_run_does_not_touch_item(cli_env: dict[str, str]) -> None:
+    key = _seed(cli_env["config"], cli_env["env"])
+    repo = _cli_repo(cli_env)
+    before = repo.get_item_row(key).status
+
+    result = _run(["force", "--key", key, "--dry-run"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "未改动" in result.output
+    assert repo.get_item_row(key).status == before
+    assert repo.get_item(key).force_fix is False, "dry-run 不许置标记"
+
+
+def test_force_rejects_prs(cli_env: dict[str, str]) -> None:
+    """PR 没有自动修复流程：点到了也要说清并跳过，而不是硬塞进修复队列。"""
+    repo = _cli_repo(cli_env)
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    pr = RawItem(
+        platform=Platform.GITHUB, repo="psf/requests", number=7,
+        item_type=ItemType.PR, title="一个 PR", body="b",
+    )
+    repo.upsert_item(rid, pr)
+
+    result = _run(["force", "--key", pr.key], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "PR 没有自动修复流程" in result.output
+    assert repo.get_item(pr.key).force_fix is False
+
+
+def test_force_undo_clears_the_flag(cli_env: dict[str, str]) -> None:
+    """`--undo` 是强制修复的退路：标记必须清掉，否则条目会一直绕过闸门。"""
+    key = _seed(cli_env["config"], cli_env["env"])
+    repo = _cli_repo(cli_env)
+    repo.set_force_fix(key, True)
+
+    result = _run(["force", "--key", key, "--undo", "--yes"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert "已取消强制" in result.output
+    assert repo.get_item(key).force_fix is False
+
+
+def test_force_runs_verify_after_setting_the_flag(
+    cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """标记置上后必须真的走一遍验证阶段（顺带补齐验证器），而不是只改状态就结束。"""
+    from types import SimpleNamespace
+
+    import fissue.pipeline.stages as stages
+
+    key = _seed(cli_env["config"], cli_env["env"])
+    repo = _cli_repo(cli_env)
+    seen: list[str] = []
+
+    class FakeVerifyStage:
+        def __init__(self, ctx: Any) -> None:
+            self.ctx = ctx
+
+        async def run(self, item: Any, evaluation: Any) -> Any:
+            seen.append(item.key)
+            return SimpleNamespace(notes=[])
+
+    monkeypatch.setattr(stages, "VerifyStage", FakeVerifyStage)
+    result = _run(["force", "--key", key, "--yes"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert seen == [key]
+    assert repo.get_item(key).force_fix is True
+    assert "状态 →" in result.output
+
+
+def test_force_asks_before_bypassing_gates(cli_env: dict[str, str]) -> None:
+    """没给 --yes 时必须先问；答「不」就一个字段都不动。"""
+    key = _seed(cli_env["config"], cli_env["env"])
+    repo = _cli_repo(cli_env)
+
+    result = runner.invoke(
+        app,
+        ["force", "--key", key, "--config", cli_env["config"], "--env", cli_env["env"]],
+        input="n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "已取消" in result.output
+    assert repo.get_item(key).force_fix is False
+
+
+# ---------------------------------------------------------------------------
+# bench：基线是「可复现跑分」的证据，写读比都不能含糊
+# ---------------------------------------------------------------------------
+
+
+def test_bench_capture_list_and_self_diff(cli_env: dict[str, str]) -> None:
+    captured = _run(["bench", "capture", "--label", "baseline-a"], cli_env)
+    assert captured.exit_code == 0, captured.output
+
+    path = Path(cli_env["root"]) / "data" / "benchmarks" / "baseline-a.json"
+    assert path.exists(), "capture 必须真的落盘"
+
+    listed = _run(["bench", "list", "--json"], cli_env)
+    assert listed.exit_code == 0, listed.output
+    rows = json.loads(listed.stdout)
+    assert any(row["file"] == "baseline-a.json" for row in rows)
+
+    # 同一份基线自比：可比且无变化 → 0。先把它标成「工作区干净」，
+    # 否则 diff 会按「存在未提交改动」判为不可比（这是 diff 刻意的保守口径）。
+    from fissue import benchmark as bm
+
+    record = bm.load(path)
+    record["provenance"]["git"]["dirty"] = False
+    record["provenance"]["git"]["dirty_files"] = 0
+    bm.save(record, path)
+
+    diff = _run(["bench", "diff", str(path), str(path)], cli_env)
+    assert diff.exit_code == 0, diff.output
+    assert "可比" in diff.output
+
+
+def test_bench_diff_exit_codes_express_comparability(cli_env: dict[str, str]) -> None:
+    """退出码就是结论：0 可比无变化 / 1 不可比 / 2 可比有变化。
+
+    把「不可比」也当成 0 或 2，下游脚本就会拿两次前提不同的测量当回归依据——
+    这正是 BENCHMARK §7.2 那条方法学局限要机械表达的东西。
+    """
+    from fissue import benchmark as bm
+
+    assert _run(["bench", "capture", "--label", "a"], cli_env).exit_code == 0
+    base = Path(cli_env["root"]) / "data" / "benchmarks" / "a.json"
+    record = bm.load(base)
+    # 工作区脏会先被判成「不可比」（diff 的保守口径）；这里要单独验「可比但变化」，
+    # 所以先把前提标干净，而不是指望测试环境恰好是干净的。
+    record["provenance"]["git"]["dirty"] = False
+    record["provenance"]["git"]["dirty_files"] = 0
+    bm.save(record, base)
+
+    incomparable = json.loads(json.dumps(record))
+    incomparable["provenance"]["git"]["commit"] = "0" * 40
+    p1 = base.parent / "b.json"
+    bm.save(incomparable, p1)
+    r1 = _run(["bench", "diff", str(base), str(p1)], cli_env)
+    assert r1.exit_code == 1, r1.output
+    assert "不可比" in r1.output
+
+    changed = json.loads(json.dumps(record))
+    changed["result"]["items"]["total"] = int(changed["result"]["items"]["total"]) + 1
+    p2 = base.parent / "c.json"
+    bm.save(changed, p2)
+    r2 = _run(["bench", "diff", str(base), str(p2)], cli_env)
+    assert r2.exit_code == 2, r2.output
+
+
+def test_bench_list_survives_a_broken_baseline(cli_env: dict[str, str]) -> None:
+    """一个坏文件不该让整个列表失败——否则「有一份基线写坏了」= 其余都看不见。"""
+    directory = Path(cli_env["root"]) / "data" / "benchmarks"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "broken.json").write_text("{not json", encoding="utf-8")
+
+    result = _run(["bench", "list", "--json"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)
+    assert any(row["file"] == "broken.json" and row["label"] == "(无法解析)" for row in rows)

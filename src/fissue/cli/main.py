@@ -290,12 +290,15 @@ def evaluate(
                     limit=limit or (200 if all_items else 50),
                 )
                 if not items:
-                    emit(f"（{cfg.slug} 没有待评测条目）")
+                    if not json_out:
+                        emit(f"（{cfg.slug} 没有待评测条目）")
                     continue
                 conv = ctx.budget_guard(cfg.slug)
                 ctx.llm.budget_guard = conv
                 result = await stage.run_batch(items, deep=deep, concurrency=concurrency)
-                emit(result.summary)
+                # --json 的 stdout 只能是 JSON：摘要走 emit 会混进解析器（与 status 同口径）。
+                if not json_out:
+                    emit(result.summary)
                 for r in result.results:
                     if r.evaluation is not None:
                         rows.append(
