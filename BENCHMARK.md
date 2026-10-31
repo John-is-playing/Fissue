@@ -573,20 +573,65 @@ Gitee **完全不同**（`POST /labels` 要 **form 表单**、颜色**必须带 
 放在 `_safe_label`（打标签的**唯一打桩缝**）而不是 `_label_all`。守卫用例走生产路径（respx 打到 HTTP
 层），把两处源码改动 stash 掉后**确实失败**。
 
+### 4.34 lockkit 修复通路全链路压测（2026-10-31）
+
+此前 lockkit 只验证过「条目都能出结论」，修复侧只跑了 1 条（§2.1 脚注）。这次在**全新空库**
+（远端 PostgreSQL）上把 `fetch → eval → verify → flush → fix --dry-run` 整条链路跑完，
+只问一件事：**把修复候选从 1 条放大到 8 条，通路还成不成立？**
+
+| 阶段 | 输入 → 输出 | 墙钟 |
+|---|---|---|
+| fetch | 20 条（15 Issue + 5 PR），另过滤 11 | 93.7s |
+| eval | 20 条全评：9 条 tier2 `fix_now`，其余 triage / needs_info / close | ~97s |
+| verify | 16 条实际处理（4 条 feature 按规则跳过）：Issue 9 条可复现、PR 3 条 F2P 成立、1 条被回归门拦、1 条验证器自身 TypeError、1 条仅文档跳过 | 711s |
+| flush | 10 条结论、10 条打标成功（0 失败）、8 条进待修 | ~110s |
+| fix（dry-run） | **8 条尝试：7 条产出补丁，1 条被回归门拦下转人工** | 387s |
+
+**修复行为**（`fix_attempts` + `data/patches/`）：
+
+- 7 条补丁全部落在 **1~2 轮**内（#9/#5 各 1 轮，其余 5 条各 2 轮，合计 14 轮）；没有出现
+  b4/b7 那类「十几轮只读不写」。
+- 自动评审对 7 条补丁均给出「可合并 / 仅 nit」：例如 #9 补 `peak` 空样本分支、#6 删掉失败
+  分支写 `_done`、#5 把 `>` 改 `>=`、#2 给 `yield` 补 `try/finally`、#3 按 `max_delay` 截断。
+- 唯一失败是 **#8**：补丁让目标用例通过，却弄坏 `tests/test_limiter.py::test_peek_reflects_taken_tokens`；
+  带反馈重跑 2 轮仍倒在同一处，最终 `needs_manual`。**回归门再次拦下「修好目标却弄坏别处」**，
+  与 §4.6 / b5 同一类证据。
+- Issue 侧 9 条全部 `reproduced=True`，但 `f2p=False`（进入 `verify` 队列等修复阶段复核），
+  PR 侧 2 条 F2P 直接成立。
+
+**两处必须记下来的偏差**（都不是本次口径，但会影响别人复盘）：
+
+1. **dry-run 的成功在库里是 `needs_manual`**：`_finish_dry_run` 刻意把 outcome 落成
+   `needs_manual`（因为没提 PR），只有 CLI 的 `_attempt_row` 在 `--dry-run` 时把它显示成成功。
+   于是 `select outcome from fix_attempts` 会得到「8/8 needs_manual」，与屏幕上「成功 7」矛盾。
+   这不是新 bug，但**从 DB 复盘 dry-run 时不能直接按 outcome 统计成功率**。
+2. **LLM token 统计全为 0**：同一端点、同一模型的一次非流式请求返回
+   `usage={prompt_tokens:33, completion_tokens:8}`；而本次 80 次调用在 `llm_usage` 里全部记 0。
+   差异在**流式路径**：`stream_options.include_usage` 没有被这个端点兑现，`_stream` 拿不到
+   usage 帧就按 0 落库（`ai/client.py` 的 docstring 已承认「事后统计偏少」）。后果不是「数字
+   不好看」——`hard_stop` 依赖 `llm_usage` 的当日累计，它永远为 0，**预算硬停实际不可达**。
+   这是计量缺陷，应在后续版本修（至少要在流式拿不到 usage 时显式告警/降级，而不是静默记 0）。
+
+**与旧数据的关系**：§2.1 的 lockkit 行是 10-13 首次接入（27 条、只跑 1 条修复、其余卡在
+`fix_queued`），本次是夹具 20 条的全链路压测。**两次不可横比**（条目集不同、模型不同、本次
+是 dry-run）。可比的是**通路结论**：当时「单条修复通路」放大到 8 条后仍然成立，且回归门在
+规模化下依旧能拦。
+
 ## 5. 尚未测量
 
 | 项 | 状态 |
 |---|---|
 | `pipekit` Issue 侧自动修复 | **已跑通（10-14）**：7/7 全在 2~3 轮内产出补丁；此前曾是 0/2（§4.9） |
-| `lockkit` 全量 | **已测量（10-13）**：27 条全有结论、48 次沙盒执行；`lockkit#2` 3 轮修好并提 PR #28 |
+| `lockkit` 全量 | **已测量（10-13）**：27 条全有结论、48 次沙盒执行；`lockkit#2` 3 轮修好并提 PR #28。**修复通路压测（10-31）**：8 条候选 7 条在 1~2 轮内出补丁、1 条被回归门拦下（§4.34） |
 | 真实提 PR（`mode: fork`） | **已测量（10-13）**：`envkit#4` → PR #31（已关闭）、`lockkit#2` → PR #28（open）；改动只有源码文件、**未夹带验证器测试文件**。10-15 按 [TRIAGE.md](TRIAGE.md) 关闭了 16 个演示 PR，只留 `lockkit#28` 当证据——**这改变了夹具状态**，老 PR 侧数字与新状态不再直接可比 |
-| 四平台 | **只读全部跑通**；写操作 GitHub / 极狐 / AtomGit 已验证，Gitee 只剩「建/改 Issue」404（原因未定位）。过程中共挖出并修掉 **10 个**真缺陷 |
+| 四平台 | **只读全部跑通**；写操作 GitHub / 极狐 / AtomGit 已验证；Gitee 的「建/改 Issue」404 **已收口**（排除令牌类型、仓库可见性与 Bearer 通道，见 §4.16）。过程中共挖出并修掉 **10 个**真缺陷 |
 | PostgreSQL 后端 | **已测量（`1.1.0-b4`）**：`db init` / `db check` / 全量单测 / 服务启动与页面实测均在该后端跑过（看板总览 4.8s → 2ms、条目页 7.4s → 0.45s）。⚠️ 验证的是**部署与并发路径**，不改变各夹具口径 |
 | MySQL 后端 | **全链路已验证（10-30）**：Docker `mysql:8.0` 上跑通 `db init → fetch → eval → verify → flush → fix`；`tests/test_store_mysql.py` 钉住 MEDIUMTEXT / 640 键列 / 3072 字节索引 / `SKIP LOCKED` / naive 时间戳 / `information_schema` 补列迁移 |
 | 冻结版本的可复现跑分 | 四份基线（§2.3），逐对不可比 |
 
 **仍然站不住 / 未测的**：跨 Issue 的语义裁决（明确不做，成本不可控）；「仓库没测到的既有行为」
-（属验证器提示词职责）；Gitee「建/改 Issue」404 的原因；tier 标定的逐条稳定性（§4.7.1）。
+（属验证器提示词职责）；Gitee 非企业空间是否放开 Issue 对象写（需企业版空间才能再验，见 §4.16）；
+tier 标定的逐条稳定性（§4.7.1）。
 
 ## 6. 如何复现
 
