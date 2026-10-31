@@ -15,6 +15,20 @@
 
 > **未发布**：`v1.3.0-b2` 之后的变更。
 
+### 修复 —— 流式 LLM 调用把 token 记成 0，预算硬停实际不可达
+
+- **问题**：`lockkit` 全链路压测（2026-10-31）里 80 次 LLM 调用在 `llm_usage` 中全部记 0。
+  同一端点、同一模型的一次**非流式**请求能正常返回 `usage`，差异在**流式路径**：端点没有兑现
+  `stream_options.include_usage`，`_stream_with_retry` 拿不到 usage 帧就把空值原样落库。
+- **后果比「数字不好看」严重**：`llm.budget.hard_stop` 依赖 `llm_usage` 的当日累计；累计永远
+  为 0，**硬停条件永远不会触发**，常驻服务可以无限烧 token 而账面上毫无消耗。
+- **改法**：流式响应缺 `prompt_tokens` / `completion_tokens` 时按文本估算（CJK 约 1 字 1 token，
+  其余约 4 字符 1 token，**向上取整**——低估会让预算更晚收手，高估只是早一点停），并在
+  `Usage.estimated` 上标记；每个模型只告警一次，说明「这是近似值以及精确统计需要端点做什么」。
+  端点正常返回 usage 时原样采用，不覆盖。
+- **验证**：新增两条流式用例——没有 usage 帧时 `estimated=True` 且 token/成本均大于 0；带 usage
+  帧时数值与端点一致且 `estimated=False`。
+
 ### 变更 —— 五套夹具布局统一：textkit 不再是那个特例
 
 - **问题**：`envkit` / `lockkit` / `pipekit` / `ratekit` 四套都是

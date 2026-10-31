@@ -47,6 +47,10 @@ class Usage:
     completion_tokens: int = 0
     cost_usd: float = 0.0
     success: bool = True
+    #: 该条用量是否为**估算值**：流式端点不返回 ``usage`` 时按文本估算，标记后
+    #: 预算统计仍然可用（否则当日累计永远是 0，``hard_stop`` 形同虚设），但读数
+    #: 必须让人知道它不精确。
+    estimated: bool = False
 
     @property
     def total_tokens(self) -> int:
@@ -72,6 +76,7 @@ def _merge_usage(total: Usage, part: Usage) -> Usage:
     total.model = part.model or total.model
     total.purpose = part.purpose or total.purpose
     total.success = total.success and part.success
+    total.estimated = total.estimated or part.estimated
     return total
 
 
@@ -180,6 +185,9 @@ class LLMClient:
         self._client = client
         self._owns_client = client is None
         self._json_mode_supported: bool | None = None
+        #: 流式端点不返回 usage 时，按文本估算并**每个模型只告警一次**——
+        #: 逐次告警会淹没日志，而完全静默正是这次要修的病。
+        self._usage_estimate_warned: set[str] = set()
         #: 流式输出观察者。任务要实时展示 LLM 输出时挂上桥；CLI / 无观察 = None（走原路）。
         self.sink: LLMEmitter | None = None
 
@@ -299,12 +307,23 @@ class LLMClient:
         usage_raw = data.get("usage") or {}
         prompt_tokens = int(usage_raw.get("prompt_tokens") or 0)
         completion_tokens = int(usage_raw.get("completion_tokens") or 0)
+        estimated = bool(usage_raw.get("estimated"))
+        if estimated and model not in self._usage_estimate_warned:
+            # 只告警一次：这条信息重要（预算统计从此是近似值），但逐次刷屏等于没告警。
+            self._usage_estimate_warned.add(model)
+            log.warning(
+                "LLM 端点 %s 的流式响应未返回 usage：token 已按文本估算（本次 %d/%d），"
+                "预算与成本统计为**近似值**；要精确统计请让端点在最后一个 SSE 帧返回 usage，"
+                "或对这条链路关闭流式",
+                model, prompt_tokens, completion_tokens,
+            )
         usage = Usage(
             purpose=purpose,
             model=model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cost_usd=self.config.pricing.cost(prompt_tokens, completion_tokens),
+            estimated=estimated,
         )
         await self._record(usage)
 
@@ -446,11 +465,23 @@ class LLMClient:
                 await asyncio.sleep(delay + random.uniform(0, 0.5))
                 delay = min(delay * 2, 30.0)
                 continue
+            text = "".join(parts)
+            # 端点不兑现 `stream_options.include_usage` 时（实测有），这里拿到的是空
+            # usage。**静默记 0 会让当日累计永远为 0，`hard_stop` 形同虚设**——按文本
+            # 估算并标记，宁可略微高估（低估会让预算提前失效）。
+            reported_prompt = int(usage_raw.get("prompt_tokens") or 0)
+            reported_completion = int(usage_raw.get("completion_tokens") or 0)
+            if reported_prompt <= 0 or reported_completion <= 0:
+                usage_raw = {
+                    "prompt_tokens": reported_prompt or _estimate_tokens(payload.get("messages") or []),
+                    "completion_tokens": reported_completion or _estimate_text_tokens(text),
+                    "estimated": True,
+                }
             emitter.llm_end(model=model, from_fallback=from_fallback, usage=usage_raw or None)
             return {
                 "choices": [
                     {
-                        "message": {"content": "".join(parts), "tool_calls": []},
+                        "message": {"content": text, "tool_calls": []},
                         "finish_reason": finish_reason or "stop",
                     }
                 ],
@@ -688,6 +719,17 @@ def _estimate_tokens(messages: Sequence[Message]) -> int:
     """粗略估算提示 token（4 字符 ≈ 1 token，中文按 1.5 字符算）。"""
     chars = sum(len(m.get("content") or "") for m in messages)
     return max(1, int(chars / 3))
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """估算一段文本的 token（CJK 约 1 字 1 token，其余约 4 字符 1 token）。
+
+    只用于「端点没有返回 usage」时的兜底记账。刻意**向上取整**：低估会让
+    ``hard_stop`` 在真实用量已经超限时还不触发，而高估最多让预算早一点收手。
+    """
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    other = len(text) - cjk
+    return max(1, cjk + (other + 3) // 4)
 
 
 def _retry_after(resp: httpx.Response) -> float:

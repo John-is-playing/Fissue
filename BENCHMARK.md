@@ -605,12 +605,13 @@ Gitee **完全不同**（`POST /labels` 要 **form 表单**、颜色**必须带 
    `needs_manual`（因为没提 PR），只有 CLI 的 `_attempt_row` 在 `--dry-run` 时把它显示成成功。
    于是 `select outcome from fix_attempts` 会得到「8/8 needs_manual」，与屏幕上「成功 7」矛盾。
    这不是新 bug，但**从 DB 复盘 dry-run 时不能直接按 outcome 统计成功率**。
-2. **LLM token 统计全为 0**：同一端点、同一模型的一次非流式请求返回
+2. **LLM token 统计全为 0（已修，见 `ai/client.py`）**：同一端点、同一模型的一次非流式请求返回
    `usage={prompt_tokens:33, completion_tokens:8}`；而本次 80 次调用在 `llm_usage` 里全部记 0。
    差异在**流式路径**：`stream_options.include_usage` 没有被这个端点兑现，`_stream` 拿不到
-   usage 帧就按 0 落库（`ai/client.py` 的 docstring 已承认「事后统计偏少」）。后果不是「数字
-   不好看」——`hard_stop` 依赖 `llm_usage` 的当日累计，它永远为 0，**预算硬停实际不可达**。
-   这是计量缺陷，应在后续版本修（至少要在流式拿不到 usage 时显式告警/降级，而不是静默记 0）。
+   usage 帧就按 0 落库。后果不是「数字不好看」——`hard_stop` 依赖 `llm_usage` 的当日累计，
+   它永远为 0，**预算硬停实际不可达**。修法：流式缺 usage 时按文本估算（CJK 约 1 字 1 token、
+   其余约 4 字符 1 token，**刻意向上取整**以免预算提前失效），标记 `Usage.estimated`，并对
+   每个模型只告警一次（逐次刷屏等于没告警）。上表的 0 是**修复前**的实测数据，保留原样。
 
 **与旧数据的关系**：§2.1 的 lockkit 行是 10-13 首次接入（27 条、只跑 1 条修复、其余卡在
 `fix_queued`），本次是夹具 20 条的全链路压测。**两次不可横比**（条目集不同、模型不同、本次

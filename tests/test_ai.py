@@ -1196,3 +1196,95 @@ def test_agent_repo_context_carries_call_graph(settings, tmp_path) -> None:
 
     assert "跨模块调用链" in text
     assert "a.f → b.g" in text
+
+
+# ---------------------------------------------------------------------------
+# 流式 usage：端点不返回时按文本估算（否则当日累计永远为 0，hard_stop 失效）
+# ---------------------------------------------------------------------------
+
+
+class _StreamSink:
+    """最小的流式观察桥：只为触发「走流式」这条路径。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def llm_start(self, *, purpose: str, model: str) -> None:
+        self.events.append(("start", purpose, model))
+
+    def llm_delta(self, text: str) -> None:
+        self.events.append(("delta", text))
+
+    def llm_end(self, *, model: str, from_fallback: bool, usage: dict | None) -> None:
+        self.events.append(("end", model, from_fallback, usage))
+
+
+def _sse_response(chunks: list[str], *, usage: dict | None = None):
+    """拼一个 SSE 流响应；``usage=None`` 模拟**端点不兑现 include_usage**。"""
+    import json
+
+    import httpx
+
+    frames: list[dict] = [
+        {"choices": [{"delta": {"role": "assistant", "content": ""}, "index": 0}]}
+    ]
+    for i, piece in enumerate(chunks):
+        frame: dict = {"choices": [{"delta": {"content": piece}, "index": 0}]}
+        if i == len(chunks) - 1:
+            frame["choices"][0]["finish_reason"] = "stop"
+        frames.append(frame)
+    if usage is not None:
+        frames.append({"choices": [], "usage": usage})
+    body = "".join(f"data: {json.dumps(f, ensure_ascii=False)}\n\n" for f in frames)
+    body += "data: [DONE]\n\n"
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
+
+
+def _stream_client(responses: list):
+    import httpx
+
+    from fissue.ai.client import LLMClient
+    from fissue.config import LLMConfig
+    from fissue.net import httpx_verify
+
+    queue = list(responses)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queue.pop(0)
+        return responses[len(responses) - len(queue) - 1]
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), verify=httpx_verify())
+    llm = LLMClient(
+        LLMConfig(api_key="k", base_url="https://llm.invalid/v1", model="m", max_retries=1),
+        client=client,
+    )
+    llm.sink = _StreamSink()
+    return llm
+
+
+async def test_stream_estimates_usage_when_endpoint_omits_it() -> None:
+    """流式响应只有正文、没有 usage 帧时，必须**估算并标记**，而不是静默记 0。
+
+    回归（lockkit 压测 2026-10-31）：80 次调用在 ``llm_usage`` 里全部记 0——端点不返回
+    usage，``_stream_with_retry`` 就把空 dict 原样落库。后果不是数字难看：``hard_stop``
+    依赖当日累计，它永远为 0，预算硬停实际不可达。
+    """
+    llm = _stream_client([_sse_response(["OK"])])
+    resp = await llm.chat([{"role": "user", "content": "只回复 OK"}], purpose="probe")
+
+    assert resp.content == "OK"
+    assert resp.usage.estimated is True
+    assert resp.usage.prompt_tokens > 0
+    assert resp.usage.completion_tokens > 0
+    assert resp.usage.cost_usd > 0, "估算后成本不应再恒为 0"
+
+
+async def test_stream_keeps_reported_usage() -> None:
+    """端点**给了** usage 时必须原样采用，不能把它覆盖成估算值。"""
+    llm = _stream_client(
+        [_sse_response(["OK"], usage={"prompt_tokens": 33, "completion_tokens": 8})]
+    )
+    resp = await llm.chat([{"role": "user", "content": "只回复 OK"}], purpose="probe")
+
+    assert resp.usage.estimated is False
+    assert (resp.usage.prompt_tokens, resp.usage.completion_tokens) == (33, 8)
