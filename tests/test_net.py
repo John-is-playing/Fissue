@@ -500,19 +500,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # 这些文件/目录不参与扫描
 _SCAN_SKIP_DIRS = {
     ".git", ".venv", "venv", "__pycache__", ".pytest_cache", ".ruff_cache",
-    ".mypy_cache", "node_modules", "dist", "build", "data", "demo/textkit",
+    ".mypy_cache", "node_modules", "dist", "build", "data",
 }
 
 
 def _iter_python_files() -> list[Path]:
-    """遍历仓库里所有 .py 文件（跳过虚拟环境、缓存、嵌套 demo 仓库等）。"""
+    """遍历仓库里所有 .py 文件（跳过虚拟环境与缓存目录）。
+
+    五套夹具的**仓库本体**都放在 ``demo/<kit>/repo/`` 下，这里**不做**特例跳过——
+    它们与仓库其余代码同样受「httpx 客户端必须显式传 verify=」这条守卫约束
+    （夹具仓库里没有 httpx 用法，所以扫到也不会误报）。
+    此前 textkit 是个特例（仓库直接放在 ``demo/textkit/``，靠一条路径前缀整段跳过），
+    布局统一后那条特例撤销了——**特例本身就是漂移的来源**。
+    """
     out: list[Path] = []
     for path in REPO_ROOT.rglob("*.py"):
-        rel = path.relative_to(REPO_ROOT).as_posix()
         if any(part in _SCAN_SKIP_DIRS for part in path.relative_to(REPO_ROOT).parts):
-            continue
-        # 跳过嵌套仓库（它有独立的依赖与 TLS 处理）
-        if rel.startswith("demo/textkit/"):
             continue
         out.append(path)
     return out
@@ -630,8 +633,8 @@ def test_guard_ignores_unrelated_client_names() -> None:
 
 def test_setup_script_resolves_tls() -> None:
     """demo 脚本必须自己解析出 TLS 上下文（它要能脱离 Fissue 独立运行）。"""
-    script = REPO_ROOT / "demo" / "scripts" / "setup_github.py"
-    assert script.exists(), "缺少 demo/scripts/setup_github.py"
+    script = REPO_ROOT / "demo" / "textkit" / "scripts" / "setup_github.py"
+    assert script.exists(), "缺少 demo/textkit/scripts/setup_github.py"
     text = script.read_text(encoding="utf-8")
     assert "TLS_VERIFY" in text
     assert "truststore" in text, "脚本应具备 truststore 降级路径"
@@ -643,7 +646,7 @@ def test_setup_script_tls_verify_is_usable() -> None:
     import importlib.util
     import sys
 
-    script = REPO_ROOT / "demo" / "scripts" / "setup_github.py"
+    script = REPO_ROOT / "demo" / "textkit" / "scripts" / "setup_github.py"
     spec = importlib.util.spec_from_file_location("_demo_setup_github", script)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)

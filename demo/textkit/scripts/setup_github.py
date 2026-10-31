@@ -15,13 +15,13 @@
     export GITHUB_TOKEN=ghp_xxx
 
     # 2) 干跑看看会发生什么（不真的写）
-    python demo/scripts/setup_github.py --owner 你的用户名 --dry-run
+    python demo/textkit/scripts/setup_github.py --owner 你的用户名 --dry-run
 
     # 3) 真跑
-    python demo/scripts/setup_github.py --owner 你的用户名
+    python demo/textkit/scripts/setup_github.py --owner 你的用户名
 
     # 可选：指定仓库名 / 私有 / 跳过 PR
-    python demo/scripts/setup_github.py --owner me --name textkit-demo --private --no-prs
+    python demo/textkit/scripts/setup_github.py --owner me --name textkit-demo --private --no-prs
 
 注意：脚本是**可重入**的——已存在的 Issue（按标题匹配）与 PR（按 head 分支匹配）
 会被跳过，所以失败后可以放心重跑。

@@ -15,6 +15,75 @@
 
 > **未发布**：`v1.3.0-b2` 之后的变更。
 
+### 变更 —— 五套夹具布局统一：textkit 不再是那个特例
+
+- **问题**：`envkit` / `lockkit` / `pipekit` / `ratekit` 四套都是
+  `demo/<kit>/{README.md, fixtures/, scripts/, repo/}`，而 `textkit` 是**旧布局**——
+  仓库直接摆在 `demo/textkit/`，定义文件却散落在 `demo/` 根
+  （`demo/README.md`、`demo/fixtures/`、`demo/scripts/`）。
+- **后果不只是难看**：`demo/README.md` 的标题写的是「Fissue 测试夹具：textkit」，
+  于是 `demo/` 顶层那份 README 实际只覆盖五套里的一套；而 `CONTRIBUTING.md` 把
+  「加一套夹具」列为**首选贡献路径**，新人照它找总览时会以为夹具只有一套。
+  `.gitignore` 也因此多出一条特例（`demo/textkit/` 整目录忽略 vs 其余只忽略 `repo/`）。
+- **改法**：textkit 迁到同一套布局——`demo/textkit/{README.md, fixtures/, scripts/, repo/}`。
+  `tests/test_net.py` 里那条「按路径前缀整段跳过 textkit」的特例随之撤销：
+  五套的仓库本体都归到 `repo/` 下，与仓库其余代码**同一套守卫**（夹具里没有 httpx 用法，
+  扫到也不会误报）。**特例本身就是漂移的来源。**
+- **新增 `demo/README.md`**：五套夹具的总索引——领域、形态、考察点、规模，以及
+  「加一套新夹具」的落地步骤。原来那份只讲 textkit 的 README 已归到 `demo/textkit/README.md`。
+- **验证**：迁移用 `git mv`，git 识别为**重命名**而非删+增；textkit 独立仓库的分支
+  （`main` + 两个修复分支）、远端与 16 个跟踪文件完整，其自身基线测试仍 32 passed。
+
+### 修复 —— `fissue auth reset` 失败时留下副作用：口令没改成，2FA 却先被清了
+
+- **原行为**：`auth reset --password <口令>` 的执行顺序是「先清 2FA / 恢复码 / 会话，
+  **再**校验口令长度」。于是给一个 3 位口令会得到「口令至少 8 位」的错误退出，
+  但账号的 **2FA 密钥、恢复码与全部会话已经被清掉了**——动作失败，状态却改了。
+- **为什么这条特别糟**：这条命令的存在理由是「把自己救回来」（手机丢了、2FA 进不去、
+  恢复码也没了）。于是最坏情形是「2FA 已清、口令没设上」——比执行前**更难**进去，
+  因为原本还留着一把能用的旧口令。
+- **改法**：把口令长度校验提到**所有副作用之前**。校验不过则一个字段都不动。
+- **新增回归用例**：断言「口令校验不过时 `totp_enabled` 仍为 true、口令哈希未变」。
+
+### 测试 —— `fissue auth` CLI 此前**一条测试都没有**（覆盖率 21%）
+
+- 这条命令是**界面上进不去时唯一能救自己的出口**：改口令的接口本身就要求先登录，
+  于是 WebUI 是进不去的那一侧，而它就是「唯一的后门」。它的安全性质此前**只靠文档承诺**。
+- 新增 `tests/test_cli_auth.py`（20 条），钉的是**性质**而不是「命令能跑」：
+  改口令必须注销该账号的**全部**会话（否则「口令泄露后改口令」等于没做）；
+  `reset` 必须真的**忘掉** TOTP 密钥（只关开关而留着密钥 = 「关了还能用旧码开」）；
+  Key 明文只在创建那一刻出现一次、库里绝不留明文；短口令 / 账号不存在 / 吊销不存在的 Key
+  都要明确报错并给非零退出码，而不是抛裸异常或静默成功。
+- 顺带把 `cli/auth.py` 的 `_store()` 补上返回类型标注、`_fail()` 标成 `NoReturn`：
+  此前**整条命令都落在 `Any` 上**，等于没有被类型检查（`_fail()` 之后的 Optional 收窄
+  全靠运行时巧合）。补上标注后 mypy 立刻能盯住这条路径。
+
+### 修复 —— 文档与实现漂移：三处文档在教人配**已彻底移除**的旧口令
+
+- `docs/USAGE.md` / `docs/ENV.md`（开发与生产两段）仍把 `FISSUE_API_TOKEN` 当作
+  **当前的鉴权配置**写进示例。那条垫片已在 v1.3.0 整体移除——启动时不再读它，
+  校验只认 `fissue_<prefix>_<secret>` 形状的 Key。**照着文档配的部署会真的没有鉴权**：
+  启动检查的报错文案早已改成「开 `web.auth.enabled` 或声明 `web.trusted_networks`」，
+  而文档还在教人设那个早已不读的环境变量。
+- 改法：三处示例改成「会话登录 + 多 API Key」的真实路径（`fissue auth key create`
+  / `fissue auth set-password`），并把 `docs/AUTH.md` 里引用的启动报错文案同步成当前的。
+- 同批修正：`README.md` 的命令表仍列着 `fissue auth key import-legacy`（该命令已随垫片删除）；
+  `config.example.yaml` 里 `web` 段仍写「仓库与密钥管理界面尚未实现」（`/repos` 与
+  `/settings` 早已落地）；`config.example.yaml` 补上 `web.trust_proxy` / `web.trusted_proxies` /
+  `web.allow_remote_config_write` 三项（反代部署必须两层同时声明，缺一不可）。
+
+### 测试 —— Gitee 写探测脚本此前也**一条测试都没有**
+
+- `scripts/probe_gitee_write.py` 是**判定平台写能力的诊断工具**，而 Gitee 那条「条目级写 404」
+  的关键教训恰恰是「**先看状态码、再看文案**」——`404`（找不到资源）与 `403`（没有权限）
+  处置完全相反，而 Gitee 有时会把权限问题也包装成一句 404。
+- 脚本里固化下来的判据此前**只靠文档承诺**：401 / 403 / 404 / 429 各自的判读各不相同；
+  `--number` 按**字符串**收（Gitee 编号是 `IKM265` 这种形状，按 int 收根本传不进去）；
+  打标签必须发**裸 JSON 数组**（发 `{"labels": [...]}` 会得到 `400 Problems parsing JSON`——
+  那句报错说的是「JSON 解析失败」，极易误判成「平台不支持这个接口」）；默认**只读**。
+- 新增 `tests/test_probe_gitee_write.py`（16 条）。其中打标签那条断言的是**请求体的类型**
+  （`isinstance(body, list)`）而不是「请求发出去了」——否则把形状改回 dict 也照样过。
+
 ### 新增 —— doctor 扩到「克隆」与「推分支」：把 fix/verify 的前置也算进体检
 
 - **克隆探测（默认跑，只读）**：它是 `verify` / `fix` 的第一道门。失败时会**再试一次匿名克隆**

@@ -7,7 +7,7 @@
     3. 按 ``fixtures/issue-*.md`` 创建 10 个 Issue（含重复 / 误报 / 刷量）
     4. 推送 3 个修复分支并创建 3 个 Pull Request（1 正确 / 1 半吊子 / 1 无效）
 
-与 ``demo/scripts/setup_github.py``（textkit）是**同一套实现**，只换了
+与 ``demo/textkit/scripts/setup_github.py``（textkit）是**同一套实现**，只换了
 仓库目录、fixtures 目录与默认仓库名。两个夹具互相独立，可分别推送。
 
 为什么不用 ``gh`` CLI：它不一定装了。这个脚本只依赖 ``httpx``（Fissue 已有依赖）。

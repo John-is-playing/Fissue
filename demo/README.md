@@ -1,208 +1,69 @@
-# Fissue 测试夹具：textkit
+# Fissue 测试夹具
 
-一个刻意设计的小型 Python 库，用来**真实验证 Fissue 的完整链路**：
-抓取 → AI 评测 → 生成验证器 → 沙盒 F2P 验证 → 自动修复提 PR。
+五套**互相独立**的对抗性夹具，用来真实验证 Fissue 的完整链路：
+抓取 → AI 评测 → 生成验证器 → 沙盒 F2P 验证 → 回归门 → 自动修复提 PR。
 
-## 目录结构
+`BENCHMARK.md` 里的所有跑分数字都出自这五套；它们合计 **60 个 Issue + 20 个 PR**。
 
-```
-demo/
-├── textkit/                     待推送的测试仓库（独立 git 仓库）
-│   ├── textkit/                 库源码（植入 2 个 bug）
-│   ├── tests/                   32 个基线测试（全绿，刻意不覆盖那两个 bug）
-│   └── README.md, pyproject.toml, .gitattributes
-├── fixtures/                    5 个 Issue 的内容与元数据
-│   ├── issue-01-word-count-empty.md          tier1：难度低 + 重要性高 → 应自动修复
-│   ├── issue-02-slugify-collapse.md          tier2：难度低 + 重要性低 → 应自动修复
-│   ├── issue-03-inconsistent-text-semantics.md  难度高 → 不应自动修复
-│   ├── issue-04-wrap-cjk-support.md          FEATURE → 只打标签
-│   └── issue-05-slugify-extra-dashes.md      疑似重复 → 应被识别
-└── scripts/setup_github.py      一键建仓库 / 建 Issue / 建 PR
-```
+## 五套夹具
 
-## 设计意图：每个 fixture 考什么
-
-### 植入的 2 个真实 Bug（未被基线测试覆盖）
-
-| # | Bug | 表现 | 期望 Fissue 行为 |
-|---|---|---|---|
-| 1 | `word_count("")` 返回 1 | 空串应返回 0 | 生成验证器 → base 失败 → tier1 → 自动修复 |
-| 2 | `slugify("Hello   World")` → `hello---world` | 连续空白未折叠 | 生成验证器 → tier2 → 自动修复 |
-
-> 关键在于**基线 32 个测试是全绿的**——bug 藏在没被覆盖的路径上。
-> 这正好逼 Fissue 真正去「读代码 → 写验证器 → 跑 F2P」，而不是抄现成测试。
-
-### 两个 PR（一个真好、一个半吊子）
-
-| PR | 分支 | 修的 Issue | 质量 | 期望 Fissue 行为 |
+| 夹具 | 领域 | 形态 | 考什么 | 规模 |
 |---|---|---|---|---|
-| 1 | `fix/word-count-empty` | #1 | ✅ 完整修复，含回归测试 | 验证器通过 → 建议合并 |
-| 2 | `fix/slugify-collapse` | #2 | ⚠️ **只修一半** | 验证器仍失败 → 建议不合并 |
+| [`textkit`](textkit/README.md) | 文本处理 | 单模块、独立函数 | 单函数语义；**识破「看似正确」的假修复** | 5 Issue + 2 PR |
+| [`ratekit`](ratekit/README.md) | 金额 / 费率 | 单模块、数值边界 | 数值边界；**中文标题的重复检测**、刷量与误报拦截 | 10 Issue + 3 PR |
+| [`pipekit`](pipekit/README.md) | 分片流水线 / 区间 | 多模块、调用链耦合 | **跨模块根因定位**（同一约定散落三处）、回归门 | 15 Issue + 5 PR |
+| [`envkit`](envkit/README.md) | 配置 / 缓存 / 校验 | 有状态对象 + 环境依赖 | 状态副作用、环境依赖、输入校验 | 15 Issue + 5 PR |
+| [`lockkit`](lockkit/README.md) | 并发原语 / 资源管理 | 不变量约束 + 时间注入 | 资源不变量、超时上限、一次性语义 | 15 Issue + 5 PR |
 
-PR 2 是刻意设计的**假修复**：它用 `\s+` 折叠了连续空格，
-但 `Hello - World`（空格与连字符混排）仍产出 `hello---world`。
+每套各占一个独立领域与语法形状，避免「照着同一类缺陷出题」的偏差。
+除 textkit 外，每套都刻意混入**错误 / 无效 / 同源但不重复 / 刷量**的请求——
+它们是「反刷子」与「重复检测」两条能力的实测素材。
+
+## 目录布局
+
+五套**完全一致**，仓库本体在 `repo/` 下、不进外层版本库：
 
 ```
-✅ "Hello   World"  -> hello-world    （修好了）
-❌ "Hello - World"  -> hello---world   （漏了）
+demo/<kit>/
+├── README.md      这套夹具的设计意图与期望结果对照表
+├── fixtures/      每个 Issue 的内容与元数据（标题 / 标签在文件头的注释里）
+├── scripts/       setup_github.py：一键建仓库 / 建 Issue / 建 PR
+└── repo/          待推送的独立 git 仓库（外层 .gitignore 忽略）
 ```
 
-这是最有价值的一个用例——它检验 Fissue 能不能**识破看似正确的修复**。
+`repo/` 之所以不进外层仓库：它自带 `.git`，嵌套进来会被 git 当成 embedded
+repository，产生难以察觉的 submodule 陷阱。
 
-### 其余 3 个 Issue 的作用
+## 怎么用
 
-| Issue | 作用 |
-|---|---|
-| #3 文本口径不统一 | 难度高、需设计决策 → 检验「不该自动修的要拦住」 |
-| #4 CJK 折行 | FEATURE → 检验「只打标签、不生成验证器」 |
-| #5 多余的横线 | 与 #2 高度重叠 → 检验反刷子的**重复检测** |
-
----
-
-## 一、推送到 GitHub
-
-### 方式 A：一键脚本（推荐）
-
-只需要一个 GitHub token（勾 `repo` 权限）。
+以任意一套为例（把 `<kit>` 换成上表里的名字）：
 
 ```bash
-# 1) 准备 token
-#    https://github.com/settings/tokens  →  Generate new token (classic)  →  勾 repo
-export GITHUB_TOKEN=ghp_xxxx
+# 1) 推送到 GitHub（会产生平台写操作，请自行执行）
+python demo/<kit>/scripts/setup_github.py --owner 你的用户名 --dry-run   # 先看计划
+python demo/<kit>/scripts/setup_github.py --owner 你的用户名            # 真跑
 
-# 2) 先干跑看看计划（不写任何东西）
-python demo/scripts/setup_github.py --owner 你的用户名 --dry-run
-
-# 3) 真跑
-python demo/scripts/setup_github.py --owner 你的用户名
-```
-
-脚本会依次完成：
-
-1. 创建 `你的用户名/textkit` 仓库（已存在则复用）
-2. 推送 `main` 分支
-3. 从 `fixtures/*.md` 创建 5 个 Issue（带标签）
-4. 推送 2 个修复分支并创建 2 个 PR（正文里带 `Closes #N`）
-
-脚本是**可重入**的：已存在的 Issue（按标题）与 PR（按 head 分支）会跳过，失败可放心重跑。
-
-常用参数：
-
-```bash
---name textkit-demo    # 换个仓库名
---private              # 建私有仓库（注意：Fissue 需要 token 才能读私有库）
---no-prs               # 只建 Issue，先看看评测效果
-```
-
-### 方式 B：手动推送
-
-```bash
-cd demo/textkit
-
-# 1) 在 GitHub 网页上新建一个空仓库（不要勾 README/gitignore）
-#    然后关联并推送主分支
-git remote add origin https://github.com/你的用户名/textkit.git
-git push -u origin main
-
-# 2) 推送两个修复分支
-git push origin fix/word-count-empty
-git push origin fix/slugify-collapse
-```
-
-然后在网页上：
-
-- 按 `demo/fixtures/*.md` 的 **title / labels / 正文** 逐个建 5 个 Issue
-  （文件头部的 `<!-- ... -->` 注释里就是标题和标签，正文是注释之后的部分）
-- 建 2 个 PR，base 选 `main`，head 分别选两个修复分支
-
----
-
-## 二、用 Fissue 测它
-
-把仓库登记进 Fissue 的 `config.yaml`：
-
-```yaml
-repos:
-  - platform: github
-    owner: 你的用户名
-    name: textkit
-    base_branch: main
-    collect: [issue, pr]
-    since_days: 0        # 0 = 不限制时间窗口，确保 5 个 Issue 全抓到
-    test_hint: "python -m pytest -q"    # 明确告诉它怎么跑测试
-```
-
-然后跑完整链路：
-
-```bash
-# 1) 抓取（应拉到 5 个 Issue + 2 个 PR）
-fissue fetch --repo 你的用户名/textkit --limit 50
-
-# 2) 评测（四维评分 + 分类 + 反刷子）
-fissue eval --repo 你的用户名/textkit --all
-
-# 3) 看结果：Issue 1/2 应为 tier1/tier2，#4 应为 feature
-fissue report --repo 你的用户名/textkit
-
-# 4) 生成验证器并做 F2P 验证
-fissue verify --repo 你的用户名/textkit
-
-# 5) 批量定论 + 打标签
+# 2) 跑完整链路
+fissue fetch  --repo 你的用户名/<kit> --limit 50
+fissue eval   --repo 你的用户名/<kit> --all
+fissue verify --repo 你的用户名/<kit>
 fissue flush
+fissue fix    --repo 你的用户名/<kit> --dry-run --limit 6
 
-# 6) 试跑自动修复（只出补丁，不提 PR）
-fissue fix --repo 你的用户名/textkit --dry-run --limit 5
+# 3) 出报告，与本套 README 的期望对照表逐项核对
+fissue report --repo 你的用户名/<kit> --format markdown --out data/exports/<kit>.md
 ```
 
----
-
-## 三、期望结果对照表
-
-跑完后逐项核对，就能判断 Fissue 是否真的在工作：
-
-| # | 条目 | 期望分类 | 期望优先级 | 期望验证 | 期望动作 |
-|---|---|---|---|---|---|
-| 1 | word_count 空串 | bug | **tier1** | base 失败（可复现） | 自动修复 → 提 PR |
-| 2 | slugify 连续空白 | bug | **tier2** | base 失败 | 自动修复 → 提 PR |
-| 3 | 文本口径不统一 | bug | **none** | 难自动化 | 不修复，打标签 |
-| 4 | CJK 折行 | **feature** | none | 不验证 | 只打标签 |
-| 5 | 多余的横线 | bug | none | — | **疑似重复 #2** |
-| PR1 | word_count 修复 | bug | none | **F2P 成立** | 建议合并 |
-| PR2 | slugify 修复 | bug | none | **F2P 不成立** | 建议不合并 ⚠️ |
-
-第 7 行是最关键的一项：如果 Fissue 把 PR2 也判为「可合并」，说明
-它的验证器没能覆盖「空格+连字符混排」这个场景，需要检查验证器生成质量。
-
----
-
-## 四、本地自检（不连网）
-
-推之前可以先在本地确认夹具是自洽的：
+单测完全离线，不需要这些仓库：
 
 ```bash
-cd demo/textkit
-python -m pytest -q            # 基线应 32 passed
-
-# 确认 bug 确实存在
-python -c "
-import sys; sys.path.insert(0,'.')
-from textkit import word_count, slugify
-print('word_count(\"\") =', word_count(''))                    # 期望 1（bug）
-print('slugify(\"a   b\") =', repr(slugify('a   b')))          # 期望 a---b（bug）
-"
+python -m pytest -q
 ```
 
-## 五、故障排查
+## 加一套新夹具
 
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| `需要 GitHub token` | 没设 `GITHUB_TOKEN` | `export GITHUB_TOKEN=ghp_xxx` |
-| `token 无效（HTTP 401）` | token 过期 / 权限不足 | 重新生成，勾 `repo` |
-| `创建仓库失败（HTTP 422）` | 同名仓库已存在 | 换 `--name`，或让它复用（脚本会自动跳过） |
-| `textkit 工作区不干净` | demo 仓库有未提交改动 | `cd demo/textkit && git status` 后提交或还原 |
-| `创建 PR 失败（HTTP 422）` | 分支无差异，或 PR 已存在 | 脚本会跳过已存在的；确认分支已推送 |
-| 推送后换行符变了 | Windows 上 CRLF 混入 | 仓库已有 `.gitattributes` 强制 LF，确认它也在目标仓库里 |
+这是**门槛最低、收益最高**的贡献路径（见 [CONTRIBUTING.md](../CONTRIBUTING.md)）：
+在你自己关心的场景里验证 Fissue 是否可靠，而夹具正是这个项目最重要的资产。
 
-> **为什么强调换行符**：Fissue 验证 PR 时用 `git apply` 打平台返回的 diff。
-> 如果仓库里混入 CRLF，diff 的上下文行与实际文件字节不一致，补丁会应用失败。
-> 所以 `demo/textkit/.gitattributes` 里固定了 `* text=auto eol=lf`。
+按上面的布局放好 `README.md` / `fixtures/` / `scripts/` / `repo/`，
+再把 `demo/<kit>/repo/` 加进 `.gitignore`（与其余五套同一套规则）。

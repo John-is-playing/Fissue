@@ -31,11 +31,15 @@ data/*
 *.sqlite
 *.sqlite3
 
-# demo/textkit 与 demo/*/repo 都是**独立仓库**（自带 .git），
+# 五套夹具的**仓库**都是独立 git 仓库（自带 .git），统一放在 demo/<kit>/repo/，
 # 供推送到 GitHub 当测试夹具用。外层仓库只保留它们的"定义"
-# （fixtures/ 与 scripts/），不嵌套整个仓库，否则 git 会把它当作
+# （README / fixtures/ / scripts/），不嵌套整个仓库，否则 git 会把它当作
 # embedded repository 处理，产生难以察觉的 submodule 陷阱。
-demo/textkit/
+#
+# 五套必须**同一套规则**：此前 textkit 的仓库直接放在 demo/textkit/、定义文件
+# 却散落在 demo/ 根（demo/README.md、demo/fixtures/、demo/scripts/），
+# 于是它既不符合"定义在 demo/<kit>/ 下"的约定，也让忽略规则多出一条特例。
+demo/textkit/repo/
 demo/ratekit/repo/
 demo/pipekit/repo/
 demo/envkit/repo/
