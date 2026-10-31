@@ -131,6 +131,22 @@ file` → 确认父目录存在。
 
 Token 等同密码：不要提交 git，日志与报告里会自动脱敏成 `***`。
 
+**Gitee 第三方应用（OAuth）**：除了个人访问令牌，也可以登记一个 OAuth 应用。但要先说清楚——
+**只填 Client ID 与 Client Secret 不够**：它们是应用凭据，不能直接调 API，还差一步用户授权：
+
+1. 在 [Gitee 应用管理](https://gitee.com/oauth/applications) 建应用，回调地址填
+   `http://127.0.0.1:8765/callback`（或你自己的地址，**必须完全一致**）；
+2. `.env` 填 `FISSUE_GITEE_CLIENT_ID` / `FISSUE_GITEE_CLIENT_SECRET` /
+   `FISSUE_GITEE_REDIRECT_URI`；
+3. 跑 `python scripts/gitee_oauth.py --login`：浏览器点「同意」，脚本用回调里的 `code`
+   换 `access_token`，并写入 `FISSUE_GITEE_TOKEN`；
+4. `access_token` 约 **1 天**有效，过期跑 `--refresh`（`refresh_token` 约 30 天）。
+
+scope 默认 `user_info projects pull_requests issues notes`；少 `issues` 会让写探测拿到 403
+而不是 404，别把**权限问题**记成平台限制。要复核「建/改 Issue 是否仍 404」，用同一枚令牌跑
+`python scripts/probe_gitee_write.py --repo <owner>/<repo> --write`，把令牌来源（个人 / 第三方应用）
+一并记进 `BENCHMARK.md` §4.16——这正是该节唯一没验完的假设。
+
 ### 3.5 Web / API
 
 鉴权**不是环境变量**：口令、TOTP 密钥、API Key 哈希都存在数据库，策略在 `config.yaml` 的

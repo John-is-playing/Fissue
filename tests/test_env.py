@@ -262,6 +262,11 @@ def _vars_read_by_code() -> set[str]:
     # net.py 的 TLS 变量以常量形式声明：ENV_CA_BUNDLE = "FISSUE_CA_BUNDLE"
     net_src = (REPO_ROOT / "src" / "fissue" / "net.py").read_text(encoding="utf-8")
     names |= set(re.findall(r'ENV_[A-Z_]+ = "FISSUE_([A-Z_]+)"', net_src))
+
+    # 第三方应用凭据由 scripts/gitee_oauth.py 读取：它不在 src/ 下，但同样是「代码」。
+    # 不把它算进来，示例里这些键就会被判成「写了不生效」——而实际只是读的人换了。
+    oauth_src = (REPO_ROOT / "scripts" / "gitee_oauth.py").read_text(encoding="utf-8")
+    names |= set(re.findall(r'"FISSUE_([A-Z_]+)"', oauth_src))
     return names
 
 
