@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="src/fissue/web/static/favicon.svg" width="110" alt="Fissue">
+</p>
+
 # Fissue
 
 > 自动抓取 **GitHub / Gitee / AtomGit / GitLab** 的 Issue 与 PR，用 AI 判断

@@ -13,7 +13,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Fissue{% endblock %}</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔍</text></svg>">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="stylesheet" href="{{ static_url }}">
 {% block head %}{% endblock %}
 </head>
@@ -23,7 +23,7 @@
 
   <aside class="side">
     <div class="brand">
-      <a href="/">Fissue</a>
+      <a href="/"><img class="logo" src="/static/favicon.svg" alt="" width="18" height="18">Fissue</a>
       <span class="ver">v{{ version }}</span>
     </div>
 

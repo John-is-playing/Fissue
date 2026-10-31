@@ -15,13 +15,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>登录 · Fissue</title>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🔍</text></svg>">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="stylesheet" href="{{ static_url }}">
 <style>
   /* 登录页是独立布局：不套 .shell 的左右两栏，居中一张卡片即可。 */
   body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
   .login-card { width: 380px; max-width: 92vw; }
-  .login-card h1 { margin: 0 0 4px; font-size: 22px; }
+  .login-card h1 { margin: 0 0 4px; font-size: 22px; display: flex; align-items: center; gap: 8px; }
+  .login-card h1 .logo { width: 24px; height: 24px; border-radius: 5px; flex: none; }
   .login-card .ver { color: var(--muted); font-size: 12px; }
   .login-card .panel { margin-top: 18px; }
   .login-card input { width: 100%; }
@@ -39,7 +40,7 @@
 </head>
 <body>
 <div class="login-card">
-  <h1>Fissue</h1>
+  <h1><img class="logo" src="/static/favicon.svg" alt="" width="24" height="24">Fissue</h1>
   <div class="ver">v{{ version }} · Web 控制台</div>
 
   {# ---- 第一步：用户名 + 口令 ---- #}

@@ -411,9 +411,11 @@ dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin
   padding: 14px 12px; display: flex; flex-direction: column; gap: 14px;
   position: sticky; top: 0; height: 100vh; overflow-y: auto;
 }
-.brand { display: flex; align-items: baseline; gap: 8px; padding: 0 6px; }
-.brand a { color: var(--fg); font-size: 17px; font-weight: 600; letter-spacing: .4px; }
+.brand { display: flex; align-items: center; gap: 8px; padding: 0 6px; }
+.brand a { color: var(--fg); font-size: 17px; font-weight: 600; letter-spacing: .4px;
+  display: inline-flex; align-items: center; gap: 6px; }
 .brand a:hover { text-decoration: none; color: var(--accent); }
+.brand .logo { width: 18px; height: 18px; border-radius: 4px; flex: none; }
 .brand .ver { color: var(--muted); font-size: 11px; }
 
 .nav { display: flex; flex-direction: column; gap: 2px; }
