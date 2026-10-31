@@ -987,6 +987,9 @@ class AutoFixer:
             for line in trace.review:
                 log.warning("自动评审 %s：%s", item.key, line)
             review_path = Path(path).with_suffix(".review.txt")
+            # 生产里 _save_patch 已建好父目录；但路径可能来自 mock / 跨平台（如 /tmp），
+            # 父目录未必存在，先兜底建好，避免 Windows 上 FileNotFoundError。
+            review_path.parent.mkdir(parents=True, exist_ok=True)
             review_path.write_text("\n".join(trace.review) + "\n", encoding="utf-8")
             attempt.error += f"｜自动评审意见见 {review_path}"
         self.ctx.repo.save_fix_attempt(attempt)

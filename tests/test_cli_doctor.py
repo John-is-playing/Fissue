@@ -266,8 +266,17 @@ def test_doctor_is_registered_under_platforms() -> None:
     runner = CliRunner()
     result = runner.invoke(app, ["platforms", "doctor", "--help"])
     assert result.exit_code == 0, result.output
-    assert "--write" in result.output
-    assert "--number" in result.output
+    # 不直接断言渲染文本里有 "--write"：Rich 会按终端宽度截断选项名（Windows CI
+    # 上宽度极小，选项被截成 "-…"），导致断言假阴性。改成直接查命令注册的参数。
+    from typer.core import TyperGroup
+    from typer.main import get_group
+
+    platforms = get_group(app).commands["platforms"]
+    assert isinstance(platforms, TyperGroup)
+    doctor = platforms.commands["doctor"]
+    param_names = {p.name for p in doctor.params}
+    assert "write" in param_names
+    assert "number" in param_names
 
 
 # ---------------------------------------------------------------------------
