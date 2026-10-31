@@ -124,7 +124,7 @@ file` → 确认父目录存在。
 |---|---|
 | `401 Bad credentials` | Token 错 / 过期 / 已撤销 |
 | `404` 访问私有仓库 | 权限不含该仓库 |
-| `404 project or enterprise`（**建/改** Issue） | **Gitee 特有，原因未定位**：读、推送、打标签、建评论、仓库级写都正常，只有创建/更新 Issue 对象被拒（换令牌、换公开/私有库均复现）。见 `BENCHMARK.md` §4.16 |
+| `404 project or enterprise`（**建/改** Issue） | **Gitee 特有，已收口**：读、推送、打标签、建评论、仓库级写都正常，只有创建/更新 Issue 对象被拒。**令牌类型已排除**——个人令牌与第三方应用 OAuth 令牌（scope 含 `issues`、私有库、`Bearer` 头）都是同一个 404。口径：不要依赖这两个动作，用「打标签 + 评论 + 人工建单」替代。见 `BENCHMARK.md` §4.16 |
 | `400 Problems parsing JSON`（写标签） | 请求体形状：Gitee 只认**裸 JSON 数组** `["a"]`，发 `{"labels":[…]}` 就报这句。适配器已按平台分派，再见到先查体形状而不是猜权限 |
 | `403` 打标签失败 | Token 缺写权限 |
 | `403` 克隆私有仓库（Gitee） | 令牌需带**项目（projects）**权限，`issue` 权限不够。用 `fissue platforms doctor -r gitee:owner/repo` 区分「缺项目权限」与「凭据传递问题」 |
