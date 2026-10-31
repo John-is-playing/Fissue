@@ -122,6 +122,53 @@ jobs:
           FISSUE_TEST_DOCKER: "1"
         run: python -m pytest -q -p no:cacheprovider tests/test_sandbox_docker.py
 
+  mysql:
+    name: store (mysql 8.0)
+    runs-on: ubuntu-24.04
+    # 为什么要单独一个任务：默认套件跑的是 SQLite，MySQL 独有的坑（utf8mb4 下 3072 字节
+    # 索引上限、`TEXT` 只有 64KB、无 `ADD COLUMN IF NOT EXISTS`、`SKIP LOCKED` 要 8.0、
+    # `DATETIME` 读回来是 naive）在 SQLite / PostgreSQL 上**一条都不会暴露**。
+    # `tests/test_store_mysql.py` 早就写好了，但只在开发机手工跑过一次——改 `store/`
+    # 时没有任何机器拦得住回归。库名必须带 `test`：夹具会 `drop_all()`（见该文件头部）。
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: fissue-root-pw
+          MYSQL_DATABASE: fissue_test
+          MYSQL_USER: fissue
+          MYSQL_PASSWORD: fissue-pw
+        ports:
+          - 3306:3306
+        # 健康检查是必需的：容器「起来了」不等于 mysqld 接受连接，早跑一步就是连接失败。
+        # 字符集/排序规则跟随生产配置，否则 utf8mb4 索引长度这条约束验不到。
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ufissue -pfissue-pw"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+          --character-set-server=utf8mb4
+          --collation-server=utf8mb4_unicode_ci
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: 跑 MySQL 仓储用例
+        env:
+          FISSUE_TEST_MYSQL_URL: "mysql+pymysql://fissue:fissue-pw@127.0.0.1:3306/fissue_test?charset=utf8mb4"
+        # 只跑这一个文件：其余用例假定 SQLite 的「每用例一个临时库」，
+        # 切到 MySQL 既慢又会互相污染（见 test_store_mysql.py 头部）。
+        run: python -m pytest -q -p no:cacheprovider tests/test_store_mysql.py
+
   lint:
     name: ruff + mypy
     runs-on: ubuntu-24.04
