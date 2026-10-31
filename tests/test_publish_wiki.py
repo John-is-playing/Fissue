@@ -222,7 +222,9 @@ def test_real_pages_keep_their_code_examples_and_fix_their_links() -> None:
     assert "`../xxx.md`" in home, "Home.md 里反引号包着的示例被改坏了"
 
     ai = files["AI-Layer.md"][0]
-    assert "](Benchmark#提示词重写前后的对照同一批待修条目)" in ai, (
+    # 锚点用的是 wiki 侧真实标题（`### 提示词重写前后（同一批待修条目）` 去掉全角括号），
+    # 断言的是「`.md#锚点` 被改写成 `#锚点`」这条路径，而不是某个具体锚点文本。
+    assert "](Benchmark#提示词重写前后同一批待修条目)" in ai, (
         "那条带锚点的页间链接没被改写——正文里行内出现的三反引号把判定带偏了"
     )
     assert "](Benchmark.md#" not in ai
