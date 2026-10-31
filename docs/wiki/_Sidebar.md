@@ -29,12 +29,12 @@
 - [基准与可信度](Benchmark.md)
 - [贡献指南](Contributing.md)
 
-**仓库文档**
+**仓库文档（详版）**
 
 - [README](../../README.md)
-- [架构设计（详版）](../DESIGN.md)
-- [使用手册（详版）](../USAGE.md)
-- [环境变量（详版）](../ENV.md)
+- [使用手册](../USAGE.md)
+- [环境变量](../ENV.md)
+- [架构设计](../DESIGN.md)
 - [Web 鉴权设计](../AUTH.md)
 - [回归门规范](../REGRESSION-GATE.md)
 - [安全策略](../../SECURITY.md)

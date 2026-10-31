@@ -1,236 +1,108 @@
-# `.env` 配置详解
+# 环境变量（`.env`）详解
 
-> 本文逐项说明 Fissue 的每个环境变量：**是什么、填什么、不填会怎样、填错了什么表现**。
-> 想直接抄模板跳到 [§6 配置模板](#6-配置模板)。业务规则（仓库列表、阈值、策略）
-> 在 `config.yaml`，见 [USAGE.md §4](USAGE.md#4-配置业务规则configyaml)。
+> 逐项说明每个变量的作用、默认值与填错的表现。业务规则（仓库列表、阈值、策略）在
+> `config.yaml` 里，见 [USAGE.md §4](USAGE.md)。模板可直接抄 [§6](#6-配置模板)。
 
----
-
-## 1. 先搞清 `.env` 和 `config.yaml` 的分工
+## 1. `.env` 与 `config.yaml` 的分工
 
 | | `.env` | `config.yaml` |
 |---|---|---|
-| 放什么 | 密钥、连接串、**随环境变化**的值 | 业务规则、策略、阈值 |
-| 是否提交 git | ❌ 不提交（已在 `.gitignore`） | ✅ 可提交 |
-| 典型内容 | LLM key、数据库密码、平台 Token | 抓哪些仓库、修哪些 Issue、通知发给谁 |
-| 格式 | `KEY=value`（无引号，无缩进） | YAML |
+| 放什么 | 密钥、连接串、随环境变化的值 | 业务规则、策略、阈值 |
+| 提交 git | ❌（已在 `.gitignore`） | ✅ |
+| 格式 | `KEY=value`，无引号无缩进 | YAML |
 
-判断标准：**这个值换台机器/换个人会不会变？** 会变 → `.env`；不会 → `config.yaml`。
+判断标准：**换台机器/换个人会变的值 → `.env`**。
 
----
-
-## 2. 优先级（最容易踩坑的地方）
+## 2. 优先级
 
 ```
-① 进程环境变量         FISSUE_LLM_MODEL=xxx fissue eval
-        ↓ 覆盖
-② .env 文件            ./​.env
-        ↓ 覆盖
-③ config.yaml          ./config.yaml 的 llm.model
-        ↓ 覆盖
-④ 内置默认值           deepseek-chat 等
+进程环境变量 > .env 文件 > config.yaml > 内置默认值
 ```
-
-实测验证（已写成测试 `tests/test_env.py::test_process_env_beats_dotenv_file`）：
 
 ```bash
-# .env 里写 FISSUE_LLM_MODEL=from-dotenv
-$ FISSUE_LLM_MODEL=from-shell fissue eval
-# → 实际使用 from-shell（进程环境赢）
+# .env 写 FISSUE_LLM_MODEL=from-dotenv
+FISSUE_LLM_MODEL=from-shell fissue eval      # → 用 from-shell
 ```
 
-**为什么这样设计？** 容器 / CI / 临时调试时用一行前缀覆盖最符合直觉；
-`.env` 是「长期默认值」，不该压住你当场显式指定的值。
+理由：容器 / CI / 临时调试用一行前缀覆盖最符合直觉，`.env` 是长期默认值，不该压住当场显式指定。
 
-### 2.1 一个常见误解
-
-`.env` 里的**空值等于没写**，不会把 `config.yaml` 的值清空：
-
-```bash
-# .env
-FISSUE_LLM_MODEL=          # ← 空值，将被忽略
-```
-```yaml
-# config.yaml
-llm:
-  model: deepseek-chat     # ← 仍生效
-```
-
-所以「临时清掉某个配置」要删掉那一行，或者显式设成有效值。
-
----
+⚠️ `.env` 里的**空值等于没写**，不会清空 `config.yaml` 的值。要「临时清掉某个配置」请删掉那行。
 
 ## 3. 逐项说明
 
-### 3.1 元配置（一般不用动）
+### 3.1 元配置
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `FISSUE_CONFIG` | `./config.yaml` | 指定 `config.yaml` 路径 |
-| `FISSUE_ENV` | `./.env` | 指定 env 文件路径（多环境切换用，如 `.env.prod`） |
-| `FISSUE_LOG_LEVEL` | `info` | `debug` / `info` / `warning` / `error`，等价于全局 `-v` |
+| `FISSUE_CONFIG` | `./config.yaml` | 配置文件路径 |
+| `FISSUE_ENV` | `./.env` | env 文件路径（多环境用，如 `.env.prod`） |
+| `FISSUE_LOG_LEVEL` | `info` | `debug`/`info`/`warning`/`error`，等价全局 `-v` |
 
-```bash
-# 多环境示例：生产配置单独放
-FISSUE_CONFIG=/etc/fissue/config.prod.yaml
-FISSUE_ENV=/etc/fissue/.env.prod
-```
+`debug` 会打印每次 HTTP 请求与 token 数，排错有用但输出量大。
 
-> `FISSUE_LOG_LEVEL=debug` 会打印每次 HTTP 请求与 LLM 调用的 token 数，
-> 排查问题时很有用，但输出量大。
-
----
-
-### 3.2 `FISSUE_DATABASE_URL` —— 数据库（可选，默认 SQLite）
-
-**格式**：SQLAlchemy 连接串。
+### 3.2 `FISSUE_DATABASE_URL` —— 数据库
 
 | 场景 | 值 |
 |---|---|
-| 默认（零依赖） | `sqlite:///./data/fissue.db`（文件落在 `./data/`，父目录会自动创建） |
-| SQLite 绝对路径 | `sqlite:////home/me/fissue.db`（注意 4 个斜杠 = 绝对路径） |
-| PostgreSQL（生产 / 多机，推荐但需自建） | `postgresql+psycopg://用户:密码@主机:5432/库名` |
-| MySQL（8.0+，需自建） | `mysql+pymysql://用户:密码@主机:3306/库名` |
-| 密码含特殊字符 | 需 URL 编码，如 `@` → `%40`，`:` → `%3A` |
+| 默认（零依赖） | `sqlite:///./data/fissue.db`（父目录自动创建） |
+| SQLite 绝对路径 | `sqlite:////home/me/fissue.db`（**4 个斜杠**） |
+| PostgreSQL | `postgresql+psycopg://用户:密码@主机:5432/库名` |
+| MySQL 8.0+ | `mysql+pymysql://用户:密码@主机:3306/库名?charset=utf8mb4` |
+| 密码含特殊字符 | 需 URL 编码：`@`→`%40`、`:`→`%3A` |
 
 ```bash
-# PostgreSQL 示例（换成 PG 时才需要）
-FISSUE_DATABASE_URL=postgresql+psycopg://fissue:my%40pass@localhost:5432/fissue
-
-# MySQL 示例（8.0+；库与库的字符集必须是 utf8mb4）
-FISSUE_DATABASE_URL=mysql+pymysql://fissue:my%40pass@localhost:3306/fissue?charset=utf8mb4
+createdb -U fissue fissue && fissue db init && fissue db check     # PostgreSQL 首次
 ```
-
-**不填会怎样**：用内置默认 `sqlite:///./data/fissue.db`——零依赖、开箱即用，
-`fissue db init` 之后就能跑（这也是本项目开发期与单测真正验证过的那条路）。
-
-**换成 PostgreSQL 时首次准备**：
-
-```bash
-createdb -U fissue fissue          # 先建库（PG 不会自己建）
-fissue db init                     # 建表
-fissue db check                    # 验证连通
-```
-
-**换成 MySQL 时首次准备**：
 
 ```sql
-CREATE DATABASE fissue CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
--- 账号按需：CREATE USER 'fissue'@'%' IDENTIFIED BY '...'; GRANT ALL ON fissue.* TO 'fissue'@'%';
+CREATE DATABASE fissue CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;   -- MySQL
 ```
 
-```bash
-fissue db init && fissue db check
-```
+**MySQL 三条硬约束**：① 库/表字符集必须 utf8mb4；② utf8mb4 下索引上限 3072 字节，键列用
+640 字符（旧的 767 会让队列表复合唯一索引建不上）；③ TEXT 只有 64KB，正文/沙盒日志/补丁列在
+MySQL 上落 `MEDIUMTEXT`。另外 8.0 以下不支持 `FOR UPDATE SKIP LOCKED`，队列并发回收会失效。
 
-> MySQL 侧的三条硬约束（实现已按它们落地，换库时别踩）：
-> ① **库/表字符集必须 utf8mb4**，否则中文与 emoji 直接乱码或报错；
-> ② 索引在 utf8mb4 下的上限是 **3072 字节**，所以键列用的是 640 字符——旧值 767 会让
-> 队列表的复合唯一索引（queue + item_key + status）超限，建表直接失败；
-> ③ **TEXT 上限只有 64KB**——正文 / 沙盒日志 / 补丁这几列在 MySQL 上落成 `MEDIUMTEXT`。
-> 另外 `8.0` 之前的版本不支持 `FOR UPDATE SKIP LOCKED`，队列并发回收会失效，故要求 8.0+。
+**填错表现**：`无法连接数据库` → `fissue db check` / `pg_isready`；`database does not exist` →
+先 `createdb`；`password authentication failed` → 转义特殊字符；SQLite `unable to open database
+file` → 确认父目录存在。
 
-**填错了什么表现**：
+后端选择：SQLite 是默认（单机、零运维，开发与单测全程在用）；常驻服务 + Web 并发或多机部署
+建议 PostgreSQL（SQLite 并发写会锁表），MySQL 8.0+ 是同类选择。
 
-| 现象 | 原因 | 解决 |
-|---|---|---|
-| `无法连接数据库：...` | 服务没起 / 连接串错 | `pg_isready`；`fissue db check` |
-| `database "fissue" does not exist` | 没建库（PG） | `createdb -U fissue fissue` |
-| `password authentication failed` | 密码错或含特殊字符未编码 | 编码特殊字符 |
-| SQLite `unable to open database file` | 目录不存在 / 路径格式错 | 默认路径会自动建目录；自定义路径请确认父目录存在 |
-
-> **SQLite vs PostgreSQL / MySQL**：SQLite 是默认（单机、零运维，本项目开发与单测全程在用）；
-> 常驻服务 + Web 并发、或多机部署建议 **PostgreSQL**（SQLite 并发写会锁表），
-> **MySQL 8.0+** 是同一类选择（适合已有 MySQL 运维栈的环境）。
-> 两个网络后端的验证深度不同：
->
-> * **PostgreSQL**：`1.1.0-b4` 起做过真实部署验证（`db init` / `db check` / 全量单测 /
->   服务启动与页面实测均在该后端上跑过，见 [BENCHMARK.md §5](../BENCHMARK.md#5-尚未测量)）；
-> * **MySQL**：已在 Docker 的 `mysql:8.0` 上验证**建表 / 读写 / 队列 / 抓取链路**
->   （`tests/test_store_mysql.py` 是可复跑的真机用例，按 `FISSUE_TEST_MYSQL_URL` 启用；
->   核对内容包括 MEDIUMTEXT 长文本、640 键列与 3072 字节索引上限、`SKIP LOCKED` 队列领取、
->   naive 时间戳相减、`information_schema` 补列迁移），并**跑通了完整链路**
->   `db init → fetch → eval → verify → flush → fix`：评测结论、验证器运行（base/fix +
->   回归门）、flush 打标与修复 Agent（2 轮产出补丁）都在该后端上真跑过。
->
-> 两者验证的都是**部署与并发路径**，各夹具的跑分数字仍全部来自 SQLite，**别混读**。
-
----
+> 验证深度不同：**PostgreSQL** 在 `1.1.0-b4` 起做过真实部署验证（`db init` / `db check` /
+> 全量单测 / 服务与页面实测）；**MySQL** 在 Docker `mysql:8.0` 上跑通了
+> `db init → fetch → eval → verify → flush → fix` 全链路（`tests/test_store_mysql.py` 可复跑，
+> 按 `FISSUE_TEST_MYSQL_URL` 启用）。两者验证的都是**部署与并发路径**，各夹具跑分数字仍全部
+> 来自 SQLite，**别混读**。
 
 ### 3.3 LLM 相关
 
-#### `FISSUE_LLM_API_KEY` —— **必填**
+| 变量 | 必需 | 说明 |
+|---|---|---|
+| `FISSUE_LLM_API_KEY` | ✅ | 唯一必填项；`fetch` / `status` / `report` 不需要 |
+| `FISSUE_LLM_BASE_URL` | | 端点，默认取 `config.yaml` 的 `llm.base_url` |
+| `FISSUE_LLM_MODEL` | | 模型名，默认取 `config.yaml` |
+| `FISSUE_LLM_FALLBACK_MODEL` | | 主模型失败时的降级模型；不填则直接报错 |
 
-唯一的必填项。命令会校验它（`fissue eval` / `verify` / `fix` 等需要 AI 的命令
-在不填时直接报错退出）。
+| 供应商 | `BASE_URL` | 推荐 `MODEL` |
+|---|---|---|
+| DeepSeek（默认） | `https://api.deepseek.com/v1` | `deepseek-chat` |
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` |
+| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+| Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+| 本地 Ollama | `http://localhost:11434/v1` | `qwen2.5:14b` |
 
-```
-缺少 LLM API Key：请在 .env 中设置 FISSUE_LLM_API_KEY
-```
+`BASE_URL` 只写到 `/v1`（程序自动补 `/chat/completions`）。
 
-> 只做 `fetch` / `status` / `report` 不需要 key。
+**填错表现**：`401` → key 错或与 base_url 不匹配；`404` → base_url 少 `/v1` 或多 `/chat/completions`；
+`模型调用失败（xxx）` → 模型名不存在；`429` → 限流，调小 `llm.concurrency`。
 
-#### `FISSUE_LLM_BASE_URL` —— 端点地址
+> 不支持 `response_format` 的端点会被自动识别并降级为文本解析，本地小模型也能跑，只是偶尔重试。
 
-**不填**：用 `config.yaml` 的 `llm.base_url`（默认 `https://api.deepseek.com/v1`）。
+### 3.4 平台 Token
 
-各供应商对照（**只改这两项即可换供应商**）：
-
-| 供应商 | `BASE_URL` | 推荐 `MODEL` | 备注 |
-|---|---|---|---|
-| DeepSeek | `https://api.deepseek.com/v1` | `deepseek-chat` | 便宜、中文好，默认 |
-| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | 通用能力强 |
-| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` | 国内直连 |
-| 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` | 便宜 |
-| Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` | 长上下文 |
-| 本地 Ollama | `http://localhost:11434/v1` | `qwen2.5:14b` | 完全离线，`API_KEY` 随便填 |
-
-**注意末尾**：填 `https://api.deepseek.com/v1`（程序自动补 `/chat/completions`），
-不要自己带 `/chat/completions`（带了也能识别，但容易写错）。
-
-#### `FISSUE_LLM_MODEL` —— 模型名
-
-**不填**：用 `config.yaml` 的 `llm.model`（默认 `deepseek-chat`）。
-
-#### `FISSUE_LLM_FALLBACK_MODEL` —— 备用模型
-
-主模型调用失败（限流、服务故障、模型名写错）时自动降级到它，避免整批任务中断。
-
-**不填**：不降级，主模型失败即报错。
-
-```bash
-# 示例：主用便宜的，故障时降级到备用
-FISSUE_LLM_MODEL=deepseek-chat
-FISSUE_LLM_FALLBACK_MODEL=deepseek-chat
-```
-
-**填错了什么表现**：
-
-| 现象 | 原因 |
-|---|---|
-| `LLM 请求失败 401` | key 错 / 与 base_url 不匹配（如用 OpenAI 的 key 调 DeepSeek） |
-| `LLM 请求失败 404` | base_url 少了 `/v1` 或多了 `/chat/completions` |
-| `模型调用失败（xxx）: ...` | model 名不存在 |
-| `LLM 服务错误 429` | 限流；调小 `config.yaml` 的 `llm.concurrency` |
-| 中文输出变成英文 | 换成了不擅长中文的模型（不影响功能） |
-
-> 不支持的 `response_format`（结构化输出）会被**自动识别并降级**为文本解析，
-> 所以本地小模型也能跑，只是偶尔需要重试。
-
----
-
-### 3.4 平台 Token（可选，但建议配）
-
-四个变量独立，**配哪个平台就填哪个**，用不到的留空。
-
-```bash
-FISSUE_GITHUB_TOKEN=
-FISSUE_GITEE_TOKEN=
-FISSUE_ATOMGIT_TOKEN=
-FISSUE_GITLAB_TOKEN=
-```
-
-**不填会怎样**：
+四个变量独立，用哪个填哪个。
 
 | | 有 Token | 无 Token |
 |---|---|---|
@@ -239,410 +111,208 @@ FISSUE_GITLAB_TOKEN=
 | 读私有仓库 | ✅ | ❌ |
 | 打标签 / 提 PR | ✅ | ❌（自动修复不可用） |
 
-**申请入口与最小权限**：
-
 | 平台 | 入口 | 最小权限 |
 |---|---|---|
-| GitHub | [settings/tokens](https://github.com/settings/tokens) | classic 勾 `repo`；或 fine-grained 勾 Contents + Issues + Pull requests 读写 |
-| Gitee | [个人访问令牌](https://gitee.com/profile/personal_access_tokens) | `projects` `pull_requests` `issues` |
-| AtomGit | [访问令牌](https://atomgit.com/setting/token-classic) | `read_repository` `write_repository` `issues` `pull_requests` |
-| GitLab | [Access Tokens](https://gitlab.com/-/user_settings/personal_access_tokens) | `api`（或 `read_api` + `write_repository`） |
+| GitHub | settings/tokens | classic `repo`；或 fine-grained 的 Contents + Issues + Pull requests 读写 |
+| Gitee | 个人访问令牌 | `projects` `pull_requests` `issues` |
+| AtomGit | 访问令牌（classic） | `read_repository` `write_repository` `issues` `pull_requests` |
+| GitLab | Access Tokens | `api`（或 `read_api` + `write_repository`） |
 
-> **只试用不修复**：可以不填任何 Token，用公开仓库跑 `fetch`/`eval`/`verify`，
-> 只是会很快触到 60 次/小时的限流。
-
-**注意**：Token 等同于密码，**永远不要提交进 git**（`.env` 已在 `.gitignore`）。
-日志里的 Token 会被自动脱敏成 `***`。
-
-**填错了什么表现**：
+**填错表现**：
 
 | 现象 | 原因 |
 |---|---|
-| `401 Bad credentials` | Token 错 / 已过期 / 撤销了 |
-| `404` 访问私有仓库 | Token 权限不含该仓库 |
-| `404` `project or enterprise`（**建** Issue / **改** Issue） | **Gitee 特有，原因未定位**：读接口、git 推送、打标签、建评论、仓库级写都正常，只有**创建/更新 Issue 对象本身**这两个动作被拒。已排除「令牌作用域」与「仓库可见性」（换新令牌、公开库与私有库同样 404，均为实测）。详见 `BENCHMARK.md` §4.16 |
-| `400` `Problems parsing JSON`（**写** 标签） | 这是**请求体形状**问题，不是平台限制：Gitee 的 `POST /issues/{n}/labels` 只认**裸 JSON 数组** `["a"]`，发 `{"labels": ["a"]}` 就会报这句。v1.3.0-b2 起适配器已按平台分派形状（`v5.item_label_body`），正常情况下不该再出现——再见到它，先查体形状而不是猜权限 |
-| `403` 打标签失败 | Token 缺写权限（只勾了只读） |
-| `403` 克隆私有仓库：`The token is not authorized to access this project` | **Gitee 特有**：私人令牌需要带**项目（projects）**权限，`issue` 权限不够——API 读与打标签能通，git over HTTPS 却会被拒。用 `fissue platforms doctor -r gitee:owner/repo` 复核：它会在失败后重试匿名克隆，从而区分「令牌缺项目权限」与「凭据传递有问题」 |
-| `触发限流` | 未配 Token 或调用过密 |
+| `401 Bad credentials` | Token 错 / 过期 / 已撤销 |
+| `404` 访问私有仓库 | 权限不含该仓库 |
+| `404 project or enterprise`（**建/改** Issue） | **Gitee 特有，原因未定位**：读、推送、打标签、建评论、仓库级写都正常，只有创建/更新 Issue 对象被拒（换令牌、换公开/私有库均复现）。见 `BENCHMARK.md` §4.16 |
+| `400 Problems parsing JSON`（写标签） | 请求体形状：Gitee 只认**裸 JSON 数组** `["a"]`，发 `{"labels":[…]}` 就报这句。适配器已按平台分派，再见到先查体形状而不是猜权限 |
+| `403` 打标签失败 | Token 缺写权限 |
+| `403` 克隆私有仓库（Gitee） | 令牌需带**项目（projects）**权限，`issue` 权限不够。用 `fissue platforms doctor -r gitee:owner/repo` 区分「缺项目权限」与「凭据传递问题」 |
 
----
+Token 等同密码：不要提交 git，日志与报告里会自动脱敏成 `***`。
 
 ### 3.5 Web / API
 
-#### Web / API 鉴权（**不是一个环境变量**）
-
-> 旧版的 `FISSUE_API_TOKEN`（单一全局口令）已被**会话登录 + 多 API Key** 整体替换，
-> 完整设计见 [AUTH.md](./AUTH.md)。口令、TOTP 密钥、API Key 哈希都存在**数据库**里，
-> 配置项在 `config.yaml` 的 `web.auth` 段（可在「设置」页改）。
-
-三种身份来源互为「或」：
+鉴权**不是环境变量**：口令、TOTP 密钥、API Key 哈希都存在数据库，策略在 `config.yaml` 的
+`web.auth` 段（可在「设置」页改）。完整设计见 [AUTH.md](AUTH.md)。
 
 | 来源 | 适用 | 怎么用 |
 |---|---|---|
-| **回环** | 本机 | 永远免登录——本机打开 `http://127.0.0.1:8000/` 即可 |
-| **可信网段** | 内网 | 把内网写进 `web.trusted_networks`（如 `["192.168.1.0/24"]`），视同回环：免登录、可写配置 |
-| **会话 / API Key** | 其余（含对外） | 浏览器在 `/login` 登录；脚本用 `Authorization: Bearer fissue_<prefix>_<secret>` |
+| 回环 | 本机 | 永远免登录 |
+| 可信网段 | 内网 | 写进 `web.trusted_networks`（如 `["192.168.1.0/24"]`），视同回环 |
+| 会话 / API Key | 其余 | `/login` 登录；脚本用 `Authorization: Bearer fissue_<prefix>_<secret>` |
 
-首次启动且**没有管理员账号**时，控制台会打印一条一次性引导口令（同时写在
-`data/auth-bootstrap-token`，0600）：本机访问 `/login` 可直接初始化；从别的机器访问则要带上它，
-**用后即焚**。
+首次启动且无管理员时，控制台打印一次性引导口令（也写在 `data/auth-bootstrap-token`，0600），
+用后即焚。
 
 ```bash
-# 本机初始化（无需引导口令）
-# 浏览器打开 http://127.0.0.1:8000/login
-
-# 从别的机器初始化 / 或口令忘了，在服务器上自救
-fissue auth status                  # 看有没有账号、引导口令是什么
-fissue auth set-password            # 设/改口令（会注销该账号全部会话）
-fissue auth reset                   # 清 2FA 与恢复码（手机丢了用这个）
-fissue auth key create --name ci    # 建一把 API Key（明文只显示这一次）
+fissue auth status                  # 有没有账号 / 引导口令
+fissue auth set-password            # 设或改口令（会注销该账号全部会话）
+fissue auth reset                   # 清 2FA 与恢复码
+fissue auth key create --name ci    # 建 API Key（明文只显示一次）
 ```
 
-> 对外暴露（`--host 0.0.0.0`）时，**`web.auth.enabled` 保持默认的 `true`** 即可，
-> 不会再看到旧版那条「没有鉴权」的启动报错。真正危险的是**显式关掉它、又不声明可信网段**——
-> 那种组合配置层会直接拒绝启动（fail-closed）。
->
-> 反向代理：CIDR 判定**只看真实对端地址**，默认**不信任** `X-Forwarded-For`。所以
-> 「绑 127.0.0.1 + 同机 nginx 转出去」时，请把代理/内网网段写进 `web.trusted_networks`
-> 显式声明，否则带转发头的写请求会被 403 拦下（那是补刀，不是边界）。
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `FISSUE_WEB_HOST` | `127.0.0.1` | 仅本机可访问，最安全；`0.0.0.0` 时需有身份机制（默认 `web.auth.enabled=true` 已满足） |
+| `FISSUE_WEB_PORT` | `8000` | 非整数会友好报错 |
 
-#### `FISSUE_WEB_HOST` / `FISSUE_WEB_PORT`
+> 反向代理：CIDR 判定只看真实对端，默认不信 `X-Forwarded-For`。「绑 127.0.0.1 + 同机 nginx
+> 转出去」时请把代理/内网网段写进 `web.trusted_networks` 显式声明。
 
-| 值 | 含义 |
-|---|---|
-| `127.0.0.1`（默认） | 仅本机可访问，最安全 |
-| `0.0.0.0` | 所有网卡可访问，**需有身份机制**：默认的 `web.auth.enabled=true` 已满足（内网可再声明 `web.trusted_networks` 免登录） |
+**填错表现**：`FISSUE_WEB_PORT 必须是整数` → 填了非数字；`Address already in use` → 换端口；
+局域网访问不到 → `WEB_HOST` 仍是 `127.0.0.1`。
 
-```bash
-FISSUE_WEB_HOST=127.0.0.1
-FISSUE_WEB_PORT=8000
-```
+### 3.6 `FISSUE_SANDBOX_RUNNER_SOCKET` —— 沙盒转发组件
 
-**填错了什么表现**：
-
-| 现象 | 原因 |
-|---|---|
-| `环境变量 FISSUE_WEB_PORT 必须是整数` | 端口填了非数字（已友好报错，不会抛 traceback） |
-| `Address already in use` | 端口被占，换一个 |
-| 局域网访问不到 | `WEB_HOST` 仍是 `127.0.0.1` |
-
----
-
-### 3.6 `FISSUE_SANDBOX_RUNNER_SOCKET` —— 沙盒转发组件（可选）
-
-**默认不填**：走 `inline` 模式——进程内直调 Docker，简单够用。
-
-**填了**：走转发组件模式——宿主机常驻一个受控进程，容器执行只经这条通道，
-调用方不持有 Docker 句柄。生产环境（Linux）推荐。
+不填：走 `inline`（进程内直调 Docker，简单够用）。填了：走转发组件，调用方不持有 Docker 句柄，
+生产（Linux）推荐。
 
 ```bash
-# 1) 起转发组件
 fissue sandbox serve
-
-# 2) 告诉客户端走这条通道
-FISSUE_SANDBOX_RUNNER_SOCKET=/var/run/fissue-runner.sock
+FISSUE_SANDBOX_RUNNER_SOCKET=/var/run/fissue-runner.sock     # 等价 sandbox.forwarder.socket
 ```
 
-等价于 `config.yaml` 的 `sandbox.forwarder.socket`。
+Windows 不支持 Unix socket，会自动回退 inline；要让它工作请写 `\\.\pipe\fissue-runner`。
 
-> **Windows 不支持 Unix domain socket**，会自动回退 `inline` 模式。
-> 想让转发组件在 Windows 上工作，把值写成 `\\.\pipe\fissue-runner`。
+### 3.7 TLS 证书
 
-**填错了什么表现**：
-
-| 现象 | 原因 |
-|---|---|
-| `无法连接转发组件 /var/run/...` | 没起 `fissue sandbox serve`，或路径不一致 |
-| `Windows 不支持 Unix socket` | 平台限制，改用 inline 或命名管道 |
-
----
-
-### 3.7 TLS 证书（`FISSUE_CA_BUNDLE` / `FISSUE_INSECURE_SKIP_VERIFY`）
-
-**默认可不填。** 只有遇到下面这个报错时才需要：
+只有遇到下面这个报错才需要配：
 
 ```
-[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
-unable to get local issuer certificate (_ssl.c:1082)
+[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate
 ```
 
-#### 为什么会这样
-
-你的环境里存在 **HTTPS 中间人**，常见两类：
-
-| 类型 | 例子 |
-|---|---|
-| 企业安全网关 | Zscaler、Netskope、深信服、Palo Alto… |
-| 本机代理 / 抓包工具 | Fiddler、Charles、**SteamTools**、Clash(部分模式) |
-
-它们会用自己的根证书**重签**所有 HTTPS 证书。浏览器访问正常，是因为浏览器装了
-这张根证书；Python 这边认不认，取决于它查的是哪套信任库——**所以要先分清是哪种
-情况，再对症下药**（无脑装 truststore 是最常见的白折腾）。
-
-#### 先看当前实际走的是哪条信任链
+说明环境里有 **HTTPS 中间人**（企业安全网关，或 Fiddler / Charles / SteamTools / 部分 Clash
+模式）。**先分清是哪种情况再动手**，无脑装 truststore 是最常见的白折腾：
 
 ```bash
 python -c "from fissue import net; print(net.ca_bundle_hint())"
 ```
 
-（TLS 报错信息里也会直接写出这一行。）
-
-| 实际走的链路 | 说明 | 该怎么办 |
+| 实际链路 | 说明 | 怎么办 |
 |---|---|---|
-| `certifi 默认 CA 列表` | truststore 没装上 | 装 `truststore` → 方案 1 |
-| `操作系统信任库（truststore）` | 装了，但**这张根证书连系统信任库也没有**（浏览器打得开只因它自己装过） | 导出该根证书为 PEM → 方案 2 |
-| `自定义 CA：…` | 已经指定了却仍失败 | 多半是根证书不止一张（代理套代理），把它们**合并**进同一个 PEM → 方案 2 |
+| `certifi 默认 CA 列表` | truststore 没装上 | 方案 1 |
+| `操作系统信任库（truststore）` | 装了，但这张根证书连系统信任库也没有 | 方案 2 |
+| `自定义 CA：…` | 已指定仍失败 | 根证书不止一张（代理套代理），合并成同一个 PEM |
 
-#### 解决方案（按推荐顺序）
+1. **用系统信任库**（默认）：依赖里已含 `truststore`，装好依赖即可，无需配置。仅在「根证书
+   确实进了 OS 信任库」时有效。
+2. **显式指定根证书**：把根证书导出为 PEM，`FISSUE_CA_BUNDLE=/path/to/root-ca.pem`（支持 `~`）。
+   该变量是**严格的**：路径不存在或内容不是合法 PEM 会**直接报错**，不静默回退——静默回退等于
+   你以为只信这张证书、实际用的是 OS 信任库。多层中间人需合并：`cat a.pem b.pem > combined.pem`。
+3. **临时关闭校验**（仅排查）：`FISSUE_INSECURE_SKIP_VERIFY=1`。存在中间人攻击风险，绝不写进生产。
 
-**方案 1：用系统信任库（默认已启用）**
+优先级：`INSECURE_SKIP_VERIFY > CA_BUNDLE > 系统信任库 > certifi`。
 
-Fissue 依赖里已包含 [`truststore`](https://pypi.org/project/truststore/)，
-它会自动把 TLS 后端切到操作系统信任库。装好依赖即可，无需配置。
+验证：`fissue status --verbose`（日志说明 CA 来源），或 `fissue fetch --repo psf/requests --limit 1`。
 
-> 如果你的旧环境没装：`pip install truststore`
->
-> ⚠️ 这一招**只在「根证书确实装进了操作系统信任库」时才有效**。若上表查到已经是
-> `操作系统信任库（truststore）` 却仍失败，装它再多遍也没用，请走方案 2。
-
-**方案 2：显式指定根证书**
-
-把代理/企业的根证书导出成 PEM，写进 `.env` 即可（进程环境变量优先于 `.env`，
-临时调试也可以 `FISSUE_CA_BUNDLE=/path/root.pem fissue fetch …`）：
-
-```bash
-FISSUE_CA_BUNDLE=/path/to/root-ca.pem
-```
-
-> ⚠️ 这个变量是**严格的**：路径不存在、或内容不是合法 PEM 时，Fissue 会**直接报错**，
-> **不会**静默回退到系统信任库。这是刻意的——静默回退会让你以为「只信我钉的这张根证书」，
-> 实际用的却是 OS 信任库，属于安全配置被无声忽略。路径支持 `~`（如 `~/corp-root.pem`）。
-
-若中间人不止一层，根证书就不止一张，要**合并**成一个 PEM：
-
-```bash
-cat corp-root.pem another-root.pem > combined.pem   # 顺序无所谓
-```
-
-**方案 3：临时关闭校验（仅排查）**
-
-```bash
-FISSUE_INSECURE_SKIP_VERIFY=1
-```
-
-> ⚠️ 这会关闭全部证书校验，**存在被中间人攻击的风险**。
-> 只在本地确认「是不是证书问题」时短暂使用，绝不要写进生产配置。
-
-#### 优先级
-
-```
-FISSUE_INSECURE_SKIP_VERIFY  >  FISSUE_CA_BUNDLE  >  系统信任库(truststore)  >  certifi
-```
-
-#### 验证是否修好
-
-```bash
-# 看当前用的是哪套 CA
-fissue status --verbose          # 日志会说明 CA 来源
-
-# 或直接测一次真实请求
-fissue fetch --repo psf/requests --limit 1
-```
-
-#### 顺带说明：SSL 错误不会重试
-
-证书错误是**确定性**的（重试不会让证书变好），所以 Fissue 遇到它会
-**立即失败**并给出上面三个方案，而不是傻等 4 轮退避（约 8.5 秒）。
-其它网络抖动（超时、连接重置）仍会正常重试。
-
----
+> 证书错误是**确定性**的，Fissue 会立即失败并给出上述方案，而不是白等 4 轮退避；其它网络抖动
+> （超时、连接重置）仍正常重试。
 
 ## 4. 完整变量清单
 
 | 变量 | 必需 | 默认 | 作用 |
 |---|---|---|---|
-| `FISSUE_DATABASE_URL` | | `sqlite:///./data/fissue.db` | 存储连接串（生产/多机换 PostgreSQL） |
+| `FISSUE_DATABASE_URL` | | `sqlite:///./data/fissue.db` | 存储连接串 |
 | `FISSUE_LLM_API_KEY` | ✅ | 无 | 大模型密钥 |
-| `FISSUE_LLM_BASE_URL` | | `config.yaml` 值 | 模型端点 |
-| `FISSUE_LLM_MODEL` | | `config.yaml` 值 | 模型名 |
+| `FISSUE_LLM_BASE_URL` | | config.yaml 值 | 模型端点 |
+| `FISSUE_LLM_MODEL` | | config.yaml 值 | 模型名 |
 | `FISSUE_LLM_FALLBACK_MODEL` | | 无 | 降级模型 |
-| `FISSUE_GITHUB_TOKEN` | | 空 | GitHub 访问 |
-| `FISSUE_GITEE_TOKEN` | | 空 | Gitee 访问 |
-| `FISSUE_ATOMGIT_TOKEN` | | 空 | AtomGit 访问 |
-| `FISSUE_GITLAB_TOKEN` | | 空 | GitLab 访问 |
-| ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：单一访问口令被会话 + API Key 替换（见 [AUTH.md](./AUTH.md)）。旧口令既不再被导入、也不能当 Bearer 用（兼容垫片于 v1.3.0 移除）；表里遗留的 `prefix=legacy` Key 到「API Key」页吊销即可 |
+| `FISSUE_GITHUB_TOKEN` / `GITEE` / `ATOMGIT` / `GITLAB` | | 空 | 平台访问 |
+| ~~`FISSUE_API_TOKEN`~~ | — | — | **已移除**：被会话 + API Key 替换（垫片于 v1.3.0 移除）。遗留的 `prefix=legacy` Key 到「API Key」页吊销 |
 | `FISSUE_WEB_HOST` | | `127.0.0.1` | 监听地址 |
 | `FISSUE_WEB_PORT` | | `8000` | 监听端口 |
-| `FISSUE_SANDBOX_RUNNER_SOCKET` | | 空（inline） | 沙盒转发组件 socket |
-| `FISSUE_CA_BUNDLE` | | 空（用系统信任库） | 指定 CA 证书 PEM 路径（支持 `~`；路径不可用会**直接报错**，不静默回退） |
-| `FISSUE_INSECURE_SKIP_VERIFY` | | 空（开启校验） | 关闭 TLS 校验（**仅排查**） |
+| `FISSUE_SANDBOX_RUNNER_SOCKET` | | 空（inline） | 转发组件 socket |
+| `FISSUE_CA_BUNDLE` | | 空（系统信任库） | CA PEM 路径（不可用直接报错） |
+| `FISSUE_INSECURE_SKIP_VERIFY` | | 空 | 关闭 TLS 校验（仅排查） |
 | `FISSUE_LOG_LEVEL` | | `info` | 日志级别 |
-| `FISSUE_CONFIG` | | `./config.yaml` | 配置文件位置 |
-| `FISSUE_ENV` | | `./.env` | env 文件位置 |
+| `FISSUE_CONFIG` / `FISSUE_ENV` | | `./config.yaml` / `./.env` | 文件位置 |
 
-> 这份清单与 `.env.example` 由测试 `tests/test_env.py` 自动校验一致性：
-> 代码会读的变量必须在示例里有说明，示例里列出的必须真的会被读取。
+> 这份清单与 `.env.example` 由 `tests/test_env.py` 自动校准：代码会读的必须在示例里有说明，
+> 示例列出的必须真的会被读取。
 
----
-
-## 5. 验证你的 `.env` 有没有写对
+## 5. 验证 `.env`
 
 ```bash
-# 1) 语法与取值能否成功加载
-fissue status
-
-# 2) 数据库通不通
-fissue db check
-
-# 3) LLM key 是否有效、模型名对不对
-fissue eval --limit 1              # 会真的调一次模型
+fissue status                      # 语法与取值能否加载
+fissue db check                    # 数据库
+fissue eval --limit 1              # 真的调一次模型
 fissue eval --limit 1 --verbose    # 看请求细节
-
-# 4) 平台 Token 是否有效
-fissue fetch --repo <owner/name> --limit 1
-fissue fetch --repo <owner/name> --limit 1 --verbose
-
-# 5) 沙盒是否就绪
-fissue sandbox check
+fissue fetch --repo <owner/name> --limit 1   # 平台 Token
+fissue sandbox check               # 沙盒
 ```
-
-`fissue status` 会把关键项一次性打出来：
-
-```
-配置仓库：psf/requests
-沙盒：✅ Docker 26.0.0
-条目状态 / 队列状态表格…
-今日用量：0 tokens（prompt 0 / completion 0），约 $0.0000，调用 0 次
-```
-
----
 
 ## 6. 配置模板
 
-### 6.1 最小可用（本地试用，不碰平台写操作）
+**最小可用**（本地试用，不写平台）：
 
 ```bash
-# .env —— 只填这一项就能评测
 FISSUE_LLM_API_KEY=sk-你的真实key
-
-# 可选：用 SQLite 免装 PostgreSQL
-FISSUE_DATABASE_URL=sqlite:///E:/Fissue/data/fissue.db
 ```
 
-> 但要做自动修复（提 PR）必须配对应平台的 Token。
-
-### 6.2 开发环境（DeepSeek + SQLite + 本机 Web）
+**开发**（DeepSeek + SQLite + 本机 Web）：
 
 ```bash
 FISSUE_DATABASE_URL=sqlite:///E:/Fissue/data/fissue.db
-
 FISSUE_LLM_API_KEY=sk-xxx
 FISSUE_LLM_BASE_URL=https://api.deepseek.com/v1
 FISSUE_LLM_MODEL=deepseek-chat
-
 FISSUE_GITHUB_TOKEN=ghp_xxx
-
 FISSUE_WEB_HOST=127.0.0.1
 FISSUE_WEB_PORT=8000
-# 旧口令 FISSUE_API_TOKEN 已随 v1.3.0 移除，不再被读取。
-# 鉴权走「会话登录 + 多 API Key」，策略在 config.yaml 的 web.auth 段。
-
 FISSUE_LOG_LEVEL=debug
 ```
 
-### 6.3 生产（PostgreSQL + 四平台 + 鉴权 + 转发组件）
+**生产**（PostgreSQL + 四平台 + 鉴权 + 转发组件）：
 
 ```bash
 FISSUE_DATABASE_URL=postgresql+psycopg://fissue:强密码@db.internal:5432/fissue
-
 FISSUE_LLM_API_KEY=sk-xxx
 FISSUE_LLM_BASE_URL=https://api.deepseek.com/v1
 FISSUE_LLM_MODEL=deepseek-chat
 FISSUE_LLM_FALLBACK_MODEL=deepseek-chat
-
 FISSUE_GITHUB_TOKEN=ghp_xxx
 FISSUE_GITEE_TOKEN=xxx
 FISSUE_ATOMGIT_TOKEN=xxx
 FISSUE_GITLAB_TOKEN=glpat-xxx
-
-# 鉴权：旧口令 FISSUE_API_TOKEN 已随 v1.3.0 移除，不再被读取。
-# 对外暴露（web.host=0.0.0.0）时必须开 web.auth.enabled（默认 true）或声明
-# web.trusted_networks，否则启动会被直接拒绝。
-# API Key 用 `fissue auth key create` 生成；口令用 `fissue auth set-password` 设置。
 FISSUE_WEB_HOST=0.0.0.0
 FISSUE_WEB_PORT=8000
-
 FISSUE_SANDBOX_RUNNER_SOCKET=/var/run/fissue-runner.sock
-
 FISSUE_LOG_LEVEL=info
 ```
 
-配套：生产环境建议在 `.env` 同级放一份 `config.yaml` 收紧自动修复策略
-（见 [USAGE.md §9.2](USAGE.md#92-观察自动修复质量推荐的上线姿势)）。
+对外绑定时必须开 `web.auth.enabled`（默认已是 true）或声明 `web.trusted_networks`，否则拒绝启动。
+API Key 用 `fissue auth key create`，口令用 `fissue auth set-password`。
 
-### 6.4 完全离线（本地 Ollama）
+**完全离线**（Ollama）：
 
 ```bash
 FISSUE_LLM_API_KEY=ollama          # 任意非空值
 FISSUE_LLM_BASE_URL=http://localhost:11434/v1
 FISSUE_LLM_MODEL=qwen2.5:14b
-
-FISSUE_DATABASE_URL=sqlite:///E:/Fissue/data/fissue.db
 ```
+
+小模型在「生成验证器」上成功率低于大模型，`needs_manual` 会更多，属正常现象。
+
+**CI**：不要提交 `.env`，用平台 Secrets 注入（见 [USAGE.md §9.5](USAGE.md)）。
+
+## 7. 写法注意事项
 
 ```bash
-ollama serve                       # 另开终端
-ollama pull qwen2.5:14b
-```
-
-> 小模型在「生成验证器」这类任务上成功率低于大模型，可能出现更多
-> `needs_manual`，属正常现象。
-
-### 6.5 CI（GitHub Actions Secrets）
-
-不要提交 `.env`，用平台 Secrets 注入：
-
-```yaml
-- run: fissue serve --once
-  env:
-    FISSUE_DATABASE_URL: ${{ secrets.FISSUE_DATABASE_URL }}
-    FISSUE_LLM_API_KEY: ${{ secrets.FISSUE_LLM_API_KEY }}
-    FISSUE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # Actions 内置
-    FISSUE_LOG_LEVEL: info
-```
-
----
-
-## 7. `.env` 写法注意事项
-
-```bash
-# ✅ 正确
+# ✅
 FISSUE_LLM_API_KEY=sk-abc123
-FISSUE_LLM_API_KEY="sk-abc 123"      # 含空格用引号
-FISSUE_DATABASE_URL=postgresql+psycopg://u:p%40word@h:5432/db   # 密码特殊字符要 URL 编码
+FISSUE_LLM_API_KEY="sk-abc 123"                                # 含空格用引号
+FISSUE_DATABASE_URL=postgresql+psycopg://u:p%40word@h/db       # 特殊字符 URL 编码（双引号）
 
-# ❌ 常见错误
-FISSUE_LLM_API_KEY = sk-abc123       # = 两边不要加空格
-export FISSUE_LLM_API_KEY=sk-abc123  # 不需要 export
-FISSUE_LLM_API_KEY='sk-abc123'       # 单引号在某些 shell 下行为不同，用双引号或不用
-FISSUE_WEB_PORT=8000   # 注释必须独占一行或用 #（行内 # 后面会被当注释）
+# ❌
+FISSUE_LLM_API_KEY = sk-abc123        # = 两边不要空格
+export FISSUE_LLM_API_KEY=sk-abc123   # 不需要 export
+FISSUE_LLM_API_KEY='sk-abc123'        # 单引号行为因 shell 而异
 ```
 
-行内注释可用，但要注意 `#` 会开始注释：
-
-```bash
-FISSUE_WEB_PORT=8000    # 这样写是可以的
-```
-
-**Token 脱敏**：Fissue 在日志与报告中会把 Token 替换为 `***`，
-但 `.env` 文件本身请确保权限收紧：
-
-```bash
-chmod 600 .env
-```
-
----
+行内注释可用但 `#` 会开始注释。Token 在日志与报告中被替换为 `***`，但文件权限请收紧：
+`chmod 600 .env`。
 
 ## 8. 相关文件
 
@@ -650,7 +320,11 @@ chmod 600 .env
 |---|---|
 | `.env.example` | 变量清单与注释（提交进 git） |
 | `.env` | 你的实际密钥（**不提交**） |
-| `config.yaml` | 业务规则 |
-| `docs/USAGE.md` | 完整使用手册 |
-| `docs/DESIGN.md` | 架构与设计取舍 |
+| `config.yaml` | 业务规则（见 [USAGE.md §4](USAGE.md)） |
+| [AUTH.md](AUTH.md) | Web 鉴权设计 |
 | `tests/test_env.py` | 变量接线与优先级的自动化校验 |
+
+---
+
+相关：[USAGE.md](USAGE.md) · [AUTH.md](AUTH.md) · [DESIGN.md](DESIGN.md) ·
+[wiki/Configuration.md](wiki/Configuration.md)

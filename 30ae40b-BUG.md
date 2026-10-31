@@ -1,486 +1,209 @@
-# 30ae40b 缺陷与提升清单（ratekit 夹具实测）
+# ratekit 实测缺陷清单与修复记录
 
-> 基线 commit：`30ae40b test: 新增 ratekit 纯净测试夹具（10 Issue + 3 PR）`
-> 来源：用 `demo/ratekit` 夹具完整跑通 `fetch → eval → verify → flush → fix --dry-run` 后，
-> 逐项比对「期望结果」与「实际落库」时发现的差异。
-> 说明：本文件只记录**已定位根因**的问题，每条都给出代码位置与证据。
+> 基线 commit `30ae40b`（新增 ratekit 夹具 10 Issue + 3 PR）。用 `demo/ratekit` 完整跑通
+> `fetch → eval → verify → flush → fix --dry-run` 后，逐项比对「期望 vs 落库」发现的差异。
+> 只记录**已定位根因**的问题；前半是修复前诊断，§5–§6 是实际改动与验证。
 
----
+## 0. 前置结论
 
-## 0. 前置结论：项目自身是健康的
+排查前基线：`pytest -q` → **394 passed**。所以下面不是「改坏了」，而是换到
+「领域不同、中文标题、含重复/刷量/误报」的场景后才照出来的问题。
 
-跑缺陷排查前先确认基线：
+ratekit 整体表现：6 个可复现 Issue 的 F2P + 回归门 + 修复补丁全部通过；
+PR#12「修好目标却弄坏别处」被回归门拦下；PR#13 假修复被 `reject`；
+#10 刷量判 `authenticity=20` + `is_spam=true` + `action=close`。问题集中在
+**重复检测、优先级落库一致性、报告口径**三处。
 
-```text
-.venv/Scripts/python.exe -m pytest -q
-→ 394 passed, 1 warning in 173.13s
-```
+## 1. 期望 vs 实际（修复前）
 
-**394 项单测全绿**。因此下面这些不是「改坏了」，而是 ratekit 换了一个
-**领域不同、语言偏中文、包含重复/刷量/误报**的真实场景后，才被照出来的问题。
-
-ratekit 整体表现（详见期望对照表）：
-
-- 6 个可复现 Issue：F2P 验证 + 回归门 + 自动修复补丁，全部通过；
-- PR#12「修好目标却弄坏别处」：回归门 `regression:fix` = **fail**，成功拦下；
-- PR#13「假修复」：F2P 不成立 → `reject`；
-- #10 刷量：`authenticity=20` + `is_spam=true` + `action=close`，判定正确。
-
-问题集中在**重复检测**、**优先级落库一致性**、**报告口径**三处。
-
----
-
-## 1. 期望 vs 实际对照表
-
-| # | 条目 | 期望分类/优先级 | 实际 | 判定 |
+| # | 条目 | 期望 | 实际 | 判定 |
 |---|---|---|---|---|
-| 1 | format_amount int 丢小数位 | bug / tier1 | bug / tier2 | ⚠️ tier 差一档 |
-| 2 | remove_tax 公式错 | bug / tier1 | bug / tier1 | ✅ |
-| 3 | parse_amount 丢负号 | bug / **tier1**（期望已修正） | bug / tier1 | ✅ 见 §6.6 |
-| 4 | percent_of 负数取绝对值 | bug / tier2 | bug / tier2 | ✅ |
-| 5 | is_weekend 漏周六 | bug / tier2 | bug / tier2 | ✅ |
-| 6 | 精度口径不统一 | 不自动修 | base 即 pass → f2p=0 → 未入队 | ✅ 高难度被拦住 |
-| 7 | 按小时计费 | feature / 只打标 | feature / labeled | ✅ |
-| 8 | 含税反推不对（重复 #2） | 疑似重复 #2 | **未判重复**，独立验证并入 fix 队列 | ❌ 见缺陷 A |
-| 9 | 非法输入应返回 0（误报） | 低真实性 | **authenticity=90**，未误修 | ⚠️ 见提升项 F |
-| 10 | 性能+推广（刷量） | 低真实性 | auth=20 / spam=true / close | ✅ |
-| PR1 | #11 remove_tax 完整修复 | F2P 成立 → 建议合并 | `merge` | ✅ |
-| PR2 | #12 修好目标却弄坏别处 | F2P 成立但回归门拦 | `regression:fix` = fail（exit=1）→ 转人工 | ✅ **最关键一项生效** |
-| PR3 | #13 假修复（abs→×-1） | F2P 不成立 → 不合并 | `reject` | ✅ |
+| 1 | format_amount 丢小数位 | bug / tier1 | tier2 | ⚠️ 差一档 |
+| 2 | remove_tax 公式错 | tier1 | tier1 | ✅ |
+| 3 | parse_amount 丢负号 | tier1 | tier1 | ✅ |
+| 4–5 | percent_of 负数 / is_weekend 漏周六 | tier2 | tier2 | ✅ |
+| 6 | 精度口径不统一 | 不自动修 | base 即 pass → 未入队 | ✅ |
+| 7 | 按小时计费 | feature | labeled | ✅ |
+| 8 | 含税反推不对（重复 #2） | 判重复 #2 | **未判重复**，独立入 fix 队列 | ❌ 缺陷 A |
+| 9 | 非法输入应返回 0（误报） | 低真实性 | authenticity=90 | ⚠️ 提升项 F |
+| 10 | 性能 + 推广（刷量） | 低真实性 | auth=20 / spam / close | ✅ |
+| PR#11 | remove_tax 完整修复 | 建议合并 | `merge` | ✅ |
+| PR#12 | 修好目标却弄坏别处 | 回归门拦 | `regression:fix` fail → 转人工 | ✅ 最关键 |
+| PR#13 | 假修复（abs→×-1） | 不合并 | `reject` | ✅ |
 
-PR#12 回归门的实际失败输出（`data/artifacts/github_John-is-playing_ratekit#12/regression_fix/stdout.log`）：
+PR#12 无批量结论不是漏跑：`stages.py` 的 strict 分支在回归门不通过时直接 `return`，
+拦截项不入 `fix_bug` 队列——设计使然。
 
-```text
-..FFF...............................                                     [100%]
-test_add_working_days_over_weekend: 2024-01-09 != 2024-01-08
-test_add_working_days_span:         2024-01-16 != 2024-01-15
-test_add_working_days_zero:         ...
-```
+## 2. 确凿缺陷
 
-> PR#12 没有批量结论，不是漏跑：`stages.py:471-477` 的 strict 分支在回归门不通过时
-> 直接 `return`，拦截项**不入 fix_bug 队列**——这是设计使然。
+### 🔴 A. 中文标题的重复预筛失效（`pipeline/stages.py`）
 
----
+`_similar_to` 只比对标题、Jaccard 阈值 0.25，而 `_title_tokens` 把中文切成**单字**，
+单字稀释相似度：#8 与 #2 的 Jaccard 仅 0.208 < 0.25，**候选都没进**，LLM 根本没机会判重复。
 
-## 2. 确凿缺陷（已定位到代码行）
+textkit 没暴露是因为英文标题命中 `slugify` 这类 ASCII 词会被抬到 0.5；换成中文仓库是
+**系统性失效**。
 
-### 🔴 A. 中文标题的重复预筛失效 → #8 漏检
+### 🟠 B. flush 落库覆盖规则优先级（`store/repository.py`）
 
-**位置**：`src/fissue/pipeline/stages.py:687`（`_title_tokens`）、`:699`（`_similar_to`）
-
-**根因**：`_similar_to` 只比对**标题**，相似度用 Jaccard，阈值 `≥ 0.25`；
-而 `_title_tokens` 把中文切成**单字**。单字严重稀释相似度。
-
-**实测**（用项目自身函数复现）：
-
-```text
-#8 tokens: ['不','价','像','出','反','含','好','对','总','推','来','的','税']
-#2 tokens: ['remove_tax','严','价','低','偏','公','净','反','含','式','推','税',...]
-Jaccard = 0.208  →  < 0.25，未过阈值
-#8 的相似候选 = []          ← LLM 根本没收到 #2 作为候选
-```
-
-**影响**：`#8` 与 `#2` 语义高度重合（都是「含税反推不对」），却因为标题字面
-Jaccard 只有 0.208，连候选都进不了重复判定。这不是模型判错，是**预筛阶段就漏了**。
-
-**为什么 textkit 没暴露**：textkit 是英文标题，命中 `slugify` 这类 ASCII 词会被
-直接抬到 `score = 0.5`（`_similar_to` 里的 ASCII 特判），天然过阈值。换成
-AtomGit / Gitee 的中文仓库，这是**系统性失效**。
-
-**修法（择一或组合）**：
-- 中文改用**字符二元组（bigram）**做相似度，替代单字；
-- 或对 CJK 单独设更低阈值（单字交集 ≥ N 个即入选）；
-- 或把「标题 + 正文摘要」共同纳入预筛，而不只是标题。
-
-**可补单测**：构造一对中文近义标题，断言 `_similar_to` 能召回；构造一对中文无关标题，断言不误召回。
-
----
-
-### 🟠 B. flush 把 LLM 的 priority 写库，与规则结论矛盾
-
-**位置**：`src/fissue/store/repository.py:788`（`save_batch_conclusion` 里
-`item.priority = priority.value`）
-
-**根因**：只有 verify 队列的**派发**走了 `_rule_priority` 规则纠偏
-（`src/fissue/pipeline/flush.py:117-121`），**落库**没有纠偏，直接写入批量结论里
-LLM 给的 priority。
-
-**实际后果**（来自 ratekit 落库：
-
-| 条目 | 评测阶段（`compute_priority` 规则） | `items` 表（被覆盖后） |
-|---|---|---|
-| issue #1 | tier1 | **tier2** |
-| PR #11 | none（`only_issues=true` 时 PR 应恒为 none） | **tier1** |
-
-**影响**：
-- 报告 / 看板 / API 显示的优先级与规则结论**自相矛盾**；
-- 破坏 `compute_priority` 在 `evaluator.py:255-262` 文档中明确的不变式：
-  「`only_issues` 为真时 PR 一律 none」。
-
-**注意**：实际派发是安全的（verify 队列有纠偏），所以这是**展示层与存储层的一致性 bug**，
-不会导致误修，但会让报告不可信。
-
-**修法**：写库前对**所有队列**套用 `_rule_priority`；或至少在 `save_batch_conclusion`
-内对 PR / 重复 / 非 bug 条目兜底为 `Priority.NONE`。
-
-**可补单测**：对 PR 条目写一条 batch conclusion（priority=tier1），断言 `items.priority == none`。
-
----
+只有 verify 队列**派发**走了 `_rule_priority` 纠偏，`save_batch_conclusion` **落库**却直接写
+LLM 给的 priority。后果：报告/看板/API 与规则结论自相矛盾（#1 tier1→tier2、PR#11 应为
+none 却写 tier1），破坏 `compute_priority` 的不变式。实际派发安全，但报告不可信。
 
 ### 🟡 C. dry-run 下 fix 汇总与明细口径打架
 
-**位置**：`src/fissue/fixer/autofix.py:78-92`（`FixReport.record`）与
-`src/fissue/cli/ops.py:106-114`（`_attempt_row`）
+`FixReport.record` 把「补丁已产出」计入 `succeeded`，而 `_attempt_row` 又输出
+`needs_manual`——同屏出现「成功 6，需人工 0」与「全部 needs_manual」。
 
-**根因**：dry-run 且产出 patch 时，`record()` 把 `NEEDS_MANUAL` 计入 `succeeded`
-（`:87-90`，语义是「补丁已产出即修复成功」），但 `_attempt_row()` 又原样输出
-`attempt.outcome`（`needs_manual`）。
+## 3. 提升项
 
-**实际输出**：同一屏里
+| 项 | 现象 | 方向 | 状态 |
+|---|---|---|---|
+| D | `kind=executable` 却缺 `command`，静默退化成读输出判定，f2p=0 | 带反馈重生成，末轮仍缺则转人工 | 已实现 |
+| E | 难度/重要性阈值边界太陡，#1 与 #3 同难度差一档就翻转 | 阈值可配 + 分档策略 | 已实现 |
+| F | 「API 设计偏好」被判高真实性（#9 auth=90） | 提示词区分「缺陷」与「行为偏好变更」 | 已实现 |
 
-```text
-修复尝试 6，成功 6，需人工 0，跳过 0，失败 0，产出 PR 0      ← 汇总
-│ github:.../ratekit#1 │ needs_manual │ 2 │ - │ ...patch │   ← 明细
-```
+## 4. 验收方式
 
-**影响**：汇总说「全部成功」，明细说「全部需人工」，读者无法判断到底成没成。
-`record()` 的文档注释（`autofix.py:65-67`）明确写着要「避免让报告里的数字完全不可信」，
-但两处口径没对齐，目标没达成。
+1. 只跑单测：`pytest -q`，确认无回归（不连网、快）；
+2. 单测 + 重跑 ratekit：验证 #8 判重复、#1 回 tier1、PR 一律 none、dry-run 口径一致。
 
-**修法**：汇总与明细用同一口径——要么明细也把 dry-run 的 patch 显示为成功态，
-要么汇总单独列出「dry-run 产出补丁 N 条」，不走 `succeeded` 计数。
+## 5. 修复记录（A / B / WSL）
 
----
+### 5.0 顺带发现：Windows 误选 WSL bash（`sandbox/runtime.py`）
 
-## 3. 提升项（非缺陷，属质量与标定）
-
-### D. 验证器缺 `command` 只告警不重试
-
-**位置**：`src/fissue/verifier/generator.py:104`（`warnings.append("可执行验证器缺少 command")`）
-
-**现象**：ratekit #6 生成出一个 `command=None` 的「可执行」验证器（`verify-6`），
-退化成「读输出判定」，最终 `f2p_satisfied=0`。整个生成过程只 debug 了一条告警。
-
-**方向**：对 `kind=executable` 却缺 `command` 的产物，**自动重生成一轮**（复用现有的
-`generation_rounds` 机制），而不是默默降级。
-
-### E. 难度阈值边界太陡
-
-**现象**：#1 难度 15 → tier2（首次评测），#3 难度 15 → tier1，一档之差就翻转优先级。
-
-**方向**：标定 `fix_policy.tier1.max_difficulty` / `min_importance`，或对难度接近
-边界的条目做平滑/人工复核。
-
-> **状态：已实现**（阈值可配置 + 三策略），见 §6.3 与 §6.6。
-
-### F. 「API 设计偏好」被判高真实性
-
-**现象**：#9 提议「`parse_amount` 解析失败返回 0 而非抛异常」，被判定为
-`authenticity=90`。它**不是缺陷**，是 API 行为设计偏好——真实性评分应反映
-「这是否确为缺陷」，故期望判低。
-
-**方向上**：评测提示词里明确区分「缺陷」与「行为偏好变更」，后者真实性应下调。
-（好的一面：#9 未被误打修复标签、未误修，所以风险可控。）
-
-> **状态：已实现**，见 §6.4。
-
----
-
-## 4. 建议的修复与验收
-
-**建议优先修 A + B**：
-
-- A 影响中文仓库的核心能力（重复检测在中文场景系统性失灵）；
-- B 是存储/报告一致性 bug，会破坏 `compute_priority` 的不变式。
-
-**验收方式（二选一）**：
-
-1. **只跑项目单测**：`.venv/Scripts/python.exe -m pytest -q`，确认 394 项无回归（不连网、快）；
-2. **单测 + 重跑 ratekit 比对**：连 LLM，直接验证
-   - #8 是否被判为 #2 的重复；
-   - #1 是否回到 tier1、PR#11 是否回到 none；
-   - dry-run 汇总与明细是否一致。
-
-C / D / E / F 可作为后续打磨项。
-
----
-
-## 5. 修复记录（A / B / WSL 三项已修并验证）
-
-> 本节记录**实际改动**：根因、改法、验证证据。
-> 上面第 1–4 节保留为「修复前」的原始诊断，便于对照。
-
-### 5.0 修复期间新发现：Windows 本地沙盒误选 WSL bash
-
-这个不在原清单里，是验证过程中暴露的**环境兼容 bug**，且此前一直潜伏。
-
-**现象**：同一份代码，在 Git Bash 里跑全绿（396 passed），在 PowerShell 里跑
-**10 个用例全红**，报错都带同一条：
-
-```text
-<3>WSL (4921 - Relay) ERROR: CreateProcessCommon:818:
-    execvpe(/bin/...): No such file or directory
-```
-
-| 环境 | `shutil.which("sh")` | `shutil.which("bash")` |
-|---|---|---|
-| Git Bash PATH | `Git\usr\bin\sh.exe` | — |
-| **PowerShell（系统 PATH 只有 `Git\cmd`）** | **None** | **`C:\Windows\System32\bash.EXE`（WSL 垫片）** |
-
-**根因**：`src/fissue/sandbox/runtime.py:242` 的
-`shutil.which("sh") or shutil.which("bash")` 在取不到 `sh` 时，回退命中了
-**WSL 的 bash 垫片**。WSL 垫片不认 `-lc`，于是所有走**本地沙盒**的用例全废——
-`test_sandbox_verifier`(6) + `test_regression_gate`(3) + `test_e2e`(2)，这 10 个
-文件与 A/B 的改动毫无关系。
-
-**改法**（`sandbox/runtime.py`，新增 `_find_posix_shell` + `_is_posix_shell`）：
-
-1. 逐个试 `sh` / `bash`，**排除** WSL 垫片（`System32` 下的 `bash.exe` / `wsl.exe`）
-   与 WindowsApps 应用别名；
-2. PATH 里都没有时，从 `shutil.which("git")` 的安装根推导 `usr\bin\sh.exe`。
-
-**验证**（受限 PATH，等价 PowerShell 环境）：
-
-```text
-_find_posix_shell() → C:\Program Files\Git\usr\bin\sh.exe     ← 不再落到 WSL
-test_sandbox_verifier + test_regression_gate → 78 passed
-test_e2e                                     → 3 passed
-全量                                         → 396 passed, 1 warning
-```
+同一份代码 Git Bash 下全绿、PowerShell 下 10 个用例全红，报
+`WSL ... CreateProcessCommon`。根因：`which("sh") or which("bash")` 在取不到 `sh` 时命中了
+`C:\Windows\System32\bash.EXE` 垫片，而垫片不认 `-lc`。改法：新增 `_find_posix_shell`，
+排除 WSL 垫片与 WindowsApps 别名，PATH 无解时从 `git` 安装根推导 `usr\bin\sh.exe`。
+验证：受限 PATH 下 78 + 3 passed，全量 396 passed。
 
 ### 5.1 A — 中文重复预筛
 
-**改法**（`pipeline/stages.py`）：
-
 | 项 | 修复前 | 修复后 |
 |---|---|---|
-| 中文分词 | 单字（`[\u4e00-\u9fff]` 逐字） | **字符二元组 bigram** |
-| 相似度 | Jaccard（交/并） | **包含度**（交 / 较短一侧） |
+| 中文分词 | 单字 | **字符二元组 bigram** |
+| 相似度 | Jaccard | **包含度**（交 / 较短一侧） |
 | 阈值 | 0.25 | **0.22** |
 
-两个关键点，都不是拍脑袋定的：
+两个关键点都不是拍脑袋：
 
-1. **只换 bigram 不够**：bigram 会同时放大并集，Jaccard 反而从 0.208 降到 0.16。
-   必须同时把度量换成包含度——包含度回答「较短的标题是否基本被较长标题覆盖」，
-   对「一条啰嗦、一条精炼」的长度差不敏感。
-2. **阈值 0.22 是实测标定**：真实重复对 #2~#8 得 **0.286**，而仅同属
-   `parse_amount`、实为设计偏好而非重复的 #3~#9 只得 **0.154**。0.22 落在两者
-   中间，两侧各留 0.066 间隔。
+1. **只换 bigram 不够**——bigram 同时放大并集，Jaccard 反而从 0.208 降到 0.16，必须换成
+   包含度（回答「较短标题是否基本被较长标题覆盖」，对长度差不敏感）。
+2. **0.22 是实测标定**：真重复对 #2~#8 得 0.286，同属 `parse_amount` 但属设计偏好的 #3~#9 得
+   0.154，阈值落在中间，两侧各留 0.066 间隔。
 
-**验证**：
-
-```text
-修复前: #8 -> []                     ← 漏检（单字 Jaccard 0.208 < 0.25）
-修复后: #8 -> [(2, 0.29)]            ← 正确召回 #2，其余 9 条无新增误召回
-```
-
-**端到端实证**（`eval --all` 重跑）：
-
-| | 修复前 | 修复后 |
-|---|---|---|
-| `#8` `is_duplicate` | `false` | **`true`** |
-| `#8` `duplicate_of` | `[]` | **`[2]`** |
-| `#8` `action` / `priority` | `fix_now` / `tier1` | **`triage` / `none`** |
-
-`reasons`：「内容与已开启的 #2 标题及描述高度一致；作者自述不确定是否重复」。
-即：预筛把 #2 送进候选 → LLM 正确判重复 → `compute_priority` 因
-`spam.suspicious` 归零，**不再为一条重复 Issue 生成第二份补丁**。
-夹具 README 里「#8 → 疑似重复 #2」这条期望，现在成立。
-
-**新增单测**：`test_similar_to_recalls_chinese_duplicate_titles`
-（断言召回 #2、且不误召 #3）。
+验证：`#8 -> [(2, 0.29)]`（修复前 `[]`），其余 9 条无新增误召回；端到端 `eval --all` 后
+#8 `is_duplicate=true`、`duplicate_of=[2]`、`action=triage`、`priority=none`，
+不再为重复 Issue 生成第二份补丁。
 
 ### 5.2 B — 结论优先级以规则为准
 
-**改法**（`pipeline/flush.py`）：把规则优先级从「verify 队列专属」提升为
-**所有队列统一**，并回写进结论：
+在 `pipeline/flush.py` 把规则优先级从「verify 队列专属」提升为**所有队列统一**，并回写进结论：
 
 ```python
 priority = self._rule_priority(key, payload, fallback=priority)
-c["priority"] = priority          # 新增，让落库口径与派发一致
+c["priority"] = priority
 ```
 
-这一处同时管住两个落库点：`batch_conclusions.priority` 与 `items.priority`
-（经 `save_batch_conclusion`）。
+之所以不改仓储层：`flush.apply` 是所有 flush 的唯一入口，在那里纠偏最集中；改仓储会让存储层
+反向依赖业务规则。验证：PR#11 的 `items.priority` 与批量结论均由 tier1 变 **none**，同轮 F2P
+仍成立。
 
-**为什么没动 `repository.py`**：`flush.apply` 是所有 flush 的唯一入口
-（`make_handler` → `handler` → `apply` → 落库），在那里纠偏最集中；若改在仓储层
-会让存储层反向依赖业务规则。
+### 5.3 修复后复测（A/B）
 
-**验证**（真实链路 `verify #11` → `flush fix_bug`）：
+#1 回到 tier1、#8 判重复、11–13 三个 PR 一律 none；#4/#5 仍偏高（重要性 75 越线），属标定
+问题（E），非本次改动引入。
 
-| | 修复前 | 修复后 |
-|---|---|---|
-| `items.priority`（PR#11） | `tier1` ❌ | **`none`** ✅ |
-| 最新批量结论 priority | `tier1` ❌ | **`none`** ✅ |
-
-LLM 在 flush 里给的是 tier1，规则（`only_issues=true` → PR 恒为 none）纠偏生效
-并落库；同轮 `verify` 显示 PR#11 的 F2P 依然成立（base fail → fix pass，回归门
-双 pass），证明 B 未影响验证流程本身。
-
-**新增单测**：`test_flush_conclusion_priority_follows_rules_for_pr`
-（走**生产路径** `make_handler` → `apply` → 落库；LLM 给 tier1，断言 PR 落 none）。
-
-### 5.3 修复后的期望对照表（`eval --all` 复测）
-
-| # | 条目 | 期望 | 复测结果 | 判定 |
-|---|---|---|---|---|
-| 1 | format_amount int 丢小数位 | tier1 | **tier1** | ✅（修复前 tier2） |
-| 2 | remove_tax 公式错 | tier1 | tier1 | ✅ |
-| 3 | parse_amount 丢负号 | tier2 → **tier1**（期望已修正，见 §6.6） | tier1 | ✅ |
-| 4 | percent_of 负数 | tier2 | tier1 | ⚠️ 偏高（重要性 75 越线，见 E） |
-| 5 | is_weekend 漏周六 | tier2 | tier1 | ⚠️ 同上 |
-| 6 | 精度口径不统一 | 不自动修 | none / triage | ✅ |
-| 7 | 按小时计费 | feature | feature / triage | ✅ |
-| **8** | **重复 #2** | **判重复** | **dup=true, of=[2]** | ✅ **本次修复** |
-| 9 | 误报 | 低真实性 | auth=90 | ⚠️ 未变（见 F） |
-| 10 | 刷量 | 低真实性 | auth=15 / spam=true / close | ✅ |
-| 11–13 | 三个 PR | 一律 none | **全部 none** | ✅（B 生效） |
-
-> `#4/#5` 的 tier 偏高**不是本次改动引入**——是 `compute_priority` 的阈值
-> 标定问题（重要性 75 恰好越过 `tier1.min_importance`），即提升项 **E**。
-> 该表是 A/B 修复后的复测；C/D/E/F 修复后的再次复测见 §6.6。
-
-### 5.4 改动清单与验证
+### 5.4 改动清单
 
 | 文件 | 主题 |
 |---|---|
-| `src/fissue/pipeline/stages.py` | A：中文 bigram + 包含度 + 阈值 0.22 |
-| `src/fissue/pipeline/flush.py` | B：规则优先级对所有队列生效并回写落库 |
-| `src/fissue/sandbox/runtime.py` | WSL：Windows 下正确选 POSIX shell |
+| `pipeline/stages.py` | A：中文 bigram + 包含度 + 阈值 0.22 |
+| `pipeline/flush.py` | B：规则优先级对所有队列生效并回写落库 |
+| `sandbox/runtime.py` | WSL：Windows 下正确选 POSIX shell |
 | `tests/test_pipeline.py` | 新增 2 个回归单测 |
 
-验证：全量单测 **394 → 396 passed**（新增 2 个），在 Git Bash 与受限 PATH
-（等价 PowerShell）下均全绿。
+全量单测 394 → 396 passed，Git Bash 与受限 PATH 下均全绿。
 
-**C / D / E / F 四项均已实现**，见第 6 节。
+## 6. 后续修复（C / D / E / F）
 
----
+### 6.1 C — 统一 dry-run 口径
 
-## 6. 后续修复记录（C / D / E / F）
-
-### 6.1 C — dry-run 汇总与明细统一口径
-
-**改法**（`fixer/autofix.py` + `cli/ops.py`）：按「补丁已产出即修复成功」这一**既有
-语义**统一到明细侧（而非改汇总——既有测试已锁定该语义）。
-
-- `FixReport` 新增 `dry_run_patches` 计数，`summary` 追加
-  「（其中 dry-run 产出补丁 N）」，让口径在汇总里显式可见；
-- `_attempt_row(a, dry_run=...)`：dry-run 下有补丁的 `NEEDS_MANUAL` 显示为
-  `success`，error 改写为「dry-run：已产出补丁，未提 PR」；补丁路径照常给出。
-  非 dry-run 时维持原状，不把真失败冒充成成功。
-
-新增单测：`test_fix_report_dry_run_patch_counted_and_summary_labeled`、
-`test_attempt_row_matches_summary_under_dry_run`。
+按「补丁已产出即修复成功」这一既有语义统一到**明细侧**（既有测试已锁定该语义）：
+`FixReport` 新增 `dry_run_patches` 计数，`summary` 追加「（其中 dry-run 产出补丁 N）」；
+`_attempt_row(a, dry_run=...)` 在 dry-run 且有补丁时显示 `success`，非 dry-run 维持原状，
+不把真失败冒充成功。
 
 ### 6.2 D — 可执行验证器缺 command 时重生成
 
-**改法**（落点在 `verifier/runner.py` 的 `generate_and_validate`，非清单原先写的
-`generator.py`——`validate_spec` 只产生 warning，无法触发重生成）：
+落点在 `verifier/runner.py:generate_and_validate`（不是 `generator.py`——`validate_spec` 只产生
+warning，无法触发重生成）：缺 `command` 时带明确反馈走既有 `refine` 回路；末轮仍缺则判不可靠
+转人工，不再空跑沙盒。
 
-可执行形态却没有 `command` 时，带着明确反馈走既有 `refine` 回路重生成；
-最后一轮仍缺命令则直接判不可靠转人工，**不再空跑沙盒**。对应 ratekit #6 的
-`command=None` 的「可执行」验证器。
-
-新增单测：`test_generate_and_validate_retries_when_executable_lacks_command`、
-`test_generate_and_validate_unreliable_when_command_never_given`。
-
-### 6.3 E — 优先级分档策略可配置
-
-**改法**（`config.py` + `ai/evaluator.py`）：新增 `fix_policy.tier_strategy` 三选一。
+### 6.3 E — 分档策略可配置（`fix_policy.tier_strategy`）
 
 | 策略 | 行为 |
 |---|---|
-| `importance`（默认） | 难度是硬门槛，`min_importance` 区分 tier1/tier2。**行为与改动前一致** |
-| `dual` | 难度、重要性各自判档，**取更严**的一档；tier1 难度门槛更紧时才真正生效 |
-| `custom` | 交由 `custom_tier` 指定的用户函数判定；**`min_importance` 不生效** |
+| `importance`（默认） | 难度是硬门槛，`min_importance` 区分 tier1/tier2；与改动前一致 |
+| `dual` | 难度、重要性各自判档，**取更严** |
+| `custom` | 由 `custom_tier` 指定的用户函数判定，`min_importance` 不生效 |
 
-custom 函数签名 `func(difficulty, importance, policy) -> "tier1"|"tier2"|"none"`
-（也接受 `Priority`）；支持 `pkg.mod:func` 与 `pkg.mod.func` 两种写法。函数加载或
-执行失败时记 warning 并**回退默认策略**，避免「配置写错 → 静默不修」；加载结果
-`lru_cache`。配置期校验：非法策略名、`custom` 却未给 `custom_tier`，均直接抛
-`ConfigError`。
+custom 签名 `func(difficulty, importance, policy) -> "tier1"|"tier2"|"none"`（也接受 `Priority`），
+支持 `pkg.mod:func` 与 `pkg.mod.func`；加载/执行失败记 warning 并回退默认策略（避免「配置写错
+→ 静默不修」）。配置期校验：非法策略名、`custom` 未给 `custom_tier` 均抛 `ConfigError`。
 
-这解决了本文件 §5.3 里 `#3/#4/#5` 的 tier 偏差：设 `tier1.min_importance: 80`
-（或改 `dual` 并把 `tier1.max_difficulty` 收到 20）即可让它们落到 tier2。
+### 6.4 F — 设计偏好判低真实性（`ai/prompts.py`）
 
-新增单测：dual 取严、custom 用用户函数且门槛不生效、custom 不可用回退、
-非法配置被拒。
-
-### 6.4 F — 「API 设计偏好」判低真实性
-
-**改法**（`ai/prompts.py`）：在 `evaluation_prompt` 两处加指引。
-
-- authenticity 维度说明：点明它衡量的是「**这是不是一个真实存在的问题**」，
-  **不是**「这个诉求是否合理」；
-- 打分要求：**行为/API 设计偏好变更 ≠ 缺陷**。若诉求只是「把现有行为换一种
-  做法」而现有行为并非错误 → authenticity 判 ≤40、category 取 feature、
-  action 建议 triage；反之，现有行为确实不符合其自身文档/契约/常识预期
-  （如公式算错、边界漏判）才是缺陷，按真实程度给分。
-
-反向条款是关键：只压不抬会把真 Bug 也误伤成低真实性。
-
-对应 ratekit #9（`parse_amount` 解析失败应返回 0），原先被判 `authenticity=90`。
-
-新增单测：`test_evaluation_prompt_distinguishes_design_preference_from_defect`、
-`test_evaluation_prompt_pr_variant_keeps_guidance`（PR 分支同样带该指引）。
+- authenticity 维度点明它衡量「**这是否是一个真实存在的问题**」，不是「诉求是否合理」；
+- 打分要求：行为/API 设计偏好变更 ≠ 缺陷，若只是「把现有行为换一种做法」且现有行为并非
+  错误 → authenticity ≤40、category 取 feature、action 建议 triage；
+- **反向条款**：若现有行为确实不符其文档/契约/常识（公式错、边界漏判），仍按真实程度给分——
+  只压不抬会把真 Bug 误伤。
 
 ### 6.5 累计验证
 
-全量单测：`394 → 396 → 400 → 405 → 407 passed`，无回归。
+单测 394 → 396 → 400 → 405 → 407 passed，无回归。
 
 | commit | 主题 |
 |---|---|
-| `bda74c1` | A + B：重复预筛支持中文、结论优先级以规则为准 |
-| `8e49b0c` | WSL：Windows 本地沙盒不再误选 bash 垫片 |
-| `ccd8d05` | docs：缺陷清单与修复过程 |
-| `9427d9e` | C：dry-run 汇总与明细统一口径 |
-| `14dd85e` | D：验证器缺 command 时带反馈重生成 |
-| `c79c65c` | E：优先级分档策略可配置 |
-| `29b1e82` | F：设计偏好变更判低真实性 |
-| `28420e6` | docs：补记 C/D/E/F |
+| `bda74c1` | A + B |
+| `8e49b0c` | WSL shell 选择 |
+| `ccd8d05` | 缺陷清单与修复过程 |
+| `9427d9e` | C |
+| `14dd85e` | D |
+| `c79c65c` | E |
+| `29b1e82` | F |
+| `28420e6` | 补记 C/D/E/F |
 | `0bd0e41` | F 收紧：不误伤新增功能 |
 
-**第 3 节的 C / D / E / F 四项均已实现。**
-
-### 6.6 E/F 实测复测（`config.yaml` 调整 + `eval` 重跑）
-
-**配置调整**：`fix_policy.tier1.min_importance` 由 70 调到 80。
-
-**实测结果**：
+### 6.6 E/F 复测（`tier1.min_importance` 70 → 80）
 
 | # | 条目 | 难度/重要性 | 期望 | 复测 | 判定 |
 |---|---|---|---|---|---|
 | 1 | format_amount | 15 / 85 | tier1 | tier1 | ✅ |
 | 2 | remove_tax | 5 / 95 | tier1 | tier1 | ✅ |
-| **3** | **parse_amount 丢负号** | 15 / **85** | ~~tier2~~ → **tier1** | tier1 | ✅ **期望已修正** |
-| 4 | percent_of | 10 / 65 | tier2 | **tier2** | ✅（原 tier1） |
-| 5 | is_weekend | 10 / 75 | tier2 | **tier2** | ✅（原 tier1） |
+| 3 | parse_amount 丢负号 | 15 / 85 | ~~tier2~~ → **tier1** | tier1 | ✅ 期望已修正 |
+| 4 | percent_of | 10 / 65 | tier2 | tier2 | ✅ |
+| 5 | is_weekend | 10 / 75 | tier2 | tier2 | ✅ |
 | 6 | 精度口径 | 80 / 85 | none | none | ✅ |
-| 7 | 按小时计费 | 45 / 60 | feature | feature / **auth=90** | ✅（见下） |
+| 7 | 按小时计费 | 45 / 60 | feature | feature / auth=90 | ✅ |
 | 8 | 重复 #2 | 25 / 80 | 判重复 | dup=true, of=[2] | ✅ |
-| 9 | 误报 | 30 / 40 | 低真实性 | **auth=30** | ✅（原 90） |
+| 9 | 误报 | 30 / 40 | 低真实性 | auth=30 | ✅（原 90） |
 | 10 | 刷量 | 50 / 10 | 低真实性 | auth=10 / spam=true | ✅ |
 | 11–13 | 三个 PR | — | 一律 none | 全部 none | ✅ |
 
-**#3 的期望修正**：`tier1.min_importance` 提到 80 后 #3 **仍是 tier1**，因为它
-重评后重要性为 **85**。这不是阈值能解决的——「把正数金额当负数解析」会让资金
-方向颠倒，模型判它高重要性并不算错，是**原期望值本身偏低**。若要压到 tier2 得把
-门槛提到 86+，但那会把 #1（85）一起打下去，得不偿失。故修正**期望**：`#3` 应为
-tier1。已同步 `demo/ratekit/README.md`、`fixtures/issue-03-*.md` 头部 target。
+**#3 为何仍是 tier1**：门槛提到 80 后它重评重要性为 85。这不是阈值能解决的——「把正数金额当
+负数解析」会让资金方向颠倒，模型判高重要性不算错，是**原期望偏低**。压到 tier2 需把门槛提到
+86+，但会把 #1（85）一起打下去，得不偿失。已同步 `demo/ratekit/README.md` 与
+`fixtures/issue-03-*.md` 的 target。
 
-**F 的两个方向都验到了**：
+**F 两个方向都验到**：#9（设计偏好 90 → 30，属设计偏好变更非缺陷）；#7（新增功能
+95 → 35 → 收紧后 90，明确新增能力的需求不被误伤）。
 
-```text
-#9（设计偏好变更）  真实性 90 → 30   reason: 属设计偏好变更，非缺陷……
-#7（新增功能）      真实性 95 → 35（过度泛化）→ 90（收紧后）
-                    reason: 明确的新增功能需求，现有库仅支持按天分摊……
-```
+> 提示词与模型输出非确定，以上为单次实测，不是稳定保证。单测只锁定「规则写对了」。
 
-即：`#9` 这类「替换现有行为」的诉求被正确压低，而 `#7` 这类「新增能力」的需求
-不被误伤。第一版规则写得太宽导致 `#7` 被压，已收紧为「仅限替换现有行为」并补
-「新增功能不属此类」条款（commit `0bd0e41`）。
+---
 
-> 注：提示词与模型输出是非确定性的，以上为单次实测结果，非稳定保证。单测只锁定
-> 「规则写对了」，不锁定「模型每次照做」。
-
+相关：[BENCHMARK.md](BENCHMARK.md) · [demo/ratekit/README.md](demo/ratekit/README.md) ·
+[docs/DESIGN.md](docs/DESIGN.md) · [docs/REGRESSION-GATE.md](docs/REGRESSION-GATE.md)
