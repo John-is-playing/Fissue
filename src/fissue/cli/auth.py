@@ -8,10 +8,16 @@ WebUI 是进不去的那一侧——口令忘了、2FA 手机丢了、Key 全吊
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, NoReturn
+
 import typer
 
-from ..config import load_settings
+from ..config import Settings, load_settings
 from ..logging_setup import setup_logging
+
+if TYPE_CHECKING:
+    from ..auth import AuthStore
+    from ..store.db import Database
 
 auth_app = typer.Typer(help="账号与凭据：改口令 / 清 2FA / 管理 API Key / 看状态")
 
@@ -20,11 +26,16 @@ ENV_OPT = typer.Option(None, "--env", "-e", help=".env 路径")
 VERBOSE_OPT = typer.Option(False, "--verbose", "-v", help="输出调试日志")
 
 
-def _store(config: str | None, env: str | None, *, verbose: bool = False):
+def _store(
+    config: str | None, env: str | None, *, verbose: bool = False
+) -> tuple[Settings, Database, AuthStore]:
     """打开数据库并确保表存在，返回 ``(settings, database, AuthStore)``。
 
     ``create_all`` 不能省：这几条命令常在**新库**上跑（`auth set-password` 是初始化之后
     的第一条命令），表还不存在时直接查会 ``no such table``。
+
+    返回类型**必须标注**：标了之后 mypy 才会检查这个模块里「查出来的行可能是 None」
+    那类问题（此前没有注解，整条命令都落在 ``Any`` 上，等于没被类型检查）。
     """
     from ..auth import AuthStore
     from ..store.db import build_database
@@ -36,9 +47,25 @@ def _store(config: str | None, env: str | None, *, verbose: bool = False):
     return settings, database, AuthStore(database)
 
 
-def _fail(message: str) -> None:
+def _fail(message: str) -> NoReturn:
+    """报错并以非零码退出。
+
+    标成 ``NoReturn``（而不是 ``None``）是刻意的：它让 mypy 知道「这行之后不会回来」，
+    于是 ``if user is None: _fail(...)`` 之后 ``user`` 被正确收窄成非空——
+    否则下面那几行会带着 Optional 走到运行时。
+    """
     typer.secho(f"❌ {message}", fg=typer.colors.RED, err=True)
     raise typer.Exit(1)
+
+
+def _exit(code: int = 0) -> NoReturn:
+    """以指定退出码结束命令（成功退出也是「不会回来」）。
+
+    同 ``_fail`` 的理由：``raise typer.Exit(0)`` 之后代码不可达，但 mypy 不认得
+    ``typer.Exit`` 是 ``NoReturn``，于是「尚未创建管理员」那条分支之后的
+    ``admin.username`` 会被报成 Optional 访问。用这个包装函数收口。
+    """
+    raise typer.Exit(code)
 
 
 def _ok(message: str) -> None:
@@ -88,7 +115,7 @@ def auth_status(
             typer.echo(f"引导口令      : {token}")
         else:
             typer.echo("引导口令文件  : （不存在；下次启动 `fissue web`/`serve` 会生成）")
-        raise typer.Exit(0)
+        _exit(0)
     typer.echo(f"管理员        : {admin.username}")
     typer.echo(f"两步验证      : {'已开启' if admin.totp_enabled else '未开启'}")
     typer.echo(f"恢复码剩余    : {len(admin.recovery_code_hashes or [])} 个")
@@ -159,13 +186,19 @@ def auth_reset(
     if user is None:
         _fail(f"账号不存在：{username}（可先用 fissue auth set-password 创建）")
 
+    # 口令长度**必须在任何副作用之前**校验。原实现是先清 2FA / 恢复码 / 会话，
+    # 再检查口令够不够长——于是「给一个 3 位口令」会先把这些清掉、然后报错退出。
+    # 用户看到的是「失败了」，但账号的 2FA 与会话**已经被清掉了**：状态被改了，
+    # 而动作没做成。对一个专门用来「把自己救回来」的命令，这种半途而废最坑人
+    # （手机丢了、2FA 已清、口令却没设上——比执行前更难进去）。
+    if password is not None and len(password) < 8:
+        _fail(f"口令至少 8 位（当前 {len(password)} 位）。")
+
     store.set_totp(user.id, secret=None, enabled=False)
     store.set_recovery_codes(user.id, [])
     kicked = store.delete_sessions_for_user(user.id)
     _ok(f"已清除 {username} 的两步验证与恢复码，注销 {kicked} 个会话")
     if password:
-        if len(password) < 8:
-            _fail(f"口令至少 8 位（当前 {len(password)} 位）。")
         store.set_password(user.id, hash_password(password))
         _ok("口令已一并重设")
 
