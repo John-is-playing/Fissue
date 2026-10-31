@@ -1493,3 +1493,77 @@ def test_mysql_long_text_columns_become_mediumtext() -> None:
         FixAttemptRow.diff,
     ):
         assert col.type.compile(dialect=dialect) == "MEDIUMTEXT"
+
+
+def test_usage_records_estimated_flag(repo: Repository) -> None:
+    """估算用量必须能在库里分辨出来——否则「预算里有多少是估的」事后无从核对。"""
+    from sqlalchemy import text
+
+    repo.record_usage(
+        repo_key="psf/requests", purpose="evaluate", model="m",
+        prompt_tokens=10, completion_tokens=5, cost_usd=0.001,
+    )
+    repo.record_usage(
+        repo_key="psf/requests", purpose="agent", model="m",
+        prompt_tokens=10, completion_tokens=5, cost_usd=0.001, estimated=True,
+    )
+    with repo.db.session() as s:
+        rows = s.execute(text("select purpose, estimated from llm_usage order by id")).all()
+    assert [(r[0], bool(r[1])) for r in rows] == [("evaluate", False), ("agent", True)]
+
+
+def test_llm_usage_estimated_migration_sql_differs_by_dialect() -> None:
+    """``llm_usage.estimated`` 的补列 SQL 与 ``force_fix`` 同一套三方言口径。"""
+    from fissue.store.db import llm_usage_estimated_migration
+
+    pg_probe, pg_alter = llm_usage_estimated_migration("postgresql")
+    assert pg_probe is None, "PostgreSQL 的 ADD COLUMN IF NOT EXISTS 本身幂等"
+    assert "IF NOT EXISTS" in pg_alter
+
+    my_probe, my_alter = llm_usage_estimated_migration("mysql")
+    assert my_probe is not None and "information_schema.columns" in my_probe
+    assert "llm_usage" in my_probe
+    assert "IF NOT EXISTS" not in my_alter, "MySQL 不支持它，发过去是语法错"
+    assert my_alter.startswith("ALTER TABLE llm_usage ADD COLUMN estimated")
+
+    lite_probe, lite_alter = llm_usage_estimated_migration("sqlite")
+    assert lite_probe is not None and "pragma_table_info" in lite_probe
+    assert lite_alter.startswith("ALTER TABLE llm_usage ADD COLUMN estimated")
+
+
+def test_old_database_gets_the_estimated_column(tmp_path) -> None:
+    """旧库（``llm_usage`` 建表时还没有 ``estimated``）在 create_all 后必须补列。
+
+    只建 llm_usage 这一张表来模拟旧库：``create_all`` 只建缺失的表、**不改**已存在的表，
+    不跑迁移的话，新代码一读这一列就 ``no such column``。
+    """
+    import sqlite3
+
+    from sqlalchemy import text
+
+    from fissue.store.db import Database
+
+    db_file = tmp_path / "old.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute(
+        "CREATE TABLE llm_usage ("
+        "id INTEGER PRIMARY KEY, repo_key VARCHAR(640), purpose VARCHAR(48), "
+        "model VARCHAR(128), prompt_tokens INTEGER, completion_tokens INTEGER, "
+        "cost_usd FLOAT, success BOOLEAN, created_at DATETIME)"
+    )
+    conn.execute(
+        "INSERT INTO llm_usage (repo_key, purpose, model, prompt_tokens, completion_tokens, "
+        "cost_usd, success) VALUES ('r', 'p', 'm', 1, 2, 0.0, 1)"
+    )
+    conn.commit()
+    conn.close()
+
+    database = Database(f"sqlite:///{db_file.as_posix()}")
+    database.create_all()
+
+    with database.engine.connect() as c:
+        # PRAGMA table_info 的列是 (cid, name, type, ...)：name 在第二列。
+        cols = {str(r[1]).lower() for r in c.exec_driver_sql("PRAGMA table_info(llm_usage)")}
+        old_value = c.execute(text("select estimated from llm_usage where purpose='p'")).scalar()
+    assert "estimated" in cols, "旧库必须补上新列"
+    assert bool(old_value) is False, "旧数据默认是「非估算」，不能因补列被标成估算"

@@ -66,6 +66,29 @@ def force_fix_migration(dialect: str) -> tuple[str | None, str]:
     )
 
 
+def llm_usage_estimated_migration(dialect: str) -> tuple[str | None, str]:
+    """``llm_usage.estimated`` 补列在各方言上的 ``(探针 SQL, ALTER SQL)``。
+
+    与 :func:`force_fix_migration` 同一套口径（探针只查一列、结果按列名判断；
+    PostgreSQL 直接靠 ``IF NOT EXISTS``）。单独一个函数而不是把表名参数化：
+    两条迁移各自只有一处调用，参数化反而让「哪张表漏了迁移」更难看出来。
+    """
+    if dialect == "postgresql":
+        return None, (
+            "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS estimated BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    if dialect == "mysql":
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'llm_usage'",
+            "ALTER TABLE llm_usage ADD COLUMN estimated BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+    return (
+        "SELECT name FROM pragma_table_info('llm_usage')",
+        "ALTER TABLE llm_usage ADD COLUMN estimated BOOLEAN NOT NULL DEFAULT 0",
+    )
+
+
 def ensure_sqlite_parent_dir(url: str) -> None:
     """SQLite 文件库：把父目录建出来。
 
@@ -162,6 +185,7 @@ class Database:
         # Web/常驻服务的启动路径走这里（而不是 ensure_schema）——迁移必须两个入口都跑，
         # 否则旧库上任何带新列的查询都会 no such column（树莓派部署时实炸过）。
         self._migrate_items_force_fix()
+        self._migrate_llm_usage_estimated()
         self._schema_ready = True
         log.info("数据库表已就绪：%s", self._safe_url())
 
@@ -177,6 +201,7 @@ class Database:
             return
         Base.metadata.create_all(self.engine)
         self._migrate_items_force_fix()
+        self._migrate_llm_usage_estimated()
         self._schema_ready = True
         log.debug("数据库表已确保存在：%s", self._safe_url())
 
@@ -197,14 +222,27 @@ class Database:
         全新库（列已随 create_all 建出）三条路径都是空操作。
         """
         probe, alter = force_fix_migration(self.engine.dialect.name)
+        self._apply_column_migration(probe, alter, "force_fix")
+
+    def _migrate_llm_usage_estimated(self) -> None:
+        """给旧库补 ``llm_usage.estimated`` 列（理由与 ``force_fix`` 相同）。
+
+        这一列让「预算统计里有多少是估算的」可被 SQL 直接复核；此前它只体现在
+        ``Usage`` 对象与日志里，事后查库看不出来。
+        """
+        probe, alter = llm_usage_estimated_migration(self.engine.dialect.name)
+        self._apply_column_migration(probe, alter, "estimated")
+
+    def _apply_column_migration(self, probe: str | None, alter: str, column: str) -> None:
+        """按「探针查一列 → 缺了再 ALTER」执行一次补列（全新库是空操作）。"""
         with self.engine.begin() as conn:
             if probe is None:
                 conn.execute(text(alter))
                 return
             # 探针语句要么返回「列名」列表，要么返回「有没有」——两种都只看第一列，
-            # 于是统一按 ``是否出现 force_fix`` 判断，不必为每种方言各写一个分支。
+            # 于是统一按「是否出现目标列名」判断，不必为每种方言各写一个分支。
             found = {str(row[0]).lower() for row in conn.execute(text(probe))}
-            if "force_fix" in found:
+            if column in found:
                 return
             conn.execute(text(alter))
 

@@ -32,6 +32,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -326,6 +327,13 @@ class LLMUsageRow(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
     success: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: 该条用量是否为**估算值**（流式端点没返回 usage 时按文本估算）。
+    #: 落库是为了让「预算统计里有多少是估的」可被复核——只写在日志里等于没记录。
+    #: 必须带 ``server_default``：裸 SQL 的 INSERT（迁移脚本 / 排障手写）不会带这一列，
+    #: 只有 Python 侧 ``default`` 的话会直接撞 NOT NULL。
+    estimated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
 
 

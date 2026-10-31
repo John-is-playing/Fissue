@@ -1722,6 +1722,7 @@ class Repository:
         completion_tokens: int,
         cost_usd: float,
         success: bool = True,
+        estimated: bool = False,
     ) -> None:
         with self.db.session() as s:
             s.add(
@@ -1733,6 +1734,7 @@ class Repository:
                     completion_tokens=completion_tokens,
                     cost_usd=cost_usd,
                     success=success,
+                    estimated=estimated,
                 )
             )
 

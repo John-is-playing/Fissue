@@ -26,6 +26,9 @@
   其余约 4 字符 1 token，**向上取整**——低估会让预算更晚收手，高估只是早一点停），并在
   `Usage.estimated` 上标记；每个模型只告警一次，说明「这是近似值以及精确统计需要端点做什么」。
   端点正常返回 usage 时原样采用，不覆盖。
+- **估算必须可复核，不只在日志里**：`llm_usage` 新增 `estimated` 列，旧库由
+  `db init` / 启动路径按三方言补列（PostgreSQL 用 `ADD COLUMN IF NOT EXISTS`；MySQL 查
+  `information_schema.columns`；SQLite 查 `pragma_table_info`）。旧数据默认 `0`，不会被误标。
 - **验证**：新增两条流式用例——没有 usage 帧时 `estimated=True` 且 token/成本均大于 0；带 usage
   帧时数值与端点一致且 `estimated=False`。
 

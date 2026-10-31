@@ -281,6 +281,7 @@ def _make_usage_sink(repo: Repository):
             completion_tokens=usage.completion_tokens,
             cost_usd=usage.cost_usd,
             success=usage.success,
+            estimated=usage.estimated,
         )
 
     return sink
