@@ -714,12 +714,20 @@ curl -X POST "$BASE/actions/approve-merge?key=github%3Apsf%2Frequests%2399" \
 鉴权（对外暴露时必须开）：
 
 ```bash
-# .env
-FISSUE_API_TOKEN=your-long-random-token
+# .env —— 旧口令 FISSUE_API_TOKEN 已随 v1.3.0 整体移除，不再被读取。
+# 现在用「会话登录 + 多 API Key」，口令与 Key 哈希都存在**数据库**里，
+# 鉴权策略在 config.yaml 的 web.auth 段（可在「设置」页改）。
+FISSUE_LLM_API_KEY=sk-xxx
 ```
+
 ```bash
-curl $BASE/stats -H "Authorization: Bearer your-long-random-token"
+# 建一把 API Key（明文只显示这一次）
+fissue auth key create --name my-machine
+
+curl $BASE/stats -H "Authorization: Bearer fissue_<prefix>_<secret>"
 ```
+
+> 浏览器访问则走 `/login` 登录（`fissue auth set-password` 建口令）。详见 [AUTH.md](./AUTH.md)。
 
 只读模式：
 

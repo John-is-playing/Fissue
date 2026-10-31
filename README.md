@@ -153,7 +153,7 @@ fissue web
 | `fissue web` | Web 工作台 + REST API：总览 / 条目 / 队列 / 任务 / 监控仓库 / 状态监测 / 初始化向导 / 设置 |
 | `fissue sandbox serve` | 起沙盒转发组件（宿主侧常驻，沙盒执行的唯一通道）；`fissue sandbox check` 检查沙盒环境是否就绪 |
 | `fissue bench` | 跑分基线：`capture` 冻结 / `diff` 逐项对比（先判可比性）/ `list` 列出 |
-| `fissue auth` | Web/API 身份管理：`status` 看鉴权状态、`set-password` 建或改管理员口令、`reset` 重置、`key list/create/revoke/import-legacy` 管 API Key（详见 [docs/AUTH.md](docs/AUTH.md)） |
+| `fissue auth` | Web/API 身份管理：`status` 看鉴权状态、`set-password` 建或改管理员口令、`reset` 重置、`key list/create/revoke` 管 API Key（详见 [docs/AUTH.md](docs/AUTH.md)） |
 
 ---
 

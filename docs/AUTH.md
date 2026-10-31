@@ -23,7 +23,7 @@
 触发点：`api.enabled=true` 且 `web.host=0.0.0.0`（非回环）却没有鉴权时，配置层直接拒绝启动：
 
 ```
-api.enabled=true 且 web.host=0.0.0.0 对外可达，但没有鉴权：请在 .env 里设置 FISSUE_API_TOKEN…
+api.enabled=true 且 web.host=0.0.0.0 对外可达，但没有身份机制：请在 config.yaml 打开 web.auth.enabled…或声明可信内网网段 web.trusted_networks…
 ```
 
 现有模型只有**一个全局 Bearer 口令**（`api.token`），且：
@@ -262,7 +262,9 @@ POST /api/auth/api-keys/{id}/revoke  吊销
 - **授权矩阵**：{回环, 可信 CIDR, 非回环} × {无身份, 会话, API Key, 引导口令} × {读, 写}。
 - **fail-closed**：`host=0.0.0.0` + 无机制 → `ConfigError`；有 `web.auth.enabled` 或可信网 → 放行。
 - **bootstrap**：无账号时非回环被挡；引导口令可建号；用后即焚。
-- **迁移**：旧 `FISSUE_API_TOKEN` 导入后仍能作 Bearer 用；吊销后失效。
+- **迁移（旧口令垫片）**：**已随 v1.3.0 移除**并钉了回归——`migrate_legacy_token` 符号不存在、
+  `POST /api/auth/legacy-token` 不存在（404/405）、`.env` 里残留的 `FISSUE_API_TOKEN`
+  **不会**被导入、也不能当 Bearer 用。
 - **爆破**：连续失败触发退避锁定。
 
 ---
@@ -280,7 +282,9 @@ POST /api/auth/api-keys/{id}/revoke  吊销
    * 二维码**不经任何外部服务**（把 TOTP 密钥交给第三方生成图片 = 把二次验证的密钥交出去），
      且 SVG 里只有黑白模块坐标，没有明文密钥；
    * 顺带加了 `GET /api/auth/2fa/pending`：刷新页面后二维码还在原处，不必重新生成一把。
-2. **旧 token 迁移方式**（§7）：自动导入 vs 只警告（要求手动重建）。本文取前者，更平滑。
+2. **旧 token 迁移方式**（§7）：**已定案并落地**——自动导入这条垫片在 v1.3.0 **整体移除**，
+   迁移改为「新建一把正式 Key + 删掉旧口令」。理由见 §7：一条垫片等于一条永不过期、
+   绕过吊销与审计的明文口令，留着它的成本是永久性的。
 3. **多用户**：本设计按单管理员落地，表结构已留多用户余地；是否要 RBAC 待定。
 4. **反代场景**：`web.trust_proxy` **已实现**（连同 `web.trusted_proxies`）——采信转发头
    需要「开关打开 + 直接对端在声明的代理网段里」两条同时成立，且只取最右一跳。

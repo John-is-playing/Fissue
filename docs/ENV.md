@@ -545,7 +545,8 @@ FISSUE_GITHUB_TOKEN=ghp_xxx
 
 FISSUE_WEB_HOST=127.0.0.1
 FISSUE_WEB_PORT=8000
-FISSUE_API_TOKEN=
+# 旧口令 FISSUE_API_TOKEN 已随 v1.3.0 移除，不再被读取。
+# 鉴权走「会话登录 + 多 API Key」，策略在 config.yaml 的 web.auth 段。
 
 FISSUE_LOG_LEVEL=debug
 ```
@@ -565,7 +566,10 @@ FISSUE_GITEE_TOKEN=xxx
 FISSUE_ATOMGIT_TOKEN=xxx
 FISSUE_GITLAB_TOKEN=glpat-xxx
 
-FISSUE_API_TOKEN=生成一个32字节随机串
+# 鉴权：旧口令 FISSUE_API_TOKEN 已随 v1.3.0 移除，不再被读取。
+# 对外暴露（web.host=0.0.0.0）时必须开 web.auth.enabled（默认 true）或声明
+# web.trusted_networks，否则启动会被直接拒绝。
+# API Key 用 `fissue auth key create` 生成；口令用 `fissue auth set-password` 设置。
 FISSUE_WEB_HOST=0.0.0.0
 FISSUE_WEB_PORT=8000
 
