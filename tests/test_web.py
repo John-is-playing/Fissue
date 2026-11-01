@@ -1756,3 +1756,64 @@ def test_job_detail_page_renders_the_same_result_summary(client) -> None:  # noq
         assert "刷出 3 条结论" in r.text
     finally:
         registry._jobs.pop("done2", None)
+
+
+# ---------------------------------------------------------------------------
+# 正文渲染：Markdown 要出标签，原始 HTML 仍必须转义
+# ---------------------------------------------------------------------------
+
+
+def test_item_page_renders_markdown_bodies(client) -> None:
+    """正文 / 评论 / 验证器说明与清单都是 **Markdown 源**，页面上要出标签。
+
+    实测观感问题：验证器说明里模型写的 `- 步骤`、`**重点**`、围栏代码块原样铺成纯文本，
+    页面上看到的是字面量 `**`；Issue 正文与评论同理（平台上本来就是 Markdown 写的）。
+    另一头必须守住：**原始 HTML 一律转义**——渲染不是放大不可信输入的入口。
+    """
+    from fissue.models import Comment, RawItem, VerifierKind, VerifierSpec
+
+    repo = client.repo
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(
+        rid,
+        RawItem(
+            platform=Platform.GITHUB,
+            repo="psf/requests",
+            number=42,
+            item_type=ItemType.ISSUE,
+            title="程序崩溃",
+            body=(
+                "## 复现步骤\n\n- 第一步 **重要**\n- 第二步 `requests.get`\n\n"
+                "```\npip install -e .\n```\n\n<script>alert(1)</script>\n"
+            ),
+            labels=["bug"],
+            author="reporter",
+            comments=[Comment(author="maintainer", body="- 一条 **评论**")],
+        ),
+    )
+    repo.save_verifier(
+        KEY,
+        VerifierSpec(
+            kind=VerifierKind.EXECUTABLE,
+            name="repro",
+            files={"tests/test_repro.py": "def test_x():\n    assert False\n"},
+            command="python -m pytest tests/test_repro.py -q",
+            notes="**注意**\n\n- 先 `pip install -e .`",
+            checklist=["先 `pip install -e .`", "再 **跑** 一次"],
+        ),
+    )
+
+    html = client.get(f"/item/{KEY_ENC}").text
+
+    # 正文：标题 / 列表 / 代码块都成了真标签
+    assert '<h2 class="md-h">复现步骤</h2>' in html
+    assert "<b>重要</b>" in html
+    assert '<pre class="md-pre"><code>pip install -e .' in html
+    # 评论同样是 Markdown
+    assert "<b>评论</b>" in html
+    # 验证器说明（块级）与清单（行内）
+    assert "<b>注意</b>" in html
+    assert "<b>跑</b>" in html
+    # 安全性：不可信输入的原始标记只能以转义形式出现
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "<script>alert(1)</script>" not in html

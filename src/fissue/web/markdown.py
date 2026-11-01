@@ -17,6 +17,8 @@ import json
 import re
 from typing import Any
 
+from markupsafe import Markup
+
 from ..ai.client import extract_json
 
 #: 链接只允许 http(s) / mailto——``javascript:`` 之类不渲染成链接，留作纯文本。
@@ -27,6 +29,34 @@ _OL_RE = re.compile(r"^\d+[.)]\s+(.*)$")
 _HR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _FENCE_RE = re.compile(r"^```(\w*)[ \t]*\n(.*?)^\s*```[ \t]*$", re.M | re.S)
+
+
+def render_markdown_markup(text: str | None) -> Markup:
+    """模板过滤器（``{{ x | md }}``）：渲染后再标成 ``Markup``。
+
+    为什么必须包一层 :class:`Markup`：Jinja 默认会把字符串再转义一次，于是页面上
+    出现的是 ``&lt;p&gt;…``；而直接写 ``| safe`` 又等于让**每一处调用**自己承担
+    「这个渲染器是安全的」这个前提——一旦有人把 ``| safe`` 挪到未渲染的原始字段上，
+    就是一条 XSS。把「安全」这件事收在过滤器内部，模板侧只剩一个 `md`。
+
+    安全性只靠 :func:`render_markdown` 的第一行（输入整体 ``html.escape``）：
+    输出里只有本模块产出的标签，原始输入的任何标记都进不来。
+    """
+    return Markup(render_markdown(text or ""))
+
+
+def render_markdown_inline(text: str | None) -> str:
+    """只做**行内**格式（代码 / 链接 / 粗体 / 斜体），不生成块级标签。
+
+    用途是列表项（验证清单、评测证据）：那个位置套一层 ``<p>`` 会带出块级间距，
+    读起来像「每一条都自成一段」。同样先整体转义，安全性同 :func:`render_markdown`。
+    """
+    return _inline(html.escape(text or "", quote=False))
+
+
+def render_markdown_inline_markup(text: str | None) -> Markup:
+    """模板过滤器（``{{ x | mdi }}``）：行内版，理由同 :func:`render_markdown_markup`。"""
+    return Markup(render_markdown_inline(text))
 
 
 def render_markdown(text: str) -> str:

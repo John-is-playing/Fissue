@@ -44,6 +44,11 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     # 由 `fastapi.templating.Jinja2Templates` 使用，代码里不直接 import。
     "jinja2>=3.1",
+    # 这个**是**直接 import 的（`web/markdown.py` 用它把渲染结果标成 Markup，
+    # 模板侧因此不必在每处调用写 `| safe`）。它本来是 jinja2 的传递依赖，显式声明
+    # 只是让「import 什么就声明什么」这条规矩站得住——否则 wheel 装好后能不能 import
+    # 就取决于别人包的依赖表，不是我们的。
+    "markupsafe>=2.1",
 ]
 
 # 这里**没有**、以及为什么没有（免得有人"补齐"回来）。清理依据见

@@ -44,6 +44,7 @@ from ..models import ItemStatus, ItemType, QueueName
 from .auth import AUTH_PREFIX, page_guard_middleware
 from .auth import register as register_auth
 from .job_results import summarize_result
+from .markdown import render_markdown_inline_markup, render_markdown_markup
 from .jobs import Job, JobRegistry
 from .status import queue_panel
 
@@ -209,6 +210,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 作业结果的「可读化」是一个纯函数（web/job_results.py）：模板里直接调用，
     # 不必每个路由各自把摘要塞进上下文——任务面板与任务详情页两处都要用。
     templates.env.globals["job_result_summary"] = summarize_result
+    # `{{ x | md }}`：把 LLM / 用户写的 Markdown 渲染成安全 HTML。过滤器的返回值是
+    # `Markup`，模板侧因此**不需要**再写 `| safe`——那个写法会把「这里的内容已经
+    # 渲染过、可以当 HTML」的判断摊到每一处调用上，挪错一个字段就是 XSS。
+    templates.env.filters["md"] = render_markdown_markup
+    # `{{ x | mdi }}`：只做行内格式（列表项用，避免每条都带块间距）。
+    templates.env.filters["mdi"] = render_markdown_inline_markup
     application.state.templates = templates
     # 进程启动时刻：状态页显示「已运行多久」。放在这里而不是 lifespan 里，是因为
     # `_ensure_state` 那条兜底路径（测试用 TestClient 不做上下文管理器）不会跑 lifespan，

@@ -148,11 +148,14 @@
 
 {# 正文与讨论：这是一个**分诊**工具，旧版却把正文与评论内容整块漏掉了——
    想读 Issue 说了什么只能点「在平台打开」跳出去。数据一直在库里
-   （`get_item` 会 selectinload 评论），只是 payload 不发、页面不渲染。 #}
+   （`get_item` 会 selectinload 评论），只是 payload 不发、页面不渲染。
+   正文与评论都是**Markdown 源**（平台上就是这么写的），所以走 `md` 过滤器渲染，
+   而不是 `white-space: pre-wrap` 原样铺开——后者会把 `**加粗**`、列表、代码块
+   一并显示成字面量。 #}
 <div class="panel">
   <h2>正文</h2>
   {% if data.body %}
-  <div class="body-text">{{ data.body }}</div>
+  <div class="md">{{ data.body | md }}</div>
   {% else %}
   <div class="muted">（正文为空）</div>
   {% endif %}
@@ -168,7 +171,7 @@
       <span class="tag">{{ c.author_kind }}</span>
       {{ c.created_at or '' }}
     </div>
-    <div class="body-text">{{ c.body }}</div>
+    <div class="md">{{ c.body | md }}</div>
   </div>
   {% endfor %}
 </details>
@@ -190,9 +193,9 @@
     {% if dim %}
       <div class="mt"><b>{{ name }}</b>
         <span class="muted mono">{{ dim.score }} / 100（置信度 {{ '%.2f' % dim.confidence }}）</span></div>
-      <div class="muted">{{ dim.reason }}</div>
+      <div class="muted md">{{ dim.reason | md }}</div>
       {% if dim.evidence %}
-      <ul class="muted small">{% for e in dim.evidence %}<li>{{ e }}</li>{% endfor %}</ul>
+      <ul class="muted small">{% for e in dim.evidence %}<li>{{ e | mdi }}</li>{% endfor %}</ul>
       {% endif %}
     {% endif %}
   {% endfor %}
@@ -208,7 +211,8 @@
     {% if evaluation.spam.reasons %}<div class="muted small">{{ evaluation.spam.reasons | join('；') }}</div>{% endif %}
   </div>
   {% endif %}
-  <div class="mt"><b>结论：</b>{{ evaluation.summary }}</div>
+  <div class="mt"><b>结论：</b></div>
+  <div class="md">{{ evaluation.summary | md }}</div>
 
   {# 旁路打分器的读数与告警：只在启用过 EdgeJev 或确有降级时出现。
      `relation=shadow` 时分数不会被改动，这里必须让人看清「读了什么、有没有被采用」，
@@ -266,7 +270,7 @@
     <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
     {% for l in conclusion.labels %}<span class="tag">{{ l }}</span>{% endfor %}
   </div>
-  <div class="mt">{{ conclusion.reason }}</div>
+  <div class="mt md">{{ conclusion.reason | md }}</div>
   <div class="muted small">置信度 {{ '%.2f' % conclusion.confidence }}</div>
 </div>
 {% endif %}
@@ -285,9 +289,12 @@
   <div class="mt"><b>验证器文件</b><ul class="muted">{% for p in verifier.files %}<li><code>{{ p }}</code></li>{% endfor %}</ul></div>
   {% endif %}
   {% if verifier.checklist %}
-  <div class="mt"><b>验证清单</b><ol class="muted">{% for c in verifier.checklist %}<li>{{ c }}</li>{% endfor %}</ol></div>
+  <div class="mt"><b>验证清单</b><ol class="muted">{% for c in verifier.checklist %}<li>{{ c | mdi }}</li>{% endfor %}</ol></div>
   {% endif %}
-  {% if verifier.notes %}<div class="mt"><b>说明</b><div class="muted">{{ verifier.notes }}</div></div>{% endif %}
+  {# 验证器说明 / 清单都是 **LLM 输出**：模型习惯用 Markdown 排版（`- 步骤`、`**重点**`、
+     围栏代码块），原样铺成纯文本时这些标记会字面显示。渲染走 `md` 过滤器（先整体转义，
+     原始 HTML 进不来）。 #}
+  {% if verifier.notes %}<div class="mt"><b>说明</b><div class="muted md">{{ verifier.notes | md }}</div></div>{% endif %}
   {% else %}
   <div class="muted">尚未生成验证器。</div>
   {% endif %}
