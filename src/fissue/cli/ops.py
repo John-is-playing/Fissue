@@ -479,7 +479,7 @@ def force(
 
     async def main() -> int:
         from ..pipeline.context import RuntimeContext
-        from ..pipeline.stages import VerifyStage
+        from ..pipeline.stages import VerifyStage, verify_with_retry
 
         async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
@@ -510,6 +510,7 @@ def force(
                 return 0
 
             stage = VerifyStage(ctx)
+            max_retries = max(0, settings.verifier.item_retries)
             for k, _why in plan:
                 if undo:
                     ctx.repo.unforce_item(k)
@@ -520,10 +521,25 @@ def force(
                 if item is None:  # 理论上不会消失；防御
                     emit(f"  {k}：处理中消失，跳过", style="yellow")
                     continue
-                try:
-                    await stage.run(item, ctx.repo.latest_evaluation(k))
-                except Exception as exc:
-                    emit(f"  {k}：强制修复失败：{type(exc).__name__}: {exc}", style="red")
+                # 与 `fissue verify` 同一套：环境错误重试，用尽后落 failed。
+                # 原先这里连状态都不动——强制修复失败后条目还停在 evaluated，
+                # 再跑一次还是同一条，看不出已经失败过。
+                r = await verify_with_retry(
+                    ctx,
+                    stage,
+                    item,
+                    ctx.repo.latest_evaluation(k),
+                    max_retries=max_retries,
+                    on_retry=lambda attempt, error, delay, _key=k: emit(
+                        f"  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
+                        f"{delay:.0f}s 后重试",
+                        style="yellow",
+                    ),
+                )
+                if r.error:
+                    fresh = ctx.repo.get_item(k)
+                    state = fresh.status.value if fresh is not None else "?"
+                    emit(f"  {k}：强制修复失败：{r.error}（当前状态 {state}）", style="red")
                     continue
                 fresh = ctx.repo.get_item(k)
                 if fresh is None:

@@ -31,6 +31,37 @@ class GitError(FissueError):
     """git 操作失败。"""
 
 
+#: 「根本连不上站点」的 stderr 特征。命中它就不是仓库 / 令牌 / 分支的问题——
+#: 直连那条 443 压根没通，任何重试都只是把同一个超时再等一遍。
+_NETWORK_FAILURE_MARKERS = (
+    "unable to access",
+    "Could not connect",
+    "Failed to connect",
+    "Connection timed out",
+    "Connection refused",
+    "Connection reset",
+    "Could not resolve host",
+    "Operation too slow",
+)
+
+
+def _network_hint(text: str) -> str:
+    """给「连不上站点」的克隆失败补一句该往哪儿查。
+
+    为什么值得专门写一句：这条报错长得像瞬时抖动（``Connection timed out after
+    300036 milliseconds``），于是人的第一反应是重跑；而它实际上是**这条路根本不通**
+    （被墙 / 代理断 / DNS 污染）。配一个克隆镜像就绕过去了，不配则多跑几次也不会好。
+    """
+    if not any(marker in text for marker in _NETWORK_FAILURE_MARKERS):
+        return ""
+    return (
+        "\n这通常是**连不上托管站点**（被墙 / 代理断 / DNS 污染），不是仓库或令牌的问题；"
+        "重试只会把同一个超时再等一遍。配置 platforms.clone_mirror 走镜像即可绕过"
+        "（例：https://v6.gh-proxy.org/ ）。镜像只用于**匿名** clone/fetch，"
+        "推送仍直连真站点。"
+    )
+
+
 @dataclass
 class GitResult:
     ok: bool
@@ -50,6 +81,10 @@ class RepoWorkspace:
     #: 克隆时用的**不带令牌**的上游 URL。:meth:`harden_git` 重建 `.git/config` 时用它写回
     #: `remote.origin.url`，而不是回头去读那份可能已被容器篡改的配置。
     origin_url: str = ""
+    #: 实际取到代码的那个 URL。走镜像克隆时它才是镜像地址，而 `origin_url` 仍是真站点
+    #: ——后者决定 `.git/config` 里的远端，所以诊断信息要看这一项（``platforms doctor``
+    #: 的「经镜像克隆成功」就靠它区分）。
+    cloned_from: str = ""
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -64,12 +99,75 @@ class RepoWorkspace:
         token: str = "",
         dest: str | Path | None = None,
         default_branch: str = "main",
+        mirror_url: str = "",
     ) -> RepoWorkspace:
-        """浅克隆到临时目录。"""
+        """浅克隆到临时目录。
+
+        ``mirror_url`` 非空时按**镜像 → 直连**的顺序试两次（见
+        :meth:`_clone_once` 的说明）。留空就是原来的单次直连。
+
+        两次尝试的边界是刻意的：
+
+        * 镜像那次**绝不递令牌**。第三方镜像看得见我们送给它的一切，把平台令牌发过去
+          等于替别人做了一次凭据转发；私有仓库因此注定走不通镜像，那就落到直连那一次。
+        * 无论从哪儿取到代码，`.git/config` 里的 ``remote.origin.url`` 都写**真站点**
+          （``origin_url`` 传的是 ``clone_url``，不是镜像地址）——否则后续的 ``fetch`` /
+          ``push`` 会去镜像上推，而那注定失败。
+        """
+        # (URL, 令牌)：镜像匿名、直连带令牌。
+        attempts: list[tuple[str, str]] = []
+        if mirror_url and mirror_url != clone_url:
+            attempts.append((mirror_url, ""))
+        attempts.append((clone_url, token))
+
+        errors: list[str] = []
+        for url, use_token in attempts:
+            ws, error = cls._clone_once(
+                url,
+                slug=slug,
+                branch=branch,
+                depth=depth,
+                token=use_token,
+                dest=dest,
+                default_branch=default_branch,
+                origin_url=clone_url,
+            )
+            if ws is not None:
+                if ws.cloned_from != clone_url:
+                    log.info("镜像克隆成功（%s），远端仍记为 %s", ws.cloned_from, clone_url)
+                return ws
+            errors.append(error)
+
+        # 报错要把**两条路**的结果都带上：只报最后一条（直连超时）会让人以为是网络抖动，
+        # 而实际上是「镜像也没通」——那才是该去查的东西。
+        detail = errors[-1]
+        if len(errors) > 1:
+            detail = f"镜像与直连均失败；直连报错：{detail}"
+        raise GitError(f"克隆失败：{detail[:500]}{_network_hint(' '.join(errors))}")
+
+    @classmethod
+    def _clone_once(
+        cls,
+        url: str,
+        *,
+        slug: str,
+        branch: str | None,
+        depth: int,
+        token: str,
+        dest: str | Path | None,
+        default_branch: str,
+        origin_url: str,
+    ) -> tuple[RepoWorkspace | None, str]:
+        """按给定 URL 克隆一次；失败返回 ``(None, 报错)``，不抛异常。
+
+        为什么不在这里抛：:meth:`clone` 还要拿这次失败去试下一条路（镜像 ↔ 直连），
+        抛了就得在外面套一层 try 才能继续，报错信息反而更难串起来。
+        """
         if dest is None:
-            root = Path(tempfile.mkdtemp(prefix="fissue-repo-"))
-            target = root / "repo"
+            outer = Path(tempfile.mkdtemp(prefix="fissue-repo-"))
+            target = outer / "repo"
         else:
+            outer = None
             target = Path(dest)
             target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -96,25 +194,32 @@ class RepoWorkspace:
             cmd += ["--depth", str(depth)]
         if branch:
             cmd += ["--branch", branch]
-        cmd += [clone_url, str(target)]
+        cmd += [url, str(target)]
 
         ws = cls(
             root=target,
             slug=slug,
             token=token,
             default_branch=default_branch,
-            origin_url=clone_url,
+            # `.git/config` 的远端必须是**真站点**：镜像只读，推不进去。
+            origin_url=origin_url,
+            cloned_from=url,
         )
         result = ws._git(cmd, cwd=None, extra_env=extra_env)
         if not result.ok:
             ws.cleanup()
-            raise GitError(f"克隆失败：{ws.sanitize(result.stderr)[:500]}")
+            # `cleanup` 只删 `<mkdtemp>/repo`，外层临时目录会留下来——一次失败漏一个，
+            # 而失败现在可能有两次（镜像 + 直连），不收拾就会翻倍堆积。
+            if outer is not None:
+                shutil.rmtree(outer, ignore_errors=True)
+            return None, ws.sanitize(result.stderr)[:500]
 
         # 克隆完立刻加固：`.git/hooks` 与 `.git/config` 待会儿就要暴露给沙盒容器。
         # 顺带解决「容器里以 uid 1000 运行 → dubious ownership」的 fileMode 问题
         # （原先单独写 `core.fileMode=false`，现在由 :meth:`harden_git` 一并写进重建的配置）。
         ws.harden_git()
-        return ws
+        return ws, ""
+
 
     def cleanup(self) -> None:
         """删除工作副本。"""

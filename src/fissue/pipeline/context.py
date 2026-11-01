@@ -212,6 +212,14 @@ class RuntimeContext:
 
     # -- 工作区（克隆） ---------------------------------------------------
 
+    def clone_url_pair(self, url: str) -> tuple[str, str]:
+        """把直连 URL 展开成 ``(直连, 镜像)``；没配镜像时镜像为空串。
+
+        单独抽出来是因为**镜像只对读操作生效**：克隆与抓 PR 源分支可以走它，
+        推送必须仍是真站点（镜像只读）。任何调用方都从这里取，就不会有人写反。
+        """
+        return url, self.settings.platforms.mirrored(url)
+
     async def clone_workspace(
         self,
         repo: RepoConfig,
@@ -223,14 +231,17 @@ class RuntimeContext:
         adapter = await self.adapter_for_repo(repo)
         ref = self.repo_ref(repo)
         target_branch = branch or await self.resolve_default_branch(repo)
+        direct, mirror = self.clone_url_pair(adapter.clone_url(ref))
         return await asyncio.to_thread(
             RepoWorkspace.clone,
-            adapter.clone_url(ref),
+            direct,
             slug=repo.slug,
             branch=target_branch,
             depth=depth,
             token=adapter.token,
             default_branch=target_branch,
+            # 配了镜像就先走镜像（匿名），失败自动回退直连——见 RepoWorkspace.clone。
+            mirror_url=mirror,
         )
 
     # -- 预算 -------------------------------------------------------------

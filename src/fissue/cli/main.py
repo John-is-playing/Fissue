@@ -24,7 +24,6 @@
 from __future__ import annotations
 
 import asyncio
-import random
 import time
 from typing import Any, NoReturn
 
@@ -358,7 +357,7 @@ def verify(
     async def main() -> int:
         from ..models import Category as _C
         from ..pipeline.context import RuntimeContext
-        from ..pipeline.stages import PRVerifyStage, VerifyStage
+        from ..pipeline.stages import PRVerifyStage, VerifyStage, verify_with_retry
 
         async with RuntimeContext.open(settings, exclusive=True) as ctx:
             ctx.init_db()
@@ -444,10 +443,19 @@ def verify(
                         started = time.monotonic()
                         async with lock:
                             emit(f"▶  {item.key} 开始验证（{time.strftime('%H:%M:%S')}）")
-                        r = await _verify_with_retry(
-                            lambda: stage.run(item, ev),
-                            item_key=item.key,
+                        # 重试与**失败落档**都在 `verify_with_retry` 里：CLI 原先只把错误
+                        # 打到屏幕上，条目还挂着 evaluated/queued——界面上就是「验证 ·
+                        # 排队中 · 尚未生成验证器」，像一条还没开始的条目。
+                        r = await verify_with_retry(
+                            ctx,
+                            stage,
+                            item,
+                            ev,
                             max_retries=max_retries,
+                            on_retry=lambda attempt, error, delay, _key=item.key: emit(
+                                f"⚠️  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
+                                f"{delay:.0f}s 后重试"
+                            ),
                         )
                         elapsed = time.monotonic() - started
                         row = {
@@ -465,6 +473,14 @@ def verify(
                                 f"[{done}/{total}] {_verify_progress(r, elapsed)}"
                                 f"（本条 {elapsed:.0f}s）"
                             )
+                            # 失败要落到了 failed 才值得报恢复命令；没能落档（stage 已写下
+                            # 更具体的结论）就别说「已落 failed」。
+                            fresh = ctx.repo.get_item(item.key) if r.error else None
+                            if fresh is not None and fresh.status is ItemStatus.FAILED:
+                                emit(
+                                    f"⚠️  {item.key} 状态已落 failed："
+                                    "可用 `fissue requeue --failed` 退回重排"
+                                )
                         return row
                     except Exception as exc:
                         from ..pipeline.stages import StageResult as _SR
@@ -493,57 +509,6 @@ def verify(
         return 0
 
     run_async(main())
-
-
-# 克隆/LLM 网络抖动导致的失败不值得让整条作废：重跑要重走生成+沙盒。
-# 只重试这类「环境错误」，验证器自身写错（自错）由 runner 内部的修正回路处理，
-# 不在这里重试——那只会重复花 LLM 的钱而不改变结论。
-_TRANSIENT_ERROR_MARKERS = (
-    "克隆失败",
-    "GitError",
-    "git 超时",
-    "网络错误",
-    "连接失败",
-    "超时",
-    "timed out",
-    "timeout",
-    "Connection",
-    "LLM 服务错误",
-    "LLM 请求失败",
-)
-
-
-async def _verify_with_retry(run, *, item_key: str, max_retries: int):
-    """执行一次验证；失败且属环境错误时退避重试。
-
-    ``run`` 是无参协程工厂（每次重试都要新建协程对象，协程不可复用）。
-    重试用尽仍失败则返回一个带 ``error`` 的 StageResult，而不是抛异常——
-    否则一条失败会经 ``asyncio.gather`` 的默认行为连累整批。
-    """
-    from ..pipeline.stages import StageResult
-
-    delay = 2.0
-    last_error = ""
-    for attempt in range(1, max_retries + 2):
-        try:
-            return await run()
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            if attempt > max_retries:
-                break
-            if not _is_transient(last_error):
-                # 非环境错误（如配置错、条目状态异常）重试无意义，立即上抛由外层兜底
-                break
-            log.warning("验证失败（第 %d 次，将重试）：%s：%s", attempt, item_key, last_error[:200])
-            emit(f"⚠️  {item_key} 第 {attempt} 次失败（{last_error.split(':', 1)[0]}），{delay:.0f}s 后重试")
-            await asyncio.sleep(delay + random.uniform(0, 0.5))
-            delay = min(delay * 2, 30.0)
-    log.error("验证失败（已用尽重试）：%s：%s", item_key, last_error)
-    return StageResult(key=item_key, error=last_error)
-
-
-def _is_transient(error: str) -> bool:
-    return any(marker in error for marker in _TRANSIENT_ERROR_MARKERS)
 
 
 def _verify_progress(result, elapsed: float) -> str:

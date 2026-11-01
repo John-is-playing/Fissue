@@ -492,3 +492,88 @@ def test_valid_database_urls_load_and_are_trimmed(tmp_path: Path, raw: str, expe
     env.write_text("", encoding="utf-8")
 
     assert load_settings(cfg, env).database.url == expected
+
+
+# ---------------------------------------------------------------------------
+# 克隆镜像（platforms.clone_mirror）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("mirror", "hosts", "url", "expected"),
+    [
+        # 没配镜像 → 一律不改写（保持原来的直连行为）
+        ("", ["github.com"], "https://github.com/o/r.git", ""),
+        # 常态：GitHub 地址拼前缀
+        (
+            "https://v6.gh-proxy.org/",
+            ["github.com"],
+            "https://github.com/o/r.git",
+            "https://v6.gh-proxy.org/https://github.com/o/r.git",
+        ),
+        # 默认白名单只认 github.com：别的平台不该被送给 GitHub 镜像
+        ("https://v6.gh-proxy.org/", ["github.com"], "https://gitee.com/o/r.git", ""),
+        # 白名单放宽之后才生效
+        (
+            "https://mirror.internal/",
+            ["gitee.com"],
+            "https://gitee.com/o/r.git",
+            "https://mirror.internal/https://gitee.com/o/r.git",
+        ),
+        # 白名单留空 = 不限制宿主（自建镜像的用法）
+        (
+            "https://mirror.internal/",
+            [],
+            "https://atomgit.com/o/r.git",
+            "https://mirror.internal/https://atomgit.com/o/r.git",
+        ),
+        # 非 http(s)（本地路径 / ssh / git 协议）不该被拼前缀
+        ("https://v6.gh-proxy.org/", ["github.com"], "git@github.com:o/r.git", ""),
+        ("https://v6.gh-proxy.org/", ["github.com"], "/srv/git/r.git", ""),
+        ("https://v6.gh-proxy.org/", [], "ssh://git@github.com/o/r.git", ""),
+    ],
+)
+def test_clone_mirror_rewrites_only_http_urls_on_allowed_hosts(
+    mirror: str, hosts: list[str], url: str, expected: str
+) -> None:
+    """镜像改写只做一件事：往**合格的**直连 URL 前面拼前缀。
+
+    不该改的必须原样返回空串——本地路径与 ssh 协议拼上镜像前缀只会得到一条
+    谁也解析不了的地址，而错误会出现在 git 的报错里，离配置项十万八千里。
+    """
+    from fissue.config import PlatformConfig
+
+    cfg = PlatformConfig(clone_mirror=mirror, clone_mirror_hosts=hosts)
+    assert cfg.mirrored(url) == expected
+
+
+def test_clone_mirror_prefix_gets_trailing_slash() -> None:
+    """漏写结尾的 `/` 会在加载期补齐。
+
+    否则拼出来是 ``https://v6.gh-proxy.orgttps://github.com/…``——少一个字符，
+    报错却长得像「镜像地址写错了」，人只会去改地址而不是数斜杠。
+    """
+    from fissue.config import PlatformConfig
+
+    assert PlatformConfig(clone_mirror="https://v6.gh-proxy.org").clone_mirror == "https://v6.gh-proxy.org/"
+    # 已经带了就不重复加
+    assert PlatformConfig(clone_mirror="https://m.internal/").clone_mirror == "https://m.internal/"
+
+
+def test_clone_mirror_rejects_non_http_prefix() -> None:
+    """非 http(s) 的前缀是硬错误：拼出来的地址必然不可用，不如加载期就失败。"""
+    from fissue.config import PlatformConfig
+
+    with pytest.raises(ErrConfigError):
+        PlatformConfig(clone_mirror="v6.gh-proxy.org/")
+
+
+def test_clone_mirror_hosts_are_normalised() -> None:
+    """白名单里的协议、路径、大小写、重复项都收敛掉，才能与 URL 里的宿主对上。"""
+    from fissue.config import PlatformConfig
+
+    cfg = PlatformConfig(
+        clone_mirror="https://m.internal/",
+        clone_mirror_hosts=["GitHub.com", " https://github.com/ ", "github.com", ""],
+    )
+    assert cfg.clone_mirror_hosts == ["github.com"]

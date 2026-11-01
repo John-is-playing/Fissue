@@ -11,8 +11,11 @@ from __future__ import annotations
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
-from fissue.workspace import RepoWorkspace
+import pytest
+
+from fissue.workspace import GitError, RepoWorkspace
 
 
 def _run_git(args: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -249,6 +252,117 @@ def test_clone_passes_token_via_env_not_argv(monkeypatch, tmp_path) -> None:
     # `-c` 是 git 本体的选项，必须在子命令**之前**——放后面会被报「未知开关」
     assert args.index("-c") < args.index("clone"), "-c 必须在 clone 之前"
     assert env.get(RepoWorkspace.PUSH_TOKEN_ENV) == "SK-CLONE-TOKEN", "令牌要经环境变量递"
+
+
+# ---------------------------------------------------------------------------
+# 克隆镜像：先镜像（匿名）→ 再直连（带令牌）
+# ---------------------------------------------------------------------------
+
+
+class _GitStub:
+    """把 ``_git`` 换成按 URL 决定成败的探针，两次尝试的实参全记下来。"""
+
+    ok = True
+    stdout = ""
+    stderr = ""
+
+    def __init__(self, *, fail_substr: str = "", fail_all: bool = False, stderr: str = "") -> None:
+        self.calls: list[tuple[str, str]] = []
+        self.fail_substr = fail_substr
+        self.fail_all = fail_all
+        self.stderr = stderr
+
+    def __call__(self, args, *, cwd=None, timeout=0, extra_env=None):  # noqa: ANN001, ARG002
+        url = args[-2]
+        token = (extra_env or {}).get(RepoWorkspace.PUSH_TOKEN_ENV, "")
+        self.calls.append((url, token))
+        if self.fail_all or (self.fail_substr and self.fail_substr in url):
+            return _stub_result(ok=False, stderr=self.stderr)
+        return _stub_result(ok=True)
+
+
+def _stub_result(*, ok: bool, stderr: str = "") -> Any:
+    return type("_R", (), {"ok": ok, "stdout": "", "stderr": stderr})()
+
+
+DIRECT = "https://github.com/o/r.git"
+MIRROR = "https://v6.gh-proxy.org/https://github.com/o/r.git"
+
+
+def test_clone_tries_mirror_anonymously_then_direct(monkeypatch, tmp_path) -> None:
+    """配了镜像就先走镜像，且**镜像那次绝不递令牌**、直连那次才递。
+
+    两条边界都值得钉死：把令牌发给第三方镜像等于替别人做了一次凭据转发；
+    反过来，直连那次不带令牌则私有仓库必然 ``Access denied``。
+    """
+    stub = _GitStub(fail_substr="gh-proxy", stderr="fatal: unable to access '…': Could not connect")
+    monkeypatch.setattr(RepoWorkspace, "_git", stub)
+
+    ws = RepoWorkspace.clone(
+        DIRECT, mirror_url=MIRROR, token="SK-CLONE-TOKEN", dest=tmp_path / "repo"
+    )
+
+    assert [url for url, _ in stub.calls] == [MIRROR, DIRECT], "先镜像、后直连"
+    assert stub.calls[0][1] == "", "镜像那次绝不能带令牌"
+    assert stub.calls[1][1] == "SK-CLONE-TOKEN", "直连那次要带令牌（私有仓库靠它）"
+    assert ws.cloned_from == DIRECT
+    assert ws.origin_url == DIRECT
+
+
+def test_clone_records_direct_url_even_when_mirror_won(monkeypatch, tmp_path) -> None:
+    """镜像成功也只跑一次，且 `origin_url` 仍记**真站点**。
+
+    记成镜像就等于让后续 `fetch` / `push` 去镜像上推——而镜像只读，推送必然失败，
+    而且失败得毫无道理（`fix` 明明改好了）。
+    """
+    stub = _GitStub()
+    monkeypatch.setattr(RepoWorkspace, "_git", stub)
+
+    ws = RepoWorkspace.clone(DIRECT, mirror_url=MIRROR, token="SK-CLONE-TOKEN", dest=tmp_path / "repo")
+
+    assert [url for url, _ in stub.calls] == [MIRROR], "镜像通了就不该再去打直连"
+    assert ws.cloned_from == MIRROR
+    assert ws.origin_url == DIRECT, "远端必须是真站点"
+
+
+def test_clone_failure_names_both_paths_and_points_at_mirror_config(monkeypatch, tmp_path) -> None:
+    """两条路都失败时报错要说清**两条**，并对「连不上站点」给出该配什么的指路。
+
+    只报最后一条（直连超时）会让人以为是瞬时抖动而去重跑，重跑还是同一个超时。
+    """
+    stub = _GitStub(fail_all=True, stderr=(
+        "fatal: unable to access 'https://github.com/o/r.git/': "
+        "Connection timed out after 300036 milliseconds"
+    ))
+    monkeypatch.setattr(RepoWorkspace, "_git", stub)
+
+    with pytest.raises(GitError) as err:
+        RepoWorkspace.clone(DIRECT, mirror_url=MIRROR, token="tok", dest=tmp_path / "repo")
+
+    message = str(err.value)
+    assert "镜像与直连均失败" in message, message
+    assert "clone_mirror" in message, "要指到具体配置项，否则人不知道改哪儿"
+
+
+def test_clone_real_git_falls_back_to_direct_when_mirror_is_dead(tmp_path: Path) -> None:
+    """真跑一次（不联网）：镜像地址不通 → 回退直连成功，`.git/config` 里是真站点。
+
+    打桩只能验到「有没有按顺序调」，验不到「失败一次之后工作区还是干净的」——
+    上一次尝试会留下半个目标目录，`git clone` 到已存在的非空目录上直接报错。
+    """
+    src = _repo_with_commit(tmp_path)
+    # 用 `file://` 形态而不是裸路径：`harden_git` 写 `.git/config` 时不做转义，
+    # 而 Windows 路径里的 `\U` 会被 git 当成非法转义序列（`bad config line`）。
+    # 生产上远端恒为 https，碰不到这条；测试没必要顺带把它拽进来。
+    origin = src.as_uri()
+    mirror = tmp_path / "no-such-mirror"          # 本地路径，必然失败且不联网
+
+    ws = RepoWorkspace.clone(origin, mirror_url=str(mirror), depth=0, dest=tmp_path / "clone")
+
+    assert (ws.root / "a.txt").read_text(encoding="utf-8") == "hi\n"
+    assert ws.cloned_from == origin, "最终应当是直连那条路取到的"
+    remote = _run_git(["config", "--local", "--get", "remote.origin.url"], cwd=ws.root)
+    assert remote.stdout.strip() == origin
 
 
 # ---------------------------------------------------------------------------

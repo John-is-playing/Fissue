@@ -3408,3 +3408,119 @@ async def test_flush_apply_force_bypasses_skip_verdict(ctx, repo, monkeypatch) -
     assert fresh.status is ItemStatus.FIX_QUEUED
     assert fresh.priority is Priority.TIER1
     assert (item.key, Priority.TIER1) in report.fix_candidates
+
+
+# ---------------------------------------------------------------------------
+# 验证失败必须**落档**：不能把条目留在「排队中」
+# ---------------------------------------------------------------------------
+
+
+class _FailingStage:
+    """只会抛异常的验证阶段替身（记录被调用了几次）。"""
+
+    def __init__(self, exc: BaseException) -> None:
+        self.exc = exc
+        self.calls: list[str] = []
+
+    async def run(self, item, _evaluation: Any) -> Any:  # noqa: ANN401
+        self.calls.append(item.key)
+        raise self.exc
+
+
+def _seed_verify_item(repo, sample_issue, status: ItemStatus = ItemStatus.EVALUATED):
+    """把样例 Issue 塞进库并设成指定状态，返回库里的条目。"""
+    rid = repo.ensure_repo(RepoRef(platform=Platform.GITHUB, owner="psf", name="requests"))
+    repo.upsert_item(rid, sample_issue)
+    repo.set_item_status(sample_issue.key, status)
+    item = repo.get_item(sample_issue.key)
+    assert item is not None
+    return item
+
+
+@pytest.fixture
+def _instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把退避等待抹掉：这几条验的是「重试几次 / 落在哪个状态」，不是等多久。"""
+    from fissue.workspace import GitError  # noqa: F401  —— 保持与其他用例同源导入
+
+    import fissue.pipeline.stages as stages_mod
+
+    async def _no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(stages_mod.asyncio, "sleep", _no_sleep)
+
+
+@pytest.mark.asyncio
+async def test_verify_retry_exhausted_marks_item_failed(
+    ctx: RuntimeContext, repo, sample_issue, monkeypatch: pytest.MonkeyPatch, _instant_retries
+) -> None:
+    """环境错误重试用尽 → 条目必须落 ``failed``，而不是留在原地「排队中」。
+
+    这条路是实测出来的：``fissue verify`` 报了
+    ``GitError: 克隆失败：… Connection timed out``，WebUI 上却仍显示
+    「验证 · 排队中 · 尚未生成验证器」——像一条还没开始的条目，于是人只会再等。
+    """
+    from fissue.pipeline.stages import verify_with_retry
+    from fissue.workspace import GitError
+
+    item = _seed_verify_item(repo, sample_issue)
+    stage = _FailingStage(
+        GitError("克隆失败：fatal: unable to access 'https://github.com/psf/requests.git/': "
+                 "Connection timed out after 300036 milliseconds")
+    )
+    retried: list[int] = []
+
+    result = await verify_with_retry(
+        ctx, stage, item, None,
+        max_retries=2,
+        on_retry=lambda attempt, _error, _delay: retried.append(attempt),
+    )
+
+    assert result.error and "克隆失败" in result.error
+    assert len(stage.calls) == 3, "1 次 + 2 次重试"
+    assert retried == [1, 2], "每次重试都要能通知调用方（CLI 靠它打进度）"
+    fresh = repo.get_item(item.key)
+    assert fresh is not None and fresh.status is ItemStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_verify_non_transient_error_is_not_retried_but_still_lands_failed(
+    ctx: RuntimeContext, repo, sample_issue
+) -> None:
+    """验证器自身写错（自错）不重试——但**照样落 failed**，否则界面还在「排队中」。
+
+    两条边界得同时成立：重试只会重复烧 LLM 的钱而不改变结论；可失败了却什么都不写，
+    等于把「这一步挂了」藏起来。
+    """
+    from fissue.pipeline.stages import verify_with_retry
+
+    item = _seed_verify_item(repo, sample_issue)
+    stage = _FailingStage(ValueError("验证器语法错误：unexpected token"))
+
+    result = await verify_with_retry(ctx, stage, item, None, max_retries=3)
+
+    assert result.error and "语法错误" in result.error
+    assert len(stage.calls) == 1, "非环境错误不该重试"
+    fresh = repo.get_item(item.key)
+    assert fresh is not None and fresh.status is ItemStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_verify_failure_does_not_overwrite_a_settled_status(
+    ctx: RuntimeContext, repo, sample_issue
+) -> None:
+    """stage 已经写下「转人工」这类结论时，失败落档不能把它盖成 failed。
+
+    ``NEEDS_MANUAL`` 说的是「验证器跑通了，但问题复现不出来，要人看」——它比
+    「跑挂了」信息量大得多。把它改写成 ``failed`` 等于把结论抹掉，还会骗人去做
+    没必要的重试。
+    """
+    from fissue.pipeline.stages import verify_with_retry
+
+    item = _seed_verify_item(repo, sample_issue, ItemStatus.NEEDS_MANUAL)
+    stage = _FailingStage(RuntimeError("收尾阶段炸了"))
+
+    await verify_with_retry(ctx, stage, item, None, max_retries=0)
+
+    fresh = repo.get_item(item.key)
+    assert fresh is not None and fresh.status is ItemStatus.NEEDS_MANUAL

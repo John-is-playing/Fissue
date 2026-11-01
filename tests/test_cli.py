@@ -665,9 +665,8 @@ def test_force_runs_verify_after_setting_the_flag(
     cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """标记置上后必须真的走一遍验证阶段（顺带补齐验证器），而不是只改状态就结束。"""
-    from types import SimpleNamespace
-
     import fissue.pipeline.stages as stages
+    from fissue.pipeline.stages import StageResult
 
     key = _seed(cli_env["config"], cli_env["env"])
     repo = _cli_repo(cli_env)
@@ -679,7 +678,9 @@ def test_force_runs_verify_after_setting_the_flag(
 
         async def run(self, item: Any, evaluation: Any) -> Any:
             seen.append(item.key)
-            return SimpleNamespace(notes=[])
+            # 必须返回真的 `StageResult`：调用方（force）读的是 `.error` / `.notes`，
+            # 而 `verify_with_retry` 只是把 stage 的结果原样透传。
+            return StageResult(key=item.key)
 
     monkeypatch.setattr(stages, "VerifyStage", FakeVerifyStage)
     result = _run(["force", "--key", key, "--yes"], cli_env)
@@ -781,3 +782,52 @@ def test_bench_list_survives_a_broken_baseline(cli_env: dict[str, str]) -> None:
     assert result.exit_code == 0, result.output
     rows = json.loads(result.stdout)
     assert any(row["file"] == "broken.json" and row["label"] == "(无法解析)" for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# 3. 验证失败必须**落档**：克隆超时之后条目不能还挂在「排队中」
+# ---------------------------------------------------------------------------
+
+
+def _status_of(config_file: str, env_file: str, key: str) -> ItemStatus:
+    from fissue.config import load_settings
+    from fissue.store.db import build_database
+    from fissue.store.repository import Repository
+
+    settings = load_settings(config_file, env_file)
+    repo = Repository(build_database(settings))
+    item = repo.get_item(key)
+    assert item is not None, f"条目不在了：{key}"
+    return item.status
+
+
+def test_verify_clone_failure_marks_item_failed(
+    cli_env: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """克隆超时（重试用尽）后，条目必须落到 ``failed``，而不是停在「排队中」。
+
+    这是实测过的观感问题：``fissue verify`` 明明报了
+    ``GitError: 克隆失败：… Connection timed out``，WebUI 上却还是
+    「验证 / 排队中 / 尚未生成验证器」——看上去像一条**还没开始**的条目，
+    于是人会以为「再等等就好」，而不是「这一步已经失败了」。
+
+    常驻服务那侧一直是落 ``failed`` 的（重试用尽后），CLI 只是把错误打到屏幕上
+    就撒手，两者对同一件事给出两种事实。``failed`` 不是死局：``fissue requeue
+    --failed`` 能把条目按已有结论退回该走的下一步。
+    """
+    key = _seed(cli_env["config"], cli_env["env"])
+
+    from fissue.workspace import GitError, RepoWorkspace
+
+    def boom(*_a: Any, **_kw: Any) -> Any:
+        raise GitError(
+            "克隆失败：fatal: unable to access 'https://github.com/psf/requests.git/': "
+            "Connection timed out after 300036 milliseconds"
+        )
+
+    monkeypatch.setattr(RepoWorkspace, "clone", classmethod(boom))
+
+    result = _run(["verify", "--key", key, "--retries", "0"], cli_env)
+
+    assert result.exit_code == 0, result.output
+    assert _status_of(cli_env["config"], cli_env["env"], key) is ItemStatus.FAILED

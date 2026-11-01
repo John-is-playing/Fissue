@@ -68,12 +68,18 @@ def _cleanup_workspace(ws: Any) -> None:
             shutil.rmtree(parent, ignore_errors=True)
 
 
-async def _probe_clone(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]:
+async def _probe_clone(
+    adapter: Any, ref: RepoRef, token: str, settings: Settings
+) -> dict[str, Any]:
     """克隆探测：**只读**，但它是 ``verify`` / ``fix`` 的第一道门。
 
     这一项最有前车之鉴：私有仓库克隆曾经因为「克隆从不递令牌 + ``GIT_ASKPASS=echo``」
     必然失败，而公开夹具一直匿名可克隆，于是这个缺陷在四套夹具上从没露过头
     （见 BENCHMARK §4.15）。克隆是唯一能无副作用验出这类问题的探测。
+
+    配了 ``platforms.clone_mirror`` 时这里走的是**与生产完全一致**的路径
+    （镜像优先、失败回退直连），所以「镜像配了但没用 / 镜像本身不通」都会当场现形，
+    而不是等到几十条条目各自超时一遍才发现。
     """
     import asyncio
 
@@ -81,11 +87,13 @@ async def _probe_clone(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]
 
     slug = f"{ref.owner}/{ref.name}"
     url = adapter.clone_url(ref, use_token=False)
+    mirror = settings.platforms.mirrored(url)
 
     def work(use_token: str) -> str:
-        ws = RepoWorkspace.clone(url, slug=slug, token=use_token, depth=1)
+        ws = RepoWorkspace.clone(url, slug=slug, token=use_token, depth=1, mirror_url=mirror)
         try:
-            return f"克隆成功，分支 {ws.current_branch()}"
+            via = "" if ws.cloned_from == url else f"（经镜像 {ws.cloned_from}）"
+            return f"克隆成功，分支 {ws.current_branch()}{via}"
         finally:
             _cleanup_workspace(ws)
 
@@ -114,11 +122,14 @@ async def _probe_clone(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]
         }
 
 
-async def _probe_push(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]:
+async def _probe_push(adapter: Any, ref: RepoRef, token: str, settings: Settings) -> dict[str, Any]:
     """推分支探测：``fix`` 的产出就靠这一步。
 
     只推一个空提交的探测分支，推成功立刻删远端分支。推送凭据的递法（不带令牌的 URL +
     子进程环境变量 + 凭据助手）与生产路径完全一致——所以这里通了，``fix`` 的推送基本就通。
+
+    克隆那一下可以走镜像（它是**读**），推送则一律直连真站点：镜像只读，往它身上推
+    必然失败，而这一步要验的正是**真站点上的凭据**有没有问题。
     """
     import asyncio
 
@@ -126,9 +137,10 @@ async def _probe_push(adapter: Any, ref: RepoRef, token: str) -> dict[str, Any]:
 
     slug = f"{ref.owner}/{ref.name}"
     url = adapter.clone_url(ref, use_token=False)
+    mirror = settings.platforms.mirrored(url)
 
     def work() -> str:
-        ws = RepoWorkspace.clone(url, slug=slug, token=token, depth=1)
+        ws = RepoWorkspace.clone(url, slug=slug, token=token, depth=1, mirror_url=mirror)
         pushed = False
         try:
             if not ws.checkout(PROBE_BRANCH, create=True):
@@ -379,7 +391,7 @@ async def _run(
 
             # 克隆：只读，所以不需要 --write。它验的是 `verify` / `fix` 的第一道门。
             if read_ok:
-                rows.append(await _probe_clone(adapter, ref, token))
+                rows.append(await _probe_clone(adapter, ref, token, settings))
 
             if write and read_ok:
                 rows.extend(await _probe_write(adapter, ref, number))
@@ -395,7 +407,7 @@ async def _run(
 
             # 推分支：默认不探，因为它会在远端短暂留下一个分支。
             if probe_push and read_ok:
-                rows.append(await _probe_push(adapter, ref, token))
+                rows.append(await _probe_push(adapter, ref, token, settings))
             elif probe_push:
                 rows.append(
                     {

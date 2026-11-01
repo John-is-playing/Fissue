@@ -911,6 +911,81 @@ class PlatformConfig(BaseModel):
     #: 重试调成 0」会顺手关掉平台重试，「调大 LLM 重试」又会放大写请求的风险，
     #: 两个不相干的旋钮被绑在了一个数上。
     max_retries: int = 4
+    #: **克隆镜像前缀**，用来绕过「连不上托管站点」。留空 = 直连（默认）。
+    #:
+    #: 解决的是这么一类报错：``GitError: 克隆失败：fatal: unable to access
+    #: 'https://github.com/…': Connection timed out after 300036 milliseconds``。
+    #: 它不是「偶发抖动」——直连那个站点的 443 真不通（被墙 / 代理断 / DNS 污染），
+    #: 于是 ``clone_retries`` / ``verifier.item_retries`` 只是把同一个 300 秒超时
+    #: 重复几遍，条目最后还是退出队列。
+    #:
+    #: 填法就是往原 URL 前面拼一个前缀（gh-proxy 这一族的形态）::
+    #:
+    #:     clone_mirror: https://v6.gh-proxy.org/     # → https://v6.gh-proxy.org/https://github.com/o/r.git
+    #:
+    #: 三条边界，都是刻意的：
+    #:
+    #: * **只用于 clone / fetch**。推送仍然直连真站点（镜像只读，推不进去）；
+    #:   也正因如此，这里没用 git 的全局 ``url.*.insteadOf``——那个连 push 一起改写。
+    #: * **只做匿名克隆**。第三方镜像看得见我们递给它的一切，令牌绝不发给它；带令牌的
+    #:   私有仓库克隆压根不会走镜像（见 ``workspace.RepoWorkspace.clone`` 的尝试顺序）。
+    #: * **镜像失败自动回退直连**。宁可慢一次，也不要因为镜像抽风把条目判死。
+    clone_mirror: str = ""
+    #: 镜像只对这些宿主生效。默认只认 ``github.com``——gh-proxy 这类镜像只代理 GitHub，
+    #: 而把 GitLab / Gitee / AtomGit 的地址也往它身上送，等于把仓库名白送给一个第三方
+    #: 而且必然失败。留空 = 不限制宿主（自建镜像时用）。
+    clone_mirror_hosts: list[str] = Field(default_factory=lambda: ["github.com"])
+
+    @field_validator("clone_mirror")
+    @classmethod
+    def _check_clone_mirror(cls, v: str) -> str:
+        """镜像前缀必须是 http(s) 且**以 ``/`` 结尾**。
+
+        少了这个斜杠会拼成 ``https://v6.gh-proxy.orghttps://github.com/…``，
+        报错信息看上去像「镜像地址写错了」，实际是少了个字符——加载期就纠正，
+        比让人对着一条 curl 报错猜要省事得多。
+        """
+        text = (v or "").strip()
+        if not text:
+            return ""
+        if "://" not in text or text.split("://", 1)[0] not in ("http", "https"):
+            raise ConfigError(
+                f"platforms.clone_mirror 必须是 http(s) 地址，当前为 {v!r}。"
+                "例如 https://v6.gh-proxy.org/"
+            )
+        return text if text.endswith("/") else text + "/"
+
+    @field_validator("clone_mirror_hosts")
+    @classmethod
+    def _check_clone_mirror_hosts(cls, v: list[str]) -> list[str]:
+        """宿主白名单按小写、去协议、去路径收敛；便于与 ``urlsplit().hostname`` 对齐。"""
+        out: list[str] = []
+        for item in v:
+            host = (item or "").strip().lower()
+            if not host:
+                continue
+            host = host.split("://", 1)[-1].split("/", 1)[0]
+            if host and host not in out:
+                out.append(host)
+        return out
+
+    def mirrored(self, url: str) -> str:
+        """按 ``clone_mirror`` 把直连 URL 改写成镜像 URL；不适用时返回空串。
+
+        返回空串的含义是「这条 URL 不该走镜像」，调用方据此保持原行为——本地路径、
+        ``ssh://``、``git://`` 与白名单外的主机都走这条分支（自建 GitLab、Gitee
+        等私有部署照旧直连）。
+        """
+        if not self.clone_mirror or not url:
+            return ""
+        scheme, sep, rest = url.partition("://")
+        if not sep or scheme not in ("http", "https"):
+            return ""
+        authority = rest.split("/", 1)[0]
+        host = authority.rsplit("@", 1)[-1].lower()
+        if self.clone_mirror_hosts and host not in self.clone_mirror_hosts:
+            return ""
+        return self.clone_mirror + url
 
 
 class Settings(BaseModel):

@@ -15,6 +15,56 @@
 
 > **未发布**：`v1.3.0-b2` 之后的变更。
 
+### 修复 —— 验证失败不落档：克隆超时后条目还挂着「排队中 · 尚未生成验证器」
+
+- **现象**：`fissue verify` 明明报了
+  `GitError: 克隆失败：… Connection timed out after 300036 milliseconds`，WebUI 上那条
+  却仍是「验证 · 排队中 · 尚未生成验证器」——看上去像一条**还没开始**的条目，于是人的
+  结论是「再等等」，而不是「这一步已经失败了」。实测确认：库里的 `${status}` 一直停在
+  `evaluated` / `queued`。
+- **根因是三处调用方各写了一遍**：`VerifyStage` 刻意把异常**上抛**（落档交给调用方，
+  这样常驻服务的退避重试才有机会跑）。常驻服务照做了（重试用尽 → `failed`），CLI 与
+  Web 却只把错误打到屏幕上就撒手，`control force` 连状态都不动。同一次失败留下三种事实。
+- **改法**：新增 `pipeline.stages.verify_with_retry(ctx, stage, item, evaluation,
+  max_retries=…, on_retry=…)`，把「重试几次、什么算可重试、失败落到哪儿」收成一份实现；
+  CLI `verify`、Web 验证端点、`control force` 全部改用它（Web 顺带拿到了与 CLI 相同的
+  环境错误重试）。落档走 `mark_verify_failed`：**只在条目还在半路上**（`evaluated` /
+  `queued` / `new`…）才写 `failed`，stage 已写下的 `needs_manual` / `skipped` /
+  `fix_queued` / `labeled` 一概不覆盖——那些结论比「跑挂了」信息量大得多。
+- **`failed` 不是死局**：`fissue requeue --failed` 会按已有结论把条目退回该走的下一步
+  （有评测 → `evaluated`，没有 → `new`），所以「落档」与「可重试」并不冲突，这也正是
+  常驻服务一直以来的口径。CLI 在落档后会直接提示这条恢复命令。
+- **测试**：新增命中用例（CLI `verify --key` 在克隆超时后状态必须是 `failed`——先复现、
+  再修复）与三条 `verify_with_retry` 单测（环境错误重试用尽落档 / 自错不重试但落档 /
+  已落定状态不被覆盖）。
+
+### 新增 —— 克隆镜像（`platforms.clone_mirror`）：直连不通时别再空等 300 秒
+
+- **问题**：`verify` / `fix` 偶尔报
+  `GitError: 克隆失败：fatal: unable to access 'https://github.com/o/r.git/': Connection timed out after 300036 milliseconds`。
+  它长得像瞬时抖动，实际是那条 443 **根本不通**（被墙 / 代理断 / DNS 污染）：本机实测直连
+  `Could not connect`，同一个仓库走 `https://v6.gh-proxy.org/` 前缀 **1.4 秒**就
+  `ls-remote` 成功。于是 `auto_fix.clone_retries` / `verifier.item_retries` 只是把同一个
+  300 秒超时重复三遍，条目最后照样退出待修队列——重试次数再多也没用。
+- **先说清楚它不在哪儿**：克隆**不是**在沙盒里做的，沙盒只跑验证器命令；克隆是宿主上
+  `RepoWorkspace.clone` 起的 git 子进程。所以「往沙盒镜像里加镜像源」对这条报错毫无作用，
+  镜像必须加在**宿主 git 的克隆路径**上。
+- **改法**：新增 `platforms.clone_mirror`（前缀，例 `https://v6.gh-proxy.org/`，结尾 `/`
+  漏了加载期补齐）与 `platforms.clone_mirror_hosts`（默认 `["github.com"]`）。配了它，
+  `RepoWorkspace.clone` 按**镜像（匿名）→ 直连（带令牌）**试两次，镜像不通自动回退直连。
+- **三条边界都刻意留了**：① 只改 `clone` 与抓 PR 源分支的 `fetch`，**推送仍直连真站点**
+  （镜像只读，推不进去）；② **令牌绝不发给镜像**——第三方镜像看得见我们递过去的一切，
+  所以镜像那次一律匿名，私有仓库自然落到直连；③ `.git/config` 的 `remote.origin.url`
+  始终写**真站点**，否则后续 fetch / push 会打到镜像上。
+- **没采用 `url.*.insteadOf`**：它能一条配置治全部克隆，但**连 push 一起改写**——推送会
+  打到镜像上必然失败，于是「修好了却提不出 PR」，比现在更糟。
+- **顺手补的两处观测**：`platforms doctor` 的克隆探测现在走**与生产一致**的路径，detail 里
+  标出「（经镜像 …）」，所以「配了没生效 / 镜像本身不通」会当场现形；克隆报错若命中
+  「连不上站点」的特征（`unable to access` / `Could not connect` / `Connection timed out`…），
+  末尾直接指到 `platforms.clone_mirror`，而不是让人对着超时去重跑。
+- **一处顺带的清理**：克隆失败时除了删 `<mkdtemp>/repo`，连外层临时目录一起删——原先一次
+  失败漏一个目录，而失败现在可能有两次（镜像 + 直连），不收拾就会翻倍堆积。
+
 ### 修复 —— 流式 LLM 调用把 token 记成 0，预算硬停实际不可达
 
 - **问题**：`lockkit` 全链路压测（2026-10-31）里 80 次 LLM 调用在 `llm_usage` 中全部记 0。

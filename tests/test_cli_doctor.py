@@ -305,10 +305,14 @@ class _FakeWorkspace:
         bad = fail_tokens or set()
         cls.instances = []
 
-        def fake_clone(_url: str, *, slug: str = "", token: str = "", depth: int = 1):  # noqa: ARG001
+        def fake_clone(_url: str, *, slug: str = "", token: str = "", depth: int = 1, **_kw: Any):  # noqa: ARG001
             if token in bad:
                 raise RuntimeError("remote: The token is not authorized to access this project")
-            return cls()
+            ws = cls()
+            # 真实现记下**实际取到代码的 URL**（走镜像时它才是镜像地址），
+            # 探测据此在 detail 里标出「经镜像」。替身照抄这个形状。
+            ws.cloned_from = _url
+            return ws
 
         from fissue.workspace import RepoWorkspace
 
@@ -358,7 +362,7 @@ def _result(*, ok: bool, stderr: str = "") -> Any:
 @pytest.mark.asyncio
 async def test_probe_clone_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
     _FakeWorkspace.install(monkeypatch)
-    row = await _probe_clone(_FakeAdapter(), REF, "tok")
+    row = await _probe_clone(_FakeAdapter(), REF, "tok", Settings())
     assert row["result"] == "✅"
     assert "克隆成功" in row["detail"]
     assert _FakeWorkspace.instances[0].cleaned is True, "探测完必须清理工作副本"
@@ -374,7 +378,7 @@ async def test_probe_clone_blames_credentials_when_anonymous_works(
     所以命令必须自己分辨，而不是只丢一句「克隆失败」。
     """
     _FakeWorkspace.install(monkeypatch, fail_tokens={"bad-token"})
-    row = await _probe_clone(_FakeAdapter(), REF, "bad-token")
+    row = await _probe_clone(_FakeAdapter(), REF, "bad-token", Settings())
     assert row["result"] == "❌"
     assert "问题在凭据传递" in row["detail"]
 
@@ -393,7 +397,7 @@ async def test_probe_clone_blames_token_scope_when_anonymous_also_fails(
         raise RuntimeError("remote: The token is not authorized to access this project")
 
     monkeypatch.setattr(RepoWorkspace, "clone", classmethod(always_fail))
-    row = await _probe_clone(_FakeAdapter(), REF, "tok")
+    row = await _probe_clone(_FakeAdapter(), REF, "tok", Settings())
     assert row["result"] == "❌"
     assert "projects" in row["detail"]
 
@@ -406,7 +410,7 @@ async def test_probe_push_deletes_the_probe_branch(monkeypatch: pytest.MonkeyPat
     「不留痕迹地知道能做什么」。
     """
     _FakeWorkspace.install(monkeypatch)
-    row = await _probe_push(_FakeAdapter(), REF, "tok")
+    row = await _probe_push(_FakeAdapter(), REF, "tok", Settings())
 
     assert row["result"] == "✅", row
     calls = _FakeWorkspace.instances[0].calls
@@ -428,7 +432,7 @@ async def test_probe_push_reports_when_branch_cannot_be_deleted(
         return _result(ok=False, stderr="permission denied")
 
     monkeypatch.setattr(ws_cls, "delete_remote_branch", bad_delete)
-    row = await _probe_push(_FakeAdapter(), REF, "tok")
+    row = await _probe_push(_FakeAdapter(), REF, "tok", Settings())
 
     assert row["result"] == "❌"
     assert "fissue-doctor-probe" in row["detail"] or PROBE_BRANCH in row["detail"]

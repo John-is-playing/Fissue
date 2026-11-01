@@ -413,3 +413,28 @@ platforms:
   # 平台 HTTP 的重试次数。与 llm.max_retries 无关：两者此前共用一个数，
   # 「调 LLM 重试」会顺手改变平台行为（写请求重试尤其敏感）。
   max_retries: 4
+  # 克隆镜像前缀：用来绕过「连不上托管站点」。留空 = 直连（默认）。
+  #
+  # 它治的是这条报错：
+  #   GitError: 克隆失败：fatal: unable to access 'https://github.com/o/r.git/':
+  #   Connection timed out after 300036 milliseconds
+  # 那不是偶发抖动——直连那个站点的 443 根本不通（被墙 / 代理断 / DNS 污染），
+  # 于是 auto_fix.clone_retries 与 verifier.item_retries 只是把同一个 300 秒超时
+  # 重复几遍，条目最后还是退出队列。配一个镜像就绕过去了：
+  #
+  #   clone_mirror: https://v6.gh-proxy.org/
+  #   # → https://v6.gh-proxy.org/https://github.com/o/r.git
+  #
+  # 三条边界（都是刻意的，别指望它连推送一起治）：
+  #   * 只用于 clone / 与抓 PR 源分支的 fetch；推送仍直连真站点（镜像只读，推不进去）。
+  #   * 只做**匿名**克隆：第三方镜像看得见我们递给它的一切，令牌绝不发给它，
+  #     所以私有仓库的克隆不会走镜像（会自动落到直连那次）。
+  #   * 镜像不通会自动回退直连：宁可慢一次，也不因镜像抽风把条目判死。
+  #
+  # 顺带一提：另一条路是宿主上配 git 的全局 url.*.insteadOf，但它**连 push 一起改写**，
+  # 于是推送会打到镜像上必然失败——那正是这里只做 clone/fetch 改写的原因。
+  clone_mirror: ""
+  # 镜像只对这些宿主生效（小写，不带协议/路径）。默认只认 github.com：
+  # gh-proxy 这一族只代理 GitHub，把 GitLab / Gitee / AtomGit 的地址也往它身上送，
+  # 等于把仓库名白送给一个第三方而且还必然失败。留空 = 不限制宿主（自建镜像用）。
+  clone_mirror_hosts: ["github.com"]

@@ -194,7 +194,17 @@ budget_exceeded, needs_manual`）。
 `webhooks.enabled: false` + `webhooks.secrets.{github,gitlab,gitee,atomgit}`；
 `export.output_dir: ./data/exports`；
 `platforms.label_cache_ttl_seconds: 600` · `label_concurrency: null` ·
-`max_retry_after_seconds: 300` · `max_retries: 4`。
+`max_retry_after_seconds: 300` · `max_retries: 4` ·
+`clone_mirror: ""` · `clone_mirror_hosts: ["github.com"]`。
+
+> **克隆镜像**（`platforms.clone_mirror`）治的是「连不上托管站点」：
+> `克隆失败：fatal: unable to access 'https://github.com/…': Connection timed out after
+> 300036 milliseconds` 不是抖动，而是那条 443 根本不通，重试只会再等一遍。
+> 填一个前缀即可（`https://v6.gh-proxy.org/` → `https://v6.gh-proxy.org/https://github.com/o/r.git`，
+> 结尾 `/` 漏了会在加载期补齐）。三条边界：只用于 **clone / fetch**（推送直连真站点）、
+> 只做**匿名**克隆（令牌绝不发给第三方镜像，私有仓库因此不镜像）、镜像失败**自动回退直连**。
+> `clone_mirror_hosts` 决定哪几个宿主适用，留空 = 不限制（自建镜像）。
+> 宿主上配 git 的 `url.*.insteadOf` 也能通，但它连 `push` 一起改写——推不上去，别用。
 
 ## 4. 启动期校验（fail-closed）
 

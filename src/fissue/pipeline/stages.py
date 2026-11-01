@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -95,6 +96,111 @@ class BatchResult:
             f"{self.repo}：评测 {self.evaluated}，验证 {self.verified}，"
             f"入队 {self.queued}，跳过 {self.skipped}，失败 {self.failed}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 验证的重试与失败落档（CLI / Web / 常驻服务共用同一套语义）
+# ---------------------------------------------------------------------------
+
+
+#: 只有这类「环境错误」值得重试。验证器自身写错（自错）由 runner 内部的修正回路处理，
+#: 在这里重试只会重复烧 LLM 的钱而不改变结论。
+_TRANSIENT_ERROR_MARKERS = (
+    "克隆失败",
+    "GitError",
+    "git 超时",
+    "网络错误",
+    "连接失败",
+    "超时",
+    "timed out",
+    "timeout",
+    "Connection",
+    "LLM 服务错误",
+    "LLM 请求失败",
+)
+
+#: stage 自己写下的这些状态**比「跑挂了」更具体**（转人工 / 跳过 / 待修 / 已打标），
+#: 失败落档不该把它们的含义盖掉。只有在「还在半路上」（new / evaluated / queued…）
+#: 才落 FAILED。
+_SETTLED_STATUSES = frozenset(
+    {
+        ItemStatus.NEEDS_MANUAL,
+        ItemStatus.SKIPPED,
+        ItemStatus.FIX_QUEUED,
+        ItemStatus.LABELED,
+        ItemStatus.PR_CREATED,
+        ItemStatus.FAILED,
+    }
+)
+
+
+def is_transient_verify_error(error: str) -> bool:
+    """这条失败是不是「再试一次可能就好了」的环境错误。"""
+    return any(marker in error for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def mark_verify_failed(ctx: RuntimeContext, key: str) -> bool:
+    """把验证失败的条目落到 ``FAILED``；stage 已写下更具体的结论则不动它。
+
+    **为什么必须落档**：留在原处（``evaluated`` / ``queued``）在界面上就是
+    「验证 · 排队中 · 尚未生成验证器」——看上去像一条还没开始的条目，于是人只会
+    「再等等」，而实际这一步已经失败了。实测就是这么白等了一轮：``fissue verify``
+    明明把 ``GitError: 克隆失败：… Connection timed out`` 打到了屏幕上，WebUI 里
+    却还挂着「排队中」。
+
+    ``FAILED`` 不是死局：``fissue requeue --failed`` 会按已有结论把条目退回该走的
+    下一步（有评测 → ``evaluated``，没有 → ``new``），所以「落档」与「可重试」
+    并不冲突——这正是常驻服务那侧一直以来的口径（重试用尽后落 ``FAILED``）。
+    """
+    item = ctx.repo.get_item(key)
+    if item is not None and item.status in _SETTLED_STATUSES:
+        return False
+    ctx.repo.set_item_status(key, ItemStatus.FAILED)
+    return True
+
+
+async def verify_with_retry(
+    ctx: RuntimeContext,
+    stage: Any,
+    item: RawItem,
+    evaluation: Any,
+    *,
+    max_retries: int,
+    on_retry: Callable[[int, str, float], None] | None = None,
+) -> StageResult:
+    """跑一条验证：环境错误退避重试，用尽后**落 FAILED** 并返回带 ``error`` 的结果。
+
+    这个函数存在的原因是「三处调用方各写一遍，然后各错一遍」：
+
+    * ``VerifyStage`` 刻意把异常**上抛**（见它末尾的注释）——失败落档交给调用方，
+      这样常驻服务的退避重试才有机会跑；
+    * 常驻服务照做了（重试用尽 → ``FAILED``），CLI 与 Web 却只把错误打到屏幕上就
+      撒手，于是同一次失败在三处留下三种事实；
+    * 收进这里之后，「重试几次、什么算可重试、失败落到哪儿」只有一份实现。
+
+    返回值仍是 ``StageResult``（带 ``error``）而不是抛异常：调用方通常在一个
+    ``asyncio.gather`` / 循环里跑一批，抛出去会连累已经跑完的那几条。
+    """
+    last_error = ""
+    delay = 2.0
+    for attempt in range(1, max_retries + 2):
+        try:
+            return await stage.run(item, evaluation)
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if attempt > max_retries or not is_transient_verify_error(last_error):
+                break
+            log.warning(
+                "验证失败（第 %d 次，将重试）%s：%s", attempt, item.key, last_error[:200]
+            )
+            if on_retry is not None:
+                on_retry(attempt, last_error, delay)
+            await asyncio.sleep(delay + random.uniform(0, 0.5))
+            delay = min(delay * 2, 30.0)
+
+    mark_verify_failed(ctx, item.key)
+    log.error("验证失败（已用尽重试）：%s：%s", item.key, last_error)
+    return StageResult(key=item.key, error=last_error)
 
 
 # ---------------------------------------------------------------------------
@@ -742,11 +848,15 @@ class PRVerifyStage:
         # 退路：直接抓源分支
         if item.head_repo and item.head_branch:
             fetched = ws.fetch("origin", f"refs/heads/{item.head_branch}")
-            if not fetched:
+            # 抓源分支也是**读**，所以先试镜像；镜像不通再回直连（顺序与克隆一致）。
+            direct, mirror = self.ctx.clone_url_pair(adapter.clone_url(ref))
+            for url in [u for u in (mirror, direct) if u]:
+                if fetched:
+                    break
                 fetched = (
                     await asyncio.to_thread(
                         ws._git,
-                        ["git", "fetch", "--depth", "50", adapter.clone_url(ref), item.head_branch],
+                        ["git", "fetch", "--depth", "50", url, item.head_branch],
                     )
                 ).ok
             if fetched:

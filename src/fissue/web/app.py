@@ -637,7 +637,7 @@ async def _work_evaluate(app: FastAPI, params: dict[str, Any], report: Report) -
 
 
 async def _work_verify(app: FastAPI, params: dict[str, Any], report: Report) -> dict[str, Any]:
-    from ..pipeline.stages import PRVerifyStage, VerifyStage
+    from ..pipeline.stages import PRVerifyStage, VerifyStage, verify_with_retry
 
     ctx = _ctx_of(app)
     keys = list(params.get("keys") or [])
@@ -651,25 +651,25 @@ async def _work_verify(app: FastAPI, params: dict[str, Any], report: Report) -> 
         return {"processed": 0, "results": []}
     stage_issue, stage_pr = VerifyStage(ctx), PRVerifyStage(ctx)
     report(f"开始验证 {len(items)} 条")
+    # 与 CLI / 常驻服务同一套语义：环境错误退避重试，用尽后把条目落 failed。
+    # 原先这里既不重试也不落档——一次克隆抖动就把条目留在 evaluated，
+    # 界面上还是「排队中」，而接口返回里那句 error 谁也看不见。
+    max_retries = max(0, ctx.settings.verifier.item_retries)
     out: list[dict[str, Any]] = []
     for index, item in enumerate(items, start=1):
         ev = ctx.repo.latest_evaluation(item.key)
         stage = stage_issue if item.item_type is ItemType.ISSUE else stage_pr
         report(f"[{index}/{len(items)}] 验证 {item.key}")
-        try:
-            r = await stage.run(item, ev)
-        except Exception as exc:
-            # 验证阶段现在把瞬时故障**上抛**（好让常驻服务那侧带退避重试，见 VerifyStage），
-            # 所以这里必须逐条兜住——否则一条失败会让整批结果全丢、端点直接 500。
-            out.append(
-                {
-                    "key": item.key,
-                    "reproduced": False,
-                    "queued": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            continue
+        r = await verify_with_retry(
+            ctx,
+            stage,
+            item,
+            ev,
+            max_retries=max_retries,
+            on_retry=lambda attempt, error, delay, _key=item.key: report(
+                f"{_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），{delay:.0f}s 后重试"
+            ),
+        )
         out.append(
             {
                 "key": r.key,
