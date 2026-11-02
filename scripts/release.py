@@ -43,6 +43,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
+try:  # 本机有 HTTPS 中间人时，truststore 让 httpx 走系统信任库
+    import truststore
+
+    truststore.inject_into_ssl()
+except Exception:  # pragma: no cover - 没有它也能跑，只是本机代理环境可能 TLS 失败
+    pass
+
+import httpx  # noqa: E402  (必须在 truststore 之后导入)
+
+# 证书口径只有一份：项目里所有 httpx 客户端都必须显式传 `verify=httpx_verify()`
+# （`tests/test_net.py::test_guard_all_httpx_clients_pass_verify` 会检查这一点）。
+from fissue.net import httpx_verify  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
@@ -213,12 +226,8 @@ def _http_post(url: str, payload: dict[str, Any], token: str) -> tuple[int, str]
     单独抽出来是为了让用例能只替换这一层：发布脚本的网络逻辑本来就该薄到「没有可测的
     东西」，可测的是「发出去的 payload 长什么样」。
     """
-    import httpx
-    import truststore
-
-    # 系统信任库：企业代理 / 抓包工具的根证书不在 certifi 里（见 fissue/net.py 的同一坑）。
-    truststore.inject_into_ssl()
-    with httpx.Client(timeout=60.0) as client:
+    # verify：企业代理 / 抓包工具的根证书不在 certifi 里（见 fissue/net.py 的同一坑）。
+    with httpx.Client(timeout=60.0, verify=httpx_verify()) as client:
         resp = client.post(
             url,
             json=payload,
