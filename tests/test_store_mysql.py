@@ -211,11 +211,18 @@ def test_oldest_unflushed_age_survives_naive_datetimes(repo: Repository) -> None
 
 
 def test_force_fix_column_migration_readds_on_mysql(repo: Repository, db: Database) -> None:
-    """补列迁移走 ``information_schema``：删掉列后 ``ensure_schema`` 必须补回来。
+    """补列迁移走 ``information_schema``：库落后时，``ensure_schema`` 必须把列补回来。
 
-    MySQL 的两个替代方案都不存在：没有 ``ADD COLUMN IF NOT EXISTS``（那是 PostgreSQL），
-    也没有 ``PRAGMA table_info``（那是 SQLite）。这条路径写错的表现是
+    MySQL 的两个替代方案都不存在：没有 ``ADD COLUMN IF NOT EXISTS``（那是 PostgreSQL，
+    SQLite 也有），也没有 ``PRAGMA table_info``（那是 SQLite）。这条路径写错的表现是
     ``OperationalError: (1064, 'You have an error in your SQL syntax')``——只在真机出现。
+
+    **版本号必须一起打回落后**（2026-11-02 修）：``fissue_meta.schema_version`` 落地后，
+    「已是最新版本」的库启动时**刻意不探列**（远端库上探针是十几次往返，
+    ``tests/test_store.py::test_up_to_date_database_skips_column_probes`` 守的就是这条）。
+    所以「删掉列 → 新实例 ensure_schema → 补回来」只在**库落后**时成立——也正是生产里
+    「老库升级上来」的那条路径。此前这条用例指望新实例无条件重跑迁移，版本表落地当天就
+    失效了；而 CI 的 MySQL job 当时正卡在容器初始化，一次都没跑到，谁也没发现。
     """
     rid = _repo_id(repo)
     item = _issue()
@@ -223,6 +230,8 @@ def test_force_fix_column_migration_readds_on_mysql(repo: Repository, db: Databa
 
     with db.engine.begin() as conn:
         conn.execute(text("ALTER TABLE items DROP COLUMN force_fix"))
+        # 把版本打回落后：这才是「探针该被跑到」的合法场景
+        conn.execute(text("DELETE FROM fissue_meta WHERE k = 'schema_version'"))
         cols = {
             row[0]
             for row in conn.execute(
@@ -234,7 +243,6 @@ def test_force_fix_column_migration_readds_on_mysql(repo: Repository, db: Databa
         }
     assert "force_fix" not in cols, "前提没造成：列没删掉"
 
-    # 新实例才有「本进程还没建过表」的标记，ensure_schema 才会真的跑迁移
     fresh = Database(MYSQL_URL)
     fresh.ensure_schema()
 

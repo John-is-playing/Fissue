@@ -81,6 +81,12 @@
   就直接查 `information_schema` 断言表排序规则以 `utf8mb4` 开头、并核对每个索引 <= 3072
   字节；而 MySQL 8.0 默认就是 utf8mb4。这比启动参数更强：断的是真实库状态。
 - 顺带把「只能放 docker create 参数」写进注释，免得下次再有人往 `options` 里加 mysqld 参数。
+- **恢复运行后立刻暴露第二处问题**：`test_force_fix_column_migration_readds_on_mysql` 失败
+  （`ensure_schema 没能把 force_fix 补回来`）。根因不在迁移代码——`fissue_meta.schema_version`
+  落地后，「版本已最新」的库启动时**刻意不探列**（`test_up_to_date_database_skips_column_probes`
+  守的就是这条，理由是真远端库上探针是十几次往返），而这条 MySQL 用例仍按「新实例就会重跑
+  迁移」的旧前提写。于是修用例：删列的同时把版本号打回落后，模拟生产里真正需要探针的
+  「老库升级」路径。这两条用例一个都没在 CI 上跑过，所以两个月来谁也没发现它们互相矛盾。
 
 ### 新增 —— 发布流程固化成 `scripts/release.py`
 
