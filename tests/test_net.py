@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import ssl
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -504,21 +505,57 @@ _SCAN_SKIP_DIRS = {
 }
 
 
+def _git_ignored(paths: list[Path]) -> set[Path]:
+    """返回其中**被 ``.gitignore`` 忽略**的路径。
+
+    为什么要问 git，而不是再维护一份目录名单：``REPO_ROOT.rglob("*.py")`` 会扫到
+    ``temp/`` 这类本地产物目录，于是任何人放个草稿脚本进去，这条守卫就在**自己机器上**
+    红、在 CI 上绿（``temp/`` 不进版本库）——同一条规则两个结论，人就会开始不信这条
+    测试。名单式修法（把 ``temp`` 加进 ``_SCAN_SKIP_DIRS``）只是等下一个草稿目录再来一次。
+
+    没有 git（源码 tarball、CI 里没装 git）时返回空集：退化为只按
+    ``_SCAN_SKIP_DIRS`` 过滤，守卫在那种环境下照旧生效，只是多扫几个目录。
+    """
+    if not paths:
+        return set()
+    rel = [p.relative_to(REPO_ROOT).as_posix() for p in paths]
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "check-ignore", "--stdin"],
+            input="\n".join(rel).encode("utf-8"),
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - 无 git 的环境
+        return set()
+    # 0 = 至少一条被忽略；1 = 一条都没有；其它（128…）= 不是 git 仓库 / git 不可用
+    if proc.returncode not in (0, 1):  # pragma: no cover - 无 git 的环境
+        return set()
+    lines = proc.stdout.decode("utf-8", "surrogateescape").splitlines()
+    return {REPO_ROOT / line for line in lines if line}
+
+
 def _iter_python_files() -> list[Path]:
-    """遍历仓库里所有 .py 文件（跳过虚拟环境与缓存目录）。
+    """遍历仓库里所有 .py 文件（跳过虚拟环境、缓存目录与 ``.gitignore`` 忽略的路径）。
 
     五套夹具的**仓库本体**都放在 ``demo/<kit>/repo/`` 下，这里**不做**特例跳过——
     它们与仓库其余代码同样受「httpx 客户端必须显式传 verify=」这条守卫约束
     （夹具仓库里没有 httpx 用法，所以扫到也不会误报）。
     此前 textkit 是个特例（仓库直接放在 ``demo/textkit/``，靠一条路径前缀整段跳过），
     布局统一后那条特例撤销了——**特例本身就是漂移的来源**。
+
+    扫描范围因此是「仓库代码」而不是「磁盘上的 .py」：``git check-ignore`` 说了算，
+    它同时满足两侧——被忽略的本地产物不算代码，**未提交但没被忽略的新文件仍然算**
+    （守卫不该因为「还没 git add」就放过新代码）。
     """
-    out: list[Path] = []
-    for path in REPO_ROOT.rglob("*.py"):
-        if any(part in _SCAN_SKIP_DIRS for part in path.relative_to(REPO_ROOT).parts):
-            continue
-        out.append(path)
-    return out
+    candidates = [
+        path
+        for path in REPO_ROOT.rglob("*.py")
+        if not any(part in _SCAN_SKIP_DIRS for part in path.relative_to(REPO_ROOT).parts)
+    ]
+    ignored = _git_ignored(candidates)
+    return [path for path in candidates if path not in ignored]
 
 
 def _builds_httpx_client(call: ast.Call) -> bool:
@@ -608,6 +645,37 @@ def test_guard_actually_finds_httpx_calls() -> None:
     """
     calls = _collect_httpx_calls()
     assert len(calls) >= 4, f"只扫描到 {len(calls)} 处 httpx 调用，守卫可能失效了：{calls}"
+
+
+def test_guard_skips_gitignored_scratch_files() -> None:
+    """被 ``.gitignore`` 忽略的目录里的 .py 不参与扫描（``temp/`` 这类本地草稿）。
+
+    没有这条用例，草稿脚本会让**本机**红、CI 绿：``temp/`` 不进版本库，CI 上根本
+    没有那些文件。守卫要守的是「仓库代码」，不是「这台机器磁盘上的 .py」。
+    """
+    scratch = REPO_ROOT / "temp" / "_guard_ignored_probe.py"
+    scratch.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        scratch.write_text("import httpx\nc = httpx.Client(timeout=1)\n", encoding="utf-8")
+        names = {path.relative_to(REPO_ROOT).as_posix() for path in _iter_python_files()}
+        assert "temp/_guard_ignored_probe.py" not in names
+    finally:
+        scratch.unlink(missing_ok=True)
+
+
+def test_guard_still_scans_untracked_but_not_ignored_files() -> None:
+    """反过来：**未被忽略的未提交文件**必须照旧被扫到。
+
+    否则「按 .gitignore 过滤」会顺手把新代码也放走——守卫只该认忽略规则，
+    不该认「有没有 ``git add``」。
+    """
+    probe = REPO_ROOT / "_guard_untracked_probe.py"
+    try:
+        probe.write_text("import httpx\nc = httpx.Client(timeout=1)\n", encoding="utf-8")
+        names = {path.name for path in _iter_python_files()}
+        assert "_guard_untracked_probe.py" in names
+    finally:
+        probe.unlink(missing_ok=True)
 
 
 def test_guard_detects_a_deliberately_unverified_client(tmp_path: Path) -> None:
