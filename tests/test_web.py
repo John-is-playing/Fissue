@@ -1408,6 +1408,81 @@ def test_stats_cache_build_failure_keeps_stale_snapshot() -> None:
         cache.stop()
 
 
+# -- 空闲降频：没人看的时候不该继续每 2 秒重算一次聚合 -------------------------
+
+
+def _cache_with_last_read(seconds_ago: float) -> Any:
+    """造一个「上次被读是 ``seconds_ago`` 秒前」的缓存（不起线程）。"""
+    from fissue.web.cache import StatsCache
+
+    cache = StatsCache(lambda: {"ok": True}, interval=2.0)
+    cache._read_at = time.monotonic() - seconds_ago
+    return cache
+
+
+def test_stats_cache_keeps_normal_cadence_while_someone_reads() -> None:
+    """刚被读过（有人在看）：按配置的周期刷，别自作主张降频。
+
+    有人正在盯着看板时把刷新拖到 30 秒一次，等于把「实时」改成了「差不多」。
+    """
+    from fissue.web.cache import REFRESH_SECONDS
+
+    cache = _cache_with_last_read(0.0)
+    refresh, wait = cache._next_action(time.monotonic())
+    assert (refresh, wait) == (True, 2.0)
+    assert wait <= REFRESH_SECONDS
+
+
+def test_stats_cache_slows_down_after_a_minute_without_reads() -> None:
+    """一分钟没人读：仍然刷，但降到 IDLE_INTERVAL。
+
+    这才是这条策略的收益所在——看板开着没人动、或页面留在后台标签，实例不该
+    继续按 2 秒一次打十来次数据库往返。
+    """
+    from fissue.web.cache import IDLE_INTERVAL, StatsCache
+
+    cache = _cache_with_last_read(120.0)
+    assert cache._next_action(time.monotonic()) == (True, IDLE_INTERVAL)
+    # 降频只影响后台线程，不影响前台语义：仍然立刻返回快照。
+    assert isinstance(cache, StatsCache)
+
+
+def test_stats_cache_stops_refreshing_once_dormant() -> None:
+    """十分钟没人读：这一圈**不刷**（判据是 refresh 为 False，而不是「刷得快一点」）。
+
+    过夜挂着的实例连聚合查询都不该发；醒来仍按 IDLE_INTERVAL 判一次，那是一次
+    内存判断，不是数据库往返。
+    """
+    from fissue.web.cache import IDLE_INTERVAL
+
+    cache = _cache_with_last_read(3600.0)
+    assert cache._next_action(time.monotonic()) == (False, IDLE_INTERVAL)
+
+
+def test_stats_cache_bump_forces_refresh_even_when_dormant() -> None:
+    """作业完成能穿透休眠：否则用户回来看到的是作业**之前**的数字。"""
+    cache = _cache_with_last_read(3600.0)
+    cache.bump()
+    refresh, wait = cache._next_action(time.monotonic())
+    assert refresh is True, "bump 之后必须真的刷一轮，不能只把线程叫醒就继续睡"
+    assert wait == 2.0
+
+
+def test_stats_cache_read_wakes_a_dormant_cache() -> None:
+    """休眠中的缓存被读一次就该醒：用户回到页面不该先等一个 IDLE_INTERVAL。"""
+    from fissue.web.cache import DORMANT_AFTER_SECONDS, StatsCache
+
+    cache = StatsCache(lambda: {"ok": True}, interval=2.0)
+    cache._snapshot = {"ok": True}
+    cache._refreshed_at = time.monotonic() - 3600.0
+    cache._read_at = time.monotonic() - (DORMANT_AFTER_SECONDS + 60.0)
+
+    assert cache.get() == {"ok": True}
+    assert cache._wakeup.is_set(), "休眠后第一次读取必须唤醒后台线程"
+    # 读取本身就把「有人在看」记上了：下一圈恢复正常节奏。
+    assert cache._next_action(time.monotonic())[1] == 2.0
+
+
 def test_collect_with_cached_aggregates_matches_live(client) -> None:
     """``collect`` 传入缓存聚合与现算必须逐项一致（口径不能因缓存而变）。"""
     from fissue.web import status as st_mod
@@ -1929,3 +2004,14 @@ def test_no_page_links_to_the_removed_status_page(client) -> None:  # noqa: ANN0
     for path in ("/", "/items", "/jobs", "/pipeline", "/repos", "/settings", "/setup", "/api-keys"):
         html = client.get(path).text
         assert 'href="/status"' not in html, f"{path} 上还有指向已删状态页的链接"
+
+
+def test_settings_page_states_known_platform_limits(client) -> None:  # noqa: ANN001
+    """设置页要在「填令牌的地方」就说清这个平台已知做不到什么。
+
+    只写在 BENCHMARK.md 里，用户会一路配到 `fissue fix` 阶段才撞上 404——而他当时
+    以为问题出在自己的令牌。结论前置的成本只是一行字。
+    """
+    html = client.get("/settings").text
+    assert "建/改 Issue 返回 404" in html, "Gitee 的已知限制必须写在平台令牌区块里"
+    assert "尚未测量" in html, "AtomGit/GitLab 的未测能力要标注成「没测过」，而不是「不行」"
