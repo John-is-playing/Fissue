@@ -547,3 +547,288 @@ def test_assert_on_branch_catches_redirection(tmp_path: Path) -> None:
 
     msg = ws.assert_on_branch("fissue/other")
     assert msg and "拒绝提交" in msg, f"应当拒绝：{msg}"
+
+
+# ---------------------------------------------------------------------------
+# 克隆通路的失败面：超时、回退、残留清理、报错脱敏
+# ---------------------------------------------------------------------------
+#
+# 这一组全部打在 `subprocess.run` 上，而不是打在 `_git` 上：`_git` 里那个
+# `except TimeoutExpired → GitResult(ok=False)` 才是「不再空等 300 秒」的落点，
+# 桩掉 `_git` 就正好把它绕过去了。假执行器一次性抛异常，测试里不 sleep 一秒。
+
+
+class _SubprocessProbe:
+    """假 `subprocess.run`：按被 clone 的 URL 决定「超时 / 报错 / 成功」。
+
+    为什么要带上「超时」这一档：生产上炸的就是 `Connection timed out after 300036
+    milliseconds`——真等一次要 300 秒，任何测试都不可能这么跑。用 `TimeoutExpired`
+    一次性表达同一个事实，`_git` 的处理分支完全一样。
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout_urls: tuple[str, ...] = (),
+        fail_urls: tuple[str, ...] = (),
+        stderr: str = "",
+        returncode: int = 128,
+        materialize: bool = False,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.timeout_urls = timeout_urls
+        self.fail_urls = fail_urls
+        self.stderr = stderr
+        self.returncode = returncode
+        # `materialize=True` 时先在目标位置建出目录：真 `git clone` 失败前往往已经
+        # 写出了半个工作副本，残留正是要断言清理掉的东西。
+        self.materialize = materialize
+
+    def __call__(self, cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(cmd))
+        url = cmd[-2] if "clone" in cmd else ""
+        if self.materialize and "clone" in cmd:
+            target = Path(cmd[-1])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "partial.txt").write_text("half\n", encoding="utf-8")
+        if url in self.timeout_urls:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=600)
+        if url in self.fail_urls:
+            return subprocess.CompletedProcess(cmd, self.returncode, "", self.stderr)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    @property
+    def urls(self) -> list[str]:
+        """被真正尝试过的 URL 顺序（`git clone … <url> <target>` 里的倒数第二位）。"""
+        return [cmd[-2] for cmd in self.calls]
+
+
+def test_git_timeout_turns_into_a_failed_result_instead_of_raising(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """超时必须被 `_git` 收成一个 `ok=False` 的结果，而不是把异常抛到整条流水线上。
+
+    守住的事故：克隆那条 443 被墙时，子进程要干等到超时才返回；若这一层抛异常，
+    上游只能看到 `TimeoutExpired`，报错里既没有「克隆失败」也没有该改哪儿。
+    """
+
+    import fissue.workspace as ws_mod
+
+    def _boom(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=600)
+
+    monkeypatch.setattr(ws_mod.subprocess, "run", _boom)
+
+    result = RepoWorkspace(root=tmp_path / "repo")._git(["git", "clone", "https://example.invalid/x.git"])
+
+    assert result.ok is False
+    assert "超时" in result.stderr, result.stderr
+
+
+def test_clone_timeout_reports_a_reason_instead_of_empty_hands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """克隆超时必须以 `GitError` 收场，且原因里带「超时」二字。
+
+    守住的事故：超时曾经表现为一个空 stderr 的失败，条目还挂着「排队中」，看上去
+    像还没开始而不是失败了；人只会「再等等」，实际这一步永远不会有结果。
+    """
+    import fissue.workspace as ws_mod
+
+    probe = _SubprocessProbe(timeout_urls=(DIRECT,))
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    with pytest.raises(GitError) as err:
+        RepoWorkspace.clone(DIRECT, token="tok", dest=tmp_path / "repo")
+
+    message = str(err.value)
+    assert "克隆失败" in message and "超时" in message, message
+
+
+def test_mirror_timeout_falls_back_to_the_direct_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """镜像那次超时不能就此放弃——继续走直连那次，并只记一条「镜像 + 直连」的尝试序列。
+
+    守住的事故：镜像本身也会挂（代理到期、镜像站点被限流）。把它当终点就等于
+    「配了镜像反而更糟」：没配镜像时直连还能通，配了之后一次都不试直连。
+    """
+    import fissue.workspace as ws_mod
+
+    probe = _SubprocessProbe(timeout_urls=(MIRROR,))
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    ws = RepoWorkspace.clone(DIRECT, mirror_url=MIRROR, token="tok", dest=tmp_path / "repo")
+
+    assert probe.urls == [MIRROR, DIRECT], "镜像超时后必须再试直连"
+    assert ws.cloned_from == DIRECT, "最终取到代码的是直连那次"
+
+
+def test_clone_failure_removes_the_half_written_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """克隆失败要把已经写了一半的目标目录删掉（否则下一次尝试直接撞上「目录非空」）。
+
+    守住的事故：镜像 → 直连的两条路共用一个 `dest`；第一次留下的半个工作副本会让
+    第二次 `git clone` 报 `destination path already exists and is not an empty
+    directory`，于是「回退到直连」这条兜底永远走不通。
+    """
+    import fissue.workspace as ws_mod
+
+    target = tmp_path / "repo"
+    probe = _SubprocessProbe(fail_urls=(DIRECT,), stderr="fatal: early EOF", materialize=True)
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    with pytest.raises(GitError):
+        RepoWorkspace.clone(DIRECT, token="tok", dest=target)
+
+    assert not target.exists(), "失败留下的半个工作副本必须被清掉"
+
+
+def test_clone_failure_removes_the_outer_temp_dir_it_created(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """不指定 `dest` 时，失败要连外层临时目录一起删（一次失败漏一个，失败现在有两次）。
+
+    守住的事故：`cleanup()` 只删 `<mkdtemp>/repo`，外层 `fissue-repo-*` 会留下来。
+    镜像 + 直连各失败一次就是每次漏两个目录，长跑的服务上磁盘只涨不落。
+    """
+    import fissue.workspace as ws_mod
+
+    outer = tmp_path / "fissue-repo-abc"
+
+    def _mkdtemp(prefix: str = "") -> str:  # noqa: ARG001
+        return str(outer)
+
+    probe = _SubprocessProbe(
+        fail_urls=(MIRROR, DIRECT), stderr="fatal: early EOF", materialize=True
+    )
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+    monkeypatch.setattr(ws_mod.tempfile, "mkdtemp", _mkdtemp)
+
+    with pytest.raises(GitError):
+        RepoWorkspace.clone(DIRECT, mirror_url=MIRROR, token="tok")
+
+    assert not outer.exists(), "失败后外层临时目录也必须删掉"
+
+
+def test_clone_failure_redacts_the_token_from_the_reported_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """克隆失败的报错里不能出现令牌原文——它会直接进日志、进 WebUI、进人工报告。
+
+    守住的事故：私有仓库克隆失败时 git 会把整个 URL（含内联凭据）或服务端的
+    鉴权回显写进 stderr，而这条 stderr 现在会被 `str(exc)` 原样落档。
+    """
+    import fissue.workspace as ws_mod
+
+    token = "SK-CLONE-SECRET-123"
+    probe = _SubprocessProbe(
+        fail_urls=(DIRECT,),
+        stderr=f"fatal: unable to access 'https://github.com/o/r.git/': 401 {token}",
+    )
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    with pytest.raises(GitError) as err:
+        RepoWorkspace.clone(DIRECT, token=token, dest=tmp_path / "repo")
+
+    assert token not in str(err.value), "令牌原文漏进了报错"
+    assert "***" in str(err.value), "令牌应当被替换成 ***"
+
+
+def test_clone_failure_keeps_a_non_network_error_verbatim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """仓库不存在 / 无权限这类错误要原样带出，且**不要**甩一句「去配 clone_mirror」。
+
+    守住的事故：给所有克隆失败都补「连不上站点」的指路，会让一个仓库名写错的
+    人在镜像配置上绕半天；指路只在真连不上时才该出现。
+    """
+    import fissue.workspace as ws_mod
+
+    probe = _SubprocessProbe(
+        fail_urls=(DIRECT,),
+        stderr="fatal: repository 'https://github.com/o/r.git/' not found",
+    )
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    with pytest.raises(GitError) as err:
+        RepoWorkspace.clone(DIRECT, token="tok", dest=tmp_path / "repo")
+
+    message = str(err.value)
+    assert "not found" in message, message
+    assert "clone_mirror" not in message, "非网络错误不该被指去配镜像"
+
+
+def test_clone_skips_the_mirror_when_it_points_at_the_same_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """镜像地址与直连地址相同时只试一次——否则同一个超时会被白等两遍。
+
+    守住的事故：有人把 `clone_mirror` 填成原站点（或填了个会被装配成原样的值），
+    于是「镜像 + 直连」等于对同一个不通的地址连试两次，耗时翻倍。
+    """
+    import fissue.workspace as ws_mod
+
+    probe = _SubprocessProbe()
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    ws = RepoWorkspace.clone(DIRECT, mirror_url=DIRECT, token="tok", dest=tmp_path / "repo")
+
+    assert probe.urls == [DIRECT], "镜像与直连是同一个地址时只该试一次"
+    assert ws.cloned_from == DIRECT
+
+
+def test_clone_omits_the_shallow_flag_when_depth_is_zero(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`depth=0` 表示要完整历史：命令行上不能出现 `--depth`（否则 git 直接报参数错）。
+
+    守住的事故：要跑 `git log` / 追溯提交的场合必须拿全量历史；拼参数时把
+    `--depth 0` 发出去，git 会以 `depth 0 is not a positive number` 拒绝克隆。
+    """
+    import fissue.workspace as ws_mod
+
+    probe = _SubprocessProbe()
+    monkeypatch.setattr(ws_mod.subprocess, "run", probe)
+
+    RepoWorkspace.clone(DIRECT, depth=0, dest=tmp_path / "repo")
+
+    assert "--depth" not in probe.calls[0], probe.calls[0]
+
+
+# ---------------------------------------------------------------------------
+# 清理路径：异常退出时也要把工作区收掉
+# ---------------------------------------------------------------------------
+
+
+def test_context_manager_cleans_up_even_when_the_body_raises(tmp_path: Path) -> None:
+    """`with` 块里抛异常时工作区照样要删掉——否则每条失败条目都在磁盘上留一份仓库。
+
+    守住的事故：验证器/修复器在 `with RepoWorkspace(...)` 里跑，LLM 报错、断言失败
+    都会从中间炸出去；若清理只写在正常返回那一路，失败条目就会持续堆积整份仓库
+    （还带着 `.git` 里的令牌可用的远端配置）。
+    """
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "a.txt").write_text("x\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="boom"), RepoWorkspace(root=root, slug="o/r"):
+        raise RuntimeError("boom")
+
+    assert not root.exists(), "异常退出后工作区必须被删掉"
+
+
+def test_cleanup_tolerates_a_workspace_that_is_already_gone(tmp_path: Path) -> None:
+    """重复清理 / 目录已不存在时 `cleanup` 不能抛——它常在 `finally` 里被调用。
+
+    守住的事故：清理放在异常处理路径上，自己再抛 `FileNotFoundError` 就会把真正的
+    失败原因盖掉，日志上只剩「删不掉目录」，查不到最初为什么失败。
+    """
+    root = tmp_path / "gone"
+    ws = RepoWorkspace(root=root, slug="o/r")
+
+    ws.cleanup()
+    ws.cleanup()
+
+    assert not root.exists()
