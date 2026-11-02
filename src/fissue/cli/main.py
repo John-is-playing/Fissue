@@ -446,16 +446,24 @@ def verify(
                         # 重试与**失败落档**都在 `verify_with_retry` 里：CLI 原先只把错误
                         # 打到屏幕上，条目还挂着 evaluated/queued——界面上就是「验证 ·
                         # 排队中 · 尚未生成验证器」，像一条还没开始的条目。
+                        # 用嵌套函数而不是 lambda：mypy 对「带默认参数捕获循环变量」的
+                        # lambda 推不出类型（Cannot infer type of lambda），而 `_key=item.key`
+                        # 这个默认值正是为了把当前条目绑进回调。
+                        def _on_retry(
+                            attempt: int, error: str, delay: float, _key: str = item.key
+                        ) -> None:
+                            emit(
+                                f"⚠️  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
+                                f"{delay:.0f}s 后重试"
+                            )
+
                         r = await verify_with_retry(
                             ctx,
                             stage,
                             item,
                             ev,
                             max_retries=max_retries,
-                            on_retry=lambda attempt, error, delay, _key=item.key: emit(
-                                f"⚠️  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
-                                f"{delay:.0f}s 后重试"
-                            ),
+                            on_retry=_on_retry,
                         )
                         elapsed = time.monotonic() - started
                         row = {

@@ -726,15 +726,20 @@ async def _work_verify(app: FastAPI, params: dict[str, Any], report: Report) -> 
         ev = ctx.repo.latest_evaluation(item.key)
         stage = stage_issue if item.item_type is ItemType.ISSUE else stage_pr
         report(f"[{index}/{len(items)}] 验证 {item.key}")
+        def _on_retry(
+            attempt: int, error: str, delay: float, _key: str = item.key
+        ) -> None:
+            report(
+                f"{_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），{delay:.0f}s 后重试"
+            )
+
         r = await verify_with_retry(
             ctx,
             stage,
             item,
             ev,
             max_retries=max_retries,
-            on_retry=lambda attempt, error, delay, _key=item.key: report(
-                f"{_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），{delay:.0f}s 后重试"
-            ),
+            on_retry=_on_retry,
         )
         out.append(
             {

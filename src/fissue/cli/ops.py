@@ -524,17 +524,22 @@ def force(
                 # 与 `fissue verify` 同一套：环境错误重试，用尽后落 failed。
                 # 原先这里连状态都不动——强制修复失败后条目还停在 evaluated，
                 # 再跑一次还是同一条，看不出已经失败过。
+                def _on_retry(
+                    attempt: int, error: str, delay: float, _key: str = k
+                ) -> None:
+                    emit(
+                        f"  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
+                        f"{delay:.0f}s 后重试",
+                        style="yellow",
+                    )
+
                 r = await verify_with_retry(
                     ctx,
                     stage,
                     item,
                     ctx.repo.latest_evaluation(k),
                     max_retries=max_retries,
-                    on_retry=lambda attempt, error, delay, _key=k: emit(
-                        f"  {_key} 第 {attempt} 次失败（{error.split(':', 1)[0]}），"
-                        f"{delay:.0f}s 后重试",
-                        style="yellow",
-                    ),
+                    on_retry=_on_retry,
                 )
                 if r.error:
                     fresh = ctx.repo.get_item(k)

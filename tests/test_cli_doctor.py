@@ -288,6 +288,10 @@ class _FakeWorkspace:
     """克隆/推送探测用的工作副本替身（不碰 git、不联网）。"""
 
     instances: list[_FakeWorkspace] = []
+    #: 真实现会记下「实际取到代码的 URL」（走镜像时是镜像地址），探测据此在 detail
+    #: 里标出「经镜像」。替身照抄这个形状；声明成类属性是为了让 mypy 知道它存在
+    #: ——`install()` 里给实例赋值，此前是「运行期有、类型上无」。
+    cloned_from: str = ""
 
     def __init__(self) -> None:
         self.calls: list[str] = []
