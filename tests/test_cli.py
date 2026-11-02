@@ -158,7 +158,11 @@ def test_status_json_output(cli_env: dict[str, str]) -> None:
     result = _run(["status", "--json"], cli_env)
 
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    # 只看 stdout：Click 8.2+ 的 `result.output` 混着 stderr（日志），而「日志一律写 stderr」
+    # 是这套 CLI 的口径（见 logging_setup）。新库首次启动会打一行「数据库 schema 版本 0 → 3」，
+    # 用 output 断言等于把「日志不许进 stdout」这条约定反过来写成了「stdout 不许有日志」的
+    # 伪失败——真进程里的那条口径由 test_status_json_is_clean_in_a_real_process 守着。
+    data = json.loads(result.stdout)
     assert set(data) >= {"repos_config", "sandbox", "items", "queues", "llm_usage_today"}
     assert "psf/requests" in data["repos_config"]
 

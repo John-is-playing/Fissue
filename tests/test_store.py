@@ -1567,3 +1567,107 @@ def test_old_database_gets_the_estimated_column(tmp_path) -> None:
         old_value = c.execute(text("select estimated from llm_usage where purpose='p'")).scalar()
     assert "estimated" in cols, "旧库必须补上新列"
     assert bool(old_value) is False, "旧数据默认是「非估算」，不能因补列被标成估算"
+
+
+# ---------------------------------------------------------------------------
+# schema 版本表：迁移从「每次启动把每条补列都探一遍」变成「落后时才探」
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_database_records_current_schema_version(tmp_path: Path) -> None:
+    """全新库建完之后，版本表里就该是最新版本号。
+
+    没有这条用例，「有没有把版本号写进去」没人守：``fissue_meta`` 一直是空的也能跑通
+    全部功能，只是每次启动都白探三条——功能正确、成本错误，最难被发现的那类退化。
+    """
+    from sqlalchemy import text
+
+    from fissue.store.db import SCHEMA_VERSION, Database
+
+    database = Database(f"sqlite:///{(tmp_path / 'fresh.db').as_posix()}")
+    database.create_all()
+
+    with database.engine.connect() as conn:
+        version = conn.execute(
+            text("select v from fissue_meta where k = 'schema_version'")
+        ).scalar()
+    assert version == str(SCHEMA_VERSION)
+
+
+def test_migration_registry_is_contiguous_and_append_only() -> None:
+    """迁移登记的版本号必须从 1 连续递增，且 ``SCHEMA_VERSION`` 就是最后一条。
+
+    这张登记表是「跑到哪了」的唯一依据：中间插一条、跳号或改号，已经上线的库就会
+    跳过某一步（少了列，查询直接 no such column）或重放某一步（ALTER 撞已有列）。
+    """
+    from fissue.store.db import MIGRATIONS, SCHEMA_VERSION
+
+    versions = [m.version for m in MIGRATIONS]
+    assert versions == list(range(1, len(MIGRATIONS) + 1)), "版本号必须从 1 连续递增"
+    assert versions[-1] == SCHEMA_VERSION
+    names = [m.name for m in MIGRATIONS]
+    assert len(set(names)) == len(names), "名字重复说明有人复制粘贴后忘了改"
+    targets = [(m.name.split(".")[0], m.column) for m in MIGRATIONS]
+    assert len(set(targets)) == len(targets), "同一张表的同一列不该有两条迁移"
+
+
+def test_old_database_without_version_table_replays_every_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """版本表不存在（任何老库）时，所有迁移都该重放一遍，然后记下最新版本。
+
+    重放是安全的，因为每条迁移自带探针（列已在就跳过 ALTER）。这条用例守的是另一半：
+    **别因为有了版本号，就把「老库首次升级」这条路径搞成空操作**。
+    """
+    from sqlalchemy import text
+
+    from fissue.store.db import MIGRATIONS, SCHEMA_VERSION, Database
+
+    database = Database(f"sqlite:///{(tmp_path / 'legacy.db').as_posix()}")
+    database.create_all()
+    with database.engine.begin() as conn:
+        conn.execute(text("DROP TABLE fissue_meta"))
+
+    seen: list[str] = []
+    original = Database._apply_column_migration
+
+    def _counting(
+        self: Database, probe: str | None, alter: str, column: str
+    ) -> None:
+        seen.append(column)
+        original(self, probe, alter, column)
+
+    monkeypatch.setattr(Database, "_apply_column_migration", _counting)
+    database._apply_migrations()
+
+    assert seen == [m.column for m in MIGRATIONS], "老库要把每条迁移都重放一次"
+    with database.engine.connect() as conn:
+        version = conn.execute(
+            text("select v from fissue_meta where k = 'schema_version'")
+        ).scalar()
+    assert version == str(SCHEMA_VERSION)
+
+
+def test_up_to_date_database_skips_column_probes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """版本号已是最新时，启动路径不该再探列——这正是版本表存在的理由。
+
+    只断言「没有调用 ``_apply_column_migration``」：探针就在它内部，探了就说明版本表
+    被绕过；而「探针很快」这种说法在远端库上并不成立，那是十几次往返。
+    """
+    from fissue.store.db import Database
+
+    database = Database(f"sqlite:///{(tmp_path / 'uptodate.db').as_posix()}")
+    database.create_all()
+
+    calls: list[str] = []
+
+    def _fake(
+        self: Database, probe: str | None, alter: str, column: str
+    ) -> None:
+        calls.append(column)
+
+    monkeypatch.setattr(Database, "_apply_column_migration", _fake)
+    database._apply_migrations()
+    assert calls == [], "版本已最新还在探列，说明版本表没起作用"

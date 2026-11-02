@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -110,6 +110,45 @@ def llm_usage_estimated_migration(dialect: str) -> tuple[str | None, str]:
     )
 
 
+class ColumnMigration(NamedTuple):
+    """一次「补列」迁移的登记项。
+
+    为什么要有这张登记表：此前每加一列就写一个 ``_migrate_xxx``，并在 ``create_all``
+    与 ``ensure_schema`` 两个入口各手抄一遍调用——漏抄一处就是「旧库上 no such column」
+    （树莓派部署时真炸过）。现在迁移是**一张有序表**，入口只调一次
+    :meth:`Database._apply_migrations`，顺序与幂等由 :data:`SCHEMA_VERSION` 兜住。
+    """
+
+    #: 版本号，从 1 开始连续递增；只能追加，不能改号（改号等于给旧库重放一次 DDL）。
+    version: int
+    #: 人类可读的名字，进日志与 ``fissue_meta``，排障时能对上「上次是哪一步没跑完」。
+    name: str
+    #: 探针要检查的列名（见 :meth:`Database._apply_column_migration`）。
+    column: str
+    #: 该迁移在各方言下的 ``(探针 SQL, ALTER SQL)``，纯函数、可单测。
+    ddl: Callable[[str], tuple[str | None, str]]
+
+
+#: 迁移登记表。**只追加、只改末尾**：版本号是「跑到哪了」的唯一依据，
+#: 中间插一条或改号，已经上线的库就会跳过或重放某一步。
+MIGRATIONS: tuple[ColumnMigration, ...] = (
+    ColumnMigration(1, "items.force_fix", "force_fix", force_fix_migration),
+    ColumnMigration(2, "llm_usage.estimated", "estimated", llm_usage_estimated_migration),
+    ColumnMigration(3, "evaluations.extras", "extras", evaluation_extras_migration),
+)
+
+#: 当前 schema 版本 = 最后一条迁移的版本号（空表时为 0）。
+SCHEMA_VERSION = MIGRATIONS[-1].version if MIGRATIONS else 0
+
+#: 迁移版本表。刻意用裸 DDL 而不是 ORM 表：老库升级上来时 ``items`` 这些表早就有了，
+#: 这张表必须**先于**任何列探针存在；而它只有两列短文本，用不上 ORM 的类型变体
+#: （MySQL 侧键列要 511 字符那套约束在这里不适用——64 字符 × utf8mb4 只有 256 字节）。
+_META_DDL = (
+    "CREATE TABLE IF NOT EXISTS fissue_meta ("
+    "k VARCHAR(64) NOT NULL PRIMARY KEY, v VARCHAR(255) NOT NULL)"
+)
+
+
 def ensure_sqlite_parent_dir(url: str) -> None:
     """SQLite 文件库：把父目录建出来。
 
@@ -205,9 +244,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         # Web/常驻服务的启动路径走这里（而不是 ensure_schema）——迁移必须两个入口都跑，
         # 否则旧库上任何带新列的查询都会 no such column（树莓派部署时实炸过）。
-        self._migrate_items_force_fix()
-        self._migrate_llm_usage_estimated()
-        self._migrate_evaluation_extras()
+        self._apply_migrations()
         self._schema_ready = True
         log.info("数据库表已就绪：%s", self._safe_url())
 
@@ -222,44 +259,61 @@ class Database:
         if self._schema_ready:
             return
         Base.metadata.create_all(self.engine)
-        self._migrate_items_force_fix()
-        self._migrate_llm_usage_estimated()
-        self._migrate_evaluation_extras()
+        self._apply_migrations()
         self._schema_ready = True
         log.debug("数据库表已确保存在：%s", self._safe_url())
 
-    def _migrate_items_force_fix(self) -> None:
-        """给旧库（建表时还没有 ``force_fix`` 列）补列。
+    def _apply_migrations(self) -> None:
+        """按版本号把还没跑过的补列迁移依序应用，然后记下新版本。
 
-        ``create_all`` 只建缺失的表、**不改**已存在的表——常驻服务的库是长跑的，
-        不加这一刀，旧库上任何带这列的查询都会 ``no such column`` 直接崩。
-
-        三种语法各不相同，所以按方言分派（判定在 :func:`force_fix_migration` 里，
-        是纯函数、可单测）：
-
-        * PostgreSQL：原生支持 ``ADD COLUMN IF NOT EXISTS``，一条语句搞定；
-        * MySQL：**不支持** ``IF NOT EXISTS``，也没有 ``PRAGMA``，先查
-          ``information_schema.columns`` 再 ``ALTER``；
-        * SQLite：先查 ``PRAGMA table_info`` 再 ``ALTER``。
-
-        全新库（列已随 create_all 建出）三条路径都是空操作。
+        为什么留着「探针」而不是只信版本号：版本号只能说明**我们**跑到哪一步了，
+        说明不了这个库有没有被人手工动过（或上次 ALTER 成功、写版本号前进程被杀）。
+        探针很便宜（一条 ``SELECT``），而漏补一列的代价是「所有带这列的查询直接
+        no such column」。版本号的作用只是把「每次启动都探三条」降成「落后时才探」。
         """
-        probe, alter = force_fix_migration(self.engine.dialect.name)
-        self._apply_column_migration(probe, alter, "force_fix")
+        current = self._read_schema_version()
+        for migration in MIGRATIONS:
+            if migration.version <= current:
+                continue
+            probe, alter = migration.ddl(self.engine.dialect.name)
+            self._apply_column_migration(probe, alter, migration.column)
+            log.info("已应用数据库迁移 v%d：%s", migration.version, migration.name)
+        if current != SCHEMA_VERSION:
+            self._write_schema_version(SCHEMA_VERSION)
+            log.info("数据库 schema 版本：%d → %d", current, SCHEMA_VERSION)
 
-    def _migrate_llm_usage_estimated(self) -> None:
-        """给旧库补 ``llm_usage.estimated`` 列（理由与 ``force_fix`` 相同）。
+    def _read_schema_version(self) -> int:
+        """读当前 schema 版本；版本表不存在时建出来并返回 0。
 
-        这一列让「预算统计里有多少是估算的」可被 SQL 直接复核；此前它只体现在
-        ``Usage`` 对象与日志里，事后查库看不出来。
+        老库升级上来时 ``fissue_meta`` 一定不存在，返回 0 让全部迁移再跑一遍——
+        它们幂等，代价是几条探针，换来「不必人工判断这次启动该跑哪几条」。
         """
-        probe, alter = llm_usage_estimated_migration(self.engine.dialect.name)
-        self._apply_column_migration(probe, alter, "estimated")
+        with self.engine.begin() as conn:
+            conn.execute(text(_META_DDL))
+            row = conn.execute(
+                text("SELECT v FROM fissue_meta WHERE k = 'schema_version'")
+            ).first()
+        if row is None:
+            return 0
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):  # pragma: no cover - 只有人工改坏才走得到
+            log.warning("fissue_meta.schema_version 不是整数（%r），按 0 处理", row[0])
+            return 0
 
-    def _migrate_evaluation_extras(self) -> None:
-        """给旧库补 ``evaluations.extras`` 列（理由与 ``force_fix`` 相同）。"""
-        probe, alter = evaluation_extras_migration(self.engine.dialect.name)
-        self._apply_column_migration(probe, alter, "extras")
+    def _write_schema_version(self, version: int) -> None:
+        """记录 schema 版本。
+
+        先 DELETE 再 INSERT：SQLite / PostgreSQL / MySQL 都认。三种方言的 upsert 语法
+        各不相同（``ON CONFLICT`` / ``ON DUPLICATE KEY``），为一张只放一行的表分三套
+        写法不值当。
+        """
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM fissue_meta WHERE k = 'schema_version'"))
+            conn.execute(
+                text("INSERT INTO fissue_meta (k, v) VALUES ('schema_version', :v)"),
+                {"v": str(version)},
+            )
 
     def _apply_column_migration(self, probe: str | None, alter: str, column: str) -> None:
         """按「探针查一列 → 缺了再 ALTER」执行一次补列（全新库是空操作）。"""
