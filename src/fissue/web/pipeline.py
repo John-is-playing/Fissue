@@ -28,7 +28,6 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from ..models import Category, ItemStatus, ItemType
-from .labels import STATUS_LABELS, status_label
 
 #: 流水线的阶段（键, 中文标签）。顺序即时间顺序。
 STAGES: tuple[tuple[str, str], ...] = (

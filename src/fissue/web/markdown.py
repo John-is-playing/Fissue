@@ -344,9 +344,7 @@ def render_patch_markup(text: str | None, *, max_lines: int = PATCH_MAX_LINES) -
         escaped = html.escape(line, quote=False)
         if line.startswith("@@"):
             cls = "d-hunk"
-        elif line.startswith("+++") or line.startswith("---"):
-            cls = "d-meta"
-        elif line.startswith("diff --git") or line.startswith("index "):
+        elif line.startswith(("+++", "---", "diff --git", "index ")):
             cls = "d-meta"
         elif line.startswith("+"):
             cls = "d-add"

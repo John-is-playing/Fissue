@@ -3440,9 +3440,8 @@ def _seed_verify_item(repo, sample_issue, status: ItemStatus = ItemStatus.EVALUA
 @pytest.fixture
 def _instant_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     """把退避等待抹掉：这几条验的是「重试几次 / 落在哪个状态」，不是等多久。"""
-    from fissue.workspace import GitError  # noqa: F401  —— 保持与其他用例同源导入
-
     import fissue.pipeline.stages as stages_mod
+    from fissue.workspace import GitError  # noqa: F401  —— 保持与其他用例同源导入
 
     async def _no_sleep(_seconds: float) -> None:
         return None

@@ -44,8 +44,8 @@ from ..models import ItemStatus, ItemType, QueueName
 from .auth import AUTH_PREFIX, page_guard_middleware
 from .auth import register as register_auth
 from .job_results import summarize_result
-from .markdown import render_markdown_inline_markup, render_markdown_markup, render_patch_markup
 from .jobs import Job, JobRegistry
+from .markdown import render_markdown_inline_markup, render_markdown_markup, render_patch_markup
 from .status import queue_panel
 
 log = get_logger(__name__)
@@ -222,20 +222,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 用的 token 直接摆给用户；英文原值留在各处的 title 里供对着 CLI/日志排查。
     # 词汇表本身住在 web/labels.py（CLI 与 API 仍输出英文原值，两者互不影响）。
     from .labels import (
-        action_label as _action_label,
-        fix_outcome_label as _fix_outcome_label,
-        platform_state_label as _platform_state_label,
-        status_label as _status_label,
-        verdict_label as _verdict_label,
-        verifier_kind_label as _verifier_kind_label,
+        action_label,
+        fix_outcome_label,
+        platform_state_label,
+        status_label,
+        verdict_label,
+        verifier_kind_label,
     )
 
-    templates.env.filters["status_label"] = _status_label
-    templates.env.filters["verdict_label"] = _verdict_label
-    templates.env.filters["action_label"] = _action_label
-    templates.env.filters["fix_outcome_label"] = _fix_outcome_label
-    templates.env.filters["verifier_kind_label"] = _verifier_kind_label
-    templates.env.filters["platform_state_label"] = _platform_state_label
+    templates.env.filters["status_label"] = status_label
+    templates.env.filters["verdict_label"] = verdict_label
+    templates.env.filters["action_label"] = action_label
+    templates.env.filters["fix_outcome_label"] = fix_outcome_label
+    templates.env.filters["verifier_kind_label"] = verifier_kind_label
+    templates.env.filters["platform_state_label"] = platform_state_label
     application.state.templates = templates
     # 进程启动时刻：状态页显示「已运行多久」。放在这里而不是 lifespan 里，是因为
     # `_ensure_state` 那条兜底路径（测试用 TestClient 不做上下文管理器）不会跑 lifespan，
