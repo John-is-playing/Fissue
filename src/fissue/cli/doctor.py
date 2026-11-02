@@ -347,6 +347,40 @@ async def _probe_write(
     return rows
 
 
+def _capability_rows(ref: RepoRef) -> list[dict[str, Any]]:
+    """把「已知能力」摊成表格行——**不探测**，只转述已经测过的结论。
+
+    为什么 result 用 ``⚠️`` 而不是 ``❌``：``❌`` 表示「这次探测失败」，会让命令以 1
+    退出；而这里是平台侧的已知限制（Gitee 建/改 Issue 404）。把它算成失败，等于让
+    ``doctor`` 在任何 Gitee 仓库上恒红——那是拿结论当故障，下一个人只会去查自己的令牌。
+    """
+    from ..platforms.capabilities import describe, known_limits
+
+    repo = f"{ref.platform.value}:{ref.owner}/{ref.name}"
+    caps = describe(ref.platform)
+    rows: list[dict[str, Any]] = []
+    for label, ok in known_limits(ref.platform):
+        if ok is False:
+            rows.append(
+                {
+                    "repo": repo,
+                    "probe": f"已知限制/{label}",
+                    "result": "⚠️",
+                    "detail": caps.known_limit or "实测不可用",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "repo": repo,
+                    "probe": f"已知限制/{label}",
+                    "result": "－",
+                    "detail": "尚未测量（不代表不可用）",
+                }
+            )
+    return rows
+
+
 def _summary(rows: list[dict[str, Any]]) -> tuple[int, int]:
     failed = [r for r in rows if r["result"] == "❌"]
     skipped = [r for r in rows if r["result"] == "－"]
@@ -367,6 +401,9 @@ async def _run(
     adapters: dict[Platform, Any] = {}
     try:
         for ref in targets:
+            # 静态结论先上表：它不需要令牌、也不发任何请求，所以放在令牌检查之前——
+            # 「这个平台建 Issue 已知不行」和「你的令牌配没配」是两件事。
+            rows.extend(_capability_rows(ref))
             token = settings.tokens.get(ref.platform)
             if not token:
                 rows.append(

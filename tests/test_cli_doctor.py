@@ -436,3 +436,31 @@ async def test_probe_push_reports_when_branch_cannot_be_deleted(
 
     assert row["result"] == "❌"
     assert "fissue-doctor-probe" in row["detail"] or PROBE_BRANCH in row["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 静态能力行：把「已知限制」搬进体检表，但不算作失败
+# ---------------------------------------------------------------------------
+
+
+def test_capability_rows_surface_known_limits_without_failing() -> None:
+    """已知限制用 ⚠️ 呈现，且不计入失败。
+
+    若用 ❌，``doctor`` 在任何 Gitee 仓库上都会以 1 退出——把结论当故障，
+    下一个人只会去查自己的令牌。
+    """
+    from fissue.cli.doctor import _capability_rows
+
+    rows = _capability_rows(RepoRef(platform=Platform.GITEE, owner="psf", name="requests"))
+    by_probe = {r["probe"]: r for r in rows}
+    assert by_probe["已知限制/建 Issue"]["result"] == "⚠️"
+    assert "404" in by_probe["已知限制/建 Issue"]["detail"]
+    failed, _skipped = _summary(rows)
+    assert failed == 0, "已知限制不该让命令失败"
+
+
+def test_capability_rows_are_empty_for_a_fully_measured_platform() -> None:
+    """全部实测通过的平台上不该多出噪音行。"""
+    from fissue.cli.doctor import _capability_rows
+
+    assert _capability_rows(REF) == []

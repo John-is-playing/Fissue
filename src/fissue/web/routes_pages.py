@@ -439,12 +439,20 @@ def _register_web_config(app: FastAPI, templates: Jinja2Templates) -> None:
     @app.get("/settings", response_class=HTMLResponse)
     async def settings_page(request: Request) -> HTMLResponse:
         """设置：LLM / 数据库 / 平台 token / Web 绑定与访问口令，并标注每个值的来源。"""
+        from ..platforms.capabilities import known_limit_text
         from .setup import settings_view
 
         return templates.TemplateResponse(
             request,
             "settings.html",
-            _page_context(request, nav="settings", view=settings_view(request, _settings(request))),
+            _page_context(
+                request,
+                nav="settings",
+                view=settings_view(request, _settings(request)),
+                # 平台「已知做不到/还没测」的结论：写在设置页而不是只写在 BENCHMARK.md，
+                # 因为用户是在这里填令牌、也是在这里以为「填完就什么都能干」。
+                platform_caps={p.value: known_limit_text(p) for p in Platform},
+            ),
         )
 
     @app.get("/setup", response_class=HTMLResponse)

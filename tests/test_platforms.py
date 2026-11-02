@@ -2195,3 +2195,61 @@ async def test_atomgit_add_labels_requires_dict_payload(atomgit) -> None:
     with pytest.raises(PlatformError):
         await atomgit.add_labels(REPO, 7, ["fissue"])
     assert not patch.called
+
+
+# ---------------------------------------------------------------------------
+# 已知能力矩阵：静态结论也要被钉住，否则它会悄悄过期
+# ---------------------------------------------------------------------------
+
+
+def test_capability_matrix_covers_every_platform() -> None:
+    """每个平台都要在矩阵里有条目——漏一个就会落进「全部未测量」的兜底里。
+
+    兜底本身是合理的（不认识就说不知道），但它会把「忘了登记」伪装成「没测过」，
+    于是一条实测过的结论就此消失在界面上。
+    """
+    from fissue.platforms.capabilities import CAPABILITIES
+
+    assert set(CAPABILITIES) == set(Platform)
+
+
+def test_gitee_issue_writes_are_marked_unsupported_with_a_reason() -> None:
+    """Gitee 建/改 Issue 的 404 要留在矩阵里，并带上原因。
+
+    这条结论只活在文档里时，用户是撞到 404 才知道的；写进矩阵后 ``doctor`` 与设置页
+    能在动手前说出来。原因非空同样重要——「不可用」三个字帮不了人排查。
+    """
+    from fissue.platforms.capabilities import describe
+
+    caps = describe(Platform.GITEE)
+    assert caps.create_issue is False and caps.update_issue is False
+    assert "404" in caps.known_limit
+
+
+def test_unmeasured_capabilities_stay_none_not_false() -> None:
+    """「没测过」必须是 ``None``，不能并进 ``False`` 或 ``True``。
+
+    并进 ``False`` 会让人去排查一个从没试过的能力；并进 ``True`` 更糟——那是替平台担保。
+    """
+    from fissue.platforms.capabilities import describe
+
+    assert describe(Platform.ATOMGIT).create_issue is None
+
+
+def test_known_limits_lists_only_non_true_capabilities() -> None:
+    """只有「不是 True」的能力才进列表；全通的平台返回空列表（界面据此不显示那一块）。"""
+    from fissue.platforms.capabilities import known_limits
+
+    assert known_limits(Platform.GITHUB) == []
+    labels = dict(known_limits(Platform.GITEE))
+    assert labels["建 Issue"] is False
+    assert "只读抓取" not in labels
+
+
+def test_known_limit_text_prefers_the_measured_reason() -> None:
+    """有实测原因就说原因；只有「没测过」时才说没测过；全通时说空串。"""
+    from fissue.platforms.capabilities import known_limit_text
+
+    assert "404" in known_limit_text(Platform.GITEE)
+    assert known_limit_text(Platform.GITHUB) == ""
+    assert known_limit_text(Platform.ATOMGIT).startswith("尚未测量：")
