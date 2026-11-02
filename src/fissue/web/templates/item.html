@@ -41,32 +41,32 @@
             {% if evaluation %}
               <span class="tag {{ evaluation.category.value }}">{{ evaluation.category.value }}</span>
               <span class="tag {{ evaluation.priority.value }}">{{ evaluation.priority.value }}</span>
-              <span class="small muted">真实性 {{ evaluation.authenticity }} · 重要性 {{ evaluation.importance }} · 难度 {{ evaluation.difficulty }}</span>
+              <span class="small muted expert-only">真实性 {{ evaluation.authenticity }} · 重要性 {{ evaluation.importance }} · 难度 {{ evaluation.difficulty }}</span>
               <div class="small muted">{{ evaluation.summary | truncate(110) }}</div>
             {% else %}<span class="muted">尚未评测</span>{% endif %}
           {% elif stage.key == 'verify' %}
             {% if verifier %}
-              <span class="tag">{{ verifier.kind.value }}</span>
-              <code class="small">{{ verifier.command or '（清单型，无命令）' }}</code>
+              <span class="tag expert-only" title="验证器形态：{{ verifier.kind.value }}">{{ verifier.kind.value | verifier_kind_label }}</span>
+              <code class="small expert-only">{{ verifier.command or '（清单型，无命令）' }}</code>
               {% if runs %}
                 {% set last = runs[0] %}
                 <span class="small {{ 'ok' if last.outcome.value == 'pass' else 'bad' }}">最近一次：{{ last.outcome.value }}</span>
               {% endif %}
               {% if regression %}
-                <span class="small {{ 'ok' if regression.status == 'pass' else ('bad' if regression.status == 'fail' else 'muted') }}">· 回归门 {{ regression.status }}</span>
+                <span class="small expert-only {{ 'ok' if regression.status == 'pass' else ('bad' if regression.status == 'fail' else 'muted') }}" title="回归门：确认修复没有把仓库原有测试改坏">· 回归门 {{ regression.status }}</span>
               {% endif %}
             {% else %}<span class="muted">尚未生成验证器</span>{% endif %}
           {% elif stage.key == 'judge' %}
             {% if conclusion %}
-              <span class="tag">{{ conclusion.verdict }}</span>
+              <span class="tag" title="裁决：{{ conclusion.verdict }}">{{ conclusion.verdict | verdict_label }}</span>
               <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
               <div class="small muted">{{ conclusion.reason | truncate(110) }}</div>
             {% else %}<span class="muted">尚未批量定论（等队列攒够或用「批量定论」）</span>{% endif %}
           {% elif stage.key == 'fix' %}
             {% if fixes %}
               {% set f = fixes[0] %}
-              <span class="tag {{ 'ok' if f.outcome.value == 'success' else 'bad' }}">{{ f.outcome.value }}</span>
-              <span class="small muted">{{ f.rounds }} 轮{% if f.branch %} · <code>{{ f.branch }}</code>{% endif %}</span>
+              <span class="tag {{ 'ok' if f.outcome.value == 'success' else 'bad' }}" title="修复结果：{{ f.outcome.value }}">{{ f.outcome.value | fix_outcome_label }}</span>
+              <span class="small muted">{{ f.rounds }} 轮<span class="expert-only">{% if f.branch %} · <code>{{ f.branch }}</code>{% endif %}</span></span>
               {% if f.error %}<div class="small bad">{{ f.error | truncate(120) }}</div>{% endif %}
             {% else %}<span class="muted">尚未尝试自动修复</span>{% endif %}
           {% elif stage.key == 'pr' %}
@@ -115,7 +115,7 @@
     <div class="v">
       <span class="tag">{{ data.type }}</span>
       <span class="tag {{ data.evaluation.category if data.evaluation else 'unknown' }}">{{ data.evaluation.category if data.evaluation else '未分类' }}</span>
-      <span class="tag status-{{ data.status }}">流水线：{{ data.status }}</span>
+      <span class="tag status-{{ data.status }}" title="流水线状态：{{ data.status }}">流水线：{{ data.status | status_label }}</span>
       {% if data.force_fix %}
       <span class="tag force" title="强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都推进修复流程">⚡ 强制</span>
       {% endif %}
@@ -126,9 +126,14 @@
       <span class="tag stale" title="{{ data.degraded | join('；') }}">⚠️ 数据残缺</span>
       {% endif %}
     </div>
+    <div class="k">标识</div>
+    <div class="v">
+      <code>{{ data.key }}</code><button type="button" class="copy-btn"
+        data-copy="{{ data.key }}" title="复制条目 key（CLI 的 --key / API 的 keys 用它）">复制</button>
+    </div>
     <div class="k">平台状态</div>
     <div class="v">
-      {{ data.state }}{% if data.type == 'pr' %} · 已合并：{{ '是' if data.merge.merged else '否' }}{% if data.merge.draft %} · 草稿{% endif %}{% endif %}
+      <span title="平台原值：{{ data.state }}">{{ data.state | platform_state_label }}</span>{% if data.type == 'pr' %} · 已合并：{{ '是' if data.merge.merged else '否' }}{% if data.merge.draft %} · 草稿{% endif %}{% endif %}
     </div>
     <div class="k">作者</div><div class="v">{{ data.author }}（{{ data.author_kind }}）</div>
     <div class="k">标签</div>
@@ -162,7 +167,7 @@
 </div>
 
 {% if data.comment_thread %}
-<details class="panel collapsible" open>
+<details class="panel collapsible">
   <summary>讨论（{{ data.comment_thread | length }} 条）</summary>
   {% for c in data.comment_thread %}
   <div class="comment {% if c.author_kind in ['bot', 'ai_agent'] %}bot{% endif %}">
@@ -201,7 +206,7 @@
   {% endfor %}
 
   <div class="mt">
-    <span class="tag">动作：{{ evaluation.action.value }}</span>
+    <span class="tag" title="建议动作：{{ evaluation.action.value }}">动作：{{ evaluation.action.value | action_label }}</span>
     <span class="tag {{ evaluation.priority.value }}">优先级：{{ evaluation.priority.value }}</span>
     {% for l in evaluation.labels_suggested %}<span class="tag">{{ l }}</span>{% endfor %}
   </div>
@@ -218,15 +223,20 @@
      `relation=shadow` 时分数不会被改动，这里必须让人看清「读了什么、有没有被采用」，
      否则页面上只能看到主模型结论，无法判断旁路到底跑没跑。 #}
   {% if evaluation.edgejev or evaluation.alerts %}
-  <div class="mt">
-    <b>EdgeJev 旁路读数</b>
+  {# EdgeJev 是旁路交叉核对数据，排查结论对不对时才需要看——默认收起，异常告警仍然
+     常显在 summary 上（见下面的小红点），避免「有问题却被折起来看不见」。 #}
+  <details class="mt j-raw expert-only">
+    <summary>
+      <b title="EdgeJev：旁路的第二个模型，用于交叉核对主模型的评分">EdgeJev 旁路读数</b>
+      {% if evaluation.alerts %}<span class="tag bad">{{ evaluation.alerts | length }} 条告警</span>{% endif %}
+    </summary>
     {% if evaluation.edgejev %}
     <span class="muted small">
       模型 {{ evaluation.edgejev.get('model', '-') }} · 融合模式 {{ evaluation.edgejev.get('relation', '-') }}
       {% if evaluation.edgejev.get('relation') == 'shadow' %}（仅记录，不改结论）{% endif %}
     </span>
     <table class="small">
-      <thead><tr><th>维度</th><th>档位</th><th>置信度</th><th>是否采用</th></tr></thead>
+      <thead><tr><th scope="col">维度</th><th scope="col">档位</th><th scope="col">置信度</th><th scope="col">是否采用</th></tr></thead>
       <tbody>
       {% for name, ans in (evaluation.edgejev.get('answers') or {}).items() %}
         <tr>
@@ -246,7 +256,7 @@
     {% for a in evaluation.alerts %}
     <div class="small bad">⚠️ {{ a }}</div>
     {% endfor %}
-  </div>
+  </details>
   {% endif %}
 
   <div class="muted small mt">
@@ -262,27 +272,36 @@
 </div>
 {% endif %}
 
+{# 分层：这一页原先从「批量结论」到「自动修复记录」是五个同级面板平铺，全部默认展开，
+   一屏之内看不出主次——而用户打开详情页第一件要问的是「它走到哪了、该不该修」，
+   那答案在页面上半部分。现在分成两层：
+     * 「批量结论」回答问题本身，两种模式都留（默认收起，展开即读）；
+     * 「验证与修复细节」是排查用（验证器命令 / F2P / 回归门 / 补丁），只给专家模式。 #}
 {% if conclusion %}
-<div class="panel">
-  <h2>批量结论</h2>
+<details class="panel collapsible">
+  <summary>批量结论（该不该修 / 该不该合）</summary>
   <div>
-    <span class="tag">{{ conclusion.verdict }}</span>
+    <span class="tag" title="裁决：{{ conclusion.verdict }}">{{ conclusion.verdict | verdict_label }}</span>
     <span class="tag {{ conclusion.priority.value }}">{{ conclusion.priority.value }}</span>
     {% for l in conclusion.labels %}<span class="tag">{{ l }}</span>{% endfor %}
   </div>
   <div class="mt md">{{ conclusion.reason | md }}</div>
   <div class="muted small">置信度 {{ '%.2f' % conclusion.confidence }}</div>
-</div>
+</details>
 {% endif %}
+
+{% if verifier or runs or regression or fixes %}
+<details class="panel collapsible section-group expert-only">
+  <summary>验证与修复细节（验证器 / 执行记录 / 回归门 / 修复记录）</summary>
 
 <div class="panel">
   <h2>验证器</h2>
   {% if verifier %}
   <div class="kv">
-    <div class="k">形态</div><div class="v">{{ verifier.kind.value }}（{{ verifier.language }}）</div>
+    <div class="k">形态</div><div class="v" title="验证器形态：{{ verifier.kind.value }}">{{ verifier.kind.value | verifier_kind_label }}（{{ verifier.language }}）</div>
     <div class="k">名称</div><div class="v">{{ verifier.name }}</div>
     <div class="k">运行命令</div><div class="v"><code>{{ verifier.command or '（清单型，无命令）' }}</code></div>
-    <div class="k">F2P 要求</div>
+    <div class="k" title="Fail-to-Pass：验证器要能证明「问题真的存在、修复真的解决了它」">F2P 要求</div>
     <div class="v">base 必失败：{{ verifier.expect_fail_on_base }} · 修复后必通过：{{ verifier.expect_pass_on_fix }}</div>
   </div>
   {% if verifier.files %}
@@ -303,52 +322,73 @@
 {% if runs %}
 <div class="panel">
   <h2>验证执行记录</h2>
-  <div class="table-scroll">
-  <table>
-    <thead><tr><th>阶段</th><th>结果</th><th class="num">退出码</th><th class="num">耗时</th>
-      <th>F2P</th><th>时间</th></tr></thead>
-    <tbody>
-    {% for r in runs %}
-      <tr>
-        <td>{{ r.stage }}</td>
-        <td class="{{ 'ok' if r.outcome.value == 'pass' else 'bad' }}">{{ r.outcome.value }}</td>
-        <td class="num">{{ r.exit_code }}</td>
-        <td class="num">{{ '%.1f' % r.duration_seconds }}s</td>
-        {# F2P 结果原先在页面上看不到，只能在报告里找——它恰恰是「这条到底验没验过」的关键。 #}
-        <td>
-          {% if r.f2p_ok is none %}<span class="muted">—</span>
-          {% elif r.f2p_ok %}<span class="ok">✓ 通过</span>
-          {% else %}<span class="bad">✗ 未通过</span>{% endif %}
-        </td>
-        <td class="muted mono">{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
-      </tr>
-    {% endfor %}
-    </tbody>
-  </table>
+  {# 只有「最近一次结果」才是大多数人要看的（流水线进度时间线上也带了这个结论）；
+     完整的历次执行明细留给排查时才展开，折起来不占版面。 #}
+  {% set latest = runs[0] %}
+  <div class="row">
+    <span class="tag">{{ latest.stage }}</span>
+    <span class="{{ 'ok' if latest.outcome.value == 'pass' else 'bad' }}">{{ latest.outcome.value }}</span>
+    <span class="muted small">退出码 {{ latest.exit_code }} · {{ '%.1f' % latest.duration_seconds }}s</span>
+    <span title="Fail-to-Pass：问题修复前必须失败、修复后必须通过">
+      {% if latest.f2p_ok is none %}<span class="muted">F2P —</span>
+      {% elif latest.f2p_ok %}<span class="ok">F2P ✓ 通过</span>
+      {% else %}<span class="bad">F2P ✗ 未通过</span>{% endif %}
+    </span>
+    <span class="muted mono small">{{ latest.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</span>
   </div>
+  {% if runs | length > 1 %}
+  <details class="j-raw">
+    <summary>全部 {{ runs | length }} 次执行记录</summary>
+    <div class="table-scroll">
+    <table>
+      <thead><tr><th scope="col">阶段</th><th scope="col">结果</th><th scope="col" class="num">退出码</th><th scope="col" class="num">耗时</th>
+        <th title="Fail-to-Pass：问题修复前必须失败、修复后必须通过">F2P</th><th scope="col">时间</th></tr></thead>
+      <tbody>
+      {% for r in runs %}
+        <tr>
+          <td>{{ r.stage }}</td>
+          <td class="{{ 'ok' if r.outcome.value == 'pass' else 'bad' }}">{{ r.outcome.value }}</td>
+          <td class="num">{{ r.exit_code }}</td>
+          <td class="num">{{ '%.1f' % r.duration_seconds }}s</td>
+          <td>
+            {% if r.f2p_ok is none %}<span class="muted">—</span>
+            {% elif r.f2p_ok %}<span class="ok">✓ 通过</span>
+            {% else %}<span class="bad">✗ 未通过</span>{% endif %}
+          </td>
+          <td class="muted mono">{{ r.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+  {% endif %}
 </div>
 {% endif %}
 
 {% if regression %}
 <div class="panel">
-  <h2>既有测试回归门</h2>
-  <div class="kv">
+  <h2 title="回归门：修复前后各跑一遍仓库原有测试，确认没有改坏别的功能">既有测试回归门</h2>
+  <div class="row">
+    <span class="muted small">结论</span>
+    {% if regression.status == 'pass' %}<span class="ok">既有测试全绿</span>
+    {% elif regression.status == 'fail' %}<span class="bad">⚠️ 修复破坏了既有测试{% if regression.blocking %}（strict：已阻断）{% else %}（未阻断）{% endif %}</span>
+    {% elif regression.status == 'untrusted' %}<span class="muted">仓库本身不绿 / 跑不通 → 回归门不可信，未阻断</span>
+    {% else %}<span class="muted">未见结论</span>{% endif %}
+  </div>
+  <details class="j-raw mt">
+    <summary>模式 / base / fix 明细{% if regression.failed_tests %} · {{ regression.failed_tests | length }} 个失败用例{% endif %}</summary>
+  <div class="kv mt">
     <div class="k">模式</div><div class="v"><code>{{ regression.mode }}</code></div>
     <div class="k">base</div>
     <div class="v">{{ regression.base.outcome if regression.base else '未运行' }}{% if regression.base and regression.base.exit_code is not none %}（exit={{ regression.base.exit_code }}）{% endif %}</div>
     <div class="k">fix</div>
     <div class="v">{{ regression.fix.outcome if regression.fix else '未运行' }}{% if regression.fix and regression.fix.exit_code is not none %}（exit={{ regression.fix.exit_code }}）{% endif %}</div>
-    <div class="k">结论</div>
-    <div class="v">
-      {% if regression.status == 'pass' %}<span class="ok">既有测试全绿</span>
-      {% elif regression.status == 'fail' %}<span class="bad">⚠️ 修复破坏了既有测试{% if regression.blocking %}（strict：已阻断）{% else %}（未阻断）{% endif %}</span>
-      {% elif regression.status == 'untrusted' %}<span class="muted">仓库本身不绿 / 跑不通 → 回归门不可信，未阻断</span>
-      {% else %}<span class="muted">未见结论</span>{% endif %}
-    </div>
   </div>
   {% if regression.failed_tests %}
   <div class="mt"><b>失败用例</b><ul class="muted">{% for t in regression.failed_tests %}<li><code>{{ t }}</code></li>{% endfor %}</ul></div>
   {% endif %}
+  </details>
 </div>
 {% endif %}
 
@@ -357,23 +397,34 @@
   <h2>自动修复记录</h2>
   <div class="table-scroll">
   <table>
-    <thead><tr><th>结果</th><th class="num">轮次</th><th>分支</th><th>PR</th><th>补丁 / 改动</th><th>说明</th></tr></thead>
+    <thead><tr><th scope="col">结果</th><th scope="col" class="num">轮次</th><th scope="col">分支</th><th scope="col">PR</th><th scope="col">补丁 / 改动</th><th scope="col">说明</th></tr></thead>
     <tbody>
     {% for f in fixes %}
       <tr>
         <td class="{{ 'ok' if f.outcome.value == 'success' else 'bad' }}">
-          {{ f.outcome.value }}{% if f.dry_run %} <span class="tag">dry-run</span>{% endif %}
+          <span title="修复结果：{{ f.outcome.value }}">{{ f.outcome.value | fix_outcome_label }}</span>{% if f.dry_run %} <span class="tag">dry-run</span>{% endif %}
         </td>
         <td class="num">{{ f.rounds }}</td>
         <td>{% if f.branch %}<code>{{ f.branch }}</code>{% else %}-{% endif %}</td>
-        <td>{% if f.pr_url %}<a href="{{ f.pr_url }}" target="_blank" rel="noopener">#{{ f.pr_number }}</a>{% else %}-{% endif %}</td>
-        {# 补丁落在哪、动了哪些文件：页面上要能看到，否则「修好了」只是一句话。 #}
+        <td>{% if f.pr_url %}<a href="{{ f.pr_url }}" target="_blank" rel="noopener">#{{ f.pr_number }}</a><button type="button" class="copy-btn" data-copy="{{ f.pr_url }}" title="复制 PR 地址">复制</button>{% else %}-{% endif %}</td>
+        {# 补丁落在哪、动了哪些文件：页面上要能看到，否则「修好了」只是一句话。
+           正文优先来自库里的 diff 列，取不到时（老记录）只显示路径——
+           不再让人为了看一眼改了什么去文件系统里翻。 #}
         <td class="small">
-          {% if f.patch_path %}<div><code>{{ f.patch_path }}</code></div>{% endif %}
+          {% set patch = fix_patches[loop.index0] if (fix_patches is defined and fix_patches | length > loop.index0) else none %}
+          {% if f.patch_path %}<div><code>{{ f.patch_path }}</code><button type="button" class="copy-btn" data-copy="{{ f.patch_path }}" title="复制补丁路径">复制</button></div>{% endif %}
           {% if f.changed_files %}
           <ul class="muted">{% for path in f.changed_files %}<li><code>{{ path }}</code></li>{% endfor %}</ul>
           {% endif %}
-          {% if not f.patch_path and not f.changed_files %}<span class="muted">—</span>{% endif %}
+          {% if patch %}
+          <details class="patch-view mt">
+            <summary>查看补丁内容</summary>
+            {{ patch | patch }}
+          </details>
+          {% elif f.patch_path %}
+          <div class="muted small mt">补丁正文取不到（文件已不存在、或超过 2 MB），可点上面的路径复制后自行查看。</div>
+          {% endif %}
+          {% if not f.patch_path and not f.changed_files and not patch %}<span class="muted">—</span>{% endif %}
         </td>
         <td class="muted small">
           {% if f.error %}<span class="bad">{{ f.error }}</span>
@@ -386,6 +437,8 @@
   </table>
   </div>
 </div>
+{% endif %}
+</details>
 {% endif %}
 
 {% endblock %}
@@ -411,7 +464,8 @@
     Fissue.confirm(
       "强制修复这一条？",
       "无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都会推进修复流程并**真提 PR**。" +
-        "尚未验证过会先生成验证器；之后可随时点「取消强制」收回。"
+        "尚未验证过会先生成验证器；之后可随时点「取消强制」收回。",
+      { danger: true, yesText: "强制修复" }
     ).then(function (ok) {
       if (ok) Fissue.runJob("force", {keys: [KEY]}, {autoReload: true});
     });
@@ -441,7 +495,8 @@
     Fissue.confirm(
       "删除这条的本地数据？",
       "会连同它的评测、验证记录、修复记录与队列条目一起删除，**不可撤销**。" +
-        "平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。"
+        "平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。",
+      { danger: true, yesText: "删除本地数据" }
     ).then(function (ok) {
       if (!ok) return;
       Fissue.api("/items/" + encodeURIComponent(KEY), {method: "DELETE"})
@@ -462,10 +517,13 @@
       Fissue.toast('这一条是 PR：PR 侧走「合并验证」，没有 fork 提 PR 的修复流程。', 'info', {timeout: 0});
       return;
     }
-    Fissue.confirm('批准自动修复？', '会对 ' + KEY + ' 真提 PR（fork、改代码、开 PR），无法一键撤销。')
-      .then(function (ok) {
-        if (ok) Fissue.runJob('fix', {keys: [KEY], dry_run: false}, {autoReload: true});
-      });
+    Fissue.confirm(
+      '批准自动修复？',
+      '会对 ' + KEY + ' 真提 PR（fork、改代码、开 PR），**无法一键撤销**。',
+      { danger: true, yesText: '真提 PR' }
+    ).then(function (ok) {
+      if (ok) Fissue.runJob('fix', {keys: [KEY], dry_run: false}, {autoReload: true});
+    });
   }
 
   function approveMerge() {

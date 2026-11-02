@@ -14,8 +14,25 @@
 {% endblock %}
 
 {% block header_extra %}
-  {% if repo_filter %}
-  <a class="small" href="/pipeline">清除仓库筛选</a>
+  {# 仓库筛选：原先只有「已筛选时」才出现的一个「清除仓库筛选」链接——想**切换**仓库
+     得先跑去 `/items` 找下拉框，或者手改地址栏。现在这里直接给下拉框，选完即跳。
+     `repos` 由 _page_context 统一提供（只含启用中的仓库）；正在筛选的仓库若已停用，
+     会额外补一条 option，否则下拉框会显示成「全部仓库」而实际仍在按它过滤。 #}
+  {% if repos or repo_filter %}
+  <form method="get" action="/pipeline" class="row" id="pipe-repo-form">
+    <label class="inline" for="pipe-repo">仓库
+      <select id="pipe-repo" name="repo_slug" data-autosubmit>
+        <option value="">全部仓库</option>
+        {% for r in repos %}
+        <option value="{{ r }}" {% if repo_filter == r %}selected{% endif %}>{{ r }}</option>
+        {% endfor %}
+        {% if repo_filter and repo_filter not in repos %}
+        <option value="{{ repo_filter }}" selected>{{ repo_filter }}（已停用）</option>
+        {% endif %}
+      </select>
+    </label>
+    <noscript><button type="submit" class="ghost small">应用</button></noscript>
+  </form>
   {% endif %}
   <button type="button" class="ghost small" id="pipe-refresh">刷新</button>
 {% endblock %}
@@ -52,7 +69,7 @@
   <div class="table-scroll">
     <table>
       <thead>
-        <tr><th>条目</th><th>状态</th><th>优先级</th><th>更新时间</th><th>动作</th></tr>
+        <tr><th scope="col">条目</th><th scope="col">状态</th><th scope="col">优先级</th><th scope="col">更新时间</th><th scope="col">动作</th></tr>
       </thead>
       <tbody>
         {% for row in stuck %}
@@ -61,11 +78,11 @@
             <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
             <div class="small muted">{{ row.title | truncate(70) }}</div>
           </td>
-          <td><span class="tag bad">{{ row.status }}</span>
+          <td><span class="tag bad" title="状态：{{ row.status }}">{{ row.status | status_label }}</span>
             {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
           </td>
           <td class="small">{{ row.priority or '—' }}</td>
-          <td class="small muted">{{ (row.updated_at or '')[:16] | replace('T', ' ') }}</td>
+          <td class="small muted"><script>document.write(Fissue.relativeTime('{{ row.updated_at }}', true));</script></td>
           <td class="pipe-acts">
             <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
             <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
@@ -78,9 +95,11 @@
 </section>
 {% endif %}
 
-{# 视图切换：分段控件，存 localStorage。 #}
+{# 视图切换：分段控件，存 localStorage。
+   漏斗是**吞吐分析**（哪一段在掉队），判断「这条该不该动」用不到它，所以归专家。
+   看板（按阶段干预）与泳道（单条进度）是干活用的，两种模式都留。 #}
 <div class="pipe-modes" role="tablist">
-  <button type="button" data-mode="funnel">漏斗</button>
+  <button type="button" data-mode="funnel" class="expert-only">漏斗</button>
   <button type="button" data-mode="kanban">看板</button>
   <button type="button" data-mode="swimlane">泳道</button>
 </div>
@@ -166,10 +185,10 @@
     <table class="pipe-swim">
       <thead>
         <tr>
-          <th>条目</th>
-          {% for key, label in stages %}<th class="pipe-dot-head">{{ label }}</th>{% endfor %}
-          <th>状态</th>
-          <th>动作</th>
+          <th scope="col">条目</th>
+          {% for key, label in stages %}<th scope="col" class="pipe-dot-head">{{ label }}</th>{% endfor %}
+          <th scope="col">状态</th>
+          <th scope="col">动作</th>
         </tr>
       </thead>
       <tbody>
@@ -185,7 +204,7 @@
           </td>
           {% endfor %}
           <td>
-            <span class="tag {{ 'bad' if row.stalled else ('stale' if row.status in ('failed','needs_manual') else '') }}">{{ row.status }}</span>
+            <span class="tag {{ 'bad' if row.stalled else ('stale' if row.status in ('failed','needs_manual') else '') }}" title="状态：{{ row.status }}">{{ row.status | status_label }}</span>
             {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
           </td>
           <td class="pipe-acts">
@@ -223,6 +242,12 @@
 
   function applyMode(mode) {
     if (MODES.indexOf(mode) < 0) mode = "kanban";
+    // 简单模式里漏斗按钮是隐藏的：如果用户上次在专家模式存了 funnel，
+    // 切回简单模式后视图会停在「按钮没了、但页面还是漏斗」的状态，看着像坏了。
+    // 这里显式回退到看板——它才是两种模式下都存在的干活视图。
+    if (mode === "funnel" && document.documentElement.getAttribute("data-mode") === "simple") {
+      mode = "kanban";
+    }
     MODES.forEach(function (m) {
       var view = document.querySelector('[data-view="' + m + '"]');
       if (view) view.hidden = (m !== mode);
@@ -241,6 +266,10 @@
   });
 
   document.getElementById("pipe-refresh").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    var originalText = btn.textContent;
+    btn.innerHTML = '<span class="spinner small"></span> 刷新中';
     window.location.reload();
   });
 

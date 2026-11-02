@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{# 通用错误页：条目不存在 / 页面不存在等「HTML 页面路由」上的 4xx。
+ #
+ # 为什么要有这个模板而不是让 FastAPI 吐裸 JSON：`/item/{key}` 之类的页面路由抛
+ # HTTPException 时，浏览器直接拿到 `{"detail": "..."}`——对着鼠标点链接进来的人，
+ # 看到一屏生 JSON 不知道是不是自己的问题。API（`/api/*`）不受影响，仍然回 JSON，
+ # 前端脚本靠状态码判断行为，不能把它们也改成 HTML。
+ #}
+{% block title %}Fissue · {{ status_code }}{% endblock %}
+{% block heading %}{{ status_code }}{% endblock %}
+{% block subtitle %}{{ title }}{% endblock %}
+
+{% block content %}
+<div class="empty panel" style="text-align:center;">
+  <div style="font-size:16px; font-weight:600; margin-bottom:8px;">{{ title }}</div>
+  <div class="muted" style="max-width:480px; margin:0 auto 16px;">{{ message }}</div>
+  <div class="row" style="justify-content:center;">
+    <a href="/"><button class="primary">回到总览</button></a>
+    <a href="/items"><button class="ghost">去条目列表</button></a>
+  </div>
+</div>
+{% endblock %}

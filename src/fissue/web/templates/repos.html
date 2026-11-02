@@ -65,15 +65,16 @@
   <div class="table-scroll">
   <table>
     <thead><tr>
-      <th>仓库</th><th>平台</th><th class="num">条目</th><th>最近抓取</th>
-      <th>参数</th><th>操作</th>
+      <th scope="col">仓库</th><th scope="col">平台</th><th scope="col" class="num">条目</th><th scope="col">最近抓取</th>
+      <th scope="col">参数</th><th scope="col">操作</th>
     </tr></thead>
     <tbody>
     {% for r in view.repos %}
       {% set slug = r.slug.split('/') %}
       <tr>
         <td>
-          <code>{{ r.slug }}</code>
+          <code>{{ r.slug }}</code><button type="button" class="copy-btn"
+            data-copy="{{ r.slug }}" title="复制 owner/name（CLI 的 --repo 用它）">复制</button>
           {% if not r.enabled %}<span class="tag none">已停用</span>{% endif %}
           {% if r.orphan %}<span class="tag tier1" title="库里有历史数据，但配置里没有它">不在配置中</span>{% endif %}
           <div class="muted small">
@@ -268,7 +269,8 @@
   function removeRepo(platform, owner, name, items) {
     if (!needWritable()) return;
     Fissue.confirm("把 " + owner + "/" + name + " 移出监控？",
-        "只停止监控，库里的 " + items + " 条历史数据会保留（想连数据一起删，可用 CLI/API 传 purge_data=true）。")
+        "只停止监控，库里的 " + items + " 条历史数据会保留（想连数据一起删，可用 CLI/API 传 purge_data=true）。",
+        { danger: true, yesText: "移出监控" })
       .then(function (ok) {
         if (!ok) return;
         Fissue.api("/repos/" + platform + "/" + owner + "/" + name, {method: "DELETE"})

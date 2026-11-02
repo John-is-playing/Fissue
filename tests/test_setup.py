@@ -549,13 +549,26 @@ def test_every_page_renders(settings: Settings, client: Any, path: str) -> None:
     r = client.get(path)
     assert r.status_code == 200, f"{path} 挂了：{r.text[:200]}"
     assert r.headers["content-type"].startswith("text/html")
-    # 侧栏导航在每个页面上都在（否则用户一旦进入某页就回不去）
-    assert "状态监测" in r.text and "初始化向导" in r.text
+    # 侧栏主航道在每个页面上都在（否则用户一旦进入某页就回不去）。
+    # 这里原先拿「状态监测」「初始化向导」当哨兵，后来导航收敛成五项，
+    # 「初始化向导」的入口移到了设置页——于是哨兵换成了主航道的五项本身。
+    # 断言反而更严了：原来只要求侧栏里出现过两个字，现在要求整条主航道都在。
+    for entry in ("流水线", "条目", "任务", "状态", "设置"):
+        assert entry in r.text, f"{path} 的侧栏缺了「{entry}」"
 
 
 def test_nav_highlights_the_current_page(settings: Settings, client: Any) -> None:
-    html = client.get("/status").text
-    assert 'class="on"' in html.split("状态监测")[0].rsplit("<a", 1)[-1] or "on" in html
+    """当前页在侧栏里高亮——否则用户进到某个页面就不知道自己在哪。"""
+    nav = client.get("/jobs").text.split('<nav class="nav">')[1].split("</nav>")[0]
+    jobs_anchor = [chunk for chunk in nav.split("<a") if ">任务</a>" in chunk]
+    assert jobs_anchor, "侧栏里找不到「任务」这一项"
+    assert 'class="on"' in jobs_anchor[0], "当前页（/jobs）没有被高亮"
+
+    # 仓库 / 向导 / API Key 是从设置页分出去的子页面，停在它们上面时高亮「设置」，
+    # 这样导航不会出现「一片全灰」的状态。
+    repos_nav = client.get("/repos").text.split('<nav class="nav">')[1].split("</nav>")[0]
+    settings_anchor = [chunk for chunk in repos_nav.split("<a") if ">设置</a>" in chunk]
+    assert settings_anchor and 'class="on"' in settings_anchor[0]
 
 
 # ---------------------------------------------------------------------------
@@ -950,22 +963,27 @@ def test_frontend_guards_for_sidebar_and_polling(client: Any) -> None:
     """三个「页面在撒谎」的守卫。
 
     * `.live-row{display:flex}` 压过 `[hidden]{display:none}` → 侧栏「任务进行中」常显；
-    * status 页的 tick() 自我续期，点一次「探测沙盒」就永久多一条轮询链；
-    * 任务页/总览轮询读不到状态就 `return`，页面永远停在「正在运行」。
+    * 轮询链自我续期 → 同一条链变成两条（状态页当年点一次「探测沙盒」就永久多一条）；
+    * 轮询读不到状态就 `return`，页面永远停在「正在运行」。
+
+    状态页已删除，这里的对象换成**仍在轮询的两处**：任务详情页与总览的任务面板。
     """
     css = client.get("/static/app.css").text
     assert ".live-row[hidden]" in css, "hidden 会被 display:flex 压掉，必须显式写回来"
 
-    status_page = client.get("/status").text
-    assert "function schedule(" in status_page, "轮询要有单链调度器"
-    assert "setTimeout(function () { tick(false); }" not in status_page, "又出现自我续期的链了"
+    # 任务详情页：每 1.5 秒一发，是现在全站频率最高的轮询。
+    from fissue.web.jobs import Job
 
-    # 读不到状态时**必须明说**，不能静默停住（页面会永远停在「正在运行」）。
-    # 「任务」已并进状态页（`/jobs` 保留重定向），所以这里查合并后的两个位置：
-    #   * `/status` 用自己的「读取失败」文案；
-    #   * `/`（总览的任务面板）用「读不到任务状态」。
-    assert "读取失败" in status_page, "状态页轮询失败时应当明说"
-    assert "catch (e) { return; }" not in status_page
+    registry = client.app.state.jobs
+    job = Job(id="pollguard", kind="scan")
+    registry._jobs[job.id] = job
+    detail = client.get("/jobs/pollguard").text
+    assert "function schedule(" in detail, "轮询要有单链调度器"
+    assert "clearTimeout(tickTimer)" in detail, "续期前必须先清掉上一张票"
+    # 自我续期的写法（定时器还挂着、可见性回调又直接踢一次）会变成两条并行链
+    assert "setTimeout(function () { tick(false); }" not in detail, "又出现自我续期的链了"
+    # 读不到状态时**必须明说**，不能静默停住
+    assert "读不到任务状态" in detail, "轮询失败时应当明说"
 
     overview_page = client.get("/").text
     assert "读不到任务状态" in overview_page, "总览轮询失败时应当明说，而不是静默停住"

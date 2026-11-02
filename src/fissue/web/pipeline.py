@@ -28,6 +28,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from ..models import Category, ItemStatus, ItemType
+from .labels import STATUS_LABELS, status_label
 
 #: 流水线的阶段（键, 中文标签）。顺序即时间顺序。
 STAGES: tuple[tuple[str, str], ...] = (
@@ -71,6 +72,10 @@ LANES: tuple[tuple[str, str], ...] = (
     ("pr-feature", "PR · FEATURE"),
     ("unknown", "未分类"),
 )
+
+#: 状态 → 中文标签的表在 :mod:`fissue.web.labels`（那里集中了所有「枚举 → 中文」的界面
+#: 词汇：状态、裁决、动作、修复结果、验证器形态）。本模块通过顶部导入复用，
+#: 让流水线视图的调用方不必关心词汇表住在哪。
 
 #: 状态 → 当前所在阶段的序号。``len(STAGES)`` 表示「已走完全程」。
 _CURSOR: dict[ItemStatus, int] = {

@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Fissue · 任务 {{ job.id }}{% endblock %}
 {% block heading %}任务详情{% endblock %}
-{% block subtitle %}<a href="/status">← 返回任务列表</a>{% endblock %}
+{% block subtitle %}<a href="/jobs">← 返回任务列表</a>{% endblock %}
 
 {% block header_extra %}
   {% set cls = 'ok' if job.status == 'done' else ('bad' if job.status == 'failed' else ('stale' if job.status == 'canceled' else 'unknown')) %}
@@ -51,7 +51,31 @@
   // 运行中：每 1.5s 轮询 API。事件附带服务端渲染好的安全 html（内容已转义），
   // 前端只负责拼接——不解析、不信任任何客户端数据。
   // 结束后：提示一次但不跳走——用户进详情页就是为了读完整结果。
-  (async function loop() {
+  //
+  // **页面不可见时不轮询**：这条链每 1.5s 一发，是全站频率最高的请求；切到别的标签页后
+  // 它仍会一直打服务端（任务动辄跑几分钟）。隐藏就只排期不发请求，回到前台立刻补一次，
+  // 免得回来看到一个停在几分钟前的旧时间线。
+  //
+  // 续期一律走 schedule()：它先清掉上一张票。否则「定时器还挂着 + 用户切回来触发一次」
+  // 就会变成两条并行链——这个错在状态页上真发生过（点一次按钮永久多一条轮询链），
+  // 别在第二个页面重犯。
+  var POLL_MS = 1500;
+  var tickTimer = null;
+
+  function schedule(delay) {
+    if (tickTimer !== null) clearTimeout(tickTimer);
+    tickTimer = setTimeout(function () { tickTimer = null; tick(false); }, delay);
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) schedule(0);
+  });
+
+  async function tick(immediate) {
+    if (document.hidden && !immediate) {
+      schedule(POLL_MS);
+      return;
+    }
     var job = null;
     for (var attempt = 0; attempt < 4; attempt++) {
       try {
@@ -71,10 +95,13 @@
     var tl = document.getElementById('timeline');
     if (tl) tl.innerHTML = (job.events || []).map(function (ev) { return ev.html; }).join('');
     if (job.live) {
-      setTimeout(loop, 1500);
+      schedule(POLL_MS);
     } else {
+      if (tickTimer !== null) { clearTimeout(tickTimer); tickTimer = null; }
       Fissue.toast('任务已结束：' + job.status, job.status === 'done' ? 'ok' : 'bad', {timeout: 0});
     }
-  })();
+  }
+
+  tick(false);
 </script>
 {% endblock %}

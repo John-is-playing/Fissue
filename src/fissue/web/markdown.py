@@ -314,3 +314,52 @@ def _render_checklist_verdict(obj: dict[str, Any]) -> str:
             "（功能未实现时，base 判定全部不满足是预期结果，并非「拒绝修复」）</div>"
         )
     return f'<div class="cl-verdict">{" ".join(parts)}</div>'
+
+
+# ---------------------------------------------------------------------------
+# 补丁 / diff → 安全 HTML（条目详情的「查看补丁」用）
+# ---------------------------------------------------------------------------
+
+#: 单次最多渲染多少行。补丁理论上可以很大（整文件替换），全铺进页面既慢又没人读；
+#: 截断时明确告诉用户「还有多少行没显示」，而不是悄悄少显示一截。
+PATCH_MAX_LINES = 2000
+
+
+def render_patch_markup(text: str | None, *, max_lines: int = PATCH_MAX_LINES) -> Markup:
+    """把 unified diff 渲染成安全 HTML（``{{ x | patch }}``）。
+
+    与 :func:`render_markdown` 同一条铁律：**先整体转义**。补丁内容来自「AI 改完的代码」，
+    里可以有任何字符（包括 ``<script>``、以及看起来像标签的模板串），所以每一行都过
+    ``html.escape``，输出里只有本函数产出的标签。
+
+    着色只按行首分类，不做语法高亮——这里要回答的是「改了什么」，不是「代码好不好看」。
+    """
+    if not text:
+        return Markup("")
+
+    lines = text.splitlines()
+    shown = lines[:max_lines]
+    out: list[str] = []
+    for line in shown:
+        escaped = html.escape(line, quote=False)
+        if line.startswith("@@"):
+            cls = "d-hunk"
+        elif line.startswith("+++") or line.startswith("---"):
+            cls = "d-meta"
+        elif line.startswith("diff --git") or line.startswith("index "):
+            cls = "d-meta"
+        elif line.startswith("+"):
+            cls = "d-add"
+        elif line.startswith("-"):
+            cls = "d-del"
+        else:
+            cls = "d-ctx"
+        out.append(f'<span class="{cls}">{escaped}</span>')
+
+    body = "\n".join(out)
+    if len(lines) > max_lines:
+        body += (
+            f'\n<span class="d-meta">… 还有 {len(lines) - max_lines} 行未显示'
+            f"（共 {len(lines)} 行）</span>"
+        )
+    return Markup(f'<pre class="diff">{body}</pre>')

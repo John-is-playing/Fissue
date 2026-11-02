@@ -321,40 +321,22 @@ def _register_web_items(app: FastAPI, templates: Jinja2Templates) -> None:
 
 
 def _register_web_status(app: FastAPI, templates: Jinja2Templates) -> None:
-    """状态监测页 + 队列页。"""
+    """旧入口：状态监测页与队列页（两页都已并入别处，这里只留重定向）。"""
 
     @app.get("/status", response_class=HTMLResponse)
-    async def status_page(
-        request: Request,
-        sandbox: bool = Query(False, description="首屏是否带一次沙盒探测"),
-    ) -> HTMLResponse:
-        """状态监测：实时（2 秒轮询）刷新写闸门、队列、任务、抓取与告警。
+    async def status_page(request: Request) -> Response:
+        """旧入口：状态监测页已经删除。
 
-        首屏那份快照**由服务端塞进页面**（`window.FISSUE_STATUS`），之后由同一个前端渲染函数
-        接管轮询——渲染逻辑只有一份（在 status.html 的脚本里），不会出现「服务端渲染的样子和
-        轮询后的样子不一样」。
+        为什么删：它和「任务」页回答的是同一个问题——「服务现在在干什么、有没有卡住」。
+        两边各有一套轮询与渲染，于是同一个事实在页面 A 上更新、在页面 B 上还没更新；
+        而真正需要「一眼看出活着没有」的地方，是**每个页面侧栏底部那行实时角标**
+        （它读的是 `/api/v1/status`，与这一页无关）。写闸门细节、队列、仓库、抓取记录
+        分别落在任务页、总览与监控仓库页，不再需要第四处入口。
+
+        **保留重定向**而不是 404：`/status` 出现在文档、书签、监控脚本和别人的肌肉记忆里，
+        404 掉会让人以为服务坏了。`/api/v1/status` 端点照旧存在——侧栏角标与任务页都靠它。
         """
-        snapshot = collect_status(
-            request.app,
-            _settings(request),
-            _repo(request),
-            with_sandbox=sandbox,
-            aggregates=_aggregates_of(request.app),
-        )
-        return templates.TemplateResponse(
-            request,
-            "status.html",
-            _page_context(
-                request,
-                nav="status",
-                snapshot=snapshot,
-                # 任务面板（原先独立的 /jobs 页）也在这里渲染：两者回答同一个问题
-                # ——「服务现在在干什么、有没有卡住」。`writer` 用来解释「写操作进行中
-                # 但表里没有对应的作业」这一类情况（常驻轮次不是网页作业）。
-                jobs=request.app.state.jobs.to_dict(),
-                writer=writer_panel(_settings(request)),
-            ),
-        )
+        return RedirectResponse("/jobs", status_code=307)
 
     @app.get("/queues", response_class=HTMLResponse)
     async def queues_page(request: Request) -> Response:
@@ -488,6 +470,44 @@ def _register_web_config(app: FastAPI, templates: Jinja2Templates) -> None:
         )
 
 
+def _patch_text(attempt: Any, data_dir: Any) -> str | None:
+    """取这次修复的补丁正文，取不到就返回 None。
+
+    优先用库里的 ``diff`` 列（那才是补丁的**源头**：落盘文件就是它写出来的）。
+    只有库里是空的、而 ``patch_path`` 有值时，才回退去读文件——而那条路径来自数据库，
+    属于「可以被人改过的输入」，所以必须做两道约束：
+
+    * **不能越界**：解析后的真实路径必须落在 ``<data_dir>/patches`` 之下；
+      否则一条被篡改的记录就能让页面去读 ``/etc/shadow`` 这类任意文件。
+    * **不能太大**：补丁是整文件替换时会很大，超过上限就不往页面里塞。
+
+    注意这里没有新增 HTTP 端点：正文本来就在库里（``fix_attempts`` 已经带出 ``diff``），
+    多开一个读文件的路由只是平白多一处攻击面。
+    """
+    from pathlib import Path
+
+    diff = getattr(attempt, "diff", None)
+    if diff:
+        return diff
+
+    raw = getattr(attempt, "patch_path", None)
+    if not raw:
+        return None
+
+    #: 补丁文件大小上限（2 MB）。超过就当「取不到」，页面显示路径本身。
+    max_bytes = 2 * 1024 * 1024
+    try:
+        path = Path(raw).resolve()
+        root = (Path(data_dir) / "patches").resolve()
+        if not path.is_relative_to(root):
+            return None
+        if not path.is_file() or path.stat().st_size > max_bytes:
+            return None
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
 def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
     """条目详情页。"""
 
@@ -514,6 +534,9 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
             )
         ]
 
+        fixes = r.fix_attempts(key)
+        data_dir = _settings(request).app.data_dir
+
         return templates.TemplateResponse(
             request,
             "item.html",
@@ -531,6 +554,10 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
                 regression=exp.regression_summary(
                     runs, mode=_settings(request).verifier.regression_gate
                 ),
-                fixes=r.fix_attempts(key),
+                fixes=fixes,
+                # 与 fixes 逐项对齐（下标一致）：模板里用 loop.index0 取。
+                # 单独传一份而不是塞进 FixAttempt：那是 pydantic 模型，加字段要动 schema，
+                # 而这份正文只在渲染这一页时有意义。
+                fix_patches=[_patch_text(f, data_dir) for f in fixes],
             ),
         )

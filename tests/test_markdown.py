@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from fissue.web.markdown import render_job_event, render_markdown
+from fissue.web.markdown import render_job_event, render_markdown, render_patch_markup
 
 # ---------------------------------------------------------------------------
 # render_markdown
@@ -176,3 +176,54 @@ def test_log_event_keeps_time_and_text() -> None:
     ev = render_job_event({"type": "log", "ts": "2026-01-01T12:34:56", "text": "step <1>"})
     assert "12:34:56" in ev["html"]
     assert "step &lt;1&gt;" in ev["html"]
+
+
+# ---------------------------------------------------------------------------
+# 补丁 / diff 渲染（条目详情的「查看补丁」）
+# ---------------------------------------------------------------------------
+#
+# 这块内容的来源是「AI 改完的代码」，里面**可以有任何字符**——包括 `<script>` 和看起来
+# 像标签的模板串。所以转义那条断言比排版断言重要得多：排版错了是难看，转义漏了是 XSS。
+
+
+def test_patch_never_emits_raw_html() -> None:
+    html = str(render_patch_markup("+<script>alert(1)</script>\n-<img src=x onerror=y>"))
+    assert "<script>" not in html
+    assert "<img" not in html
+    assert "&lt;script&gt;" in html
+    assert "&lt;img" in html
+
+
+def test_patch_classifies_lines_by_prefix() -> None:
+    diff = (
+        "diff --git a/pkg/mod.py b/pkg/mod.py\n"
+        "index 1111..2222 100644\n"
+        "--- a/pkg/mod.py\n"
+        "+++ b/pkg/mod.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+        " context\n"
+    )
+    html = str(render_patch_markup(diff))
+    assert html.startswith('<pre class="diff">')
+    # 文件头与 index 行算 meta，@@ 算 hunk，+/-/上下文各归各类
+    assert html.count('class="d-meta"') == 4          # diff --git / index / --- / +++
+    assert html.count('class="d-hunk"') == 1
+    assert html.count('class="d-del"') == 1
+    assert html.count('class="d-add"') == 1
+    assert html.count('class="d-ctx"') == 1
+
+
+def test_patch_truncates_and_reports_remainder() -> None:
+    text = "\n".join(f"+line{i}" for i in range(10))
+    html = str(render_patch_markup(text, max_lines=4))
+    assert "line3" in html
+    assert "line4" not in html
+    # 截断必须**说出来**：悄悄少显示一截会让人以为补丁就这么点
+    assert "还有 6 行未显示" in html and "共 10 行" in html
+
+
+def test_patch_empty_input_renders_nothing() -> None:
+    assert str(render_patch_markup(None)) == ""
+    assert str(render_patch_markup("")) == ""

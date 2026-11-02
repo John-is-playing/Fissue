@@ -1,7 +1,7 @@
 <div class="panel">
   <h2>代码托管平台 Token</h2>
   <table>
-    <thead><tr><th>平台</th><th>Token</th><th>状态</th><th></th></tr></thead>
+    <thead><tr><th scope="col">平台</th><th scope="col">Token</th><th scope="col">状态</th><th scope="col"></th></tr></thead>
     <tbody>
     {% for key, plat in [('FISSUE_GITHUB_TOKEN','github'), ('FISSUE_GITEE_TOKEN','gitee'), ('FISSUE_ATOMGIT_TOKEN','atomgit'), ('FISSUE_GITLAB_TOKEN','gitlab')] %}
       {% set it = by_key.get(key) %}
@@ -9,6 +9,7 @@
         <td>{{ plat }}</td>
         <td>
           <input type="password" id="env-{{ key }}" style="width:300px"
+                 aria-label="{{ plat }} 平台的访问令牌"
                  placeholder="{{ it.value if it and it.set else '未配置' }}">
           <label class="inline"><input type="checkbox" id="clear-{{ key }}"> 清空</label>
         </td>

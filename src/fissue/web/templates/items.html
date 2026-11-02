@@ -9,8 +9,34 @@
   </a>
 {%- endmacro %}
 
+{# 分数徽标：原先这一列是 `70/57/77` 三个裸数字，扫读时既分不清哪个是哪个维度，
+   也看不出「70 算高还是低」。现在每个分数一个小徽标，按阈值上色（高=绿 / 中=琥珀 / 低=红），
+   颜色只在**有意义的方向**上使用——难度越低越好修，所以它的阈值是反过来的。 #}
+{% macro score_chip(value, label, invert) -%}
+  {%- if value is number -%}
+    {%- set hi = (value <= 40) if invert else (value >= 75) -%}
+    {%- set lo = (value > 65) if invert else (value < 50) -%}
+    <span class="score-chip {{ 'hi' if hi else ('lo' if lo else 'mid') }}"
+          title="{{ label }}：{{ value }}">{{ value }}</span>
+  {%- else -%}
+    <span class="score-chip" title="{{ label }}：未评出">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
 {% block header_extra %}
   <span class="sub">共 {{ total }} 条 · 第 {{ page }} / {{ pages }} 页</span>
+  {# 导出：复用 `/api/v1/export`（与 CLI 的 `fissue export` 同一条实现，不另写一份）。
+     两点刻意为之：
+       * **带上当前仓库筛选**——否则「导出」导出的是一份和眼前表格对不上的数据，
+         那比没有按钮更糟；
+       * **limit 用上限 10000 而不是每页条数**——用户点导出要的是这一批的全部，
+         不是当前这一页的 50 行。上限之外的部分不会静默丢失，标题里写清楚了。 #}
+  <a class="small" download
+     title="导出当前筛选下的全部条目（最多 1 万条，与每页条数无关）"
+     href="{{ api_prefix }}/export?format=json&limit=10000{% if filters.repo_slug %}&repo_slug={{ filters.repo_slug | urlencode }}{% endif %}">导出 JSON</a>
+  <a class="small" download
+     title="导出当前筛选下的全部条目为 Markdown（最多 1 万条）"
+     href="{{ api_prefix }}/export?format=md&limit=10000{% if filters.repo_slug %}&repo_slug={{ filters.repo_slug | urlencode }}{% endif %}">导出 Markdown</a>
 {% endblock %}
 
 {% block content %}
@@ -52,7 +78,8 @@
   </label>
   <button type="submit" class="primary">筛选</button>
   <a href="/items"><button type="button" class="ghost">重置</button></a>
-  <button type="button" class="ghost" id="more-toggle" aria-expanded="false">更多筛选 ▾</button>
+  <button type="button" class="ghost" id="more-toggle" aria-expanded="false"
+          aria-controls="more-filters">更多筛选 ▾</button>
 
   {# 更多筛选：默认收起。里面是**精确到状态**的那些维度。
      注意它必须在**同一个 form 里**——`<details>` 放到 form 外面时，里面那些下拉框
@@ -89,7 +116,7 @@
     <select name="status">
       <option value="">全部</option>
       {% for s in statuses %}
-      <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s }}</option>
+      <option value="{{ s }}" {% if filters.status == s %}selected{% endif %}>{{ s | status_label }}</option>
       {% endfor %}
     </select>
   </label>
@@ -137,12 +164,12 @@
 <div class="row mb" id="bulk-bar">
   <span class="muted">已选 <b id="pick-count">0</b> 条</span>
   {% if not read_only %}
-  <button data-needs-pick disabled onclick="bulk('evaluate')">评测选中</button>
-  <button data-needs-pick disabled onclick="bulk('verify')">验证选中</button>
-  <button data-needs-pick disabled onclick="bulkFixDry()">试跑修复选中</button>
-  <button data-needs-pick disabled class="danger" onclick="bulkFixReal()">修复选中并提 PR</button>
-  <button data-needs-pick disabled onclick="bulkForce()" title="无论评测结论如何都推进修复流程（真提 PR）">强制修复选中</button>
-  <button data-needs-pick disabled class="danger" onclick="bulkDelete()">删除选中</button>
+  <button data-needs-pick disabled onclick="bulk('evaluate', this)">评测选中</button>
+  <button data-needs-pick disabled onclick="bulk('verify', this)">验证选中</button>
+  <button data-needs-pick disabled onclick="bulkFixDry(this)">试跑修复选中</button>
+  <button data-needs-pick disabled class="danger" onclick="bulkFixReal(this)">修复选中并提 PR</button>
+  <button data-needs-pick disabled class="expert-only" onclick="bulkForce(this)" title="无论评测结论如何都推进修复流程（真提 PR）">强制修复选中</button>
+  <button data-needs-pick disabled class="danger" onclick="bulkDelete(this)">删除选中</button>
   {% endif %}
 </div>
 
@@ -151,14 +178,14 @@
 <table>
   <thead>
     <tr>
-      <th class="shrink"><input type="checkbox" id="pick-all" title="全选本页"></th>
-      <th class="shrink">{{ sort_link('number', '编号') }}</th>
-      <th>{{ sort_link('title', '标题') }}</th>
-      <th class="shrink">{{ sort_link('category', '分类') }}</th>
-      <th class="shrink" title="真实性 / 重要性 / 难度">真/重/难</th>
-      <th class="shrink">{{ sort_link('priority', '优先级') }}</th>
-      <th class="shrink">{{ sort_link('status', '状态') }}</th>
-      <th>结论</th>
+      <th scope="col" class="shrink"><input type="checkbox" id="pick-all" title="全选本页" aria-label="全选本页"></th>
+      <th scope="col" class="shrink">{{ sort_link('number', '编号') }}</th>
+      <th scope="col">{{ sort_link('title', '标题') }}</th>
+      {# 分类 / 优先级 / 状态原先各占一列，但三列里都是同一个短徽标，横向占掉三分之一宽度，
+         而真正要读的「结论」被挤到右边。现在三个徽标并入标题下方一行（见 tbody），
+         列数从 8 降到 5。按这三项排序仍然可用——「更多筛选」里有排序下拉。 #}
+      <th scope="col" class="shrink expert-only" title="真实性 / 重要性 / 难度">真/重/难</th>
+      <th scope="col">结论</th>
     </tr>
   </thead>
   <tbody>
@@ -170,8 +197,18 @@
         <a href="{{ row.url }}" target="_blank" rel="noopener">#{{ row.number }}</a>
       </td>
       <td>
-        <a href="/item/{{ row.key | urlencode }}">{{ row.title }}</a><br>
-        <span class="muted small">{{ row.repo }} · {{ row.author }} · 💬 {{ row.comments }}</span>
+        <a href="/item/{{ row.key | urlencode }}">{{ row.title }}</a>
+        {# 三个徽标：原先各占一整列，现在并到标题下面一行。它们回答的都是
+           「这一条是什么、现在到哪了」，和标题挨着反而更好读。 #}
+        <div class="item-badges">
+          {% set cat = row.evaluation.category if row.evaluation else 'unknown' %}
+          <span class="tag {{ cat }}">{{ cat }}</span>
+          {% set pr = row.evaluation.priority if row.evaluation else 'none' %}
+          <span class="tag {{ pr }}" title="优先级：{{ pr }}">{{ pr }}</span>
+          <span class="tag status-{{ row.status }}" title="流水线状态：{{ row.status }}">{{ row.status | status_label }}</span>
+          {% if row.force_fix %}<span class="tag force" title="已强制修复：无论评测结论如何都推进修复流程">⚡ 强制</span>{% endif %}
+        </div>
+        <div class="muted small">{{ row.repo }} · {{ row.author }} · 💬 {{ row.comments }}</div>
         {% for l in row.labels %}<span class="tag">{{ l }}</span>{% endfor %}
         {% if row.conclusion_stale %}
           <span class="tag stale" title="{{ row.conclusion_stale | join('；') }}">⚠️ 结论已过期</span>
@@ -180,25 +217,15 @@
           <span class="tag stale" title="{{ row.degraded | join('；') }}">⚠️ 数据残缺</span>
         {% endif %}
       </td>
-      <td class="shrink">
-        {% set cat = row.evaluation.category if row.evaluation else 'unknown' %}
-        <span class="tag {{ cat }}">{{ cat }}</span>
-      </td>
-      <td class="shrink num">
+      <td class="shrink expert-only">
         {% if row.evaluation %}
           {% set sc = row.evaluation.scores %}
-          {{ sc.get('authenticity', '-') }}/{{ sc.get('importance', '-') }}/{{ sc.get('difficulty', '-') }}
+          <span class="score-chips">
+            {{ score_chip(sc.get('authenticity'), '真实性（越高越可信）', false) }}
+            {{ score_chip(sc.get('importance'), '重要性（越高越值得修）', false) }}
+            {{ score_chip(sc.get('difficulty'), '难度（越低越好修）', true) }}
+          </span>
         {% else %}<span class="muted">未评测</span>{% endif %}
-      </td>
-      <td class="shrink">
-        {% set pr = row.evaluation.priority if row.evaluation else 'none' %}
-        <span class="tag {{ pr }}">{{ pr }}</span>
-      </td>
-      {# 真实的流水线状态。旧版这里写的是 `row.evaluation and '已评测' or '待评测'`——
-         筛了 status、表格里却看不到 status，而且 payload 里当时根本没有它。 #}
-      <td class="shrink">
-        <span class="tag status-{{ row.status }}" title="流水线状态">{{ row.status }}</span>
-        {% if row.force_fix %}<span class="tag force" title="已强制修复：无论评测结论如何都推进修复流程">⚡</span>{% endif %}
       </td>
       <td>
         {% if row.evaluation %}
@@ -247,51 +274,103 @@ fissue eval --all</pre>
 
 {% block scripts %}
 <script>
-  function bulk(kind) {
-    var keys = Fissue.selectedKeys();
-    if (!keys.length) return;
-    Fissue.runJob(kind, {keys: keys}, {autoReload: true});
+  // 加载状态管理：禁用按钮并显示 spinner
+  function setLoading(btnOrSelector, loading) {
+    var btn = typeof btnOrSelector === 'string' 
+      ? document.querySelector(btnOrSelector) 
+      : btnOrSelector;
+    if (!btn) return;
+    
+    if (loading) {
+      btn.disabled = true;
+      if (!btn.dataset.originalText) {
+        btn.dataset.originalText = btn.textContent;
+      }
+      btn.innerHTML = '<span class="spinner small"></span> ' + btn.dataset.originalText;
+    } else {
+      btn.disabled = false;
+      if (btn.dataset.originalText) {
+        btn.textContent = btn.dataset.originalText;
+      }
+    }
   }
 
-  function bulkFixDry() {
+  // `btn` 由模板里的 onclick 传 `this` 进来：旧写法靠隐式的全局 `event`，
+  // 在 Firefox/Safari 里根本没有 window.event，加载态就永远不亮。
+  function bulk(kind, btn) {
     var keys = Fissue.selectedKeys();
     if (!keys.length) return;
-    Fissue.runJob('fix', {keys: keys, dry_run: true}, {autoReload: true});
+    var label = kind === 'evaluate' ? '评测' : (kind === 'verify' ? '验证' : kind);
+    Fissue.confirm(
+      '对选中的 ' + keys.length + ' 条执行「' + label + '」？',
+      '任务在后台跑，可在「任务」页看进度；**同一时刻只允许一个写任务**。'
+    , { yesText: '开始' + label }).then(function (ok) {
+      if (!ok) return;
+      setLoading(btn, true);
+      Fissue.runJob(kind, {keys: keys}, {autoReload: true})
+        .finally(function() { setLoading(btn, false); });
+    });
   }
 
-  function bulkFixReal() {
+  function bulkFixDry(btn) {
     var keys = Fissue.selectedKeys();
     if (!keys.length) return;
-    Fissue.confirm('对选中的 ' + keys.length + ' 条真提 PR？', '会真的 fork、改代码并在平台上开 PR，无法一键撤销。')
-      .then(function (ok) {
-        if (ok) Fissue.runJob('fix', {keys: keys, dry_run: false}, {autoReload: true});
-      });
+    Fissue.confirm(
+      '对选中的 ' + keys.length + ' 条试跑修复？',
+      '只生成补丁、**不提交、不开 PR**；会真的调用模型与沙盒，消耗 token 与时间。'
+    , { yesText: '试跑' }).then(function (ok) {
+      if (!ok) return;
+      setLoading(btn, true);
+      Fissue.runJob('fix', {keys: keys, dry_run: true}, {autoReload: true})
+        .finally(function() { setLoading(btn, false); });
+    });
+  }
+
+  function bulkFixReal(btn) {
+    var keys = Fissue.selectedKeys();
+    if (!keys.length) return;
+    Fissue.confirm(
+      '对选中的 ' + keys.length + ' 条真提 PR？',
+      '会真的 fork、改代码并在平台上开 PR，**无法一键撤销**。',
+      { danger: true, yesText: '真提 PR' }
+    ).then(function (ok) {
+      if (!ok) return;
+      setLoading(btn, true);
+      Fissue.runJob('fix', {keys: keys, dry_run: false}, {autoReload: true})
+        .finally(function() { setLoading(btn, false); });
+    });
   }
 
   // 批量强制修复：无论评测结论（分类 / 刷量 / 优先级 / 结论）如何都推进修复流程，走作业。
-  function bulkForce() {
+  function bulkForce(btn) {
     var keys = Fissue.selectedKeys();
     if (!keys.length) return;
     Fissue.confirm(
       '强制修复选中的 ' + keys.length + ' 条？',
       '无论评测结论（分类 / 刷量 / 优先级 / 结论）如何，都会推进修复流程并**真提 PR**；' +
-        '尚未验证过会先生成验证器。之后可在条目页点「取消强制」收回。'
+        '尚未验证过会先生成验证器。之后可在条目页点「取消强制」收回。',
+      { danger: true, yesText: '强制修复' }
     ).then(function (ok) {
-      if (ok) Fissue.runJob('force', {keys: keys}, {autoReload: true});
+      if (!ok) return;
+      setLoading(btn, true);
+      Fissue.runJob('force', {keys: keys}, {autoReload: true})
+        .finally(function() { setLoading(btn, false); });
     });
   }
 
   // 批量删除本地数据。走批量端点（而不是逐条 DELETE）：一次事务、一个写闸门，
   // 不会删到一半被打断留下半批数据。
-  function bulkDelete() {
+  function bulkDelete(btn) {
     var keys = Fissue.selectedKeys();
     if (!keys.length) return;
     Fissue.confirm(
       '删除选中的 ' + keys.length + ' 条本地数据？',
       '会连同它们的评测、验证记录、修复记录与队列条目一起删除，**不可撤销**。' +
-        '平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。'
+        '平台上的 Issue/PR 不受影响，data/ 下的产物文件也保留。',
+      { danger: true, yesText: '删除 ' + keys.length + ' 条' }
     ).then(function (ok) {
       if (!ok) return;
+      setLoading(btn, true);
       Fissue.api('/items/purge', {method: 'POST', body: {keys: keys}})
         .then(function (r) {
           var gone = (r.deleted || []).length;
@@ -304,6 +383,7 @@ fissue eval --all</pre>
         })
         .catch(function (err) {
           Fissue.toast('删除失败', 'bad', {detail: err.message, timeout: 0});
+          setLoading(btn, false);
         });
     });
   }

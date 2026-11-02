@@ -35,11 +35,45 @@
    * @param {"ok"|"bad"|"info"} kind 颜色
    * @param {{detail?: any, timeout?: number}} [opts] detail 会以 <pre> 折好再显示
    */
+  //: 最多同时显示几条吐司。批量操作连点几次就各弹一条，堆到五六条会把右下角整块盖住，
+  //: 反而挡住用户正要看的表格。超出时顶掉**最旧**的那条（新提示与刚做的动作更相关）。
+  var TOAST_MAX = 4;
+
   function toast(message, kind, opts) {
     opts = opts || {};
     var host = toastHost();
+    var kindClass = kind || "info";
+
+    // 已有同文案同色调的吐司 → 合并计数并重新计时，而不是再堆一条一模一样的。
+    // 两条相同提示会让人分不清「点了两次」还是「出了两次错」。
+    var existing = null;
+    Array.prototype.forEach.call(host.children, function (el) {
+      if (!existing && el.dataset.msg === String(message) && el.dataset.kind === kindClass) {
+        existing = el;
+      }
+    });
+    if (existing) {
+      var times = parseInt(existing.dataset.count || "1", 10) + 1;
+      existing.dataset.count = String(times);
+      var merged = existing.querySelector(".t-count");
+      if (merged) merged.textContent = "×" + times;
+      if (existing._dismissTimer) clearTimeout(existing._dismissTimer);
+      var again = opts.timeout !== undefined ? opts.timeout : kindClass === "bad" ? 0 : 5000;
+      if (again > 0) {
+        existing._dismissTimer = setTimeout(function () {
+          if (existing.parentNode) existing.parentNode.removeChild(existing);
+        }, again);
+      }
+      return function () {
+        if (existing.parentNode) existing.parentNode.removeChild(existing);
+      };
+    }
+
     var box = document.createElement("div");
-    box.className = "toast " + (kind || "info");
+    box.className = "toast " + kindClass;
+    box.dataset.msg = String(message);
+    box.dataset.kind = kindClass;
+    box.dataset.count = "1";
 
     var head = document.createElement("div");
     head.className = "t-head";
@@ -51,7 +85,10 @@
     close.setAttribute("role", "button");
     close.setAttribute("tabindex", "0");
     close.title = "关闭";
+    var countBadge = document.createElement("span");
+    countBadge.className = "t-count";
     head.appendChild(text);
+    head.appendChild(countBadge);
     head.appendChild(close);
     box.appendChild(head);
 
@@ -63,6 +100,7 @@
     }
 
     function dismiss() {
+      if (box._dismissTimer) clearTimeout(box._dismissTimer);
       if (box.parentNode) box.parentNode.removeChild(box);
     }
     close.addEventListener("click", dismiss);
@@ -71,9 +109,14 @@
     });
     host.appendChild(box);
 
+    // 超出上限就顶掉最旧的一条。
+    while (host.children.length > TOAST_MAX) {
+      host.removeChild(host.children[0]);
+    }
+
     // 失败信息不自动消失：它通常带着用户需要照着改的原因。
-    var timeout = opts.timeout !== undefined ? opts.timeout : kind === "bad" ? 0 : 5000;
-    if (timeout > 0) setTimeout(dismiss, timeout);
+    var timeout = opts.timeout !== undefined ? opts.timeout : kindClass === "bad" ? 0 : 5000;
+    if (timeout > 0) box._dismissTimer = setTimeout(dismiss, timeout);
     return dismiss;
   }
 
@@ -380,25 +423,77 @@
   // ---------------------------------------------------------------------
   // 确认弹窗
   // ---------------------------------------------------------------------
-  function confirmDialog(title, message) {
+  /**
+   * 把调用方写的 `**重点**` 渲染成 <strong>，其余按纯文本。
+   *
+   * 为什么不用 innerHTML：这些文案里会拼进条目标题、Key 名称这类**外部输入**
+   * （平台上的 Issue 标题、用户自建的 Key 名），innerHTML 等于把它们当 HTML 执行。
+   * 这里只切分、不解析，每段都走 createTextNode。
+   *
+   * 顺带修掉一个真实观感问题：调用方一直在文案里写 `**真提 PR**`，而旧实现用的是
+   * textContent——用户看到的是字面的星号。
+   */
+  function emphasize(el, text) {
+    var parts = String(text === undefined || text === null ? "" : text).split(/\*\*([^*]+)\*\*/g);
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      if (i % 2 === 1) {
+        var strong = document.createElement("strong");
+        strong.textContent = parts[i];
+        el.appendChild(strong);
+      } else {
+        el.appendChild(document.createTextNode(parts[i]));
+      }
+    }
+  }
+
+  /**
+   * 页内确认弹窗（替代原生 confirm）。
+   * @param {string} title 标题
+   * @param {string} message 正文，支持 `**加粗**`
+   * @param {{danger?: boolean, yesText?: string, noText?: string}} [opts]
+   *   danger：确认按钮用红色，用于删除/吊销这类不可撤销的操作；
+   *   yesText：确认按钮文案，写成动词（「删除」「吊销」）比「确认」更明确。
+   * @returns {Promise<boolean>}
+   */
+  function confirmDialog(title, message, opts) {
+    opts = opts || {};
     return new Promise(function (resolve) {
       var dlg = document.createElement("dialog");
+      if (opts.danger) dlg.className = "danger";
       dlg.innerHTML =
-        "<h3></h3><div class='muted'></div>" +
+        "<h3></h3><div class='dlg-body muted'></div>" +
         "<div class='dlg-actions'><button class='ghost' value='no'>取消</button>" +
-        "<button class='primary' value='yes'>确认</button></div>";
+        "<button class='primary' value='yes'></button></div>";
       dlg.querySelector("h3").textContent = title;
-      dlg.querySelector("div.muted").textContent = message;
+      emphasize(dlg.querySelector("div.dlg-body"), message);
+
+      var yesBtn = dlg.querySelector("button[value=yes]");
+      yesBtn.textContent = opts.yesText || "确认";
+      // 危险操作换红色按钮：让「点在哪个按钮上」在配色上也说得通，而不只是靠读标题。
+      if (opts.danger) {
+        yesBtn.className = "danger";
+        yesBtn.setAttribute("data-danger", "1");
+      }
+      var noBtn = dlg.querySelector("button[value=no]");
+      noBtn.textContent = opts.noText || "取消";
+
       document.body.appendChild(dlg);
       dlg.addEventListener("close", function () {
         var yes = dlg.returnValue === "yes";
         if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
         resolve(yes);
       });
-      dlg.querySelector("button[value=no]").addEventListener("click", function () { dlg.close("no"); });
-      dlg.querySelector("button[value=yes]").addEventListener("click", function () { dlg.close("yes"); });
-      if (typeof dlg.showModal === "function") dlg.showModal();
-      else { resolve(window.confirm(title + "\n" + message)); if (dlg.parentNode) dlg.parentNode.removeChild(dlg); }
+      noBtn.addEventListener("click", function () { dlg.close("no"); });
+      yesBtn.addEventListener("click", function () { dlg.close("yes"); });
+      if (typeof dlg.showModal === "function") {
+        dlg.showModal();
+        // showModal 会把焦点丢到第一个可聚焦元素；危险弹窗显式挪到取消按钮。
+        if (opts.danger) noBtn.focus();
+      } else {
+        resolve(window.confirm(title + "\n" + String(message).replace(/\*\*/g, "")));
+        if (dlg.parentNode) dlg.parentNode.removeChild(dlg);
+      }
     });
   }
 
@@ -426,12 +521,124 @@
     updateBulkCount();
   }
 
+  /**
+   * 界面详略模式：simple / expert。
+   *
+   * 初始值由 base.html 的 head 内联脚本先写进 `<html data-mode>`（先于样式绘制，
+   * 否则简单模式下会闪一下专家内容）。这里只负责「切换 + 记住 + 改写按钮文案」。
+   * 存 localStorage 而不是服务端配置：这是本地观看偏好，换台机器不必跟着走。
+   */
+  var UI_MODE_KEY = "fissue.ui.mode";
+
+  function currentMode() {
+    return document.documentElement.getAttribute("data-mode") === "expert" ? "expert" : "simple";
+  }
+
+  function syncModeButton() {
+    var btn = document.getElementById("mode-toggle");
+    var hint = document.getElementById("mode-hint");
+    var simple = currentMode() === "simple";
+    // 按钮说的是「点了会变成什么」，而不是「现在是什么」——后者容易让人以为点它没生效。
+    if (btn) {
+      btn.textContent = simple ? "显示专家细节" : "回到简单模式";
+      btn.setAttribute("aria-pressed", simple ? "false" : "true");
+    }
+    // 常驻那行说的是「现在是什么」：页面上少了一半信息时，得有个地方能看出原因是这个开关。
+    if (hint) {
+      hint.textContent = simple
+        ? "界面：简单（只显示日常操作）"
+        : "界面：专家（显示全部细节）";
+    }
+  }
+
+  function toggleMode() {
+    var next = currentMode() === "simple" ? "expert" : "simple";
+    document.documentElement.setAttribute("data-mode", next);
+    try {
+      localStorage.setItem(UI_MODE_KEY, next);
+    } catch (e) { /* 隐私模式写不了，本次生效即可 */ }
+    syncModeButton();
+    toast(next === "expert" ? "已显示专家细节" : "已切回简单模式", "info", { timeout: 2000 });
+  }
+
+  function wireModeToggle() {
+    syncModeButton();
+    var btn = document.getElementById("mode-toggle");
+    if (btn) btn.addEventListener("click", toggleMode);
+  }
+
+  /**
+   * 复制到剪贴板。
+   *
+   * 为什么不能只用 `navigator.clipboard`：它要求**安全上下文**（https 或 localhost）。
+   * Fissue 常被装在局域网机器上、用 `http://192.168.x.x:8000` 打开——在那种页面上
+   * `navigator.clipboard` 是 undefined，原先只有 apikeys 页用到它，一按就「不支持自动复制」。
+   * 这里加一条 `execCommand('copy')` 回退，把这种情况也覆盖掉。
+   */
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      // 必须留在文档里且能选中才复制得到，所以移出视口而不是 display:none。
+      ta.style.position = "fixed";
+      ta.style.top = "-1000px";
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      var ok = false;
+      try {
+        ok = document.execCommand("copy");
+      } catch (e) {
+        ok = false;
+      }
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error("这个浏览器不允许自动复制"));
+    });
+  }
+
   function updateBulkCount() {
     var keys = selectedKeys();
     var label = document.getElementById("pick-count");
     if (label) label.textContent = String(keys.length);
     Array.prototype.forEach.call(document.querySelectorAll("[data-needs-pick]"), function (btn) {
       btn.disabled = keys.length === 0;
+    });
+  }
+
+  /**
+   * 给 `.kv` 布局里的控件补可读名称。
+   *
+   * `.kv` 是「左边一个 `<div class="k">端点</div>`、右边一个 `<div class="v"><input></div>`」的
+   * 视觉表格——看得见的人知道那个输入框叫「端点」，读屏用户只知道「编辑框」。设置页、
+   * 初始化向导、条目详情大量使用这套结构，逐个模板加 `aria-label` 既啰嗦又容易漏，
+   * 所以在渲染后统一按 `.k` 的文字补上。
+   *
+   * 只补**没有名称**的控件：已经有 label / aria-label / placeholder / title 的一律不动，
+   * 免得把作者特意写好的名字覆盖成一个更笼统的词。
+   */
+  function wireKvLabels() {
+    Array.prototype.forEach.call(document.querySelectorAll(".kv"), function (kv) {
+      var children = Array.prototype.slice.call(kv.children);
+      children.forEach(function (el, index) {
+        if (!el.classList || !el.classList.contains("k")) return;
+        var label = (el.textContent || "").trim();
+        var valueCell = children[index + 1];
+        if (!label || !valueCell) return;
+        Array.prototype.forEach.call(
+          valueCell.querySelectorAll("input, select, textarea"),
+          function (control) {
+            if (control.type === "hidden" || control.type === "checkbox" || control.type === "radio") return;
+            if (control.getAttribute("aria-label") || control.getAttribute("aria-labelledby")) return;
+            if (control.getAttribute("placeholder") || control.getAttribute("title")) return;
+            if (control.labels && control.labels.length) return;
+            control.setAttribute("aria-label", label);
+          }
+        );
+      });
     });
   }
 
@@ -529,7 +736,20 @@
 
   function startLiveBadge() {
     if (!document.getElementById("live-box")) return;
+
+    // 页面看不见时不再拉 /status：后台标签页每 2~5 秒打一次服务端，既是白烧数据库往返，
+    // 也会让「最后更新时间」在没人看的时候一直变。浏览器虽然会把后台定时器节流到分钟级，
+    // 但那是**定时器**的节流——只要醒过来就仍然是一次真实请求，不如自己判掉。
+    // 回到前台时立刻补一次：否则角标会停在切走那一刻的旧状态，看上去像「卡住了」。
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) pollStatus();
+    });
+
     (async function loop() {
+      if (document.hidden) {
+        setTimeout(loop, STATUS_IDLE_MS);
+        return;
+      }
       var busy = await pollStatus();
       // 忙的时候看得紧一点：用户正是此刻在等结果。
       setTimeout(loop, busy ? STATUS_BUSY_MS : STATUS_IDLE_MS);
@@ -564,6 +784,51 @@
     }
   }
 
+  /**
+   * 相对时间格式化：将 ISO 8601 时间戳转换为「2 小时前」「3 天前」等友好格式。
+   * @param {string} isoString ISO 8601 格式的时间戳（如 "2024-03-15T14:23:45"）
+   * @param {boolean} withAbsolute 是否在 title 属性中保留绝对时间（用于 hover 显示）
+   * @returns {string} HTML 字符串，如果 withAbsolute=true 则带 title 属性
+   */
+  function relativeTime(isoString, withAbsolute) {
+    if (!isoString) return "—";
+    var date = new Date(isoString);
+    if (isNaN(date.getTime())) return escapeHtml(isoString);
+    
+    var now = new Date();
+    var diffMs = now - date;
+    var diffSec = Math.floor(diffMs / 1000);
+    var diffMin = Math.floor(diffSec / 60);
+    var diffHour = Math.floor(diffMin / 60);
+    var diffDay = Math.floor(diffHour / 24);
+    
+    var relative;
+    if (diffSec < 60) {
+      relative = "刚刚";
+    } else if (diffMin < 60) {
+      relative = diffMin + " 分钟前";
+    } else if (diffHour < 24) {
+      relative = diffHour + " 小时前";
+    } else if (diffDay < 7) {
+      relative = diffDay + " 天前";
+    } else if (diffDay < 30) {
+      var weeks = Math.floor(diffDay / 7);
+      relative = weeks + " 周前";
+    } else if (diffDay < 365) {
+      var months = Math.floor(diffDay / 30);
+      relative = months + " 个月前";
+    } else {
+      var years = Math.floor(diffDay / 365);
+      relative = years + " 年前";
+    }
+    
+    if (withAbsolute) {
+      var absolute = isoString.replace("T", " ").slice(0, 19);
+      return '<span title="' + escapeHtml(absolute) + '">' + escapeHtml(relative) + '</span>';
+    }
+    return escapeHtml(relative);
+  }
+
   window.Fissue = {
     api: request,
     toast: toast,
@@ -574,6 +839,8 @@
     updateBulkCount: updateBulkCount,
     formQuery: formQuery,
     escapeHtml: escapeHtml,
+    relativeTime: relativeTime,
+    copyText: copyText,
     kindLabel: kindLabel,
     statusClass: statusClass,
     pollStatus: pollStatus,
@@ -584,9 +851,40 @@
   document.addEventListener("DOMContentLoaded", function () {
     startLiveBadge();
     wireSelectAll();
+    wireKvLabels();
+    wireModeToggle();
+    // `[data-autosubmit]`：筛选类下拉框选完就提交。用事件委托而不是逐个绑定，
+    // 因为这类控件会随页面/模板增减（流水线的仓库筛选、条目页的每页条数）。
+    // 仍然保留 <noscript> 里的提交按钮：禁用 JS 时表单还得能用。
+    document.addEventListener("change", function (e) {
+      var el = e.target;
+      if (el && el.matches && el.matches("[data-autosubmit]") && el.form) {
+        if (typeof el.form.requestSubmit === "function") el.form.requestSubmit();
+        else el.form.submit();
+      }
+    });
     // 登出按钮只在 base.html 判断「当前是会话身份」时才渲染出来；这里无脑接一下。
     var logoutBtn = document.getElementById("logout-btn");
     if (logoutBtn) logoutBtn.addEventListener("click", logout);
+    // `[data-copy]`：任何标了这个属性的元素点一下就复制它自身内容。
+    // 用事件委托，模板侧只要写 `<button class="copy-btn" data-copy="{{ 值 }}">`，
+    // 不必每处再挂一次 onclick（onclick 里插值还会被 JSON 的双引号截断）。
+    document.addEventListener("click", function (e) {
+      var el = e.target && e.target.closest ? e.target.closest("[data-copy]") : null;
+      if (!el) return;
+      e.preventDefault();
+      var text = el.dataset.copy || "";
+      if (!text) return;
+      copyText(text).then(
+        function () {
+          toast("已复制：" + (text.length > 48 ? text.slice(0, 48) + "…" : text), "ok", { timeout: 2000 });
+        },
+        function () {
+          // 复制失败时把原文摊在提示里，用户至少能手动选中它。
+          toast("没能自动复制，请手动选中下面的内容", "bad", { detail: text, timeout: 0 });
+        }
+      );
+    });
     // 取消按钮在所有页面上共用这一处接线（总览的任务面板与「任务」页都用 data-act=cancel-job）。
     document.addEventListener("click", function (e) {
       var btn = e.target && e.target.closest ? e.target.closest("button[data-act=cancel-job]") : null;

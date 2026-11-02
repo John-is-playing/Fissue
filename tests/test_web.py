@@ -1144,9 +1144,12 @@ def test_item_page_renders_the_title_as_the_heading(client) -> None:
 def test_delete_entry_points_are_present(client) -> None:
     """两个删除入口：条目页的「删除选中」与详情页的「删除本地数据」，都要二次确认。"""
     items = client.get("/items").text
-    assert 'onclick="bulkDelete()"' in items
+    assert 'onclick="bulkDelete(this)"' in items
     assert "function bulkDelete" in items
     assert "Fissue.confirm(" in items, "破坏性操作必须二次确认"
+    # 删除是不可撤销的：确认框要走危险态，按钮文案得点明要删几条而不是一句「确认」。
+    assert "danger: true" in items, "删除确认必须是危险态"
+    assert "yesText" in items, "确认按钮要写成动词"
 
     detail = client.get(f"/item/{KEY_ENC}").text
     assert 'onclick="deleteItem()"' in detail
@@ -1223,9 +1226,8 @@ def test_frontend_shows_who_is_writing_and_for_how_long(client) -> None:
     它们是前端渲染的，所以只能守到「脚本里有这段接线」——真机那次的病根正是这段接线缺失：
     `who` 只有一个 pid、也没有时长，用户看不出是谁在写、更判断不出卡没卡。
     """
-    status_html = client.get("/status").text
-    assert "writerText" in status_html and "kind_label" in status_html
-
+    # 状态页删除后，这段信息的唯一落点是**全站侧栏角标**（app.js 的 renderLive）：
+    # 每个页面都看得到，反而比只在一个页面上更该说清楚。
     app_js = client.get("/static/app.js").text
     assert "writerDur" in app_js and "kind_label" in app_js
 
@@ -1704,7 +1706,7 @@ def test_pipeline_page_renders_totals_as_numbers(client) -> None:  # noqa: ANN00
     assert m.group(1).strip().isdigit(), f"条目总数不是数字：{m.group(1)!r}"
 
 
-def test_status_page_renders_a_readable_job_result(client) -> None:  # noqa: ANN001
+def test_jobs_page_renders_a_readable_job_result(client) -> None:  # noqa: ANN001
     """已完成作业的结果要渲染成**人话**，不是一坨原始 JSON。
 
     这条守的是一个真发生过的 500：`_jobs_panel.html` 的循环变量叫 `j`，而新加的结果
@@ -1712,6 +1714,7 @@ def test_status_page_renders_a_readable_job_result(client) -> None:  # noqa: ANN
     单测全绿，因为没人渲染过带结果的作业。
 
     顺带钉住「可读」本身：页面上要有一句结论和一个关键数字，原始 JSON 只出现在折叠区。
+    （状态页删除后，这段断言落在 `/jobs`——它才是作业结果的主场。）
     """
     from fissue.web import jobs as jobs_mod
 
@@ -1721,7 +1724,7 @@ def test_status_page_renders_a_readable_job_result(client) -> None:  # noqa: ANN
     job.result = {"fetched": 5, "created": 2, "updated": 1, "unchanged": 2, "error": None}
     registry._jobs["done1"] = job
     try:
-        r = client.get("/status")
+        r = client.get("/jobs")
         assert r.status_code == 200, r.text
         html = r.text
 
@@ -1817,3 +1820,112 @@ def test_item_page_renders_markdown_bodies(client) -> None:
     # 安全性：不可信输入的原始标记只能以转义形式出现
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert "<script>alert(1)</script>" not in html
+
+
+# ---------------------------------------------------------------------------
+# 补丁正文的取用规则（web/routes_pages.py 的 _patch_text）
+# ---------------------------------------------------------------------------
+#
+# 这里有一条真实的攻击面：`patch_path` 存在数据库里，属于「可以被人改过的输入」。
+# 页面若照着它去读文件，一条被篡改的记录就能让渲染过程读到任意路径。所以
+# 「越界必须读不出来」这条要有用例盯着，而不是只在实现里写一句注释。
+
+
+def test_patch_text_prefers_db_diff(tmp_path) -> None:  # noqa: ANN001
+    """库里的 diff 才是补丁的源头，有它就不碰文件系统。"""
+    from fissue.web.routes_pages import _patch_text
+
+    class Attempt:
+        diff = "db-diff-body"
+        patch_path = str(tmp_path / "patches" / "nope.patch")  # 故意指向不存在的文件
+
+    assert _patch_text(Attempt(), tmp_path) == "db-diff-body"
+
+
+def test_patch_text_reads_file_under_patches_dir(tmp_path) -> None:  # noqa: ANN001
+    """库里没有 diff 的老记录，回退读 patch_path——但只在 patches/ 之下。"""
+    from fissue.web.routes_pages import _patch_text
+
+    patch = tmp_path / "patches" / "x.patch"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("file-diff-body", encoding="utf-8")
+
+    class Attempt:
+        diff = ""
+        patch_path = str(patch)
+
+    assert _patch_text(Attempt(), tmp_path) == "file-diff-body"
+
+
+def test_patch_text_refuses_path_outside_patches_dir(tmp_path) -> None:  # noqa: ANN001
+    """patches/ 之外的路径一律拒绝——这条就是防「被篡改的记录读到任意文件」。"""
+    from fissue.web.routes_pages import _patch_text
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP-SECRET", encoding="utf-8")
+
+    class Attempt:
+        diff = ""
+        patch_path = str(secret)
+
+    assert _patch_text(Attempt(), tmp_path) is None
+
+
+def test_patch_text_refuses_traversal_that_escapes_patches_dir(tmp_path) -> None:  # noqa: ANN001
+    """`patches/../../secret` 这类穿越写法解析后落在外面，同样要拒绝。"""
+    from fissue.web.routes_pages import _patch_text
+
+    (tmp_path / "patches").mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("TOP-SECRET", encoding="utf-8")
+    sneaky = tmp_path / "patches" / ".." / "secret.txt"
+
+    class Attempt:
+        diff = ""
+        patch_path = str(sneaky)
+
+    assert _patch_text(Attempt(), tmp_path) is None
+
+
+def test_patch_text_returns_none_when_nothing_available(tmp_path) -> None:  # noqa: ANN001
+    """既没有 diff 也没有路径时给 None——模板据此显示「正文取不到」，而不是空补丁块。"""
+    from fissue.web.routes_pages import _patch_text
+
+    class Attempt:
+        diff = ""
+        patch_path = None
+
+    assert _patch_text(Attempt(), tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# 状态页已删除：旧地址保留重定向，API 端点照旧
+# ---------------------------------------------------------------------------
+#
+# 删页面和删接口是两件事。`/status`（HTML 页）删了，但 `/api/v1/status` 必须留着——
+# 全站侧栏的实时角标和任务页都靠它。这里把「哪个删了、哪个还在」钉死，
+# 免得以后有人把两者当成一个东西顺手一起删掉。
+
+
+def test_status_page_is_gone_but_its_api_stays(client) -> None:  # noqa: ANN001
+    """/status 307 → /jobs（旧书签不 404）；/api/v1/status 仍然可用。"""
+    r = client.get("/status", follow_redirects=False)
+    assert r.status_code == 307, f"旧地址应当重定向，实际 {r.status_code}"
+    assert r.headers["location"] == "/jobs"
+
+    # 跟着跳过去要能落到一个能用的页面（307 不是死路）
+    followed = client.get("/status")
+    assert followed.status_code == 200
+    assert followed.url.path == "/jobs"
+
+    # 接口不能跟着页面一起没：侧栏角标每几秒读一次
+    api = client.get("/api/v1/status")
+    assert api.status_code == 200
+    assert "writer" in api.json(), "角标要用 writer 说清「谁在写」"
+
+
+def test_no_page_links_to_the_removed_status_page(client) -> None:  # noqa: ANN001
+    """站内不该再出现指向已删页面的链接（点了才发现跳走是最烦的）。"""
+    for path in ("/", "/items", "/jobs", "/pipeline", "/repos", "/settings", "/setup", "/api-keys"):
+        html = client.get(path).text
+        assert 'href="/status"' not in html, f"{path} 上还有指向已删状态页的链接"

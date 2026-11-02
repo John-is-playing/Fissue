@@ -44,7 +44,7 @@ from ..models import ItemStatus, ItemType, QueueName
 from .auth import AUTH_PREFIX, page_guard_middleware
 from .auth import register as register_auth
 from .job_results import summarize_result
-from .markdown import render_markdown_inline_markup, render_markdown_markup
+from .markdown import render_markdown_inline_markup, render_markdown_markup, render_patch_markup
 from .jobs import Job, JobRegistry
 from .status import queue_panel
 
@@ -216,6 +216,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     templates.env.filters["md"] = render_markdown_markup
     # `{{ x | mdi }}`：只做行内格式（列表项用，避免每条都带块间距）。
     templates.env.filters["mdi"] = render_markdown_inline_markup
+    # `{{ x | patch }}`：把 unified diff 渲染成安全 HTML（条目详情的「查看补丁」）。
+    templates.env.filters["patch"] = render_patch_markup
+    # 展示词汇：枚举值 → 中文。界面不该把 `needs_manual` / `fix_now` 这种数据库与 API
+    # 用的 token 直接摆给用户；英文原值留在各处的 title 里供对着 CLI/日志排查。
+    # 词汇表本身住在 web/labels.py（CLI 与 API 仍输出英文原值，两者互不影响）。
+    from .labels import (
+        action_label as _action_label,
+        fix_outcome_label as _fix_outcome_label,
+        platform_state_label as _platform_state_label,
+        status_label as _status_label,
+        verdict_label as _verdict_label,
+        verifier_kind_label as _verifier_kind_label,
+    )
+
+    templates.env.filters["status_label"] = _status_label
+    templates.env.filters["verdict_label"] = _verdict_label
+    templates.env.filters["action_label"] = _action_label
+    templates.env.filters["fix_outcome_label"] = _fix_outcome_label
+    templates.env.filters["verifier_kind_label"] = _verifier_kind_label
+    templates.env.filters["platform_state_label"] = _platform_state_label
     application.state.templates = templates
     # 进程启动时刻：状态页显示「已运行多久」。放在这里而不是 lifespan 里，是因为
     # `_ensure_state` 那条兜底路径（测试用 TestClient 不做上下文管理器）不会跑 lifespan，
@@ -232,6 +252,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.middleware("http")
     async def _guard_pages(request: Request, call_next: Any) -> Any:
         return await page_guard_middleware(request, call_next)
+
+    # 页面路由上的 4xx（最常见的是 `/item/{key}` 条目不存在）原先直接吐 FastAPI 默认的
+    # `{"detail": "..."}`——对着链接点进来的人看到一屏裸 JSON，不知道是不是自己的问题。
+    # 这里只处理 `/api/*` 之外的请求：API 必须继续回 JSON，前端脚本靠状态码判断行为。
+    @application.exception_handler(HTTPException)
+    async def _html_error_page(request: Request, exc: HTTPException) -> Any:
+        # 用 fastapi 再导出的 JSONResponse，而不是 `from starlette.responses import ...`：
+        # starlette 是 fastapi 的传递依赖，直接 import 它等于给 wheel 装好后的可用性
+        # 押注在别人的依赖表上（tests/test_packaging.py 的守卫就是这么判的）。
+        from fastapi.responses import JSONResponse
+
+        api_prefix = st.api.prefix
+        wants_json = (
+            request.url.path.startswith(api_prefix)
+            or request.url.path.startswith("/api/auth")
+            or "application/json" in request.headers.get("accept", "")
+        )
+        if wants_json:
+            # **必须**把 exc.headers 带上：认证节流靠它发 `Retry-After`，重建响应时丢掉
+            # 就等于把「多久之后可以再试」这个信息吞了，客户端只能盲猜（tests/test_auth.py
+            # 的节流用例正是钉住这一条）。
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"detail": exc.detail},
+                headers=exc.headers,
+            )
+        titles = {404: "没找到", 403: "无权访问", 400: "请求有问题", 409: "暂时冲突"}
+        templates = application.state.templates
+        return templates.TemplateResponse(
+            request,
+            "error.html",
+            _page_context(
+                request,
+                status_code=exc.status_code,
+                title=titles.get(exc.status_code, "出错了"),
+                message=str(exc.detail),
+            ),
+            status_code=exc.status_code,
+        )
 
     # REST API 与页面路由分别住在 routes_api / routes_pages：这里只负责按配置决定
     # 要不要挂，以及把共享的鉴权依赖与模板传下去。**惰性导入**是刻意的——那两个模块

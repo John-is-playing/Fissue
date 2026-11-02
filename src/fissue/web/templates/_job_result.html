@@ -25,7 +25,7 @@
   {% if s.rows %}
   <div class="table-scroll">
     <table class="j-result-table">
-      <thead><tr>{% for col in s.columns %}<th>{{ col }}</th>{% endfor %}</tr></thead>
+      <thead><tr>{% for col in s.columns %}<th scope="col">{{ col }}</th>{% endfor %}</tr></thead>
       <tbody>
         {% for row in s.rows %}
         <tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>

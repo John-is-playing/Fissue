@@ -79,7 +79,7 @@
       <span class="tag {{ cls }}">{{ job.status }}</span>
       <span class="tag">{{ job.id }}</span>
       <span class="muted small">{{ job.duration_seconds }}s</span>
-      <span class="muted small">{{ (job.created_at or '')[:19].replace('T', ' ') }}</span>
+      <span class="muted small"><script>document.write(Fissue.relativeTime('{{ job.created_at }}', true));</script></span>
       <span class="spacer"></span>
       <a class="small" href="/jobs/{{ job.id }}">详情</a>
       {% if job.live and not read_only %}

@@ -15,9 +15,28 @@
 <title>{% block title %}Fissue{% endblock %}</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
 <link rel="stylesheet" href="{{ static_url }}">
+{# 界面模式：**先于样式绘制**就定下来。
+   如果等到 app.js（页面底部）再切，简单模式下会先闪一下满屏专家细节再被隐藏——
+   那一下闪烁比不做还糟。所以这段必须留在 head 里、且是内联的。
+   模式只存在浏览器本地（localStorage）：这是「这个人想看多细」的偏好，不是服务端配置，
+   没必要也不应该写进 config.yaml。读不到（隐私模式）就按默认值走。 #}
+<script>
+  (function () {
+    var mode = "simple";
+    try {
+      var saved = localStorage.getItem("fissue.ui.mode");
+      if (saved === "expert") mode = "expert";
+    } catch (e) { /* 隐私模式下 localStorage 不可用，用默认值 */ }
+    document.documentElement.setAttribute("data-mode", mode);
+  })();
+</script>
 {% block head %}{% endblock %}
 </head>
 <body>
+
+{# 跳转主内容：键盘用户每页都要先 Tab 过十来条导航链接才能到正文。
+   平时藏在视口外，聚焦时才出现（样式见 app.css 的 .skip-link）。 #}
+<a class="skip-link" href="#main-content">跳到主内容</a>
 
 <div class="shell">
 
@@ -27,25 +46,22 @@
       <span class="ver">v{{ version }}</span>
     </div>
 
-    {# 导航按「干活 → 观测 → 配置」三组排：
-       * 干活：流水线（首页，含队列判定与批量操作）、条目；
-       * 观测：状态（现在在干什么）、任务（历史上都干过什么、结果如何）、总览；
-       * 配置：仓库、设置、向导、Key —— 一次性动作，放最后。
+    {# 导航只留**每天都会点**的五个：流水线 / 条目 / 任务 / 状态 / 设置。
+       原先九项里，「总览、监控仓库、初始化向导、API Key」是一次性或查阅型的动作，
+       却和日常三个入口同等醒目——第一次来的人要在九项里找「我该点哪个」。
+       它们没有被删掉，只是入口移到「设置」页的「其它入口」，品牌名仍链到总览。
        「任务」独立成格而不是塞进状态页：作业表一天几百条，堆在一起会把
        「现在有没有卡住」这个主题淹掉；它自己带筛选与分页。
        「队列」并进了流水线看板（判定就在那一屏做决定），旧地址 `/queues` 保留重定向。 #}
     <nav class="nav">
       <a href="/pipeline" class="{{ 'on' if nav == 'pipeline' }}">流水线</a>
       <a href="/items" class="{{ 'on' if nav == 'items' }}">条目</a>
-      <div class="nav-sep"></div>
-      <a href="/status" class="{{ 'on' if nav == 'status' }}">状态</a>
       <a href="/jobs" class="{{ 'on' if nav == 'jobs' }}">任务</a>
-      <a href="/" class="{{ 'on' if nav == 'overview' }}">总览</a>
       <div class="nav-sep"></div>
-      <a href="/repos" class="{{ 'on' if nav == 'repos' }}">监控仓库</a>
-      <a href="/settings" class="{{ 'on' if nav == 'settings' }}">设置</a>
-      <a href="/setup" class="{{ 'on' if nav == 'setup' }}">初始化向导</a>
-      <a href="/api-keys" class="{{ 'on' if nav == 'apikeys' }}">API Key</a>
+      {# 设置组：仓库 / 向导 / API Key 是从设置页分出去的子页面——停在那些页面上时
+         高亮「设置」，用户才知道自己在大类里的哪个位置，而不是「导航全灰了」。 #}
+      <a href="/settings"
+         class="{{ 'on' if nav == 'settings' or nav in ('repos', 'setup', 'apikeys') }}">设置</a>
     </nav>
 
     {# 常驻的实时角标：每 5 秒拉一次 /api/v1/status，在**每个页面**上都显示
@@ -59,11 +75,21 @@
       <div class="live-row" id="live-jobs-row" hidden>
         <span class="spinner"></span><span id="live-jobs"></span>
       </div>
-      <a class="small" href="/status">状态监测 →</a>
+      {# 「状态监测 →」的链接随状态页一起删掉了：上面这行角标本身就在回答
+         「活着没有、在干什么」，点进去看到的是同一件事的另一个版本。
+         要看历史与细节去「任务」（导航里就有），要看写闸门细节去任务页。 #}
+      {# 界面详略开关：默认「简单」（只留该不该修、修到哪一步），需要排查时再切「专家」。
+         上面那行常驻写出当前处于哪一档：否则用户只会觉得「怎么少了一半信息」，
+         却不知道是自己开了简单模式、更不知道去哪关掉。文案由 app.js 按模式改写。 #}
+      <div class="mode-hint muted" id="mode-hint">界面：简单（只显示日常操作）</div>
+      <button type="button" class="ghost small mode-toggle" id="mode-toggle"
+              title="简单模式只显示日常操作；专家模式额外显示评分维度、验证器命令、回归门、备份读数等排查用信息">
+        显示专家细节
+      </button>
     </div>
   </aside>
 
-  <main class="main">
+  <main class="main" id="main-content">
     <header>
       <h1>{% block heading %}Fissue{% endblock %}</h1>
       <span class="sub">{% block subtitle %}{% endblock %}</span>
@@ -86,7 +112,10 @@
   </main>
 </div>
 
-<div id="toasts"></div>
+{# 提示区是 live region：否则「已删除 3 条」「任务失败」这类结果只有看得见的人知道。
+   polite 而不是 assertive——它不该打断用户正在读的内容；错误信息本身不会自动消失，
+   用户有足够时间回头读到它。 #}
+<div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <script>
   window.FISSUE = {

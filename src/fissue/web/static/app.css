@@ -75,6 +75,18 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
 /* 键盘可用的前提：焦点必须看得见。原先所有控件都没有 focus 样式。 */
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+/* 跳转主内容：每页有十来条导航链接，键盘用户每次都得 Tab 过去才能到正文。
+   平时移到视口外（不能只 `display:none`——那样它不可聚焦，等于没有），
+   拿到焦点时再滑回来。 */
+.skip-link {
+  position: absolute; left: 8px; top: -48px; z-index: 100;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--accent); border-radius: var(--radius-sm);
+  padding: 7px 12px; font-size: 13px; text-decoration: none;
+  transition: top .12s ease-out;
+}
+.skip-link:focus { top: 8px; text-decoration: none; }
+
 /* --------------------------------------------------------------------------
  * 页头 / 布局
  * -------------------------------------------------------------------------- */
@@ -309,6 +321,11 @@ td.shrink, th.shrink { width: 1%; white-space: nowrap; }
 .toast.bad { border-left-color: var(--bad); }
 .toast.info { border-left-color: var(--accent); }
 .toast .t-head { display: flex; gap: 8px; align-items: baseline; }
+/* 合并计数：同一句话重复出现时只显示「×2」，而不是堆两条一模一样的提示。 */
+.toast .t-count {
+  color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.toast .t-count:empty { display: none; }
 .toast .t-close { margin-left: auto; cursor: pointer; color: var(--muted); }
 .toast pre { margin: 6px 0 0; max-height: 180px; }
 @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -366,6 +383,107 @@ td.shrink, th.shrink { width: 1%; white-space: nowrap; }
 .progress-line { color: var(--muted); font-size: 12px; margin-top: 4px; }
 
 /* --------------------------------------------------------------------------
+ * 总览页「控制面板」任务卡（web/templates/overview.html）
+ *
+ * 原先五个任务直接堆在 grid 里，靠 title 悬浮提示解释用途——第一次打开这页
+ * 的人不会去逐个 hover。现在每张卡自带一句话说明，卡片边框把任务互相隔开。
+ * -------------------------------------------------------------------------- */
+.task-card {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 10px 12px;
+}
+
+/* --------------------------------------------------------------------------
+ * 条目列表的分数徽标（web/templates/items.html 的 score_chip 宏）
+ *
+ * 原先「真/重/难」一列是 `70/57/77` 三个裸数字：既分不清哪个数对应哪个维度，
+ * 也看不出 70 算高还是低。现在改成三个小徽标 + 按阈值上色，颜色值只在**方向明确**的
+ * 地方使用（难度越低越好修，阈值反过来）。
+ * -------------------------------------------------------------------------- */
+.score-chips { display: inline-flex; gap: 3px; }
+.score-chip {
+  display: inline-block; min-width: 24px; text-align: center;
+  padding: 0 4px; border-radius: 4px; font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.score-chip.hi { color: var(--ok); border-color: var(--feature-line); background: var(--feature-bg); }
+.score-chip.mid { color: var(--t1); border-color: var(--t1-line); background: var(--t1-bg); }
+.score-chip.lo { color: var(--bad); border-color: var(--bug-line); background: var(--bug-bg); }
+
+/* --------------------------------------------------------------------------
+ * 一键复制（app.js 的 copyText + [data-copy] 委托）
+ *
+ * 条目 key、PR 地址、补丁路径、仓库 slug 这类值都得复制出去用（贴进 CLI、贴进 Issue），
+ * 而手动三击选中很容易多选或少选一个字符。按钮做得很轻，贴在 code 后面不抢版面。
+ * -------------------------------------------------------------------------- */
+.copy-btn {
+  background: transparent; border: 1px solid var(--line); border-radius: 5px;
+  color: var(--muted); font-size: 11px; line-height: 1;
+  padding: 2px 5px; margin-left: 4px; cursor: pointer; vertical-align: baseline;
+}
+.copy-btn:hover { color: var(--accent); border-color: var(--accent); }
+.copy-btn:active { transform: translateY(1px); }
+
+/* --------------------------------------------------------------------------
+ * 补丁内容查看（web/markdown.py 的 render_patch_markup）
+ *
+ * 之前页面上只有补丁的**路径**：知道「生成了补丁」，但读不到改了什么，还得去文件系统翻。
+ * 这里只按行首给色（+/-/@@/文件头），不做语法高亮——要回答的是「改了什么」。
+ * 横向滚动而不是换行：代码换行后 +/- 的对应关系就看不出来了。
+ * -------------------------------------------------------------------------- */
+.patch-view > summary { cursor: pointer; user-select: none; color: var(--accent); font-size: 12px; }
+.patch-view > summary::before { content: "▸ "; }
+.patch-view[open] > summary::before { content: "▾ "; }
+pre.diff {
+  margin: 8px 0 0; padding: 10px 12px; overflow-x: auto;
+  background: #12151b; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12px; line-height: 1.5; white-space: pre;
+}
+pre.diff span { display: block; }
+pre.diff .d-add { color: var(--ok); background: rgba(125, 211, 160, .07); }
+pre.diff .d-del { color: var(--bad); background: rgba(255, 107, 107, .07); }
+pre.diff .d-hunk { color: var(--accent); }
+pre.diff .d-meta { color: var(--muted); }
+pre.diff .d-ctx { color: var(--fg); }
+
+/* 详情页的「深入」分组：外层是一个 <details>，里面原本是五个同级 .panel。
+   直接套会在面板里再画一圈边框（双层描边，看着像没对齐），所以内层面板改成
+   只用分隔线，标题也收小一号——它们是同一组的成员，不是并列的五个板块。 */
+.section-group[open] > summary { margin-bottom: 4px; }
+.section-group .panel {
+  background: transparent; border: none; border-radius: 0;
+  border-top: 1px solid var(--line); padding: 12px 0 4px; margin: 0;
+}
+.section-group .panel:first-of-type { border-top: none; padding-top: 8px; }
+.section-group .panel h2 { font-size: 12px; margin-bottom: 8px; }
+
+/* 条目表：分类 / 优先级 / 状态三个徽标原先各占一列（三列都是同一个短徽标，
+   横向吃掉三分之一宽度，把「结论」挤到右边）。现在并到标题下面一行，
+   列数从 8 降到 5；徽标之间用 2px 间距，读起来仍是一组「这条是什么、到哪了」。 */
+.item-badges { margin: 3px 0 2px; }
+.item-badges .tag { margin-right: 2px; }
+
+/* --------------------------------------------------------------------------
+ * 简单 / 专家模式（base.html 的 data-mode + 各页面的 .expert-only）
+ *
+ * 为什么用 CSS 隐藏而不是服务端不渲染：模式是**这个人想看多细**的本地偏好，存在
+ * localStorage 里，不该为它加一个服务端配置项、也不该为它多一份模板分支
+ * （两份模板迟早会分叉）。代价是 HTML 里仍然带着那些节点——它们只是看不见，
+ * 不会被误操作，也不影响性能。
+ *
+ * 同样的道理，`.expert-only` 只标在「排查时才看」的东西上：评分维度、验证器命令、
+ * F2P、回归门、补丁明细、队列阈值、运行时参数。**不要**标在「判断该不该修」需要的
+ * 信息上（分类、结论摘要、状态、动作按钮）——那会把简单模式变成残废模式。
+ * -------------------------------------------------------------------------- */
+html[data-mode="simple"] .expert-only { display: none !important; }
+
+.mode-toggle { margin-top: 2px; text-align: left; font-size: 11px; padding: 4px 8px; }
+/* 常驻那行要能读到、但不该抢走注意力：小号、弱色。
+   它存在的理由是「页面上少了一半信息时，得有个地方能看出原因是这个开关」。 */
+.mode-hint { font-size: 11px; line-height: 1.35; }
+
+/* --------------------------------------------------------------------------
  * 常驻保存条（「设置」页）
  * -------------------------------------------------------------------------- */
 /* 保存按钮必须**常驻可见**：这一页有四个面板，按钮若只在最后一个面板里，
@@ -399,7 +517,14 @@ dialog {
 }
 dialog::backdrop { background: rgba(0, 0, 0, .55); }
 dialog h3 { margin: 0 0 10px; font-size: 15px; }
+dialog .dlg-body { white-space: pre-wrap; }
+dialog .dlg-body strong { color: var(--fg); font-weight: 600; }
 dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+/* 危险确认：边框与标题都转向告警色，配合红色的确认按钮，让「这是不可撤销的」在
+   配色上就成立，而不是只写在正文里等人读。取消按钮同时描边，成为视觉上更"安全"的默认。 */
+dialog.danger { border-color: var(--bug-line); }
+dialog.danger h3 { color: var(--bad); }
+dialog.danger .dlg-actions button[value="no"] { border-color: var(--muted); }
 
 /* --------------------------------------------------------------------------
  * 工作台布局：左侧导航 + 主区
@@ -471,6 +596,33 @@ dialog .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin
   .grid-2 { grid-template-columns: 1fr; }
   .kv { grid-template-columns: 96px 1fr; }
   .card { min-width: 104px; padding: 10px 12px; }
+  
+  /* 卡片网格在小屏改为单列或双列，避免拥挤 */
+  .cards { gap: 8px; }
+  .card { flex: 1 1 calc(50% - 4px); min-width: 0; }
+  
+  /* 筛选表单：label 与控件纵向排列，避免横向换行混乱 */
+  form.filters { padding: 10px; }
+  label.inline { 
+    flex-direction: column; align-items: stretch; gap: 4px;
+    width: 100%;
+  }
+  label.inline select,
+  label.inline input { width: 100%; }
+  
+  /* 表格：压缩内边距，保证更多列可见 */
+  th, td { padding: 6px 8px; font-size: 13px; }
+  
+  /* 评分条在小屏缩短或堆叠 */
+  .score-row { flex-wrap: wrap; }
+  .bar-track { width: 100px; }
+  
+  /* 按钮在小屏自动换行 */
+  .row { gap: 6px; }
+  button { font-size: 13px; padding: 5px 11px; }
+  
+  /* 流水线漏斗：数字列缩窄 */
+  .pipe-funnel-row { grid-template-columns: 48px 1fr 72px; gap: 8px; }
 }
 
 /* --------------------------------------------------------------------------
@@ -675,4 +827,66 @@ a.pager-btn:hover { border-color: var(--accent); color: var(--accent); }
 /* 边界处的「上一页/下一页」是 span 不是 a，必须显式压暗并去掉指针——
    否则它会看起来和可点的按钮一样，点了没反应。 */
 .pager-btn.disabled { opacity: .4; cursor: default; }
+
+/* --------------------------------------------------------------------------
+ * 响应式设计：中等屏幕适配（平板横屏 / 小笔记本）
+ * -------------------------------------------------------------------------- */
+@media (max-width: 1024px) {
+  .wrap { max-width: 100%; padding-left: 16px; padding-right: 16px; }
+  
+  /* 控制面板任务卡在中等屏改为双列 */
+  .grid-2 { gap: 12px; }
+  
+  /* 流水线看板列宽度适当缩小 */
+  .pipe-kanban { grid-template-columns: repeat(6, minmax(140px, 1fr)); }
+}
+
+/* --------------------------------------------------------------------------
+ * 响应式设计：极小屏幕适配（手机竖屏）
+ * -------------------------------------------------------------------------- */
+@media (max-width: 480px) {
+  body { font-size: 13px; }
+  
+  /* 页头标题字号缩小 */
+  header h1 { font-size: 17px; }
+  .sub { font-size: 11px; }
+  
+  /* 卡片在极小屏改为单列堆叠 */
+  .cards { flex-direction: column; }
+  .card { flex: 1 1 auto; min-width: 0; }
+  .card .v { font-size: 18px; }
+  
+  /* 面板标题字号缩小 */
+  .panel h2 { font-size: 12px; }
+  
+  /* 按钮文字缩小，padding 压缩 */
+  button { font-size: 12px; padding: 4px 9px; }
+  
+  /* 表格字号进一步缩小，padding 压缩 */
+  th, td { padding: 5px 6px; font-size: 12px; }
+  .tag { font-size: 10px; padding: 1px 5px; }
+  
+  /* 键值对在极小屏第一列更窄 */
+  .kv { grid-template-columns: 72px 1fr; gap: 4px 10px; }
+  
+  /* 评分条在极小屏完全堆叠 */
+  .score-row { flex-direction: column; align-items: stretch; gap: 6px; }
+  .score-row .label { width: auto; }
+  .bar-track { width: 100%; }
+  
+  /* 筛选表单更紧凑 */
+  form.filters { padding: 8px; gap: 6px; }
+  
+  /* 流水线漏斗数字列再缩窄 */
+  .pipe-funnel-row { grid-template-columns: 40px 1fr 60px; gap: 6px; font-size: 12px; }
+  
+  /* 流水线看板在极小屏改为单列堆叠（横滑太难操作） */
+  .pipe-kanban { 
+    grid-template-columns: 1fr;
+    overflow-x: visible;
+  }
+  
+  /* 吐司在极小屏占据更多宽度 */
+  #toasts { max-width: calc(100vw - 20px); right: 10px; bottom: 10px; }
+}
 .pager-gap { padding: 0 2px; }

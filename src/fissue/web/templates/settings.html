@@ -70,6 +70,35 @@
  #}
 {% include "_settings/admin_account.html" %}
 
+{# 低频入口：这四页原本在主航道各占一格，与日常三个入口同等醒目。
+   收在这里，并且每一项都写清「它是干什么的」——只列页面名等于让人再点进去猜一次。
+   放在设置页而不是别的页面，是因为它们都属于「配置 / 查阅」这一类动作。 #}
+<div class="panel">
+  <h2>其它入口</h2>
+  <div class="kv">
+    <div class="k">总览</div>
+    <div class="v">
+      <a href="/">打开总览</a>
+      <span class="muted small">—— 告警、条目统计、模型用量与手动发起任务</span>
+    </div>
+    <div class="k">监控仓库</div>
+    <div class="v">
+      <a href="/repos">管理监控仓库</a>
+      <span class="muted small">—— 加入 / 启停 / 调参 / 移出要抓取的仓库</span>
+    </div>
+    <div class="k">初始化向导</div>
+    <div class="v">
+      <a href="/setup">重新走一遍向导</a>
+      <span class="muted small">—— 第一次配置时用；已配好的项会显示当前值，留空表示不改</span>
+    </div>
+    <div class="k">API Key</div>
+    <div class="v">
+      <a href="/api-keys">管理 API Key</a>
+      <span class="muted small">—— 给脚本 / CI 用的凭据（与平台 Token 是两码事）</span>
+    </div>
+  </div>
+</div>
+
 {% include "_settings/config_sources.html" %}
 
 {% endblock %}

@@ -18,7 +18,7 @@
     <summary class="muted">每个配置项由哪一层提供（点开）</summary>
     <div class="table-scroll mt">
     <table>
-      <thead><tr><th>配置路径</th><th>来源</th></tr></thead>
+      <thead><tr><th scope="col">配置路径</th><th scope="col">来源</th></tr></thead>
       <tbody>
       {% for path, source in view.sources.items() %}
       <tr><td><code>{{ path }}</code></td>

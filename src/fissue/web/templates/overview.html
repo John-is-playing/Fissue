@@ -25,6 +25,20 @@
 <div class="banner">⚠️ {{ problem }}</div>
 {% endfor %}
 
+{# 首次使用引导：库里一条数据都没有时，一排 0 的卡片 + 空表格不会告诉用户下一步做什么。
+   有告警（比如没配 LLM Key）已经在上面说明原因了；这里只在「配置看起来没问题、
+   就是还没抓过数据」时出现，避免和告警说同一件事。 #}
+{% if summary.total == 0 %}
+<div class="panel" style="text-align:center; padding:28px 20px;">
+  <div style="font-size:15px; font-weight:600; margin-bottom:6px;">还没有任何条目</div>
+  <div class="muted small" style="max-width:480px; margin:0 auto 14px;">
+    这台 Fissue 还没抓取过数据。如果还没配置过模型 / 数据库 / 监控仓库，先走一遍初始化向导；
+    已经配置好的话，点下面「控制面板」里的「开始检索」抓第一轮。
+  </div>
+  <a href="/setup"><button class="primary">去初始化向导 →</button></a>
+</div>
+{% endif %}
+
 <div class="cards">
   <a class="card link" href="/items"
      ><div class="k">全部条目</div><div class="v">{{ summary.total }}</div></a>
@@ -32,8 +46,8 @@
   <a class="card link" href="/items?item_type=pr"><div class="k">PR</div><div class="v">{{ summary.by_type.get('pr', 0) }}</div></a>
   <div class="card"><div class="k">BUG / FEATURE</div>
     <div class="v">{{ summary.by_category.get('bug', 0) }} / {{ summary.by_category.get('feature', 0) }}</div></div>
-  <a class="card link" href="/items?priority=tier1"><div class="k">tier1（优先修）</div><div class="v">{{ summary.by_priority.get('tier1', 0) }}</div></a>
-  <a class="card link" href="/items?priority=tier2"><div class="k">tier2</div><div class="v">{{ summary.by_priority.get('tier2', 0) }}</div></a>
+  <a class="card link" href="/items?priority=tier1" title="tier1：AI 判定为高优先级，建议先修"><div class="k">tier1（优先修）</div><div class="v">{{ summary.by_priority.get('tier1', 0) }}</div></a>
+  <a class="card link" href="/items?priority=tier2" title="tier2：次优先级，排在 tier1 之后再处理"><div class="k">tier2（次优先）</div><div class="v">{{ summary.by_priority.get('tier2', 0) }}</div></a>
   {% for dim, val in summary.avg_scores.items() %}
   <div class="card"><div class="k">平均 {{ dim }}</div><div class="v">{{ val }}</div></div>
   {% endfor %}
@@ -60,11 +74,11 @@
 {% endif %}
 
 <div class="grid-2">
-  <div class="panel">
+  <div class="panel expert-only">
     <h2>队列积压</h2>
     <table>
-      <thead><tr><th>队列</th><th class="num">待处理</th><th class="num">待定论</th>
-        <th class="num">阈值</th><th>最久等待</th></tr></thead>
+      <thead><tr><th scope="col">队列</th><th scope="col" class="num">待处理</th><th scope="col" class="num">待定论</th>
+        <th scope="col" class="num">阈值</th><th scope="col">最久等待</th></tr></thead>
       <tbody>
       {% for q in queues %}
         <tr>
@@ -101,7 +115,7 @@
       <div class="v mono">${{ budget.daily_usd_per_repo }} / 仓库 · {{ '{:,}'.format(budget.daily_tokens_per_repo) }} tokens</div>
     </div>
     <div class="row mt">
-      <a href="/status" class="small">状态监测 →</a>
+      <a href="/jobs" class="small">任务与历史记录 →</a>
       <a href="{{ api_prefix }}/queues" target="_blank" rel="noopener" class="small">队列判定原始数据 ↗</a>
     </div>
   </div>
@@ -111,7 +125,9 @@
    走 /jobs/{kind}（不是同步 /actions/*），所以页面不会被长任务堵住，能实时看到进度与日志。 #}
 <span id="job-panel-anchor"></span>
 {% if not read_only %}
-<details class="panel collapsible" open>
+{# 默认收起：这是**手动兜底**用的入口，日常是常驻服务自动跑。
+   原先默认展开且占掉半屏，把「有没有告警、积压多少」这些第一眼该看到的东西挤下去了。 #}
+<details class="panel collapsible">
   <summary>控制面板 · 手动发起任务</summary>
 
   <div class="row mb">
@@ -120,52 +136,69 @@
   </div>
 
   <div class="grid-2">
-    <div>
-      <div class="row mb"><b class="small">检索新增</b></div>
+    <div class="task-card">
+      <div class="row mb"><b class="small">① 检索新增</b></div>
+      <div class="muted small mb">从平台拉取新的 Issue / PR，写入本地库。流水线的第一步。</div>
       <div class="row">
-        <select id="scan-repo">
-          <option value="">全部启用仓库</option>
-          {% for r in repos %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
-        </select>
-        <input type="number" id="scan-limit" value="50" min="1" max="500" title="最多抓多少条" style="width:90px">
-        <label class="inline"><input type="checkbox" id="scan-full"> 全量（忽略游标）</label>
+        <label class="inline">仓库
+          <select id="scan-repo">
+            <option value="">全部启用仓库</option>
+            {% for r in repos %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="inline">最多抓
+          <input type="number" id="scan-limit" value="50" min="1" max="500" style="width:70px">条
+        </label>
+        <label class="inline"><input type="checkbox" id="scan-full"> 全量（忽略游标，重新抓一遍）</label>
         <button onclick="Fissue.runJob('scan', {repo: document.getElementById('scan-repo').value, limit: +document.getElementById('scan-limit').value, full: document.getElementById('scan-full').checked}, {autoReload: true})">开始检索</button>
       </div>
     </div>
 
-    <div>
-      <div class="row mb"><b class="small">AI 评测</b></div>
+    <div class="task-card">
+      <div class="row mb"><b class="small">② AI 评测</b></div>
+      <div class="muted small mb">用 AI 给条目打真实性 / 重要性 / 可行性分、分类与优先级。</div>
       <div class="row">
-        <input type="number" id="eval-limit" value="20" min="1" max="500" title="评测多少条" style="width:90px">
-        <label class="inline"><input type="checkbox" id="eval-deep"> 深度重评</label>
+        <label class="inline">最多评测
+          <input type="number" id="eval-limit" value="20" min="1" max="500" style="width:70px">条
+        </label>
+        <label class="inline"><input type="checkbox" id="eval-deep"> 深度重评（已评测过的也重新评一遍）</label>
         <button onclick="Fissue.runJob('evaluate', {limit: +document.getElementById('eval-limit').value, deep: document.getElementById('eval-deep').checked}, {autoReload: true})">评测未评测</button>
       </div>
     </div>
 
-    <div>
-      <div class="row mb"><b class="small">沙盒验证</b></div>
+    <div class="task-card">
+      <div class="row mb"><b class="small">③ 沙盒验证</b></div>
+      <div class="muted small mb">在隔离沙盒里生成并运行验证器，确认问题复现、修复前后行为符合预期。</div>
       <div class="row">
-        <input type="number" id="verify-limit" value="10" min="1" max="500" style="width:90px">
+        <label class="inline">最多验证
+          <input type="number" id="verify-limit" value="10" min="1" max="500" style="width:70px">条
+        </label>
         <button onclick="Fissue.runJob('verify', {limit: +document.getElementById('verify-limit').value}, {autoReload: true})">验证待验证条目</button>
       </div>
     </div>
 
-    <div>
-      <div class="row mb"><b class="small">Flush 队列</b></div>
+    <div class="task-card">
+      <div class="row mb"><b class="small">④ Flush 队列</b></div>
+      <div class="muted small mb">把一批已验证条目交给 AI 出批量结论并打标签，不等自动阈值触发。</div>
       <div class="row">
-        <select id="flush-queue">
-          <option value="">全部队列</option>
-          {% for q in queues %}<option value="{{ q.name }}">{{ q.name }}</option>{% endfor %}
-        </select>
-        <label class="inline"><input type="checkbox" id="flush-force" checked> 忽略阈值强制刷</label>
+        <label class="inline">队列
+          <select id="flush-queue">
+            <option value="">全部队列</option>
+            {% for q in queues %}<option value="{{ q.name }}">{{ q.name }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="inline"><input type="checkbox" id="flush-force" checked> 忽略阈值强制刷（不够批量大小也刷）</label>
         <button onclick="Fissue.runJob('flush', {queue: document.getElementById('flush-queue').value, force: document.getElementById('flush-force').checked}, {autoReload: true})">Flush</button>
       </div>
     </div>
 
-    <div>
-      <div class="row mb"><b class="small">自动修复</b></div>
+    <div class="task-card">
+      <div class="row mb"><b class="small">⑤ 自动修复</b></div>
+      <div class="muted small mb">对低难度 Issue 自动出补丁；dry-run 只生成补丁不提交，真提 PR 会真的改代码并开 PR。</div>
       <div class="row">
-        <input type="number" id="fix-limit" value="5" min="1" max="500" style="width:90px">
+        <label class="inline">最多修复
+          <input type="number" id="fix-limit" value="5" min="1" max="500" style="width:70px">条
+        </label>
         <button onclick="Fissue.runJob('fix', {limit: +document.getElementById('fix-limit').value, dry_run: true}, {autoReload: true})">试跑（dry-run，只出补丁）</button>
         <button class="danger" onclick="confirmFix()">真提 PR</button>
       </div>
@@ -196,21 +229,21 @@
   {% else %}
   <div class="muted">还没有任务记录。上面的控制面板可以手动发起一轮。</div>
   {% endfor %}
-  <div class="mt"><a href="/status" class="small">全部任务 →</a></div>
+  <div class="mt"><a href="/jobs" class="small">全部任务 →</a></div>
 </div>
 
-<div class="panel">
+<div class="panel expert-only">
   <h2>最近抓取</h2>
   {% if scans %}
   <div class="table-scroll">
   <table>
-    <thead><tr><th>仓库</th><th>开始</th><th class="num">拉取</th><th class="num">新增</th>
-      <th class="num">更新</th><th class="num">未变</th><th>结果</th></tr></thead>
+    <thead><tr><th scope="col">仓库</th><th scope="col">开始</th><th scope="col" class="num">拉取</th><th scope="col" class="num">新增</th>
+      <th scope="col" class="num">更新</th><th scope="col" class="num">未变</th><th scope="col">结果</th></tr></thead>
     <tbody>
     {% for s in scans %}
       <tr>
         <td><code class="small">{{ s.repo_key }}</code></td>
-        <td class="muted small">{{ (s.started_at or '')[:19].replace('T', ' ') }}</td>
+        <td class="muted small"><script>document.write(Fissue.relativeTime('{{ s.started_at }}', true));</script></td>
         <td class="num">{{ s.fetched }}</td>
         <td class="num">{{ s.created }}</td>
         <td class="num">{{ s.updated }}</td>
