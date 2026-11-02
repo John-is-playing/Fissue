@@ -734,26 +734,41 @@
     }
   }
 
+  // 只保留「当前那一张票」：续期前先清掉旧票，否则「定时器还挂着 + 用户切回前台补一次」
+  // 就会各起一条链、永久并行下去（状态页真出过这个事故：点一次按钮多一条轮询链）。
+  var liveTimer = null;
+
+  function scheduleLive(delay) {
+    if (liveTimer !== null) clearTimeout(liveTimer);
+    liveTimer = setTimeout(tickLive, delay);
+  }
+
+  async function tickLive() {
+    liveTimer = null;
+    // 页面看不见时只排期不发请求：后台标签页每 2~5 秒打一次服务端，既是白烧数据库往返，
+    // 也会让「最后更新时间」在没人看的时候一直变。浏览器虽然会把后台定时器节流到分钟级，
+    // 但那是**定时器**的节流——只要醒过来就仍然是一次真实请求，不如自己判掉。
+    if (document.hidden) {
+      scheduleLive(STATUS_IDLE_MS);
+      return;
+    }
+    var busy = await pollStatus();
+    // 忙的时候看得紧一点：用户正是此刻在等结果。await 期间可能又切了页签，
+    // 所以这里统一走 scheduleLive：它清票重排，排队者最多只有一个定时器。
+    scheduleLive(busy ? STATUS_BUSY_MS : STATUS_IDLE_MS);
+  }
+
   function startLiveBadge() {
     if (!document.getElementById("live-box")) return;
 
-    // 页面看不见时不再拉 /status：后台标签页每 2~5 秒打一次服务端，既是白烧数据库往返，
-    // 也会让「最后更新时间」在没人看的时候一直变。浏览器虽然会把后台定时器节流到分钟级，
-    // 但那是**定时器**的节流——只要醒过来就仍然是一次真实请求，不如自己判掉。
     // 回到前台时立刻补一次：否则角标会停在切走那一刻的旧状态，看上去像「卡住了」。
+    // 补一次也走 scheduleLive(0)，不是直接 pollStatus：清票重排保证它顶掉在途的那条链，
+    // 而不是另起一条。
     document.addEventListener("visibilitychange", function () {
-      if (!document.hidden) pollStatus();
+      if (!document.hidden) scheduleLive(0);
     });
 
-    (async function loop() {
-      if (document.hidden) {
-        setTimeout(loop, STATUS_IDLE_MS);
-        return;
-      }
-      var busy = await pollStatus();
-      // 忙的时候看得紧一点：用户正是此刻在等结果。
-      setTimeout(loop, busy ? STATUS_BUSY_MS : STATUS_IDLE_MS);
-    })();
+    scheduleLive(0);
   }
 
   /** 停止**当前这一轮**（常驻服务的定时轮次）。
