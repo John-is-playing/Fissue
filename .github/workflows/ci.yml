@@ -141,14 +141,23 @@ jobs:
         ports:
           - 3306:3306
         # 健康检查是必需的：容器「起来了」不等于 mysqld 接受连接，早跑一步就是连接失败。
-        # 字符集/排序规则跟随生产配置，否则 utf8mb4 索引长度这条约束验不到。
+        #
+        # ⚠️ 这里**只能放 `docker create` 的参数**。`services.options` 是被原样拼到
+        # `docker create` 上的，所以 mysqld 自己的参数（`--character-set-server` /
+        # `--collation-server`）写在这里会让这一步直接失败：`unknown flag` → exit 125
+        # → 整个 job 停在「Initialize containers」，`test_store_mysql.py` 一条都跑不到。
+        # 本 job 从建立到 2026-11-02 一直如此（两次 CI 记录都是这么红的），是「有 job
+        # 名字、没跑过内容」的典型。
+        #
+        # 字符集的保证改由**测试断言**承担：`tests/test_store_mysql.py` 直接查
+        # `information_schema` 断言表排序规则以 `utf8mb4` 开头，并核对每个索引 <= 3072
+        # 字节；而 MySQL 8.0 的默认就是 utf8mb4（`utf8mb4_0900_ai_ci`）。这比容器启动参数
+        # 更强——断的是真实库的状态，不是「我们以为传对了参数」。
         options: >-
           --health-cmd="mysqladmin ping -h 127.0.0.1 -ufissue -pfissue-pw"
           --health-interval=10s
           --health-timeout=5s
           --health-retries=12
-          --character-set-server=utf8mb4
-          --collation-server=utf8mb4_unicode_ci
     steps:
       - uses: actions/checkout@v7
 

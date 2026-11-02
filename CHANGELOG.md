@@ -70,6 +70,18 @@
   上抛**，绝不翻译成「没有文件」。
 - **用例 40 条**（`tests/test_platforms_gitlab.py`），全部离线打桩。
 
+### 修复 —— CI 的 MySQL job 从建立起就没跑通过
+
+- **现象**：`store (mysql 8.0)` 每次都以 `Initialize containers` 失败告终，日志里只有一行
+  `unknown flag: --character-set-server`。原因是 `services.options` 会被**原样拼到
+  `docker create`** 上——那是 mysqld 的参数，不是 docker 的参数，于是 exit 125、容器根本没
+  建起来。`tests/test_store_mysql.py` 因此**一次都没在 CI 上执行过**，而 job 名字一直是绿的
+  假象（红在初始化，看起来像环境抖动）。
+- **改法**：把那两个参数从 `options` 里去掉。字符集的保证改由**测试断言**承担——该文件本来
+  就直接查 `information_schema` 断言表排序规则以 `utf8mb4` 开头、并核对每个索引 <= 3072
+  字节；而 MySQL 8.0 默认就是 utf8mb4。这比启动参数更强：断的是真实库状态。
+- 顺带把「只能放 docker create 参数」写进注释，免得下次再有人往 `options` 里加 mysqld 参数。
+
 ### 新增 —— 发布流程固化成 `scripts/release.py`
 
 - **现象**：`v1.3.1` 的发布是照着记忆手敲的——改两处版本号、把 `[Unreleased]` 转正、
