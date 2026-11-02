@@ -69,6 +69,25 @@ def _add_run(repo, item_key: str, *, stage: str, outcome: VerifierOutcome,
     )
 
 
+def _reeval(repo, item_key: str, *, priority: Priority) -> None:
+    """给同一条目再存一次评测。
+
+    真实库里重评是正常现象（评测保留历史、结论取最新），这里复现的正是
+    「同一条条目被评了多次」的那种行，用来验证档位稳定性读数。
+    """
+    repo.save_evaluation(
+        item_key,
+        Evaluation(
+            category=Category.BUG, priority=priority, model="test-model", summary="重评",
+            scores=Scores(
+                authenticity=DimensionScore(score=90),
+                importance=DimensionScore(score=80),
+                difficulty=DimensionScore(score=20),
+            ),
+        ),
+    )
+
+
 def _clean_git(commit: str = "a" * 40) -> dict:
     return {"commit": commit, "branch": "main", "dirty": False, "dirty_files": 0}
 
@@ -190,6 +209,59 @@ def test_aggregate_scopes_to_repo(db, repo) -> None:
 
     assert bm.aggregate(db)["items"]["total"] == 2
     assert bm.aggregate(db, repo_slug="psf/requests")["items"]["total"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 档位稳定性：把 §5「tier 标定会不会抖」这句已知局限变成可观测数字
+# ---------------------------------------------------------------------------
+
+
+def test_aggregate_tier_stability_counts_changed(db, repo) -> None:
+    """重评后 priority 变了：必须记进 tier_changed，稳定率随之下降。"""
+    item = _seed(repo, 1, priority=Priority.TIER1)
+    _reeval(repo, item.key, priority=Priority.TIER2)
+
+    stability = bm.aggregate(db)["evaluation"]["tier_stability"]
+
+    assert stability["items_with_history"] == 1
+    assert stability["tier_changed"] == 1
+    assert stability["stable_ratio"] == 0.0
+
+
+def test_aggregate_tier_stability_ignores_stable_history(db, repo) -> None:
+    """评了多次但档位一直不变：计入 items_with_history，不计入 tier_changed。"""
+    item = _seed(repo, 1, priority=Priority.TIER2)
+    _reeval(repo, item.key, priority=Priority.TIER2)
+    _reeval(repo, item.key, priority=Priority.TIER2)
+
+    stability = bm.aggregate(db)["evaluation"]["tier_stability"]
+
+    assert stability["items_with_history"] == 1
+    assert stability["tier_changed"] == 0
+    assert stability["stable_ratio"] == 1.0
+
+
+def test_aggregate_tier_stability_skips_single_eval(db, repo) -> None:
+    """只评过一次的条目没有历史，完全不进统计（否则会稀释抖动率）。"""
+    _seed(repo, 1, priority=Priority.TIER1)
+    _seed(repo, 2, priority=Priority.TIER2)
+
+    stability = bm.aggregate(db)["evaluation"]["tier_stability"]
+
+    assert stability["items_with_history"] == 0
+    assert stability["tier_changed"] == 0
+
+
+def test_aggregate_tier_stability_ratio_is_none_when_no_history(db) -> None:
+    """空库没有可比的档位历史：stable_ratio 必须是 None，不能写成 0 或 1。
+
+    写成 0/1 会被 diff 读成「完全不稳定/完全稳定」的结论——而这里根本没有样本。
+    """
+    stability = bm.aggregate(db)["evaluation"]["tier_stability"]
+
+    assert stability["items_with_history"] == 0
+    assert stability["tier_changed"] == 0
+    assert stability["stable_ratio"] is None
 
 
 # ---------------------------------------------------------------------------

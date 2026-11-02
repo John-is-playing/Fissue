@@ -211,6 +211,26 @@ def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
             if isinstance(payload, dict) and isinstance(payload.get("score"), (int, float)):
                 dims.setdefault(name, []).append(int(payload["score"]))
 
+    # 档位稳定性：BENCHMARK §5 把「同一条重评时 tier 会不会因阈值边界抖动」
+    # 列为尚未测量的已知局限。这里复用上面已经取出的 evals，把它折成一个
+    # 可 diff 的数字——不新增 SQL，也不改变既有聚合口径。
+    # 只统计 >=2 次评测的条目：单次评测没有「历史」，算进来只会稀释抖动率，
+    # 让基线显得比实际更稳。
+    by_item: dict[str, list[EvaluationRow]] = {}
+    for e in evals:
+        by_item.setdefault(e.item_key, []).append(e)
+    items_with_history = 0
+    tier_changed = 0
+    for rows in by_item.values():
+        if len(rows) < 2:
+            continue
+        items_with_history += 1
+        rows.sort(key=lambda r: r.id)
+        latest_priority = rows[-1].priority
+        # 「最新一次与它更早任何一次不同」即视为抖过；与 `latest_eval` 取最新一致（按 id）
+        if any(r.priority != latest_priority for r in rows[:-1]):
+            tier_changed += 1
+
     return {
         "items": {
             "total": len(items),
@@ -231,6 +251,18 @@ def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
                 if (e.spam or {}).get("is_spam") or (e.spam or {}).get("is_duplicate")
             ),
             "avg_scores": {k: round(sum(v) / len(v), 1) for k, v in sorted(dims.items()) if v},
+            # 档位稳定性读数：把「tier 标定可能抖动」这句已知局限变成可观测数字。
+            # 全部是计数/比率，`diff` 的逐键比对语义不变；没有历史条目时
+            # stable_ratio 取 None（不可比 → 标不可比/无结论），**不写 0 或 1**，
+            # 否则会被 diff 读成「完全稳定」。
+            "tier_stability": {
+                "items_with_history": items_with_history,
+                "tier_changed": tier_changed,
+                "stable_ratio": (
+                    None if items_with_history == 0
+                    else round((items_with_history - tier_changed) / items_with_history, 3)
+                ),
+            },
         },
         "verifier": {
             "verifiers": len(verifiers),
