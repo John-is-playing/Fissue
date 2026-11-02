@@ -12,6 +12,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+import yaml
+
 import fissue.benchmark as bm
 from fissue.models import (
     Category,
@@ -518,3 +521,224 @@ def test_bench_list_on_missing_dir_is_friendly(tmp_path: Path) -> None:
     # 就会被拆到两行（``bench \ncapture``）。先归一化空白，避免断言绑死在
     # 折行位置上——在长路径的 Windows 上会必然失败，而 Linux CI 看不出。
     assert "bench capture" in " ".join(result.output.split())
+
+
+# ---------------------------------------------------------------------------
+# 档位稳定性：抽成纯函数后，`aggregate` 与 `bench tiers` 必须同一口径
+# ---------------------------------------------------------------------------
+
+
+def test_tier_stability_reports_per_item_detail(db, repo) -> None:
+    """纯函数除了计数，还要给出**逐条明细**：命令据此列出「哪几条变过档」。
+
+    `aggregate` 会把这个字段摘掉（基线键集不变），但命令侧靠它把读数变成可查的清单——
+    「稳定率 0.5」本身不告诉任何人该去看哪两条。
+    """
+    item = _seed(repo, 1, priority=Priority.TIER1)
+    _reeval(repo, item.key, priority=Priority.NONE)
+
+    stats = bm.tier_stability(bm.evaluation_history(db, item_keys=[item.key]))
+
+    assert stats["items_with_history"] == 1
+    assert stats["tier_changed"] == 1
+    assert stats["changed"] == [
+        {
+            "key": item.key,
+            "evaluations": 2,
+            # 按写入顺序（id）给出，便于看出「从哪一档漂到哪一档」
+            "priorities": [Priority.TIER1.value, Priority.NONE.value],
+        }
+    ]
+
+
+def test_evaluation_history_returns_rows_in_write_order(db, repo) -> None:
+    """历史必须按 id 升序返回：稳定率口径依赖「最后一次是哪一个」。"""
+    item = _seed(repo, 1, priority=Priority.TIER1)
+    _reeval(repo, item.key, priority=Priority.TIER2)
+
+    rows = bm.evaluation_history(db, item_keys=[item.key])
+
+    assert [r.priority for r in rows] == [Priority.TIER1.value, Priority.TIER2.value]
+
+
+def test_evaluation_history_without_keys_queries_nothing(db) -> None:
+    """空 keys 直接返回空清单——不能拼出 ``IN ()`` 这种让数据库报错的语句。"""
+    assert bm.evaluation_history(db, item_keys=[]) == []
+    assert bm.evaluation_history(db, item_keys=[""]) == []
+
+
+def test_aggregate_stability_keeps_the_baseline_key_set(db, repo) -> None:
+    """基线里 tier_stability 仍然只有三个键。
+
+    多出 ``changed`` 会让每次 `bench diff` 都刷出一串空列表（噪声），
+    而基线文件要长期进版本库、要能一眼看出差异。
+    """
+    _seed(repo, 1, priority=Priority.TIER1)
+
+    stability = bm.aggregate(db)["evaluation"]["tier_stability"]
+
+    assert set(stability) == {"items_with_history", "tier_changed", "stable_ratio"}
+
+
+# ---------------------------------------------------------------------------
+# `fissue bench tiers`
+# ---------------------------------------------------------------------------
+
+
+def _seed_cli_db(env: dict, *, priorities: list[Priority]) -> str:
+    """在 CLI 用的那个库里塞一条条目 + 若干次评测，返回条目 key。"""
+    from fissue import models as m
+    from fissue.store.db import Database
+    from fissue.store.repository import Repository
+
+    database = Database(env["db"])
+    database.create_all()
+    repository = Repository(database)
+    rid = repository.ensure_repo(m.RepoRef(platform=m.Platform.GITHUB, owner="psf", name="requests"))
+    item = m.RawItem(
+        platform=m.Platform.GITHUB, repo="psf/requests", number=1, item_type=m.ItemType.ISSUE,
+        title="t", body="b", labels=["bug"], author="u",
+    )
+    repository.upsert_item(rid, item)
+    for priority in priorities:
+        repository.save_evaluation(
+            item.key,
+            m.Evaluation(
+                category=m.Category.BUG, priority=priority, model="m", summary="s",
+                scores=m.Scores(
+                    authenticity=m.DimensionScore(score=90),
+                    importance=m.DimensionScore(score=80),
+                    difficulty=m.DimensionScore(score=20),
+                ),
+            ),
+        )
+    return item.key
+
+
+def test_bench_tiers_without_yes_only_reads_history(tmp_path: Path) -> None:
+    """默认**不重评**（不花 LLM 调用），只把已有历史统计出来。
+
+    这是本命令默认值的全部意义：会花钱又改数据的动作，必须显式 ``--yes``。
+    """
+    from typer.testing import CliRunner
+
+    from fissue.cli.main import app
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "database": {"url": f"sqlite:///{(tmp_path / 't.db').as_posix()}"},
+                "app": {"data_dir": str(tmp_path / "data"), "log_level": "warning"},
+                "llm": {"api_key": "k", "model": "m", "fallback_model": None},
+                "repos": [{"platform": "github", "owner": "psf", "name": "requests", "since_days": 0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("FISSUE_LLM_API_KEY=k\n", encoding="utf-8")
+
+    env = {"db": f"sqlite:///{(tmp_path / 't.db').as_posix()}", "root": str(tmp_path)}
+    _seed_cli_db(env, priorities=[Priority.TIER1, Priority.TIER2])
+
+    result = CliRunner().invoke(
+        app, ["bench", "tiers", "--config", str(cfg), "--env", str(env_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "稳定率 0.0" in result.output
+    assert "psf/requests" in result.output
+
+
+def test_bench_tiers_without_history_says_so(tmp_path: Path) -> None:
+    """没有重评历史时如实说「无读数」并提示 --yes，**不能**报一个 1.0 的稳定率。"""
+    from typer.testing import CliRunner
+
+    from fissue.cli.main import app
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "database": {"url": f"sqlite:///{(tmp_path / 't2.db').as_posix()}"},
+                "app": {"data_dir": str(tmp_path / "data"), "log_level": "warning"},
+                "llm": {"api_key": "k", "model": "m", "fallback_model": None},
+                "repos": [{"platform": "github", "owner": "psf", "name": "requests", "since_days": 0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("FISSUE_LLM_API_KEY=k\n", encoding="utf-8")
+
+    env = {"db": f"sqlite:///{(tmp_path / 't2.db').as_posix()}", "root": str(tmp_path)}
+    _seed_cli_db(env, priorities=[Priority.TIER1])  # 只评过一次
+
+    result = CliRunner().invoke(
+        app, ["bench", "tiers", "--config", str(cfg), "--env", str(env_file)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "无读数" in result.output
+    assert "stable_ratio" not in result.output
+
+
+def test_bench_tiers_yes_repeats_the_evaluation_rounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--yes`` 时按 ``--repeat`` 轮重评同一批条目（不联网：替换 run_batch）。"""
+    from typer.testing import CliRunner
+
+    from fissue.cli.main import app
+    from fissue.pipeline.stages import EvalStage
+
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        yaml.safe_dump(
+            {
+                "database": {"url": f"sqlite:///{(tmp_path / 't3.db').as_posix()}"},
+                "app": {"data_dir": str(tmp_path / "data"), "log_level": "warning"},
+                "llm": {"api_key": "k", "model": "m", "fallback_model": None},
+                "repos": [{"platform": "github", "owner": "psf", "name": "requests", "since_days": 0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / ".env"
+    env_file.write_text("FISSUE_LLM_API_KEY=k\n", encoding="utf-8")
+
+    env = {"db": f"sqlite:///{(tmp_path / 't3.db').as_posix()}", "root": str(tmp_path)}
+    _seed_cli_db(env, priorities=[Priority.TIER1])
+
+    rounds: list[int] = []
+
+    class _Result:
+        summary = "（打桩）"
+        results: list = []
+
+    async def fake_run_batch(self, items, *, deep=False, concurrency=3):
+        rounds.append(len(list(items)))
+        return _Result()
+
+    monkeypatch.setattr(EvalStage, "run_batch", fake_run_batch)
+
+    result = CliRunner().invoke(
+        app,
+        ["bench", "tiers", "--config", str(cfg), "--env", str(env_file), "--yes", "--repeat", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert rounds == [1, 1], "两轮，每轮把同一条重新评一次"
+
+
+def test_bench_tiers_rejects_a_repeat_of_zero(tmp_path: Path) -> None:
+    """``--repeat 0`` 立即报错：它等于「什么都不做，却给出一份读数」。"""
+    from typer.testing import CliRunner
+
+    from fissue.cli.main import app
+
+    result = CliRunner().invoke(app, ["bench", "tiers", "--repeat", "0"])
+
+    assert result.exit_code != 0
+    assert "repeat" in " ".join(result.output.split())

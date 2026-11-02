@@ -193,3 +193,42 @@ jobs:
 
       - name: mypy
         run: python -m mypy src/fissue tests scripts
+
+      - name: 文档死链
+        # 为什么不并进 ruff/mypy：它检查的是 Markdown，不是 Python。
+        # 命令形状与本地 `python scripts/check_docs.py` 完全一致（单一来源）。
+        # 锚点默认只警告——锚点随标题文字走，改标题是常有的事，当成硬错误会逼人关掉门禁。
+        run: python scripts/check_docs.py
+
+  audit:
+    name: 依赖安全扫描 (pip-audit)
+    runs-on: ubuntu-24.04
+    # 为什么单独一个 job，而不是塞进 lint
+    # ------------------------------------
+    # 它要**联网**查漏洞库，而本仓库其余所有检查都承诺离线（见文件头的第 1 条）。
+    # 混进 lint 会让「离线可复现」这条口径失效，也会把「网络抖动」与「代码有问题」
+    # 变成同一种红。
+    #
+    # 为什么需要它：`dependabot` 只在**有新版**时提醒升级，对「当前装的这个版本刚被
+    # 披露 CVE」一言不发。两者互补——一个管升级，一个管存量。
+    #
+    # 扫的是**实际装好的环境**（含传递依赖），不是 pyproject 的声明：真正被打进镜像、
+    # 被 import 的是解析后的版本集合，而漏洞几乎总是出在传递依赖上。
+    # `--skip-editable` 跳过本项目自身（它是 editable 安装，也不在 PyPI 上）。
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装（含 dev 依赖）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: pip-audit
+        # 不加 `--strict`：那会把「依赖在 PyPI 上查不到」也算失败，而本项目有若干
+        # 只在内部索引里存在的包时就会天天红。只让**已知漏洞**阻断。
+        run: python -m pip_audit --skip-editable --progress-spinner off

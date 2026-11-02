@@ -83,7 +83,7 @@ fissue serve --with-web
 | `fissue web` | Web 工作台 + `/api/v1` REST API |
 | `fissue sandbox serve` · `check` | 沙盒转发组件（执行唯一通道） · 环境就绪检查 |
 | `fissue auth ...` | Web/API 身份：`status` / `set-password` / `reset` / `key list\|create\|revoke` |
-| `fissue bench capture\|diff\|list` | 跑分基线冻结与逐项对比 |
+| `fissue bench capture\|diff\|list\|tiers` | 跑分基线冻结 / 逐项对比 / 列表 / 批量重评测档位稳定性 |
 
 ---
 

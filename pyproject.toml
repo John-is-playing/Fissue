@@ -79,6 +79,9 @@ dev = [
     # ruff / mypy，因此这套钩子与 CI 跑的是同一版本——见 CONTRIBUTING.md 的教训：
     # 「没在本地跑 mypy 就会在 CI 上红」）。
     "pre-commit>=3.7",
+    # 依赖 CVE 扫描：CI 的 audit job 跑它。`dependabot` 只在有新版时提醒**升级**，
+    # 对「已装的这个版本刚被披露漏洞」不发一言——两者互补，缺一个都会漏。
+    "pip-audit>=2.7",
 ]
 
 [project.urls]

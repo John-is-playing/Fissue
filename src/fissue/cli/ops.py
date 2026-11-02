@@ -829,6 +829,122 @@ def bench_list(
 
 
 # ---------------------------------------------------------------------------
+# 档位稳定性：批量重评
+# ---------------------------------------------------------------------------
+
+
+@bench_app.command("tiers")
+def bench_tiers(
+    repo: list[str] = REPO_OPT,
+    platform: str | None = PLATFORM_OPT,
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+    limit: int = typer.Option(20, "--limit", "-n", help="最多挑多少条已有评测的条目"),
+    repeat: int = typer.Option(3, "--repeat", help="每条重评几次（>=2 才产生可比历史）"),
+    concurrency: int = typer.Option(3, "--concurrency", help="并发评测数"),
+    yes: bool = typer.Option(
+        False, "--yes", help="真的重评（会花 LLM 调用）；缺省只统计库里已有的历史"
+    ),
+    json_out: bool = JSON_OPT,
+) -> None:
+    """批量重评同一批条目，量出 tier 档位到底抖不抖。
+
+    为什么要有它
+    ------------
+    ``BENCHMARK.md`` §5 把「tier 标定的稳定性」列为已知局限，``bench capture`` 里的
+    ``tier_stability`` 指标也早就接好了——但读数要求「同一条目有 >=2 次评测历史」，
+    而**没有任何命令会去制造这份历史**：库里恰好只有两条重评过的条目，
+    于是那个 ``stable_ratio = 1.0`` 说明不了任何事。这个命令就是补上那一步。
+
+    默认**不动数据库、不花调用**：只把库里已有历史统计出来（与 ``aggregate`` 同口径）。
+    真重评要显式 ``--yes``——与 `bench capture` / `scripts/release.py` 同一套习惯：
+    会花钱又改数据的动作，默认值必须偏向「什么都没发生」。
+
+    注意：重评会**写入**新的评测行（``evaluations`` 表保留全部历史，最新一条即当前结论），
+    所以跑完之后 ``bench capture`` 的读数会随之变化——这正是「有了样本」的表现。
+    """
+    if repeat < 1:
+        fail("--repeat 至少为 1（要产生可比历史需要 >=2 次评测）")
+    if limit < 1:
+        fail("--limit 至少为 1")
+
+    settings = load_cfg(config, env, verbose=verbose, require_llm=yes)
+    repos = _resolve_repos_safe(settings, repo, platform)
+
+    async def main() -> int:
+        from .. import benchmark as bm
+        from ..pipeline.context import RuntimeContext
+        from ..pipeline.stages import EvalStage
+
+        async with RuntimeContext.open(settings, exclusive=True) as ctx:
+            ctx.init_db()
+
+            items: list[Any] = []
+            for cfg in repos:
+                picked = ctx.repo.list_items(
+                    repo_slug=cfg.slug, status=ItemStatus.EVALUATED, limit=limit
+                )
+                if not picked and not json_out:
+                    emit(f"（{cfg.slug} 还没有已评测条目；先跑 `fissue eval`）")
+                items.extend(picked)
+
+            if yes and items:
+                stage = EvalStage(ctx)
+                for rnd in range(1, repeat + 1):
+                    if not json_out:
+                        emit(f"第 {rnd}/{repeat} 轮重评（{len(items)} 条）…")
+                    result = await stage.run_batch(items, concurrency=concurrency)
+                    if not json_out:
+                        emit(f"  {result.summary}")
+
+            rows = bm.evaluation_history(ctx.db, item_keys=[i.key for i in items])
+            stats = bm.tier_stability(rows)
+            stats["repeated"] = yes
+            stats["rounds"] = repeat if yes else 0
+
+        if json_out:
+            emit_json(stats)
+            return 0
+
+        emit(f"📊 参与条目 {len(items)} 条｜评测历史 {len(rows)} 行")
+        if stats["items_with_history"] == 0:
+            emit(
+                "   还没有任何条目被评测过两次以上 → 无读数。"
+                "加上 `--yes` 重评这批条目（会花 LLM 调用）。",
+                style="yellow",
+            )
+            return 0
+        ratio = stats["stable_ratio"]
+        emit(
+            f"   有历史的条目 {stats['items_with_history']} 条｜档位变过"
+            f" {stats['tier_changed']} 条｜稳定率 {ratio}"
+        )
+        if stats["items_with_history"] < 5:
+            emit(
+                f"   ⚠️  样本只有 {stats['items_with_history']} 条：这只能说明"
+                "「这几条重评后没变档」，不足以说明阈值边界不抖（BENCHMARK §5 同一口径）。",
+                style="yellow",
+            )
+        if stats["changed"]:
+            print_table(
+                [
+                    {
+                        "key": c["key"],
+                        "evaluations": c["evaluations"],
+                        "priorities": " → ".join(str(p) for p in c["priorities"]),
+                    }
+                    for c in stats["changed"]
+                ],
+                ["key", "evaluations", "priorities"],
+                title="档位变化过的条目",
+            )
+        return 0
+
+    run_async(main())
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 

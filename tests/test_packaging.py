@@ -60,6 +60,7 @@ _EXEMPT = {
     "ruff": "命令行 linter，只运行不 import",
     "mypy": "命令行类型检查器，只运行不 import",
     "pre-commit": "命令行工具，只在本地提交前钩子里运行，代码里不 import",
+    "pip-audit": "命令行安全扫描工具，只在 CI 的 audit job 里运行，代码里不 import",
 }
 
 

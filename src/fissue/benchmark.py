@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections import Counter
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -165,6 +166,81 @@ def _counts(values: list[str]) -> dict[str, int]:
     return dict(sorted(Counter(v for v in values if v).items()))
 
 
+def tier_stability(rows: Iterable[Any]) -> dict[str, Any]:
+    """统计「同一条目多次评测时档位有没有变」，返回计数与稳定率。
+
+    抽成独立函数是为了让 ``aggregate``（读全库历史）和 ``fissue bench tiers``（抓住一批
+    条目当场重评）用**同一份口径**：两处各写一遍，迟早会出现「聚合说稳、重评说抖」。
+
+    ``rows`` 只需要有 ``item_key`` / ``priority`` / ``id`` 三个属性（评测历史行）。
+
+    两条不能省的规矩：
+
+    * **只统计 >=2 次评测的条目**：单次评测没有「历史」，算进来只会稀释抖动率，
+      让基线显得比实际更稳；
+    * **没有样本时 ``stable_ratio`` 是 ``None``**，不是 0 也不是 1——那两个数字会被
+      ``bench diff`` 读成「完全不稳 / 完全稳」的结论，而这里根本没有样本。
+    """
+    by_item: dict[str, list[Any]] = {}
+    for row in rows:
+        by_item.setdefault(row.item_key, []).append(row)
+
+    items_with_history = 0
+    tier_changed = 0
+    changed: list[dict[str, Any]] = []
+    for key, item_rows in by_item.items():
+        if len(item_rows) < 2:
+            continue
+        items_with_history += 1
+        item_rows.sort(key=lambda r: r.id)
+        latest = item_rows[-1].priority
+        # 「最新一次与它更早任何一次不同」即视为抖过（与 aggregate 取最新一致，按 id）
+        if any(r.priority != latest for r in item_rows[:-1]):
+            tier_changed += 1
+            changed.append(
+                {
+                    "key": key,
+                    "evaluations": len(item_rows),
+                    "priorities": [r.priority for r in item_rows],
+                }
+            )
+
+    return {
+        "items_with_history": items_with_history,
+        "tier_changed": tier_changed,
+        "stable_ratio": (
+            None if items_with_history == 0
+            else round((items_with_history - tier_changed) / items_with_history, 3)
+        ),
+        "changed": sorted(changed, key=lambda c: str(c["key"])),
+    }
+
+
+def evaluation_history(db: Database, *, item_keys: Sequence[str]) -> list[Any]:
+    """取一批条目的**全部**评测历史（按 id 升序，即写入顺序）。
+
+    ``fissue bench tiers`` 用它算档位稳定性。抽在这里而不是让命令自己写 SQL，
+    是为了保证「重评后的读数」与 ``aggregate`` 口径同源——两处各写一份查询，
+    迟早会在「取哪些行 / 怎么排序」上分叉。
+    """
+    from sqlalchemy import select
+
+    from .store.tables import EvaluationRow
+
+    keys = [k for k in item_keys if k]
+    if not keys:
+        return []
+    with db.session() as s:
+        rows = list(
+            s.scalars(
+                select(EvaluationRow)
+                .where(EvaluationRow.item_key.in_(keys))
+                .order_by(EvaluationRow.id)
+            )
+        )
+    return list(rows)
+
+
 def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
     """聚合当前库里的测量结果（只读）。
 
@@ -216,20 +292,10 @@ def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
     # 可 diff 的数字——不新增 SQL，也不改变既有聚合口径。
     # 只统计 >=2 次评测的条目：单次评测没有「历史」，算进来只会稀释抖动率，
     # 让基线显得比实际更稳。
-    by_item: dict[str, list[EvaluationRow]] = {}
-    for e in evals:
-        by_item.setdefault(e.item_key, []).append(e)
-    items_with_history = 0
-    tier_changed = 0
-    for rows in by_item.values():
-        if len(rows) < 2:
-            continue
-        items_with_history += 1
-        rows.sort(key=lambda r: r.id)
-        latest_priority = rows[-1].priority
-        # 「最新一次与它更早任何一次不同」即视为抖过；与 `latest_eval` 取最新一致（按 id）
-        if any(r.priority != latest_priority for r in rows[:-1]):
-            tier_changed += 1
+    stability = tier_stability(evals)
+    # 基线键集只保留原来那三个：「逐条明细」是 `fissue bench tiers` 的用途，
+    # 塞进基线会让每次 `bench diff` 多出一串空列表噪声。
+    stability.pop("changed", None)
 
     return {
         "items": {
@@ -255,14 +321,7 @@ def aggregate(db: Database, *, repo_slug: str | None = None) -> dict[str, Any]:
             # 全部是计数/比率，`diff` 的逐键比对语义不变；没有历史条目时
             # stable_ratio 取 None（不可比 → 标不可比/无结论），**不写 0 或 1**，
             # 否则会被 diff 读成「完全稳定」。
-            "tier_stability": {
-                "items_with_history": items_with_history,
-                "tier_changed": tier_changed,
-                "stable_ratio": (
-                    None if items_with_history == 0
-                    else round((items_with_history - tier_changed) / items_with_history, 3)
-                ),
-            },
+            "tier_stability": stability,
         },
         "verifier": {
             "verifiers": len(verifiers),

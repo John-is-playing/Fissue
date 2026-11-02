@@ -21,7 +21,7 @@
 | `fissue serve` | 常驻：扫描 + 调度 + 验证 + 通知（`--with-web` 带 Web） |
 | `fissue web` | Web 工作台 + REST API |
 | `fissue sandbox serve` / `check` | 转发组件 / 环境就绪检查 |
-| `fissue bench capture\|diff\|list` | 跑分基线冻结 / 逐项对比 / 列出 |
+| `fissue bench capture\|diff\|list\|tiers` | 跑分基线冻结 / 逐项对比 / 列出 / 批量重评测档位稳定性 |
 | `fissue platforms doctor` | 平台能力体检（只读默认，`--write` / `--probe-push` 才写） |
 | `fissue auth status\|set-password\|reset\|key …` | 本机自救与 API Key 管理 |
 
@@ -123,10 +123,15 @@ fissue sandbox check · fissue sandbox serve
 fissue bench capture [-r owner/name] [--label 名字] [-o 路径] [--json]
 fissue bench list [--json]
 fissue bench diff 旧.json 新.json [--json]
+fissue bench tiers [-r owner/name] [--limit N] [--repeat N] [--yes] [--json]
 ```
 
 **退出码**：`0` 可比无变化｜`1` **不可比**（不能当回归依据）｜`2` 可比有变化。基线落
 `data/benchmarks/`，是唯一进版本库的 `data/` 子目录。
+
+`bench tiers` 是**测量工具**而不是门禁：默认只统计库里已有的重评历史（不动数据、不花
+调用），加 `--yes` 才会真的重评 `--repeat` 轮。它存在的理由见 BENCHMARK §5——`tier_stability`
+指标早就接好了，但没有任何命令去制造「同一条目评过两次以上」这份历史。
 
 ### `auth`
 
