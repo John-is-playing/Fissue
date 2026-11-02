@@ -73,8 +73,37 @@ Conventional Commits + 简体中文说明：`<type>: <中文说明>`，type 取
 - **快照版本** `vX.Y.Z-bN`（如 `v1.1.0-b3`）在正式版之间沉淀，落地形态：
   1. 建 `rel/vX.Y.Z-bN` 分支；2. 打**附注 tag**；3. `CHANGELOG.md` 写好条目，Release 内容与之一致；
   4. **快照提交不改 `pyproject.toml` / `__version__`**；5. 推送 `origin`（GitHub）与 `atomgit`。
+- **正式发布**（`vX.Y.Z-rel`）比快照多两步：`pyproject.toml` 与 `__version__` 要一起提升，
+  `CHANGELOG.md` 的 `[Unreleased]` 转正为 `[X.Y.Z] - 日期` 并留出新的空 `[Unreleased]`。
+  分支/tag 命名与快照同构：`rel/X.Y.Z-rel` + 附注 tag `vX.Y.Z-rel`。
 - `CHANGELOG.md` 参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；安全修复在
   Security 段致谢（除非要求匿名）。
+
+### 用脚本发，别手敲
+
+```bash
+# 1. 先把版本收口（三处：pyproject / __version__ / CHANGELOG 段）并提交
+# 2. 干跑：体检 + 打印计划，什么都不做
+python scripts/release.py 1.3.2
+
+# 3. 真做：本地分支 + 附注 tag → 双平台 push → 双平台 Release
+python scripts/release.py 1.3.2 --yes
+```
+
+`scripts/release.py` 会先体检三件事，任一不过就退出（`--yes` 也不会执行）：
+
+| 体检项 | 不过的后果 |
+|---|---|
+| `pyproject.toml` / `__version__` 与要发的版本一致 | Release 正文与标签对不上 |
+| `CHANGELOG.md` 有 `## [X.Y.Z]` 段 | Release 页面的正文是空的 |
+| 工作区干净（`git status --porcelain` 为空） | tag 指向的代码与磁盘上不是同一份 |
+
+Release 正文**取 CHANGELOG 那一段原文**，两个平台同一份，不缩写、不改写。
+平台通道写在脚本里：GitHub 走 `ssh.github.com:443`（`github.com:22/:443` 在部分网络被拒）、
+AtomGit 走 `atomgit` remote 的 HTTPS；缺令牌的平台**如实跳过并给出补法**，不算失败。
+
+常用变体：`--only github` / `--only atomgit`（分开补发）、`--no-push`（只建本地分支与 tag）、
+`--no-release`（只推分支与 tag）。
 
 ## 6. 跑分基线
 
