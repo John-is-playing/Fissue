@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -240,3 +241,68 @@ def test_lock_file_records_who_and_since(settings) -> None:
     assert f"pid={os.getpid()}" in text
     assert "开始于" in text
     assert "抓取/评测/验证/修复" in text, "锁文件里要能看出对方在做什么"
+
+
+# ---------------------------------------------------------------------------
+# 没有 flock 的平台：降级为「不互斥」，而不是崩掉
+# ---------------------------------------------------------------------------
+#
+# 这条分支的处境很特别：它**只在没有 fcntl 的平台上**才会走到（Windows），于是 CI 的
+# ubuntu job 一次都执行不到；而本机（Windows）又恰恰只能跑到它。两边各自缺对方的一半，
+# 所以这里把「平台能力」当成一个可替换的开关来测（`lockfile_mod.fcntl = None`），
+# 两个平台都能验同一个语义。
+
+
+def test_single_flight_degrades_to_no_lock_when_platform_lacks_flock(
+    settings, monkeypatch, caplog
+) -> None:
+    """没有 flock 时：放行、不建锁文件、把「不互斥」这件事说出来。
+
+    为什么「不建锁文件」值得断言：锁文件里的持有者信息是排障入口。若降级分支仍然建了
+    一个空锁文件，下一个人会看到「有锁文件、但里面什么都没有」，误判成「锁被谁抢着」，
+    进而去查一个根本不存在的并发进程。
+    """
+    import fissue.lockfile as lock_mod
+
+    monkeypatch.setattr(lock_mod, "fcntl", None)
+    with caplog.at_level("WARNING", logger="fissue.lockfile"), single_flight(
+        settings, action="测试降级"
+    ):
+        pass  # 不该抛：没有 flock 时唯一正确的行为是继续跑
+
+    assert not _lock_path(settings).exists(), "降级路径不该留下一个空锁文件"
+    assert lock_mod._hold_depth == 0, "降级路径不能把进程内重入深度留下"
+    assert any("没有 flock" in rec.getMessage() for rec in caplog.records), (
+        "必须告警：否则「并发跑只会重复评测、白烧开销」这件事没人知道"
+    )
+
+
+def test_reentrancy_still_works_without_flock(settings, monkeypatch) -> None:
+    """降级平台上「外层 + 内层」也要能正常嵌套——否则 daemon 一进内层就崩在入口。"""
+    import fissue.lockfile as lock_mod
+
+    monkeypatch.setattr(lock_mod, "fcntl", None)
+    with single_flight(settings, action="外层"), single_flight(settings, action="内层"):
+        pass
+
+    assert lock_mod._hold_depth == 0
+
+
+@requires_flock
+def test_flock_errors_that_are_not_contention_are_re_raised(settings, monkeypatch) -> None:
+    """只有「有人持有」才翻译成 WriterBusy；别的 errno 必须原样抛。
+
+    把 EPERM / EBADF / ENOLCK 也吞成「别处正在运行」，会把一个真故障伪装成一次
+    正常的并发拒绝——用户会安静地等一个永远不会结束的进程。
+    """
+    import fissue.lockfile as lock_mod
+
+    def _deny(fd, op):  # noqa: ANN001, ANN202
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(lock_mod.fcntl, "flock", _deny)
+    with pytest.raises(OSError) as exc, single_flight(settings, action="测试"):
+        pass
+
+    assert not isinstance(exc.value, FissueError), "非竞争错误不该被翻译成 WriterBusy"
+    assert lock_mod._hold_depth == 0

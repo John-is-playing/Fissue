@@ -631,10 +631,11 @@ Gitee **完全不同**（`POST /labels` 要 **form 表单**、颜色**必须带 
 | PostgreSQL 后端 | **已测量（`1.1.0-b4`）**：`db init` / `db check` / 全量单测 / 服务启动与页面实测均在该后端跑过（看板总览 4.8s → 2ms、条目页 7.4s → 0.45s）。⚠️ 验证的是**部署与并发路径**，不改变各夹具口径 |
 | MySQL 后端 | **全链路已验证（10-30）**：Docker `mysql:8.0` 上跑通 `db init → fetch → eval → verify → flush → fix`；`tests/test_store_mysql.py` 钉住 MEDIUMTEXT / 640 键列 / 3072 字节索引 / `SKIP LOCKED` / naive 时间戳 / `information_schema` 补列迁移 |
 | 冻结版本的可复现跑分 | 四份基线（§2.3），逐对不可比 |
+| tier 标定的逐条稳定性 | **已测量（11-02，`v1.3.1`）**：`lockkit` 库 20 条 / 23 次评测，其中 **2 条**有 ≥2 次评测历史、档位变化 **0** 条、`stable_ratio = 1.0`。读数来自 `bench capture` 的 `evaluation.tier_stability`（基线 `data/benchmarks/v1_3_1-tier.json`，`reproducible: true` @ `06ee811`）。⚠️ **样本只有 2 条**：它说明「这 2 条重评后没变档」，不足以说明阈值边界不抖——要把样本做大只能重评更多条目（会花 LLM 调用，且会改动夹具读数），所以这里如实按小样本记 |
 
 **仍然站不住 / 未测的**：跨 Issue 的语义裁决（明确不做，成本不可控）；「仓库没测到的既有行为」
 （属验证器提示词职责）；Gitee 非企业空间是否放开 Issue 对象写（需企业版空间才能再验，见 §4.16）；
-tier 标定的逐条稳定性（§4.7.1）。
+tier 标定的**大样本**稳定性（指标已接入，见上表；当前只有 2 条有重评历史）。
 
 ## 6. 如何复现
 
