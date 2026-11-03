@@ -84,6 +84,8 @@ fissue serve --with-web
 | `fissue sandbox serve` · `check` | 沙盒转发组件（执行唯一通道） · 环境就绪检查 |
 | `fissue auth ...` | Web/API 身份：`status` / `set-password` / `reset` / `key list\|create\|revoke` |
 | `fissue bench capture\|diff\|list\|tiers` | 跑分基线冻结 / 逐项对比 / 列表 / 批量重评测档位稳定性 |
+| `fissue host add\|list\|show\|remove\|ping\|enable` | 部署主机登记：连得上哪台、指纹是否已钉住（凭据加密入库） |
+| `fissue deploy plan\|apply\|status\|logs\|rollback\|destroy` | 读仓库 → AI 出计划 → 部署到主机 → 独立证据判定（失败自动回滚） |
 
 ---
 
@@ -114,6 +116,7 @@ src/fissue/
   pipeline/      抓取、阶段、队列、flush、上下文
   fixer/         受控修复循环与提 PR
   service/       常驻调度与通知
+  deploy/        部署与运维：计划生成 → 危险动作拦截 → SSH 执行 → 证据判定/回滚
   web/           REST API 与仪表盘
   cli/           命令行入口
 demo/            五套对抗性夹具（textkit / ratekit / pipekit / envkit / lockkit）

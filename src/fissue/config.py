@@ -988,6 +988,44 @@ class PlatformConfig(BaseModel):
         return self.clone_mirror + url
 
 
+class DeployConfig(BaseModel):
+    """部署与服务器运维（见 docs/DEPLOY.md §10）。
+
+    **默认关闭**。Fissue 的默认姿态是「只读地看世界」；一旦默认开启，任何拿到
+    Web 写权限的人就能对清单里的服务器动刀，而运维动作的破坏力远大于抓取和打标签。
+    """
+
+    enabled: bool = False
+    #: 目标机上的发布根。每台主机可以有自己的覆盖值（见 deploy_hosts.app_root）。
+    app_root: str = Field(default="/opt/fissue-deploy")
+    #: 保留多少个 release。清理时**一定保留** current 与 previous 各一份，
+    #: 否则「刚回滚过去的那份」可能正好被清理掉。
+    keep_releases: int = Field(default=5, ge=2)
+    connect_timeout: int = Field(default=15, ge=1)
+    command_timeout: int = Field(default=900, ge=1)
+    health_timeout: float = Field(default=60.0, gt=0)
+    #: 整份计划的步骤上限。超了直接判计划非法（不执行半份）。
+    max_plan_steps: int = Field(default=60, ge=1, le=500)
+    #: 允许 `sudo` / `rm -rf` / `apt remove` 这类动作。即使为 true，
+    #: `rm -rf /`、`mkfs` 之类的「绝对拒绝」清单依然不放行（见 deploy/guard.py）。
+    allow_dangerous: bool = False
+    #: 首次连接时是否接受未知主机公钥（TOFU）。之后指纹不匹配一律拒连。
+    accept_new_host_key: bool = True
+    #: 计划产出方式：auto=按代码自动推断（当前唯一实现）。
+    workflow: str = Field(default="auto")
+
+    @field_validator("app_root")
+    @classmethod
+    def _check_app_root(cls, v: str) -> str:
+        """必须是绝对路径且不含 `..`：它会拼进远端命令，容错空间为零。"""
+        text = (v or "").strip()
+        if not text.startswith("/"):
+            raise ConfigError(f"deploy.app_root 必须是绝对路径，当前为 {v!r}")
+        if ".." in text.split("/"):
+            raise ConfigError(f"deploy.app_root 不允许包含 '..'：{v!r}")
+        return text.rstrip("/") or "/"
+
+
 class Settings(BaseModel):
     """Fissue 全局配置。"""
 
@@ -1011,6 +1049,7 @@ class Settings(BaseModel):
     platforms: PlatformConfig = Field(default_factory=PlatformConfig)
     tokens: PlatformTokens = Field(default_factory=PlatformTokens)
     webhooks: WebhookConfig = Field(default_factory=WebhookConfig)
+    deploy: DeployConfig = Field(default_factory=DeployConfig)
 
     # 运行期元信息（不写入文件）
     config_path: str | None = None

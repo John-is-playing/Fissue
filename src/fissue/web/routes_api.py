@@ -74,6 +74,11 @@ def register_api(app: FastAPI, settings: Any) -> None:
     _register_api_actions(app, prefix, auth)
     _register_api_jobs(app, prefix, auth)
     _register_api_webhooks(app, prefix, auth)
+    # 部署运维端点住在独立模块：它是另一条业务线，混进本文件的「条目/队列/动作」
+    # 会让这个已经按域拆过一轮的文件重新长回去。
+    from .deploy_api import register_deploy_api
+
+    register_deploy_api(app, prefix, auth)
     _register_api_misc(app, prefix, auth)
 
 

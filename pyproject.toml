@@ -49,6 +49,12 @@ dependencies = [
     # 只是让「import 什么就声明什么」这条规矩站得住——否则 wheel 装好后能不能 import
     # 就取决于别人包的依赖表，不是我们的。
     "markupsafe>=2.1",
+    # 部署通道：SSH 客户端。同步库，执行器用 `asyncio.to_thread` 包住——不用
+    # asyncssh 是为了不把「一次远端操作」变成必须 async 的传染性依赖。
+    "paramiko>=3.4",
+    # 凭据可逆加密（`deploy/secretbox.py` 的 Fernet + HKDF）。它本来是 paramiko
+    # 的传递依赖，显式声明是为了让「import 什么就声明什么」这条规矩站得住。
+    "cryptography>=42.0",
 ]
 
 # 这里**没有**、以及为什么没有（免得有人"补齐"回来）。清理依据见

@@ -46,6 +46,10 @@ db_app = typer.Typer(help="数据库管理")
 sandbox_app = typer.Typer(help="沙盒与转发组件")
 bench_app = typer.Typer(help="跑分基线：冻结测量前提与结果，便于逐项对比")
 platforms_app = typer.Typer(help="平台能力体检：令牌、只读链路与写操作矩阵")
+#: 部署与服务器运维（见 docs/DEPLOY.md）。命令实现在 ``cli/deploy.py``，
+#: 这里只建组并挂到根 app 上——反过来让 main 导入它必然成环。
+deploy_app = typer.Typer(help="部署与服务器运维：读仓库 → 部署到已登记主机 → 运维它")
+host_app = typer.Typer(help="部署主机登记：新增 / 查看 / 删除目标服务器")
 from .auth import auth_app  # noqa: E402  —— 放在这里：它只用 typer 与 config，不会与 main 成环
 
 app.add_typer(db_app, name="db")
@@ -53,6 +57,8 @@ app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(bench_app, name="bench")
 app.add_typer(auth_app, name="auth")
 app.add_typer(platforms_app, name="platforms")
+app.add_typer(deploy_app, name="deploy")
+app.add_typer(host_app, name="host")
 
 # ---------------------------------------------------------------------------
 # 通用选项与输出

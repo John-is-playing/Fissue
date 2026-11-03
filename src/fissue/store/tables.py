@@ -448,3 +448,118 @@ class ApiKeyRow(Base):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     #: 非空 = 已吊销。**软删**而不是删行：审计要看得见「这把曾经存在、何时失效」。
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# 部署与服务器运维（见 docs/DEPLOY.md §4）
+# ---------------------------------------------------------------------------
+#
+# 四张都是**新表**，`create_all` 直接建，不需要登记列迁移（`db.ColumnMigration`
+# 那套只服务「给已有表补列」）。也正因为是全新表，不存在「旧库缺表」的兼容问题：
+# SQLite 与 PG/MySQL 都是启动时 create_all 补齐。
+#
+# 为什么不与 `repos` 建外键：部署可以在仓库尚未登记（或根本不是被监控仓库）时进行，
+# 这里只存 `repo_slug` 字符串。反过来，删仓库不该连带删掉「部署历史」——那正是
+# 出事后要查的东西。
+
+
+class DeployHostRow(Base):
+    """一台可部署的目标服务器。
+
+    ``credential`` 存的是 :mod:`fissue.deploy.secretbox` 产出的密文，
+    **绝不存明文**；读出来用于认证后立即丢弃，不缓存、不进日志、不进 API 响应。
+    """
+
+    __tablename__ = "deploy_hosts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    address: Mapped[str] = mapped_column(String(255))
+    port: Mapped[int] = mapped_column(Integer, default=22)
+    user: Mapped[str] = mapped_column(String(128), default="root")
+    auth_method: Mapped[str] = mapped_column(String(16), default="key")   # key | password
+    #: 私钥正文或密码的密文（见 secretbox）。长文本：私钥可能有几 KB。
+    credential: Mapped[str] = _long_text()
+    #: 首次连接 TOFU 记下的 ``SHA256:...``；不匹配即拒连（中间人防线）。
+    host_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: 目标机上的发布根目录（默认 /opt/fissue-deploy），按主机可覆盖。
+    app_root: Mapped[str] = mapped_column(String(255), default="/opt/fissue-deploy")
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class DeploymentRow(Base):
+    """一次部署。``plan_json`` 留着原始计划：排查「为什么它这么干」只能靠它。"""
+
+    __tablename__ = "deployments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    host_id: Mapped[int] = mapped_column(ForeignKey("deploy_hosts.id", ondelete="CASCADE"), index=True)
+    repo_slug: Mapped[str] = mapped_column(String(511), index=True)
+    ref: Mapped[str] = mapped_column(String(255), default="main")
+    commit_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), index=True, default="planning")
+    plan_json: Mapped[dict] = _json_col()
+    app_root: Mapped[str] = mapped_column(String(255), default="")
+    #: 本次 release 目录名（如 ``20261102T101500Z``）与上一次的，回滚靠后者。
+    release: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    previous_release: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    service_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    health_json: Mapped[dict] = _json_col()
+    error: Mapped[str | None] = _long_text(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    steps: Mapped[list[DeploymentStepRow]] = relationship(
+        back_populates="deployment", cascade="all, delete-orphan", order_by="DeploymentStepRow.seq"
+    )
+
+
+class DeploymentStepRow(Base):
+    """一步的实际执行结果。
+
+    ``output_tail`` 只留尾部若干 KB：远端一条 ``pip install`` 的日志能有几十 MB，
+    整段落库既撑爆表（MySQL 上还要 MEDIUMTEXT）又没人看。
+    """
+
+    __tablename__ = "deployment_steps"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deployment_id: Mapped[int] = mapped_column(
+        ForeignKey("deployments.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    step_id: Mapped[str] = mapped_column(String(64), default="")
+    kind: Mapped[str] = mapped_column(String(16), default="")
+    command: Mapped[str] = _long_text()
+    status: Mapped[str] = mapped_column(String(16), default="pending")
+    exit_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tail: Mapped[str] = _long_text()
+    error: Mapped[str | None] = _long_text(nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    deployment: Mapped[DeploymentRow] = relationship(back_populates="steps")
+
+
+class DeployEventRow(Base):
+    """审计流水：谁在什么时候对哪台机器下了什么命令。
+
+    单独成表而不是复用 ``notifications``：那张表是做通知去重的，语义完全不同
+    （有 ``uq_notification_dedup`` 唯一约束），塞进去会让「同一句话发两次」被静默吞掉。
+    """
+
+    __tablename__ = "deploy_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    deployment_id: Mapped[int] = mapped_column(
+        ForeignKey("deployments.id", ondelete="CASCADE"), index=True
+    )
+    level: Mapped[str] = mapped_column(String(16), default="info")   # info | warn | error
+    message: Mapped[str] = _long_text()
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

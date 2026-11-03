@@ -438,3 +438,22 @@ platforms:
   # gh-proxy 这一族只代理 GitHub，把 GitLab / Gitee / AtomGit 的地址也往它身上送，
   # 等于把仓库名白送给一个第三方而且还必然失败。留空 = 不限制宿主（自建镜像用）。
   clone_mirror_hosts: ["github.com"]
+
+# ---------------------------------------------------------------------------
+# 部署与服务器运维（见 docs/DEPLOY.md）
+#
+# **默认关闭**。它和抓取/评测/打标签不是一类能力：那些动作的影响面在平台 API 里，
+# 这个能力会**真的登录一台服务器**、装依赖、改 systemd、删目录。任何拿到 Web 写权限
+# 的人都能用它，所以「默认不开」是设计而不是保守。
+# ---------------------------------------------------------------------------
+deploy:
+  enabled: false                    # 置 true 才启用（CLI 与 Web 同一道开关）
+  app_root: /opt/fissue-deploy      # 远端发布根；每台主机可用 host add --app-root 覆盖
+  keep_releases: 5                  # 保留几份 release（current 与 previous 永不清理）
+  connect_timeout: 15               # SSH 建连超时（秒）
+  command_timeout: 900              # 单条远端命令上限（装依赖会久，默认 15 分钟）
+  health_timeout: 60                # 收尾健康判定总预算（秒）
+  max_plan_steps: 60                # 计划步骤上限；超了直接判非法，**不**截断执行半份
+  allow_dangerous: false            # 允许 sudo / rm -rf / apt remove 等；rm -rf / 仍一律拒绝
+  accept_new_host_key: true         # 首次连接用 TOFU 记指纹；之后不匹配一律拒连
+  workflow: auto                    # auto = 按代码自动推断（当前唯一实现）

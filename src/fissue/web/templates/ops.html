@@ -1,0 +1,451 @@
+{% extends "base.html" %}
+{# 部署运维页：主机清单 + 部署记录 + 四个操作区块。
+ #
+ # 为什么单独一页而不是塞进「设置」：这里能**改远端机器**（部署、回滚、下线），
+ # 是操作面；设置页是配置面。混在一页时，「把某台机器上的服务停掉」得先在
+ # 一屏参数里找半天，而这类动作最怕点错。
+ #
+ # 页面上**不内联任何凭据**：新增主机时用户填的私钥/密码只在那一跳的请求体里，
+ # 服务端加密后可作凭据使用但不回显（见 web/deploy_api.py 的模块说明）。
+ # 所以这里的输入框永远是空的，也不做「显示已保存的凭据」这种功能。
+ #}
+{% block title %}部署运维 · Fissue{% endblock %}
+{% block heading %}部署运维{% endblock %}
+{% block subtitle %}登记主机、部署、回滚、下线。计划与执行都在服务端，这一页只提交动作与看结果。{% endblock %}
+
+{% block content %}
+
+{% if not deploy_enabled %}
+<div class="alert warn">
+  <span class="a-level">未开启</span>
+  <div>
+    <div>部署能力未开启（<code>deploy.enabled=false</code>）：下面的历史记录仍可查看，但所有写操作会被拒绝。</div>
+    <div class="small muted">要开启：在 config.yaml 里设置 <code>deploy.enabled: true</code> 后重启 Web 进程。默认关闭是刻意的——这是能改远端机器的能力。</div>
+  </div>
+</div>
+{% endif %}
+
+<div class="alert info">
+  <span class="a-level">怎么工作的</span>
+  <div>
+    <div>部署 = 克隆仓库 → AI 出计划 → <b>校验计划</b> → SSH 执行 → <b>从控制端发起的健康探针</b> → 判定。</div>
+    <div class="small muted">
+      只看独立证据，不信远端自己的自述（docs/DEPLOY.md §1）；任一步失败即停止后续步骤，有上一份 release 时自动回滚（§7）。
+      发布根目录：<code>{{ app_root }}</code>（主机可覆盖）。
+    </div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>主机（{{ hosts | length }} 台）</h2>
+  {% if hosts %}
+  <div class="table-scroll">
+  <table>
+    <thead><tr>
+      <th scope="col">名字</th><th scope="col">地址</th><th scope="col">认证方式</th>
+      <th scope="col">指纹</th><th scope="col">状态</th><th scope="col">发布根</th>
+      <th scope="col">最近连接</th><th scope="col" class="shrink"></th>
+    </tr></thead>
+    <tbody id="host-rows">
+      {% for h in hosts %}
+      <tr data-host="{{ h.name }}">
+        <td><code>{{ h.name }}</code></td>
+        <td>{{ h.user }}@{{ h.address }}:{{ h.port }}</td>
+        <td>{{ '私钥' if h.auth_method == 'key' else '密码' }}</td>
+        <td>
+          {% if h.fingerprint %}
+            <span class="tag status-pr_created" title="{{ h.fingerprint }}">已钉住</span>
+            <div class="muted small"><code>{{ h.fingerprint }}</code></div>
+          {% else %}
+            <span class="tag stale" title="首次连接成功后会把主机公钥指纹记下来，之后不匹配即拒连（TOFU）">未建立</span>
+          {% endif %}
+        </td>
+        <td>
+          {% if h.enabled %}<span class="tag status-verifier_ready">启用</span>
+          {% else %}<span class="tag none">停用</span>{% endif %}
+        </td>
+        <td class="muted small"><code>{{ h.app_root or '' }}</code></td>
+        <td class="muted small">
+          {% if h.last_seen_at %}{{ h.last_seen_at[:19].replace('T', ' ') }}{% else %}从未连接{% endif %}
+        </td>
+        <td class="shrink">
+          <div class="row">
+            <button type="button" class="ghost small" data-act="ping" data-name="{{ h.name }}"
+                    {% if not deploy_enabled %}disabled{% endif %}>连接测试</button>
+            <button type="button" class="danger small" data-act="remove-host" data-name="{{ h.name }}"
+                    {% if not deploy_enabled %}disabled{% endif %}>删登记</button>
+          </div>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="muted small mt">
+    「删登记」只删本地记录（含该机的部署历史与审计流水），<b>远端服务与文件不受影响</b>——
+    要停服务请用下面的「下线」。首次「连接测试」会把主机指纹钉住，之后不匹配即拒连。
+  </div>
+  {% else %}
+  <div class="empty">还没有登记任何主机。先在下面「新增主机」里加一台。</div>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>部署记录（最近 {{ deployments | length }} 条）</h2>
+  {% if deployments %}
+  <div class="table-scroll">
+  <table>
+    <thead><tr>
+      <th scope="col" class="num">id</th><th scope="col">仓库</th><th scope="col">主机</th>
+      <th scope="col">状态</th><th scope="col">发布目录</th><th scope="col">url</th>
+      <th scope="col">时间</th><th scope="col" class="shrink"></th>
+    </tr></thead>
+    <tbody id="deploy-rows">
+      {% for d in deployments %}
+      <tr data-deployment="{{ d.id }}">
+        <td class="num">{{ d.id }}</td>
+        <td><code>{{ d.repo_slug }}</code>{% if d.ref %}<div class="muted small">{{ d.ref }}</div>{% endif %}</td>
+        <td>{{ d.host or '—' }}</td>
+        <td>
+          {% if d.status == 'success' %}<span class="tag status-pr_created">成功</span>
+          {% elif d.status == 'failed' %}<span class="tag status-failed">失败</span>
+          {% elif d.status in ('running', 'planning') %}<span class="tag status-fixing">{{ d.status }}</span>
+          {% elif d.status == 'rolled_back' %}<span class="tag stale">已回滚</span>
+          {% elif d.status == 'destroyed' %}<span class="tag none">已下线</span>
+          {% else %}<span class="tag">{{ d.status }}</span>{% endif %}
+          {% if d.error %}<div class="muted small">{{ d.error[:160] }}</div>{% endif %}
+        </td>
+        <td class="muted small"><code>{{ d.release or '—' }}</code></td>
+        <td class="muted small">
+          {% if d.url %}<a href="{{ d.url }}" rel="noreferrer noopener" target="_blank">{{ d.url }}</a>
+          {% else %}—{% endif %}
+        </td>
+        <td class="muted small">
+          {% if d.created_at %}{{ d.created_at[:19].replace('T', ' ') }}{% endif %}
+          {% if d.finished_at %}<div>完成 {{ d.finished_at[:19].replace('T', ' ') }}</div>{% endif %}
+        </td>
+        <td class="shrink">
+          <button type="button" class="ghost small" data-act="steps" data-id="{{ d.id }}">展开步骤</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="muted small mt">点「展开步骤」看每一步的命令、退出码与审计流水（来自 <code>deployments/{id}/logs</code>）。</div>
+  {% else %}
+  <div class="empty">还没有部署记录。</div>
+  {% endif %}
+</div>
+
+<div class="grid-2">
+
+  <div class="panel">
+    <h2>新增主机</h2>
+    <div class="row">
+      <label class="inline">名字
+        <input type="text" id="host-name" placeholder="pi5" style="width:130px">
+      </label>
+      <label class="inline">地址
+        <input type="text" id="host-address" placeholder="192.168.1.3" style="width:150px">
+      </label>
+    </div>
+    <div class="row mt">
+      <label class="inline">用户
+        <input type="text" id="host-user" value="root" style="width:110px">
+      </label>
+      <label class="inline">端口
+        <input type="number" id="host-port" value="22" min="1" max="65535" style="width:90px">
+      </label>
+      <label class="inline">认证
+        <select id="host-auth">
+          <option value="key">私钥</option>
+          <option value="password">密码</option>
+        </select>
+      </label>
+    </div>
+    <div class="mt">
+      <label class="inline">发布根（可选，留空用 <code>{{ app_root }}</code>）
+        <input type="text" id="host-app-root" placeholder="{{ app_root }}" style="width:220px">
+      </label>
+    </div>
+    <div class="mt">
+      <label class="inline">凭据（私钥正文或密码）
+        <textarea id="host-credential" rows="4" style="width:100%" placeholder="粘贴私钥全文（-----BEGIN ... PRIVATE KEY-----），或该用户的密码"></textarea>
+      </label>
+      <div class="muted small">
+        只提交这一次：服务端立刻加密入库，<b>任何接口都不会再回显它</b>（连密文都不回）。
+        同名再次提交视为覆盖，必须重新给凭据——不做「留空则沿用」的隐式行为。
+      </div>
+    </div>
+    <div class="row mt">
+      <button type="button" class="primary" id="host-add"
+              {% if not deploy_enabled %}disabled{% endif %}>登记主机</button>
+      <span class="muted small" id="host-result"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>部署</h2>
+    <div class="row">
+      <label class="inline">主机
+        <select id="deploy-host">
+          {% for h in hosts %}<option value="{{ h.name }}">{{ h.name }}</option>{% endfor %}
+        </select>
+      </label>
+      <label class="inline">仓库
+        <input type="text" id="deploy-repo" list="repo-list" placeholder="owner/name" style="width:170px">
+        <datalist id="repo-list">
+          {% for r in repos %}<option value="{{ r }}"></option>{% endfor %}
+        </datalist>
+      </label>
+    </div>
+    <div class="row mt">
+      <label class="inline">分支/ref
+        <input type="text" id="deploy-ref" placeholder="留空用仓库默认分支" style="width:170px">
+      </label>
+      <label class="inline">平台
+        <select id="deploy-platform">
+          <option value="">（按仓库配置）</option>
+          <option value="github">github</option>
+          <option value="atomgit">atomgit</option>
+        </select>
+      </label>
+      <label class="inline"><input type="checkbox" id="deploy-dangerous"> 允许危险动作（sudo / rm -rf 等）</label>
+    </div>
+    <div class="muted small mt">
+      提交后<b>立刻返回「已受理」</b>：一次部署可能跑几分钟，请求不会等它跑完。
+      进度与结果在「部署记录」里看（状态会从 planning → running → success/failed）。
+      计划仍会再校验一次，危险动作即使勾了也有「绝对拒绝」清单兜住。
+    </div>
+    <div class="row mt">
+      <button type="button" class="primary" id="deploy-start"
+              {% if not deploy_enabled or not hosts %}disabled{% endif %}>开始部署</button>
+      <span class="muted small" id="deploy-result"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>回滚</h2>
+    <div class="row">
+      <label class="inline">部署 id
+        <input type="number" id="rollback-id" min="1" style="width:110px">
+      </label>
+      <button type="button" id="rollback-go" {% if not deploy_enabled %}disabled{% endif %}>回滚到上一次成功发布</button>
+    </div>
+    <div class="muted small mt">
+      回滚不复用原计划的步骤：它是一段固定动作（把 current 指回 previous → 重启 → 重新跑健康探针），
+      走同一条 SSH 通道与同一套证据判定。几十秒级，会同步等到结果。回滚本身失败不会被伪装成
+      前一次部署的问题。
+    </div>
+    <div class="muted small" id="rollback-result"></div>
+  </div>
+
+  <div class="panel">
+    <h2>下线</h2>
+    <div class="row">
+      <label class="inline">部署 id
+        <input type="number" id="destroy-id" min="1" style="width:110px">
+      </label>
+      <button type="button" class="danger" id="destroy-go" {% if not deploy_enabled %}disabled{% endif %}>停服务并删除 release</button>
+    </div>
+    <div class="muted small mt">
+      下线 = 停掉服务 + 删掉这次部署的 release 目录，<code>shared/</code>（.env、上传目录、数据库文件）
+      <b>保留</b>——数据不该因为一次下线而消失。这个动作不可撤销。
+    </div>
+    <div class="muted small" id="destroy-result"></div>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  "use strict";
+  // apiPrefix 不在这里拼字符串：base.html 把 Python 侧算好的值注入 window.FISSUE，
+  // 而 Fissue.api() 内部就用它拼路径（并代管 CSRF / 401 跳登录）。页面里再写一份
+  // `"/api/v1"` 就是第二份定义，改了 api.prefix 之后必然漂移。
+  var api = window.Fissue.api;
+
+  function say(elId, text, kind) {
+    var el = document.getElementById(elId);
+    if (el) el.textContent = text || "";
+    if (kind === "bad" && window.Fissue.toast) Fissue.toast(text, "bad", { timeout: 0 });
+  }
+
+  function fail(elId, ex) {
+    // detail 原样显示：服务端保证里边只有人话（没有 traceback、没有凭据）。
+    say(elId, "失败：" + (ex && ex.message ? ex.message : ex), "bad");
+  }
+
+  function num(id) {
+    var v = parseInt(document.getElementById(id).value, 10);
+    return isNaN(v) ? null : v;
+  }
+
+  function reloadSoon() { setTimeout(function () { window.location.reload(); }, 700); }
+
+  // -- 新增主机 ----------------------------------------------------------
+  document.getElementById("host-add").addEventListener("click", async function () {
+    var body = {
+      name: document.getElementById("host-name").value.trim(),
+      address: document.getElementById("host-address").value.trim(),
+      user: document.getElementById("host-user").value.trim() || "root",
+      port: num("host-port") || 22,
+      auth_method: document.getElementById("host-auth").value,
+      credential: document.getElementById("host-credential").value,
+      app_root: document.getElementById("host-app-root").value.trim() || null
+    };
+    if (!body.name || !body.address || !body.credential) {
+      fail("host-result", new Error("名字、地址、凭据都要填。"));
+      return;
+    }
+    try {
+      var created = await api("/hosts", { method: "POST", body: body });
+      // 立刻清空凭据框：它已经交出去了，留在页面上只是多一份明文副本。
+      document.getElementById("host-credential").value = "";
+      say("host-result", "已登记：" + created.name + "（id=" + created.id + "）。凭据已加密入库，不做回显。");
+      reloadSoon();
+    } catch (ex) {
+      fail("host-result", ex);
+    }
+  });
+
+  // -- 主机行内动作 ------------------------------------------------------
+  // 空表时 tbody 根本不存在（模板里那一段在 hosts 非空时才渲染），这里必须判空：
+  // 挂在 null 上会抛 TypeError，把下面所有按钮的绑定一起带走——页面看着正常、点哪儿都没反应。
+  var hostRows = document.getElementById("host-rows");
+  if (hostRows) hostRows.addEventListener("click", async function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-act]") : null;
+    if (!btn) return;
+    var name = btn.dataset.name;
+    try {
+      if (btn.dataset.act === "ping") {
+        btn.disabled = true;
+        var info = await api("/hosts/" + encodeURIComponent(name) + "/ping", { method: "POST" });
+        btn.disabled = false;
+        Fissue.toast("连接成功：" + name, "ok", { detail: JSON.stringify(info), timeout: 6000 });
+        reloadSoon();
+      } else if (btn.dataset.act === "remove-host") {
+        var ok = await Fissue.confirm(
+          "删除主机登记",
+          "只删本地记录（含 " + name + " 的部署历史与审计流水），远端服务与文件不受影响。确认？",
+          { danger: true, yesText: "删除登记" }
+        );
+        if (!ok) return;
+        await api("/hosts/" + encodeURIComponent(name), { method: "DELETE" });
+        Fissue.toast("已删除登记：" + name, "info");
+        reloadSoon();
+      }
+    } catch (ex) {
+      btn.disabled = false;
+      Fissue.toast("操作失败", "bad", { detail: ex.message, timeout: 0 });
+    }
+  });
+
+  // -- 部署（提交后立刻返回；进度去「部署记录」看） ---------------------
+  document.getElementById("deploy-start").addEventListener("click", async function () {
+    var body = {
+      repo_slug: document.getElementById("deploy-repo").value.trim(),
+      host: document.getElementById("deploy-host").value,
+      ref: document.getElementById("deploy-ref").value.trim() || null,
+      platform: document.getElementById("deploy-platform").value || null,
+      allow_dangerous: document.getElementById("deploy-dangerous").checked
+    };
+    if (!body.repo_slug || !body.host) {
+      fail("deploy-result", new Error("仓库与主机都要选。"));
+      return;
+    }
+    try {
+      var accepted = await api("/deployments", { method: "POST", body: body });
+      say("deploy-result", "已受理：" + accepted.repo_slug + " → " + accepted.host + "（后台执行中，进度见「部署记录」）。");
+      reloadSoon();
+    } catch (ex) {
+      fail("deploy-result", ex);
+    }
+  });
+
+  // -- 回滚 --------------------------------------------------------------
+  document.getElementById("rollback-go").addEventListener("click", async function () {
+    var id = num("rollback-id");
+    if (id === null) { fail("rollback-result", new Error("先填部署 id。")); return; }
+    var ok = await Fissue.confirm(
+      "回滚",
+      "把这次部署的上一份 release 指回去并重启服务、重跑健康探针。确认回滚 id=" + id + "？"
+    );
+    if (!ok) return;
+    try {
+      var report = await api("/deployments/" + id + "/rollback", { method: "POST" });
+      say("rollback-result", "回滚结果：" + report.status + (report.error ? "（" + report.error + "）" : ""));
+      reloadSoon();
+    } catch (ex) {
+      fail("rollback-result", ex);
+    }
+  });
+
+  // -- 下线 --------------------------------------------------------------
+  document.getElementById("destroy-go").addEventListener("click", async function () {
+    var id = num("destroy-id");
+    if (id === null) { fail("destroy-result", new Error("先填部署 id。")); return; }
+    var ok = await Fissue.confirm(
+      "下线",
+      "停掉服务并删除这次部署的 release 目录（shared/ 保留）。这个动作不可撤销。确认 id=" + id + "？",
+      { danger: true, yesText: "下线" }
+    );
+    if (!ok) return;
+    try {
+      var report = await api("/deployments/" + id, { method: "DELETE" });
+      say("destroy-result", "下线结果：" + report.status + (report.error ? "（" + report.error + "）" : ""));
+      reloadSoon();
+    } catch (ex) {
+      fail("destroy-result", ex);
+    }
+  });
+
+  // -- 展开步骤（按需拉 logs，不预先塞进页面） ---------------------------
+  var deployRows = document.getElementById("deploy-rows");
+  if (deployRows) deployRows.addEventListener("click", async function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-act=steps]") : null;
+    if (!btn) return;
+    var tr = btn.closest("tr");
+    var next = tr.nextElementSibling;
+    if (next && next.classList.contains("detail-row")) {
+      next.parentNode.removeChild(next);
+      btn.textContent = "展开步骤";
+      return;
+    }
+    try {
+      var data = await api("/deployments/" + btn.dataset.id + "/logs");
+      var row = document.createElement("tr");
+      row.className = "detail-row";
+      var cell = document.createElement("td");
+      cell.colSpan = 8;
+      var lines = [];
+      (data.steps || []).forEach(function (s) {
+        lines.push("[" + s.status + "] #" + s.seq + " " + s.step_id + " (" + s.kind + ")"
+          + (s.exit_code === null || s.exit_code === undefined ? "" : " exit=" + s.exit_code)
+          + (s.error ? "\n  错误：" + s.error : ""));
+      });
+      if (!lines.length) lines.push("（还没有步骤记录）");
+      lines.push("");
+      lines.push("—— 审计流水 ——");
+      (data.events || []).forEach(function (ev) {
+        lines.push((ev.created_at ? ev.created_at.slice(0, 19).replace("T", " ") + " " : "")
+          + "[" + ev.level + "] " + ev.message);
+      });
+      if (!(data.events || []).length) lines.push("（没有审计事件）");
+      var pre = document.createElement("pre");
+      pre.className = "small";
+      pre.textContent = lines.join("\n");  // textContent：远端命令与日志一律当纯文本，不解析 HTML
+      cell.appendChild(pre);
+      row.appendChild(cell);
+      tr.parentNode.insertBefore(row, tr.nextSibling);
+      btn.textContent = "收起步骤";
+    } catch (ex) {
+      Fissue.toast("拉取步骤失败", "bad", { detail: ex.message, timeout: 0 });
+    }
+  });
+})();
+</script>
+{% endblock %}

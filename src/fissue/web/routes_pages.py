@@ -44,6 +44,11 @@ def register_web(app: FastAPI, settings: Any, templates: Jinja2Templates) -> Non
     _register_web_jobs(app, templates)
     _register_web_config(app, templates)
     _register_web_item_detail(app, templates)
+    # 运维页（/ops）住在 deploy_api：它同时注册 REST 端点与页面，两者共用一份
+    # 视图模型；拆开会让「页面显示什么」和「API 返回什么」两处口径漂移。
+    from .deploy_api import register_deploy_pages
+
+    register_deploy_pages(app, settings)
 
 
 def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:

@@ -15,6 +15,84 @@
 
 > **未发布**：`v1.3.1` 之后的变更。
 
+### 新增 —— 部署与服务器运维（`fissue host` / `fissue deploy`）
+
+- **能力**：给一个仓库和一台已登记的服务器，Fissue 自己读 README 与代码，产出结构化
+  部署计划，SSH 上去装环境、放产物、起 systemd 服务，最后用**独立证据**判定"起来了"；
+  之后能看状态、看日志、重启、回滚、下线。
+- **为什么不让模型直接给 shell**：一串命令既无法逐步记录结果（答不出"第几步挂了"），
+  也无法在失败点干净停下回滚，更没法在执行前做白名单校验。所以模型只输出 5 种动作
+  （`upload` / `write_file` / `exec` / `service` / `probe`），每个带 `check` 与 `rollback`。
+- **成功判定不看模型怎么说**：收尾必须三类证据同时成立——`systemctl is-active` 为
+  active、远端 `ss` 里真有端口在听、**从控制端发起**的探针可达。远端自己
+  `curl localhost` 成功什么也证明不了（它连的可能是上一版进程）。
+- **失败即停 + 回滚**：任一步失败就不做后续步骤（半成品服务比没部署更糟），有上一版
+  就 `ln -sfn` 指回去、重启、**重新探针**，探针绿才记 `rolled_back`。
+- **发布布局**：`releases/<UTC 时间戳>` + `current` 软链原子切换 + `shared/` 跨版本保留
+  （`.env`、上传目录、SQLite 在 shared 里，否则每次部署都在换掉数据）。
+- **安全边界**：凭据（私钥/密码）用 `data/server.secret` 经 HKDF 派生的密钥做**可逆加密**
+  后入库，API 与日志只回显认证方式与指纹；主机公钥首次 TOFU 钉住，之后不匹配一律拒连；
+  `guard` 对命令逐段（分号/管道/子 shell/`$(...)`）检查，14 条绝对拒绝（`rm -rf /`、
+  `mkfs`、`dd of=/dev/…` 等）+ 12 条需 `--allow-dangerous` 才放行；`deploy.enabled`
+  默认 **false**。
+- **用例（42 条，全部离线）**：SSH 层用假 client 覆盖非 0 退出码不抛、`cwd` 引号注入、
+  指纹不匹配/TOFU、认证失败消息不含凭据；`guard` 覆盖组合命令绕过与白名单开关；执行器
+  用假通道覆盖"计划非法时连机器都不连"、"成功记账"、"失败回滚并重新探针"、"探针否决"；
+  planner 覆盖 schema 非法重试、超步数不截断、上下文收集截断。
+
+### 修复 —— 真机验证挖出的六个缺陷（`fissue deploy`）
+
+在一台 Ubuntu 24.04 aarch64 上真机部署 Flask 应用时逐个暴露，全部已修并补用例：
+
+- **`guard` 与执行器契约不一致**：`write_file` 在 release 内的相对路径被 `guard` 一律拒绝，
+  于是「把 unit 模板放进产物目录再 install 出去」这条最正常的写法跑不通。现在相对路径
+  表示「写在本次 release 里」，`..` 仍拒；相对路径叠加 `allow_outside_release` 判矛盾直接拒。
+- **`_prepare` 吞掉 mkdir 的失败**：`mkdir` 与探测被 `&&`/`||` 串成一句，权限失败被
+  `|| echo WARN` 短路，整体退出码仍为 0，直到上传步骤才以 `tar: Cannot open` 的形式爆出来。
+  改为「一条命令一件事」并按自身退出码判定；非 root 目标回退 `sudo -n mkdir` 并把属主
+  交给连接用户（默认 `app_root=/opt` 普通用户建不了）。
+- **健康检查不等待**：`Type=simple` 的 unit 刚 exec 就报 active，而应用 bind 端口还要一两秒，
+  首轮检查必然误判失败（`deploy.health_timeout` 此前定义了却没接上）。改为按
+  `health_timeout` 轮询证据，超时后抓 `journalctl` 尾部作为失败原因——否则使用者只能自己
+  SSH 上去猜。
+- **端口监听判定误报**：`ss | grep ':5000 '` 依赖对齐空格且会误匹配 `:50000`，改用
+  `ss -ltnH 'sport = :5000'`。
+- **`service` 动作没有提权通道**：非 root 账号操作系统级 unit 必须 sudo，而计划里无处表达。
+  新增 `ServiceSpec.sudo` / `AppSpec.service_sudo`，执行器统一走 `sudo -n`（非交互，
+  失败立刻报错而不是卡在密码提示）；该提权同样受 `deploy.allow_dangerous` 约束。
+- **`destroy` 漏了提权**：`systemctl stop` 直接以 `Interactive authentication required` 失败
+  （`restart`/回滚带了，销毁路径漏了）。现在统一从计划里取 `service_sudo`。
+- **`destroy` 不清理 unit**：只停服务、不 disable 也不删 unit 文件，于是「下线」之后
+  `systemctl is-enabled` 仍是 `enabled`，机器重启会去启动一个指向已删除目录的服务。
+  现在依次 stop → disable → 删 unit → `daemon-reload`，`shared/` 仍保留。
+- 附带新增：`deploy apply --source`（复用 `--plan-file` 时必须显式给源码目录，否则拒绝执行，
+  避免把控制端当前目录传到别人服务器上）；`deploy rollback`/`destroy` 按计划取提权。
+
+### 修复 —— AI 计划真机验证挖出的五个缺陷
+
+让模型自己读 README 出计划、再在同一台机器上执行，暴露的问题与手写计划那一轮不同：
+
+- **计划落库序列化崩溃**：`getattr(workspace, "commit", None)` 取到的是 `RepoWorkspace.commit()`
+  **方法**，赋给 `commit_sha` 后直到 `model_dump` 才炸（`Unable to serialize unknown type`）。
+  改为只接受字符串的取值函数，并给 `DeployPlan` 开 `validate_assignment=True`，让这类错误在
+  赋值那一刻就暴露。
+- **计划自相矛盾且无兜底**：模型 `sudo install` 了系统 unit，却把 `service.sudo` 留空；
+  探针写成主机**别名**（控制端解析不了）。提示词是请求不是保证——新增 `deploy/normalize.py`
+  做**确定性归一化**：从计划本身推断「装系统 unit ⇒ service 需提权」「探针主机名等于别名 ⇒
+  换真实地址」，每处改动写进 `notes` 供审计，且幂等。
+- **内联 TCP 探针缺目标主机**：`probe tcp:5000` 步骤只有 port，执行器只给 `health` 里的探针
+  补过主机，于是报「TCP 探针缺少目标主机」。改为从连接上下文取地址。
+- **回滚到已删除的 release**：回滚点被此前的 `destroy` 删掉后，`ln -sfn` 造出悬空软链，
+  unit 工作目录不存在，服务以 `200/CHDIR` 反复重启（比不回滚更糟）。回滚前 `test -d` 校验，
+  `destroy` 同时把同仓库历史「成功」记录标成 `destroyed`。
+- **服务以 root 运行 + 删除静默失败**：模型写的 unit 没有 `User=`，应用以 root 跑（安全事故，
+  且 `__pycache__` 归 root）；`destroy` 的 `rm -rf` 权限报错却被忽略，`releases/` 仍在盘上
+  而记录写着「已删除」。归一化给 unit 补 `User=<部署用户>`；`destroy` 删除失败即报错并
+  `sudo -n` 重试，绝不假成功。
+- 提示词同步修正四条真机事实：系统 unit 必须由计划自己 `write_file` + `install`；`service`
+  步骤对系统 unit 必须置 `sudo`；Debian/Ubuntu 先装 `python3-venv` 再 `python3 -m venv`；
+  健康探针优先给 HTTP `url` 且服务须监听 `0.0.0.0`。
+
 ### 新增 —— 文档死链检查（`scripts/check_docs.py` + CI 一步）
 
 - **现象**：文档已经是一张互相引用的网（`README.md` 指向 18 个文件、`docs/wiki/` 19 篇
