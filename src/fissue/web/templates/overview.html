@@ -29,9 +29,9 @@
    有告警（比如没配 LLM Key）已经在上面说明原因了；这里只在「配置看起来没问题、
    就是还没抓过数据」时出现，避免和告警说同一件事。 #}
 {% if summary.total == 0 %}
-<div class="panel" style="text-align:center; padding:28px 20px;">
-  <div style="font-size:15px; font-weight:600; margin-bottom:6px;">还没有任何条目</div>
-  <div class="muted small" style="max-width:480px; margin:0 auto 14px;">
+<div class="panel hero">
+  <div class="hero-title">还没有任何条目</div>
+  <div class="hero-text">
     这台 Fissue 还没抓取过数据。如果还没配置过模型 / 数据库 / 监控仓库，先走一遍初始化向导；
     已经配置好的话，点下面「控制面板」里的「开始检索」抓第一轮。
   </div>
@@ -39,17 +39,30 @@
 </div>
 {% endif %}
 
-<div class="cards">
-  <a class="card link" href="/items"
-     ><div class="k">全部条目</div><div class="v">{{ summary.total }}</div></a>
-  <a class="card link" href="/items?item_type=issue"><div class="k">Issue</div><div class="v">{{ summary.by_type.get('issue', 0) }}</div></a>
-  <a class="card link" href="/items?item_type=pr"><div class="k">PR</div><div class="v">{{ summary.by_type.get('pr', 0) }}</div></a>
-  <div class="card"><div class="k">BUG / FEATURE</div>
-    <div class="v">{{ summary.by_category.get('bug', 0) }} / {{ summary.by_category.get('feature', 0) }}</div></div>
-  <a class="card link" href="/items?priority=tier1" title="tier1：AI 判定为高优先级，建议先修"><div class="k">tier1（优先修）</div><div class="v">{{ summary.by_priority.get('tier1', 0) }}</div></a>
-  <a class="card link" href="/items?priority=tier2" title="tier2：次优先级，排在 tier1 之后再处理"><div class="k">tier2（次优先）</div><div class="v">{{ summary.by_priority.get('tier2', 0) }}</div></a>
+<div class="stat-grid">
+  <a class="stat" href="/items">
+    <span class="stat-label">全部条目</span><span class="stat-value">{{ summary.total }}</span>
+  </a>
+  <a class="stat" href="/items?item_type=issue">
+    <span class="stat-label">Issue</span><span class="stat-value">{{ summary.by_type.get('issue', 0) }}</span>
+  </a>
+  <a class="stat" href="/items?item_type=pr">
+    <span class="stat-label">PR</span><span class="stat-value">{{ summary.by_type.get('pr', 0) }}</span>
+  </a>
+  <div class="stat">
+    <span class="stat-label">BUG / FEATURE</span>
+    <span class="stat-value">{{ summary.by_category.get('bug', 0) }} / {{ summary.by_category.get('feature', 0) }}</span>
+  </div>
+  <a class="stat" href="/items?priority=tier1" title="tier1：AI 判定为高优先级，建议先修">
+    <span class="stat-label">tier1（优先修）</span><span class="stat-value">{{ summary.by_priority.get('tier1', 0) }}</span>
+  </a>
+  <a class="stat" href="/items?priority=tier2" title="tier2：次优先级，排在 tier1 之后再处理">
+    <span class="stat-label">tier2（次优先）</span><span class="stat-value">{{ summary.by_priority.get('tier2', 0) }}</span>
+  </a>
   {% for dim, val in summary.avg_scores.items() %}
-  <div class="card"><div class="k">平均 {{ dim }}</div><div class="v">{{ val }}</div></div>
+  <div class="stat">
+    <span class="stat-label">平均 {{ dim }}</span><span class="stat-value">{{ val }}</span>
+  </div>
   {% endfor %}
 </div>
 
@@ -147,7 +160,7 @@
           </select>
         </label>
         <label class="inline">最多抓
-          <input type="number" id="scan-limit" value="50" min="1" max="500" style="width:70px">条
+          <input type="number" id="scan-limit" value="50" min="1" max="500" class="w-num">条
         </label>
         <label class="inline"><input type="checkbox" id="scan-full"> 全量（忽略游标，重新抓一遍）</label>
         <button onclick="Fissue.runJob('scan', {repo: document.getElementById('scan-repo').value, limit: +document.getElementById('scan-limit').value, full: document.getElementById('scan-full').checked}, {autoReload: true})">开始检索</button>
@@ -159,7 +172,7 @@
       <div class="muted small mb">用 AI 给条目打真实性 / 重要性 / 可行性分、分类与优先级。</div>
       <div class="row">
         <label class="inline">最多评测
-          <input type="number" id="eval-limit" value="20" min="1" max="500" style="width:70px">条
+          <input type="number" id="eval-limit" value="20" min="1" max="500" class="w-num">条
         </label>
         <label class="inline"><input type="checkbox" id="eval-deep"> 深度重评（已评测过的也重新评一遍）</label>
         <button onclick="Fissue.runJob('evaluate', {limit: +document.getElementById('eval-limit').value, deep: document.getElementById('eval-deep').checked}, {autoReload: true})">评测未评测</button>
@@ -171,7 +184,7 @@
       <div class="muted small mb">在隔离沙盒里生成并运行验证器，确认问题复现、修复前后行为符合预期。</div>
       <div class="row">
         <label class="inline">最多验证
-          <input type="number" id="verify-limit" value="10" min="1" max="500" style="width:70px">条
+          <input type="number" id="verify-limit" value="10" min="1" max="500" class="w-num">条
         </label>
         <button onclick="Fissue.runJob('verify', {limit: +document.getElementById('verify-limit').value}, {autoReload: true})">验证待验证条目</button>
       </div>
@@ -197,7 +210,7 @@
       <div class="muted small mb">对低难度 Issue 自动出补丁；dry-run 只生成补丁不提交，真提 PR 会真的改代码并开 PR。</div>
       <div class="row">
         <label class="inline">最多修复
-          <input type="number" id="fix-limit" value="5" min="1" max="500" style="width:70px">条
+          <input type="number" id="fix-limit" value="5" min="1" max="500" class="w-num">条
         </label>
         <button onclick="Fissue.runJob('fix', {limit: +document.getElementById('fix-limit').value, dry_run: true}, {autoReload: true})">试跑（dry-run，只出补丁）</button>
         <button class="danger" onclick="confirmFix()">真提 PR</button>

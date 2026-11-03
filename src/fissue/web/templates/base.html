@@ -14,7 +14,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Fissue{% endblock %}</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+{# 字体自托管、只带 Latin 子集（中文走系统字体）：先 preload 再加载样式，
+   否则首屏会先用回退字体画一遍再换字，中文段落会明显抖一下。 #}
+<link rel="preload" href="/static/fonts/inter-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/static/fonts/inter-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+{# tokens.css 必须排在 app.css 前面：组件层只引用变量，顺序反了会全部落空。 #}
+<link rel="stylesheet" href="{{ request.url_for('static', path='tokens.css') }}">
 <link rel="stylesheet" href="{{ static_url }}">
+{# 主题：**先于样式绘制**就定下来，否则深色用户每次进页面都会白闪一下。
+   取值只有 light / dark / auto；auto 交给 prefers-color-scheme 决定。
+   偏好只存在浏览器本地——这是"这个人喜欢什么配色"，不是服务端配置。 #}
+<script>
+  (function () {
+    var theme = "auto";
+    try {
+      var saved = localStorage.getItem("fissue.ui.theme");
+      if (saved === "light" || saved === "dark" || saved === "auto") theme = saved;
+    } catch (e) { /* 隐私模式下 localStorage 不可用，按 auto 走 */ }
+    var dark = theme === "dark" ||
+      (theme === "auto" && window.matchMedia &&
+       window.matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme-pref", theme);
+  })();
+</script>
 {# 界面模式：**先于样式绘制**就定下来。
    如果等到 app.js（页面底部）再切，简单模式下会先闪一下满屏专家细节再被隐藏——
    那一下闪烁比不做还糟。所以这段必须留在 head 里、且是内联的。
@@ -96,6 +119,19 @@
       <span class="sub">{% block subtitle %}{% endblock %}</span>
       <span class="spacer"></span>
       {% block header_extra %}{% endblock %}
+      {# 主题切换：三态（跟随系统 / 浅色 / 深色）循环。图标用内联 SVG，
+         省一次请求，也避免"图标字体没到、按钮是空白"。 #}
+      <button type="button" class="theme-toggle" id="theme-toggle"
+              title="切换主题：跟随系统 → 浅色 → 深色" aria-label="切换主题"
+              data-pref="{{ theme_pref or 'auto' }}">
+        <svg class="icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="4"></circle>
+          <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8z"></path>
+        </svg>
+      </button>
       {# 当前身份：三种来源（回环 / 可信网段 / 会话）在权限上很不一样，页面上必须看得见，
          否则出了「为什么这台机器不用登录」这类问题，用户没有任何线索。 #}
       <span class="tag" title="本次请求的身份判定结果">{{ identity.label }}</span>
@@ -132,6 +168,7 @@
     identity: {{ identity.to_dict() | tojson }}
   };
 </script>
+<script src="{{ request.url_for('static', path='theme.js') }}"></script>
 <script src="{{ script_url }}"></script>
 {% block scripts %}{% endblock %}
 </body>

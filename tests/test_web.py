@@ -1773,10 +1773,17 @@ def test_pipeline_page_renders_totals_as_numbers(client) -> None:  # noqa: ANN00
     assert "built-in method" not in html, "模板把 dict 的方法当成值渲染了"
     assert "object at 0x" not in html
 
-    # 「条目总数」那张卡里的值必须是纯数字
+    # 「条目总数」那张卡里的值必须是纯数字。
+    # 兼容两套标记：旧摘要卡是 <div class="k">标题</div><div class="v">值</div>，
+    # 新设计系统是 <span class="stat-label">标题</span><span class="stat-value">值</span>。
+    # 这里守的**不是**某种 HTML 结构，而是"值必须是数字、不能是 dict 的方法 repr"。
     import re
 
-    m = re.search(r"条目总数\s*</div>\s*<div class=\"v\">([^<]*)</div>", html)
+    m = re.search(
+        r"条目总数\s*</(?:div|span)>.*?class=\"(?:v|stat-value)\"[^>]*>([^<]*)<",
+        html,
+        re.S,
+    )
     assert m, "没找到「条目总数」那张卡的数值节点"
     assert m.group(1).strip().isdigit(), f"条目总数不是数字：{m.group(1)!r}"
 

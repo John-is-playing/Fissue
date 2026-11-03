@@ -28,10 +28,10 @@
       </select>
     </label>
     <label class="inline">owner
-      <input type="text" id="add-owner" placeholder="John-is-playing" style="width:170px">
+      <input type="text" id="add-owner" placeholder="John-is-playing">
     </label>
     <label class="inline">name
-      <input type="text" id="add-name" placeholder="envkit" style="width:150px">
+      <input type="text" id="add-name" placeholder="envkit">
     </label>
     <button type="button" onclick="probeRepo()">探测</button>
     <span class="muted small" id="probe-result"></span>
@@ -39,13 +39,13 @@
 
   <div class="row mt">
     <label class="inline">base 分支
-      <input type="text" id="add-base" placeholder="探测结果或留空自动" style="width:140px">
+      <input type="text" id="add-base" placeholder="探测结果或留空自动">
     </label>
     <label class="inline">测试命令
-      <input type="text" id="add-test-hint" value="{{ suggested_test_hint }}" style="width:210px">
+      <input type="text" id="add-test-hint" value="{{ suggested_test_hint }}">
     </label>
     <label class="inline">时间窗（天）
-      <input type="number" id="add-since" value="30" min="0" style="width:80px">
+      <input type="number" id="add-since" value="30" min="0">
     </label>
     <label class="inline"><input type="checkbox" id="add-issue" checked> 收 Issue</label>
     <label class="inline"><input type="checkbox" id="add-pr" checked> 收 PR</label>
@@ -97,7 +97,7 @@
             <input type="text" size="20" placeholder="测试命令" value="{{ r.test_hint or '' }}"
                    id="hint-{{ loop.index }}">
             <input type="number" size="4" min="0" value="{{ r.since_days if r.since_days is not none else 30 }}"
-                   id="since-{{ loop.index }}" style="width:74px">
+                   id="since-{{ loop.index }}">
           </div>
           {% else %}
           <span class="muted small">—</span>
@@ -131,7 +131,7 @@
   </table>
   </div>
   {% else %}
-  <div class="muted">还没有监控仓库。用上面的表单加一个，或到<a href="/setup">初始化向导</a>。</div>
+  <div class="empty">还没有监控仓库。用上面的表单加一个，或到<a href="/setup">初始化向导</a>。</div>
   {% endif %}
 </div>
 

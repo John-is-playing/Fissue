@@ -1,0 +1,279 @@
+/* ============================================================================
+ * Fissue 设计系统 · Token 层
+ *
+ * 视觉方向：Notion / Craft 式的「纸」——米白底、极细分割线、几乎无装饰、
+ * 靠字重与留白建立层次；只有状态色与强调色带一点暖调。
+ *
+ * 为什么单独成文件而不塞进 app.css：token 是**契约**。组件层（app.css）
+ * 只允许引用这里的变量，不允许出现字面色值——否则深色模式会漏掉某几处，
+ * 表现为"切换到深色后还有一块白底"，而且很难靠肉眼找全。
+ * 检查方法：`grep -nE '#[0-9a-fA-F]{3,8}' app.css` 应当只剩遮罩/SVG 少数例外。
+ * ========================================================================== */
+
+/* --------------------------------------------------------------------------
+ * 1. 自托管字体
+ *
+ * 只带 Latin 子集（每个 20~25KB，合计约 90KB），中文一律回退到系统字体：
+ * 思源黑体/苹方/微软雅黑这些系统字体质量足够，而完整 CJK 字体动辄 8~16MB，
+ * 为了几个中文字形把首屏拖慢十几倍不值。字体文件随静态资源一起发布，
+ * **不发任何外部请求**——内网/离线部署同样能用。
+ * ------------------------------------------------------------------------ */
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-400-normal.woff2") format("woff2");
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/inter-latin-600-normal.woff2") format("woff2");
+}
+
+/* 标题衬线：纸感的来源。正文保持无衬线，否则长段落中文读起来发花。 */
+@font-face {
+  font-family: "Source Serif 4";
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url("/static/fonts/source-serif-4-latin-600-normal.woff2") format("woff2");
+}
+
+/* 等宽只用于数值对齐与命令，不用于正文。 */
+@font-face {
+  font-family: "JetBrains Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("/static/fonts/jetbrains-mono-latin-400-normal.woff2") format("woff2");
+}
+
+/* --------------------------------------------------------------------------
+ * 2. 主题色板
+ *
+ * 默认浅色；`html[data-theme="dark"]` 覆盖成暖色深色（不是纯黑——纯黑配暖色
+ * 强调会显得脏，用 #191715 这类带一点棕的底色才像"夜里的一张纸"）。
+ * ------------------------------------------------------------------------ */
+
+:root {
+  color-scheme: light;
+
+  /* 纸面与层级：surface 越靠上越"浮起" */
+  --bg: #fbfaf8;
+  --bg-subtle: #f5f2ee;
+  --surface: #ffffff;
+  --surface-2: #faf8f5;
+  --surface-3: #f2eee9;
+
+  /* 描边：分三级，正文区用最浅的一级才不显生硬 */
+  --border: #e6e1da;
+  --border-strong: #d6cfc6;
+  --border-hair: #efebe5;
+
+  /* 文字：暖近黑，不用纯黑 */
+  --text: #2c2825;
+  --text-muted: #6b645d;
+  --text-subtle: #9a918a;
+  --text-inverse: #fbfaf8;
+
+  /* 强调色：陶土/琥珀系，克制使用（链接、选中项、主按钮） */
+  --accent: #9a5f3c;
+  --accent-hover: #834f31;
+  --accent-soft: #f3e8de;
+  --accent-border: #e3d2c2;
+
+  /* 状态色：低饱和，能分辨即可，不抢注意力 */
+  --ok: #3d7358;
+  --ok-soft: #e8f1ec;
+  --warn: #a06b1c;
+  --warn-soft: #f8efe0;
+  --danger: #a8453a;
+  --danger-soft: #f9e9e7;
+  --info: #44698a;
+  --info-soft: #e9f0f6;
+
+  /* 阴影：纸的投影要极轻，重了就像卡片浮在半空 */
+  --shadow-xs: 0 1px 1px rgba(44, 40, 37, 0.04);
+  --shadow-sm: 0 1px 2px rgba(44, 40, 37, 0.05), 0 1px 3px rgba(44, 40, 37, 0.04);
+  --shadow-md: 0 2px 4px rgba(44, 40, 37, 0.05), 0 8px 24px -12px rgba(44, 40, 37, 0.14);
+  --shadow-lg: 0 4px 8px rgba(44, 40, 37, 0.06), 0 24px 48px -24px rgba(44, 40, 37, 0.22);
+  --ring: 0 0 0 3px rgba(154, 95, 60, 0.18);
+
+  /* 圆角：纸感偏小，胶囊只用于徽章 */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 14px;
+  --r-xl: 20px;
+  --r-full: 999px;
+
+  /* 间距：4 的倍数，避免各处 7px/13px 这种随手值 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+  --sp-10: 40px;
+  --sp-12: 48px;
+  --sp-16: 64px;
+
+  /* 字体栈 */
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --font-serif: "Source Serif 4", "Songti SC", "Noto Serif CJK SC", Georgia,
+    "Times New Roman", serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
+  /* 字阶：14.5px 正文是中文屏读的舒适区；标题用衬线 + 负字距 */
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-base: 14.5px;
+  --fs-md: 15.5px;
+  --fs-lg: 17px;
+  --fs-xl: 20px;
+  --fs-2xl: 24px;
+  --fs-3xl: 30px;
+  --fs-display: 38px;
+
+  --lh-tight: 1.25;
+  --lh-snug: 1.45;
+  --lh-base: 1.65;
+
+  /* 布局 */
+  --side-w: 232px;
+  --wrap-max: 1180px;
+  --header-h: 64px;
+
+  --transition: 160ms cubic-bezier(0.2, 0, 0.2, 1);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #191715;
+  --bg-subtle: #141312;
+  --surface: #201d1a;
+  --surface-2: #262220;
+  --surface-3: #2d2825;
+
+  --border: #35302b;
+  --border-strong: #453e37;
+  --border-hair: #2b2724;
+
+  --text: #ece6de;
+  --text-muted: #a79f96;
+  --text-subtle: #7b736b;
+  --text-inverse: #191715;
+
+  --accent: #d59570;
+  --accent-hover: #e5a882;
+  --accent-soft: #3a2b22;
+  --accent-border: #4d392c;
+
+  --ok: #7fb894;
+  --ok-soft: #1f2b24;
+  --warn: #d8a75c;
+  --warn-soft: #2e2619;
+  --danger: #e58274;
+  --danger-soft: #33211e;
+  --info: #8fb4d4;
+  --info-soft: #1e2831;
+
+  --shadow-xs: 0 1px 1px rgba(0, 0, 0, 0.3);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35), 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 2px 4px rgba(0, 0, 0, 0.35), 0 8px 24px -12px rgba(0, 0, 0, 0.6);
+  --shadow-lg: 0 4px 8px rgba(0, 0, 0, 0.4), 0 24px 48px -24px rgba(0, 0, 0, 0.7);
+  --ring: 0 0 0 3px rgba(213, 149, 112, 0.25);
+}
+
+/* --------------------------------------------------------------------------
+ * 3. 基础重置与排版基准
+ *
+ * 放这里而不是 app.css：任何组件之前必须先把 box-sizing / 行高 / 字色定好，
+ * 否则第一个引入的组件会用自己的默认值，后来的覆盖不干净。
+ * ------------------------------------------------------------------------ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+p {
+  margin: 0 0 var(--sp-3);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* 尊重系统"减少动态效果"：这不是装饰偏好，是前庭功能障碍用户的实际需求。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

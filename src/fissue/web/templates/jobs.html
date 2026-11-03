@@ -45,7 +45,7 @@
       </select>
     </label>
     <label class="inline">每页
-      <input type="number" name="per_page" value="{{ filters.per_page }}" min="1" max="200" style="width:80px">
+      <input type="number" name="per_page" value="{{ filters.per_page }}" min="1" max="200">
     </label>
     <button type="submit" class="primary">筛选</button>
     <a href="/jobs"><button type="button" class="ghost">重置</button></a>
@@ -55,7 +55,7 @@
   {% for job in jobs["items"] %}
   {% include "_job_row.html" %}
   {% else %}
-  <div class="muted">
+  <div class="empty">
     {% if filters.kind or filters.status %}
     这个筛选下没有记录。<a href="/jobs">清除筛选</a>
     {% else %}

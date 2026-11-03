@@ -18,7 +18,7 @@
     {% if job.params %} · 参数 <code>{{ job.params }}</code>{% endif %}
   </div>
   {% if job.error %}
-  <div class="alert error"><span class="a-level">失败</span><pre style="margin:0">{{ job.error }}</pre></div>
+  <div class="alert error"><span class="a-level">失败</span><pre class="j-raw">{{ job.error }}</pre></div>
   {% endif %}
   {% if job.live and not read_only %}
   <div class="row mt">

@@ -42,22 +42,22 @@
   <div class="kv">
     <div class="k">API Key</div>
     <div class="v">
-      <input type="password" id="llm-key" style="width:340px"
+      <input type="password" id="llm-key" class="w-340"
              placeholder="{{ by_key.get('FISSUE_LLM_API_KEY').value if by_key.get('FISSUE_LLM_API_KEY') and by_key.get('FISSUE_LLM_API_KEY').set else 'sk-...（必填）' }}">
       {% if by_key.get('FISSUE_LLM_API_KEY') and by_key.get('FISSUE_LLM_API_KEY').set %}
       <span class="tag status-pr_created">已配置</span>
       {% endif %}
     </div>
     <div class="k">端点</div>
-    <div class="v"><input type="text" id="llm-base" style="width:420px"
+    <div class="v"><input type="text" id="llm-base" class="w-420"
            value="{{ by_key.get('FISSUE_LLM_BASE_URL').value if by_key.get('FISSUE_LLM_BASE_URL') else '' }}"
            placeholder="https://api.deepseek.com/v1"></div>
     <div class="k">模型</div>
-    <div class="v"><input type="text" id="llm-model" style="width:260px"
+    <div class="v"><input type="text" id="llm-model" class="w-260"
            value="{{ by_key.get('FISSUE_LLM_MODEL').value if by_key.get('FISSUE_LLM_MODEL') else '' }}"
            placeholder="{{ view.effective.llm_model }}"></div>
     <div class="k">备用模型</div>
-    <div class="v"><input type="text" id="llm-fallback" style="width:260px"
+    <div class="v"><input type="text" id="llm-fallback" class="w-260"
            placeholder="可留空"></div>
   </div>
   <div class="muted small mt">
@@ -79,7 +79,7 @@
   <div class="kv">
     <div class="k">连接串</div>
     <div class="v">
-      <input type="text" id="db-url" style="width:560px"
+      <input type="text" id="db-url" class="w-560"
              value="{{ by_key.get('FISSUE_DATABASE_URL').value if by_key.get('FISSUE_DATABASE_URL') else '' }}"
              placeholder="sqlite:///E:/Fissue/fissue.db">
       <div class="muted small">当前生效：<code>{{ view.effective.database }}</code></div>
@@ -109,7 +109,7 @@
       {% set it = by_key.get(key) %}
       <tr>
         <td>{{ plat }}{% if it and it.set %} <span class="tag status-pr_created">已配</span>{% endif %}</td>
-        <td><input type="password" id="tok-{{ plat }}" style="width:320px"
+        <td><input type="password" id="tok-{{ plat }}" class="w-320"
                    aria-label="{{ plat }} 平台的访问令牌"
                    placeholder="{{ it.value if it and it.set else '未配置' }}"></td>
         <td><button type="button" data-act="test-platform" data-platform="{{ plat }}">校验</button>
@@ -134,15 +134,15 @@
         {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
       </select>
     </label>
-    <label class="inline">owner <input type="text" id="repo-owner" placeholder="John-is-playing" style="width:160px"></label>
-    <label class="inline">name <input type="text" id="repo-name" placeholder="envkit" style="width:140px"></label>
+    <label class="inline">owner <input type="text" id="repo-owner" placeholder="John-is-playing" class="w-160"></label>
+    <label class="inline">name <input type="text" id="repo-name" placeholder="envkit" class="w-140"></label>
     <button type="button" onclick="probeRepo()">探测</button>
     <span id="repo-probe" class="small muted"></span>
   </div>
   <div class="row mt">
-    <label class="inline">base 分支 <input type="text" id="repo-base" style="width:120px" placeholder="自动"></label>
-    <label class="inline">测试命令 <input type="text" id="repo-hint" value="{{ suggested_test_hint }}" style="width:210px"></label>
-    <label class="inline">时间窗（天） <input type="number" id="repo-since" value="30" min="0" style="width:80px"></label>
+    <label class="inline">base 分支 <input type="text" id="repo-base" class="w-120" placeholder="自动"></label>
+    <label class="inline">测试命令 <input type="text" id="repo-hint" value="{{ suggested_test_hint }}" class="w-210"></label>
+    <label class="inline">时间窗（天） <input type="number" id="repo-since" value="30" min="0" class="w-80"></label>
     <label class="inline"><input type="checkbox" id="repo-issue" checked> 收 Issue</label>
     <label class="inline"><input type="checkbox" id="repo-pr" checked> 收 PR</label>
     <button class="primary" onclick="stageRepo()">加入清单</button>
