@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{# 新手引导页：三个阶段 + 三档自动程度。
+ #
+ # 设计口径见 docs/DEPLOY.md §15：
+ #   - 页面只负责「展示」与「提交固定动作」，命令与解释都来自服务端（AI 或兜底模板）；
+ #   - 半自动/自动档执行的是 GUIDE_ACTIONS 白名单里的五个动作，引导内容不能指定 URL；
+ #   - 一键部署失败时必须降级到只读档并展开手动命令，而不是停在那里。
+ #
+ # 页面上**不内联任何凭据**：登记主机表单里的私钥/密码只在提交那一跳的请求体里，
+ # 提交后由 guide.js 立刻清空；服务端加密入库且不回显。
+ #}
+{% block title %}新手引导 · Fissue{% endblock %}
+{% block heading %}新手引导{% endblock %}
+{% block subtitle %}照着三步把服务部署起来：认识工具、准备服务器、部署这个仓库。可随时切换自动程度。{% endblock %}
+
+{% block content %}
+
+{# 顶部：仓库 / 主机 / 重新生成。data-* 供 guide.js 读取当前选择与版本号。 #}
+<div class="panel" id="guide-root"
+     data-repo="{{ repo_slug }}"
+     data-host="{{ host }}"
+     data-updated="{{ (guide.updated_at if guide else '') or '' }}"
+     data-source="{{ (guide.source if guide else '') or '' }}"
+     data-deploy-enabled="{{ '1' if deploy_enabled else '0' }}">
+  <h2>这次要部署什么</h2>
+  <div class="row">
+    <label class="inline">仓库
+      <input type="text" id="guide-repo" list="guide-repo-list"
+             placeholder="owner/name" style="width:200px"
+             value="{{ repo_slug }}"{% if not deploy_enabled %} disabled{% endif %}>
+      <datalist id="guide-repo-list">
+        {% for r in repos %}<option value="{{ r }}"></option>{% endfor %}
+      </datalist>
+    </label>
+    <label class="inline">主机
+      <select id="guide-host" {% if not deploy_enabled %}disabled{% endif %}>
+        <option value="">（不指定主机）</option>
+        {% for h in hosts %}
+        <option value="{{ h }}"{% if h == host %} selected{% endif %}>{{ h }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="button" class="primary" id="guide-regenerate"
+            {% if not deploy_enabled %}disabled{% endif %}>重新生成引导</button>
+    <span class="muted small" id="guide-gen-status"></span>
+  </div>
+  <div class="muted small mt">
+    生成需要克隆仓库并调用模型（会花钱），通常要几十秒。
+    没有模型或生成失败时会改用<b>通用兜底步骤</b>——页面不会停在「生成中」。
+  </div>
+</div>
+
+{% if not deploy_enabled %}
+<div class="alert warn">
+  <span class="a-level">未开启</span>
+  <div>
+    <div>部署能力未开启（<code>deploy.enabled=false</code>）：引导可以看，但所有写操作（生成、执行、登记主机）都会被拒绝。</div>
+    <div class="small muted">要开启：在 config.yaml 里设置 <code>deploy.enabled: true</code> 后重启 Web 进程。默认关闭是刻意的——这是能改远端机器的能力。</div>
+  </div>
+</div>
+{% endif %}
+
+{% if guide and guide.source == 'fallback' %}
+{# 兜底模板必须显眼：新手会以为这些步骤是「为这个仓库定制的」。 #}
+<div class="alert warn" id="guide-fallback-note">
+  <span class="a-level">通用步骤</span>
+  <div>
+    <div><b>这是通用兜底步骤，尚未按本仓库内容生成。</b></div>
+    <div class="small muted">
+      它不猜你的运行时、端口或依赖，只给「先看计划 → 再执行 → 用证据确认 → 必要时回滚」这条任何技术栈都成立的链路。
+      点上面的「重新生成引导」可在模型可用时按仓库内容重写第三阶段。
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{% if guide and guide.notes %}
+<div class="alert info">
+  <span class="a-level">说明</span>
+  <div>{{ guide.notes }}</div>
+</div>
+{% endif %}
+
+{# 三档自动程度：选择只存在本浏览器（localStorage），不是服务端配置。 #}
+<div class="panel" id="guide-modes">
+  <h2>自动程度</h2>
+  <div class="steps" role="group" aria-label="自动程度">
+    <button type="button" class="step-chip guide-mode" data-mode="readonly">只读</button>
+    <button type="button" class="step-chip guide-mode" data-mode="half">半自动</button>
+    <button type="button" class="step-chip guide-mode" data-mode="auto">一键</button>
+  </div>
+  <div class="muted small" id="guide-mode-desc">
+    只读：只展示命令与解释，自己复制执行。第一次看、生产谨慎操作时用它。
+  </div>
+
+  {# 全自动档：一个按钮按固定顺序跑 generate-plan → apply → check。 #}
+  <div class="row mt" id="guide-auto-box" hidden>
+    <button type="button" class="primary" id="guide-auto-run"
+            {% if not deploy_enabled %}disabled{% endif %}>一键部署（生成计划 → 执行 → 检查）</button>
+    <span class="muted small">失败会自动切回只读档，并把手动命令展开。</span>
+  </div>
+  <div id="guide-auto-progress" hidden>
+    <div class="muted small mt">自动部署进度：</div>
+    <div id="guide-auto-steps"></div>
+    <div class="alert error mt" id="guide-auto-fail" hidden>
+      <span class="a-level">失败</span>
+      <div>
+        <div id="guide-auto-fail-reason"></div>
+        <div class="small">已切回<b>只读</b>档并展开该阶段的手动命令——照着上面的命令手动执行。</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{# 登记主机：add-host 动作需要结构化的 host_spec，不能只给一行命令。 #}
+<div class="panel" id="guide-add-host-panel">
+  <h2>登记主机（凭据只提交这一次）</h2>
+  <div class="row">
+    <label class="inline">名字
+      <input type="text" id="guide-host-name" placeholder="pi5" style="width:130px">
+    </label>
+    <label class="inline">地址
+      <input type="text" id="guide-host-address" placeholder="192.168.1.3" style="width:150px">
+    </label>
+    <label class="inline">用户
+      <input type="text" id="guide-host-user" value="root" style="width:110px">
+    </label>
+    <label class="inline">端口
+      <input type="number" id="guide-host-port" value="22" min="1" max="65535" style="width:90px">
+    </label>
+    <label class="inline">认证
+      <select id="guide-host-auth">
+        <option value="key">私钥</option>
+        <option value="password">密码</option>
+      </select>
+    </label>
+  </div>
+  <div class="mt">
+    <label class="inline">发布根（可选，留空用服务端默认）
+      <input type="text" id="guide-host-app-root" placeholder="留空即可" style="width:220px">
+    </label>
+  </div>
+  <div class="mt">
+    <label class="inline">凭据（私钥正文或密码）
+      <textarea id="guide-host-secret" rows="4" style="width:100%"
+                placeholder="粘贴私钥全文（-----BEGIN ... PRIVATE KEY-----），或该用户的密码"></textarea>
+    </label>
+    <div class="muted small">
+      只提交这一次：服务端立刻加密入库，<b>任何接口都不会再回显它</b>。提交后这里会被清空。
+    </div>
+  </div>
+  <div class="row mt">
+    <button type="button" class="primary" id="guide-host-submit"
+            {% if not deploy_enabled %}disabled{% endif %}>登记主机</button>
+    <span class="muted small" id="guide-host-result"></span>
+  </div>
+</div>
+
+{% if not guide %}
+<div class="empty">
+  还没有可展示的引导。选择仓库后点「重新生成引导」；不生成也能先看<a href="/ops">运维页</a>。
+</div>
+{% else %}
+
+{% for stage in guide.stages %}
+<details class="panel collapsible guide-stage" data-stage="{{ stage.id }}"{% if loop.first %} open{% endif %}>
+  <summary>{{ stage.title }}</summary>
+  {% if stage.goal %}<div class="muted small">{{ stage.goal }}</div>{% endif %}
+
+  {% for step in stage.steps %}
+  <div class="guide-step mt" data-step="{{ step.id }}" data-action="{{ step.action or '' }}">
+    <h3>{{ step.title }}</h3>
+    {% if step.why %}<div class="small">{{ step.why }}</div>{% endif %}
+
+    {% if step.command %}
+    <pre class="guide-command">{{ step.command }}</pre>
+    <div class="row">
+      <button type="button" class="ghost small" data-copy-step>复制命令</button>
+      <span class="muted small" data-step-note></span>
+    </div>
+    {% endif %}
+
+    {% if step.verify %}
+    <div class="small mt"><b>怎么确认成功</b>：{{ step.verify }}</div>
+    {% endif %}
+
+    {% for caution in step.cautions %}
+    <div class="alert warn mt">
+      <span class="a-level">注意</span>
+      <div>{{ caution }}</div>
+    </div>
+    {% endfor %}
+
+    {% if step.action %}
+    <div class="row mt guide-run-row">
+      <button type="button" class="primary small guide-run" data-run-action="{{ step.action }}"
+              {% if not deploy_enabled %}disabled{% endif %} hidden>执行这一步</button>
+      <span class="muted small" data-run-result></span>
+    </div>
+    <div class="muted small">这一步对应固定动作 <code>{{ step.action }}</code>；执行前会先把将调用的接口与参数给你确认。</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</details>
+{% endfor %}
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ request.url_for('static', path='guide.js') }}"></script>
+{% endblock %}

@@ -79,6 +79,10 @@ def register_api(app: FastAPI, settings: Any) -> None:
     from .deploy_api import register_deploy_api
 
     register_deploy_api(app, prefix, auth)
+    # 新手引导（/ops/guide 与动作端点）：与部署同一套闸门，独立模块便于单独演进。
+    from .guide_api import register_guide_api
+
+    register_guide_api(app, prefix, auth)
     _register_api_misc(app, prefix, auth)
 
 

@@ -49,6 +49,9 @@ def register_web(app: FastAPI, settings: Any, templates: Jinja2Templates) -> Non
     from .deploy_api import register_deploy_pages
 
     register_deploy_pages(app, settings)
+    from .guide_api import register_guide_pages
+
+    register_guide_pages(app, settings)
 
 
 def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:

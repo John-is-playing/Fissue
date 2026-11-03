@@ -20,6 +20,7 @@ from ..logging_setup import get_logger
 from .db import Database
 from .tables import (
     DeployEventRow,
+    DeployGuideRow,
     DeployHostRow,
     DeploymentRow,
     DeploymentStepRow,
@@ -368,6 +369,71 @@ class DeployRepository:
                     estimated=bool(getattr(usage, "estimated", False)),
                 )
             )
+
+    # -- 新手引导 ---------------------------------------------------------
+
+    def upsert_guide(
+        self,
+        *,
+        repo_slug: str,
+        host: str,
+        mode: str,
+        stages: list[dict[str, Any]],
+        notes: str = "",
+        source: str = "ai",
+    ) -> int:
+        """生成/覆盖一份引导。
+
+        一个 (repo_slug, host) 只留一份：引导描述的是「现在该怎么做」，
+        留着旧版本只会让新手照着过期步骤操作。
+        """
+        with self.db.session() as s:
+            row = s.scalar(
+                select(DeployGuideRow).where(
+                    DeployGuideRow.repo_slug == repo_slug, DeployGuideRow.host == host
+                )
+            )
+            if row is None:
+                row = DeployGuideRow(repo_slug=repo_slug, host=host)
+                s.add(row)
+            row.mode = mode
+            row.stages = stages
+            row.notes = notes
+            row.source = source
+            s.flush()
+            return int(row.id)
+
+    def get_guide(self, *, repo_slug: str, host: str = "") -> DeployGuideRow | None:
+        stmt = select(DeployGuideRow).where(
+            DeployGuideRow.repo_slug == repo_slug, DeployGuideRow.host == host
+        )
+        with self.db.session() as s:
+            row = s.scalar(stmt)
+            if row is not None:
+                s.expunge(row)
+            return row
+
+    def latest_guide_for_host(self, host: str) -> DeployGuideRow | None:
+        """该主机名下的最新一份引导（页面在没指定仓库时用它兜底）。"""
+        stmt = (
+            select(DeployGuideRow)
+            .where(DeployGuideRow.host == host)
+            .order_by(DeployGuideRow.updated_at.desc())
+            .limit(1)
+        )
+        with self.db.session() as s:
+            row = s.scalar(stmt)
+            if row is not None:
+                s.expunge(row)
+            return row
+
+    def list_guides(self, *, limit: int = 50) -> list[DeployGuideRow]:
+        stmt = select(DeployGuideRow).order_by(DeployGuideRow.updated_at.desc()).limit(limit)
+        with self.db.session() as s:
+            rows = list(s.scalars(stmt))
+            for row in rows:
+                s.expunge(row)
+            return rows
 
     def stats(self) -> dict[str, Any]:
         """概览：主机数、各状态部署数（Web 运维页的顶栏用）。"""

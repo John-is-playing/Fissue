@@ -86,6 +86,7 @@ fissue serve --with-web
 | `fissue bench capture\|diff\|list\|tiers` | 跑分基线冻结 / 逐项对比 / 列表 / 批量重评测档位稳定性 |
 | `fissue host add\|list\|show\|remove\|ping\|enable` | 部署主机登记：连得上哪台、指纹是否已钉住（凭据加密入库） |
 | `fissue deploy plan\|apply\|status\|logs\|rollback\|destroy` | 读仓库 → AI 出计划 → 部署到主机 → 独立证据判定（失败自动回滚） |
+| Web `/ops/guide` | 新手引导：分阶段讲清怎么配、怎么部署；三档模式（只读 / 半自动 / 一键），一键失败自动降级为手动步骤 |
 
 ---
 

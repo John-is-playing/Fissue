@@ -328,3 +328,111 @@ class StepResult(BaseModel):
     exit_code: int | None = None
     output_tail: str = ""
     error: str | None = None
+
+# ---------------------------------------------------------------------------
+# 新手引导（docs/DEPLOY.md §15）
+# ---------------------------------------------------------------------------
+
+
+class GuideMode(str, Enum):
+    """引导页的三档自动程度。
+
+    三档不是「难度」，而是**同一份内容的不同执行方式**：新手先看只读文本，
+    有信心了切半自动，跑顺了用一键；一键失败时退回只读，照着命令手动来。
+    """
+
+    READONLY = "readonly"   # 只读图文：命令自己复制
+    HALF = "half"           # 半自动：每步一个按钮，执行前展示将跑的命令
+    AUTO = "auto"           # 一键：按固定顺序把整条链跑完
+
+
+class GuideAction(str, Enum):
+    """页面认可的**固定动作**。
+
+    刻意做成枚举而不是「一个 URL 字段」：AI 生成的引导只描述"该做什么"，
+    真正调哪个端点由页面写死。否则模型一句
+    ``api: DELETE /api/v1/hosts/all`` 就能借引导页之手删东西。
+    """
+
+    ADD_HOST = "add-host"          # 登记目标服务器
+    GENERATE_PLAN = "generate-plan"  # 生成部署计划（只出计划，不执行）
+    APPLY = "apply"                # 执行部署
+    CHECK = "check"                # 看证据/状态
+    ROLLBACK = "rollback"          # 回滚
+
+
+class GuideStep(BaseModel):
+    """引导里的一步：说清「做什么、为什么、怎么确认成了」。
+
+    ``command`` 是给人复制的手动命令；``action`` 非空时，半自动/自动档把它
+    换成一次按钮点击（等价于跑同一个固定动作）。
+    """
+
+    id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=120)
+    why: str = ""
+    command: str | None = Field(default=None, max_length=2000)
+    verify: str | None = Field(default=None, max_length=500)
+    action: GuideAction | None = None
+    cautions: list[str] = Field(default_factory=list)
+
+
+class GuideStage(BaseModel):
+    """一个阶段。结构是「阶段 → 步骤」，因为新手最容易在阶段之间迷路。"""
+
+    id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=1, max_length=120)
+    goal: str = ""
+    steps: list[GuideStep] = Field(default_factory=list)
+
+
+class GuidePlan(BaseModel):
+    """一份新手引导。
+
+    ``source`` 区分来源：``ai`` 是按仓库内容生成的，``fallback`` 是模型不可用时
+    的固定模板。两者结构相同——**降级不能让页面变成空白**，那样新手连手动
+    步骤都看不到，而「自动挂了就看手动」正是这套引导存在的理由。
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
+
+    version: int = 1
+    repo_slug: str
+    host: str | None = None
+    mode: GuideMode = GuideMode.HALF
+    stages: list[GuideStage] = Field(default_factory=list)
+    notes: str = ""
+    source: str = "ai"          # ai | fallback
+    generated_at: Any = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def _shape(self) -> GuidePlan:
+        if not self.stages:
+            raise ValueError("引导至少要有一个阶段")
+        ids: set[str] = set()
+        total = 0
+        for stage in self.stages:
+            if stage.id in ids:
+                raise ValueError(f"阶段 id 重复：{stage.id!r}")
+            ids.add(stage.id)
+            if not stage.steps:
+                raise ValueError(f"阶段 {stage.id!r} 没有任何步骤")
+            for step in stage.steps:
+                key = f"{stage.id}/{step.id}"
+                if key in ids:
+                    raise ValueError(f"步骤 id 重复：{key}")
+                ids.add(key)
+                total += 1
+        if total > 40:
+            raise ValueError(f"引导步骤过多（{total}），新手看不完；请合并到 40 步以内")
+        return self
+
+    def dump(self) -> dict[str, Any]:
+        return self.model_dump(mode="json")
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> GuidePlan:
+        return cls.model_validate(raw)
+
+    def step_count(self) -> int:
+        return sum(len(stage.steps) for stage in self.stages)

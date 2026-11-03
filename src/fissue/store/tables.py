@@ -563,3 +563,30 @@ class DeployEventRow(Base):
     level: Mapped[str] = mapped_column(String(16), default="info")   # info | warn | error
     message: Mapped[str] = _long_text()
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class DeployGuideRow(Base):
+    """一份新手引导（见 docs/DEPLOY.md §15）。
+
+    ``host`` 用空串表示「不限主机」而不是 NULL：``UNIQUE(repo_slug, host)`` 在
+    PostgreSQL/MySQL 上对 NULL 是**不生效**的（NULL != NULL），用空串才能真的
+    「同一仓库同一主机只留一份」。重新生成即覆盖，历史引导没有保留价值——
+    它描述的是「现在该怎么部署」，留旧版本只会让新手照着过期步骤操作。
+    """
+
+    __tablename__ = "deploy_guides"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    repo_slug: Mapped[str] = mapped_column(String(511), index=True)
+    host: Mapped[str] = mapped_column(String(128), default="")
+    mode: Mapped[str] = mapped_column(String(16), default="half")   # readonly | half | auto
+    stages: Mapped[list] = mapped_column(JSON, default=list)
+    notes: Mapped[str] = _long_text()
+    #: ai = 按仓库内容生成；fallback = 模型不可用时的固定模板。
+    source: Mapped[str] = mapped_column(String(16), default="ai")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (UniqueConstraint("repo_slug", "host", name="uq_deploy_guide_scope"),)

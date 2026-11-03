@@ -15,6 +15,11 @@
 
 {% block content %}
 
+<p class="muted">
+  第一次部署？先看 <a href="/ops/guide{% if guide_repo %}?repo_slug={{ guide_repo }}{% endif %}">新手引导</a>——
+  它会分阶段告诉你这台服务器该怎么配、这个仓库该怎么起，并且可以一键执行。
+</p>
+
 {% if not deploy_enabled %}
 <div class="alert warn">
   <span class="a-level">未开启</span>
