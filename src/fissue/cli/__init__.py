@@ -4,6 +4,7 @@
 """
 
 from . import (
+    demo,  # noqa: F401,E402  —— 注册 demo up / demo kits（内置夹具演示）
     deploy,  # noqa: F401,E402  —— 注册 host / deploy（部署与服务器运维）
     doctor,  # noqa: F401,E402  —— 注册 platforms doctor（平台能力体检）
     onboard,  # noqa: F401,E402  —— 注册 onboard（初始化向导）

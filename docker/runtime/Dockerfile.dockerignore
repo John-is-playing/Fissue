@@ -1,0 +1,49 @@
+# Dockerfile 专用忽略清单（名字必须是 <Dockerfile 名>.dockerignore）。
+#
+# compose 的构建上下文是**仓库根**（镜像里要 src/），但仓库其余部分与镜像无关：
+# 不挡的话每次 build 都要把 .git / data/ / demo 五套夹具（各带自己的 .git）打包上传，
+# 几百 MB，还天天把构建缓存打掉。顺带把 .env 挡在构建上下文外面——它含真实密钥。
+#
+# 写法上的取舍：只做**排除**，不玩「`**` 全排除 + `!src/**` 反排除」——反排除「已被排除
+# 目录里的子项」的语义最容易踩坑，而一旦把 src/ 漏掉，镜像会在 COPY 那一步直接失败。
+# 只留一条最朴素的 `!README.md`（pyproject 的 readme 指向它，构建 wheel 时必须有）。
+#
+# 注意：这是 BuildKit 的能力（Docker 23+ 默认就是 BuildKit）；老式 classic builder
+# 会忽略它——那种情况只是慢，不影响构建结果。
+
+# -- VCS 与各种构建/测试缓存 ------------------------------------------------
+.git
+.github
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.egg-info
+.venv
+venv
+build
+dist
+
+# -- 本机数据与产物（含真实密钥、数据库、覆盖率数据）-------------------------
+.env
+.env.example
+config.yaml
+config.local.yaml
+data
+*.db
+*.db-wal
+*.db-shm
+*.log
+.coverage
+.coverage.*
+
+# -- 与镜像无关的内容 -------------------------------------------------------
+tests
+scripts
+docs
+demo
+banner
+.screenshots
+.atomcode
+*.md
+!README.md

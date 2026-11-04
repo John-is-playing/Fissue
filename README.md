@@ -45,6 +45,19 @@ fissue serve --with-web
 
 一次配好全部：`fissue onboard`（交互式向导；无头机器用 `--yes` 加参数）。
 
+### 不想装 Python？一条命令起服务
+
+本机只要有 Docker + Compose v2：
+
+```bash
+cp .env.example .env      # LLM key 可以留空，进界面再填
+docker compose up -d      # 首次构建镜像约 2~4 分钟
+```
+
+打开 <http://localhost:8000/login>，用启动日志里的一次性引导口令创建管理员
+（`docker compose logs fissue | grep -A3 引导口令`）。数据都在卷 `/data` 里（SQLite + 密钥 + 产物），
+备份、升级、端口与可选的沙盒 profile 见 [docs/COMPOSE.md](docs/COMPOSE.md)。
+
 ---
 
 ## 核心流程
@@ -79,6 +92,8 @@ fissue serve --with-web
 | `fissue report` · `export` | Markdown/JSON 报告 · 全量导出 |
 | `fissue status` | 条目统计、队列、模型用量、沙盒可用性 |
 | `fissue platforms doctor` | 平台能力体检：只读/克隆/打标签/评论/推分支（写探测需显式开启） |
+| `fissue doctor` | 全栈自检：配置、数据库、模型、沙盒、Web 端口、磁盘、时区；每项给一句下一步 |
+| `fissue demo up \| kits` | 用内置夹具起只读演示实例（不需要 token / 模型），一条命令看到完整流水线 |
 | `fissue serve` | 常驻：增量扫描 + 调度 + 验证 + 通知（`--with-web` 同进程带 Web） |
 | `fissue web` | Web 工作台 + `/api/v1` REST API |
 | `fissue sandbox serve` · `check` | 沙盒转发组件（执行唯一通道） · 环境就绪检查 |
@@ -146,6 +161,7 @@ docs/            设计、使用、环境变量、鉴权、回归门 + wiki/
 | 读者 | 入口 |
 |---|---|
 | 第一次接触 | [docs/wiki/Overview.md](docs/wiki/Overview.md) → [docs/wiki/Getting-Started.md](docs/wiki/Getting-Started.md) |
+| 不想装 Python / 用容器跑 | [docs/COMPOSE.md](docs/COMPOSE.md)（`docker compose up -d`、数据卷、沙盒 profile） |
 | 配环境 / 查变量 | [docs/USAGE.md](docs/USAGE.md) · [docs/ENV.md](docs/ENV.md) · [docs/AUTH.md](docs/AUTH.md) |
 | 查命令 / 接口 | [docs/wiki/CLI-Reference.md](docs/wiki/CLI-Reference.md) · [docs/wiki/Web-and-API.md](docs/wiki/Web-and-API.md) |
 | 改代码 / 加扩展 | [docs/DESIGN.md](docs/DESIGN.md) · [docs/wiki/Architecture.md](docs/wiki/Architecture.md) · [docs/wiki/Extending.md](docs/wiki/Extending.md) |

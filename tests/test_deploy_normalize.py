@@ -126,7 +126,7 @@ def test_unit_gets_user_line_when_missing():
     normalize_plan(plan, host_name="rpi", host_address="192.168.2.10", host_user="john")
     unit = next(s for s in plan.steps if s.id == "write-unit")
     assert "User=john" in unit.write.content
-    assert "unit 补 User=john" in plan.notes
+    assert "运行身份改为 john" in plan.notes
 
 
 def test_unit_user_not_duplicated():

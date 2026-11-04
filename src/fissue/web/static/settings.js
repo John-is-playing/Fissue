@@ -94,7 +94,7 @@
     proxies = proxies.filter(function (ip) {
       if (seenProxy[ip]) return false; seenProxy[ip] = true; return true;
     });
-    return {
+    var payload = {
       web: {
         allow_remote_config_write: checked("overlay-allow-remote"),
         auth: {
@@ -113,6 +113,20 @@
       // 边界由服务端的 pydantic 约束兜底，这里不做格式判断——写不合法就 400、文件一字不动。
       llm: llmPayload()
     };
+    // 三档修复策略：没选中任何一档就不交这一组（例如当前是 direct-upstream 的警示态），
+    // 避免"用户没碰过它、保存时却被悄悄改成 fork"。
+    var pr = prStrategyPayload();
+    if (pr) payload.auto_fix = { pr_strategy: pr };
+    return payload;
+  }
+
+  /** 修复落地方式：suggest → patch_only；draft → fork+draft；direct → fork。 */
+  function prStrategyPayload() {
+    var picked = document.querySelector('input[name="fix-strategy"]:checked');
+    if (!picked) return null;
+    if (picked.value === "suggest") return { mode: "patch_only", draft: false };
+    if (picked.value === "draft") return { mode: "fork", draft: true };
+    return { mode: "fork", draft: false };
   }
 
   /** 模型参数与计费那一组。 */

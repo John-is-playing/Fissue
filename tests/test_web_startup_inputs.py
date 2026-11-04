@@ -133,3 +133,53 @@ def test_old_plan_without_required_inputs_still_renders(settings, client):
     data = client.get(f"/api/v1/deployments/{dep_id}").json()
     assert data["startup_inputs"]["items"] == []
     assert data["startup_missing"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 失败记录行内回滚按钮（E1）
+# ---------------------------------------------------------------------------
+
+
+def _seed_with_status(settings: Any, *, status: str, previous: str | None) -> int:
+    from fissue.store.tables import DeploymentRow
+
+    dep_id = _seed(settings, _plan(env={}))
+    db = build_database(settings)
+    with db.session() as session:
+        row = session.get(DeploymentRow, dep_id)
+        row.status = status
+        row.previous_release = previous
+    return dep_id
+
+
+def test_failed_row_offers_rollback(settings, client):
+    """失败且**有上一版**时，行内直接给回滚按钮。
+
+    失败之后最该做的就是回到上一版，而原先要翻到「回滚」面板手填部署 id。
+    """
+    _seed_with_status(settings, status="failed", previous="20261101T100000Z")
+    html = client.get("/ops").text
+    assert 'data-act="rollback-row"' in html
+    assert "回滚到上一版" in html
+
+
+def test_successful_row_has_no_rollback_button(settings, client):
+    """成功记录不该出现回滚入口：一不小心点下去就是把好好的服务退回去。"""
+    _seed_with_status(settings, status="success", previous="20261101T100000Z")
+    html = client.get("/ops").text
+    assert 'data-act="rollback-row"' not in html
+
+
+def test_failed_row_without_previous_release_has_no_rollback(settings, client):
+    """没有上一版可回时不出按钮：那种回滚只会在远端制造悬空软链。"""
+    _seed_with_status(settings, status="failed", previous=None)
+    html = client.get("/ops").text
+    assert 'data-act="rollback-row"' not in html
+
+
+def test_rollback_button_confirms_before_acting(settings, client):
+    """必须先确认：回滚会重启服务，不该点一下就走。"""
+    _seed_with_status(settings, status="failed", previous="20261101T100000Z")
+    html = client.get("/ops").text
+    assert "Fissue.confirm(" in html
+    assert "会把 current 软链指回上一版" in html

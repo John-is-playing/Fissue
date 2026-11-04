@@ -94,6 +94,12 @@ def normalize_plan(
                 changes.append(
                     f"unit 运行身份改为 {host_user}（缺 User= 或以 root 运行都会被改写）"
                 )
+        # 需要 docker 时按组授予权限：短路写法保证「不需要 docker」时不去改 unit。
+        if _unit_needs_docker(plan) and _ensure_docker_group(plan):
+            changes.append(
+                "unit 补 SupplementaryGroups=docker（需要 docker 权限时按组授予，"
+                "而不是整进程 root）"
+            )
 
     if host_name and host_address:
         # `health` 与**内联 probe 步骤**都要改：真机验证时只改了 health，
@@ -302,6 +308,59 @@ def _ensure_unit_user(plan: DeployPlan, user: str) -> bool:
         if updated != content:
             spec.content = updated
             changed = True
+    return changed
+
+
+#: 需要 docker 的线索。只看**命令与 unit 内容**，不看路径：
+#: 计划里上传一个叫 `docker/` 的目录不代表要连 docker daemon。
+_DOCKER_HINT = re.compile(r"(?i)\bdocker\b")
+
+
+def _unit_needs_docker(plan: DeployPlan) -> bool:
+    """这份计划是否要用 docker（沙盒、compose、`docker run` 等）。"""
+    for step in plan.steps:
+        spec = step.spec
+        for text in (
+            getattr(spec, "command", "") or "",
+            getattr(spec, "content", "") or "",
+        ):
+            if _DOCKER_HINT.search(text):
+                return True
+    return bool(_DOCKER_HINT.search(plan.notes or ""))
+
+
+def _ensure_docker_group(plan: DeployPlan) -> bool:
+    """需要 docker 时，给 unit 补 ``SupplementaryGroups=docker``。
+
+    为什么是这条而不是 ``usermod -aG docker``：两者都能让进程拿到 docker 权限，
+    但侧重点不同——
+
+    * ``usermod`` 改的是**系统账户**，会影响该用户的每个会话与进程，
+      而且"改了组、正在跑的进程仍用旧组"这件事很容易被忽略（要重新登录/重启）；
+    * ``SupplementaryGroups=`` 只作用**这一个 unit**，systemd 以 root 身份设置附加组，
+      不需要用户事先被加进组。权限范围就是"这个服务"，回滚也只需改 unit 文件。
+
+    所以标准做法是：unit 级授予 + 只授予需要的那个组。真要执行 docker 命令的服务
+    仍然**不以 root 运行**（User 仍是部署用户）。
+
+    已经有 ``SupplementaryGroups=`` 的不动——模型可能已经写了别的组，覆盖会削权限。
+    """
+    changed = False
+    for step in plan.steps:
+        spec = step.spec
+        if not isinstance(spec, WriteFileSpec):
+            continue
+        content = spec.content or ""
+        if not spec.path.endswith(".service") or "[Service]" not in content:
+            continue
+        if re.search(r"(?im)^SupplementaryGroups\s*=", content):
+            continue
+        if not re.search(r"(?im)^User\s*=", content):
+            continue  # 没有 User= 的 unit 归 _ensure_unit_user 管，这里不越界
+        spec.content = content.replace(
+            "[Service]", "[Service]\nSupplementaryGroups=docker", 1
+        )
+        changed = True
     return changed
 
 

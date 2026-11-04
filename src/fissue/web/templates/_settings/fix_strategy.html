@@ -1,0 +1,36 @@
+<div class="panel">
+  <h2>修复策略：AI 改完代码怎么落地</h2>
+  <div class="stack">
+    <label class="inline">
+      <input type="radio" name="fix-strategy" value="suggest"
+             {% if view.effective.pr_choice == 'suggest' %}checked{% endif %}>
+      <span><b>只出建议</b>：生成补丁给你看，<b>不推分支、不提 PR</b>（<code class="code-inline">patch_only</code>）</span>
+    </label>
+    <label class="inline">
+      <input type="radio" name="fix-strategy" value="draft"
+             {% if view.effective.pr_choice == 'draft' %}checked{% endif %}>
+      <span><b>草稿 PR</b>：推分支 + <b>Draft PR</b>，评审前不惊动任何人（<code class="code-inline">fork + draft</code>）</span>
+    </label>
+    <label class="inline">
+      <input type="radio" name="fix-strategy" value="direct"
+             {% if view.effective.pr_choice == 'direct' %}checked{% endif %}>
+      <span><b>直接提 PR</b>：正常 PR，仍需人审合并（<code class="code-inline">fork</code>；Fissue 永不自动合并）</span>
+    </label>
+  </div>
+
+  {% if view.effective.pr_choice == 'direct-upstream' %}
+  <div class="alert warn mt">
+    <span class="a-level">注意</span>
+    <div>
+      当前配置是 <code class="code-inline">auto_fix.pr_strategy.mode: direct</code>——**直推上游仓库的分支**，
+      界面上没有对应档位（这个开关只能手改 config.yaml 才能打开，因为它等于往别人仓库推东西）。
+      选择上面任意一档并保存，会改成走 fork。
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="muted small mt">
+    第一次用建议选「只出建议」：先看 AI 打算改什么，确认可信后再放开到草稿 PR。
+    无论哪一档，Fissue 都<b>不会自动合并</b>；「只出建议」档也不会创建任何远端分支。
+  </div>
+</div>

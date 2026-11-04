@@ -33,6 +33,7 @@ from .main import (
     JSON_OPT,
     REPO_OPT,
     VERBOSE_OPT,
+    app,
     emit,
     emit_json,
     fail,
@@ -544,3 +545,21 @@ def doctor(
     failed, _skipped = _summary(rows)
     if failed:
         raise SystemExit(1)
+
+
+@app.command("doctor")
+def doctor_all(
+    host: str = typer.Option("127.0.0.1", "--host", help="Web 端口探测用的绑定地址"),
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+) -> None:
+    """全栈自检：配置、数据库、模型、沙盒、Web 端口、磁盘、时区。
+
+    与 ``fissue platforms doctor`` 的分工：那个只查"平台令牌能不能用"，
+    这个查"这台机器上的 Fissue 整体健不健康"，每项都给一句下一步动作。
+    """
+    from .fullcheck import collect_checks, render
+
+    settings = load_cfg(config, env, verbose=verbose, require_llm=False)
+    raise typer.Exit(render(settings, collect_checks(settings, host=host)))

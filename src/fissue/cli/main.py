@@ -50,6 +50,8 @@ platforms_app = typer.Typer(help="平台能力体检：令牌、只读链路与�
 #: 这里只建组并挂到根 app 上——反过来让 main 导入它必然成环。
 deploy_app = typer.Typer(help="部署与服务器运维：读仓库 → 部署到已登记主机 → 运维它")
 host_app = typer.Typer(help="部署主机登记：新增 / 查看 / 删除目标服务器")
+#: 演示模式（内置夹具 + 只读）。同样只在这里建组，命令实现在 ``cli/demo.py``。
+demo_app = typer.Typer(help="演示模式：内置夹具 + 只读，不需要 token / 模型")
 from .auth import auth_app  # noqa: E402  —— 放在这里：它只用 typer 与 config，不会与 main 成环
 
 app.add_typer(db_app, name="db")
@@ -59,6 +61,7 @@ app.add_typer(auth_app, name="auth")
 app.add_typer(platforms_app, name="platforms")
 app.add_typer(deploy_app, name="deploy")
 app.add_typer(host_app, name="host")
+app.add_typer(demo_app, name="demo")
 
 # ---------------------------------------------------------------------------
 # 通用选项与输出

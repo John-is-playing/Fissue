@@ -1,0 +1,58 @@
+# ============================================================================
+# 容器内默认配置（镜像里固定为 /app/config.yaml，由 FISSUE_CONFIG 指过来）
+#
+# 为什么这个文件**不叫** config.yaml：仓库根 .gitignore 里那行 `config.yaml`（本机产物，
+# 不同机器该有不同的仓库列表）是**不带斜杠的通配**，会把这个子目录里的同名文件一起忽略掉
+# ——那样新克隆的仓库里就没有这份文件，镜像直接构建失败。构建时它被 COPY 到 /app/config.yaml。
+#
+# 它只回答「容器里和在本机装 Python 有什么不一样」，业务规则一律取内置默认：
+# 仓库列表、阈值、策略都在 Web 界面里配（写进覆盖层 /data/config.local.yaml，
+# 与这份文件无关，因此容器重建不会丢）。原理见 docs/COMPOSE.md。
+#
+# 想改这份文件：改完 `docker compose up -d --build` 重建镜像即可。
+# 只想临时覆盖某一项（不必重建）：在 /data/config.local.yaml 里写同名片段，
+# 该文件是覆盖层，优先级高于本文件（也高于 config.yaml，低于 .env 与进程环境）。
+# ============================================================================
+
+app:
+  # 唯一的持久化位置：compose 把具名卷挂在 /data。相对路径（./data）在容器里会落到
+  # 镜像层，容器一重建就全丢——所以这里必须是绝对路径。
+  data_dir: /data
+
+database:
+  # 四个斜杠 = 绝对路径（sqlite:/// 后面跟 /data/fissue.db）。三斜杠会被当成相对路径，
+  # 于是库落进镜像层。真正的取值在 compose.yaml 的 FISSUE_DATABASE_URL（环境变量优先）。
+  url: sqlite:////data/fissue.db
+
+web:
+  # 容器内必须绑 0.0.0.0，否则宿主端口映射不到（绑 127.0.0.1 时只有容器自己的回环可达）。
+  # 对外暴露的范围由 compose 的 ports 决定，身份仍然由 web.auth（默认开启）把关——
+  # 首次访问要去 /login 用控制台打印的一次性引导口令创建管理员。
+  host: 0.0.0.0
+  port: 8000
+
+api:
+  # /api/v1/health 是健康检查用的公开端点（不需要登录），compose 的 healthcheck 就打它。
+  enabled: true
+  prefix: /api/v1
+
+sandbox:
+  # 沙盒（验证器 / 回归门 / 自动修复的执行环境）默认开启，但**默认 profile 里它不可用**：
+  # 服务镜像不含 docker 命令、也不挂 /var/run/docker.sock。此时验证会以
+  # 「未找到 docker 命令」明确失败，而不是悄悄降级成本机执行（allow_local_fallback 见下）。
+  #
+  # 要真正跑起来：`docker compose --profile sandbox up -d`（多起一个转发组件容器，
+  # 只有它挂 docker.sock），并在宿主上先构建沙盒基础镜像：
+  #   docker build -t fissue/sandbox-base:latest docker/sandbox
+  # 步骤与风险见 docs/COMPOSE.md「沙盒 profile」一节。
+  enabled: true
+  image: fissue/sandbox-base:latest
+  runtime: docker
+  # 不静默降级：被执行的验证器由模型生成、PR 代码来自上游，降级成本机执行等于把隔离
+  # 承诺整套架空（与 config.example.yaml 的默认口径一致）。
+  allow_local_fallback: false
+  forwarder:
+    enabled: true
+    # 转发组件与服务本体靠这个 unix socket 通信，两个容器通过具名卷共享目录。
+    # 文件不存在（= 没启用 sandbox profile）时自动退回 inline 模式。
+    socket: /run/fissue-sandbox/fissue.sock

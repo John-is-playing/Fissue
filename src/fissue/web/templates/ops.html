@@ -134,8 +134,16 @@
           {% if d.created_at %}{{ d.created_at[:19].replace('T', ' ') }}{% endif %}
           {% if d.finished_at %}<div>完成 {{ d.finished_at[:19].replace('T', ' ') }}</div>{% endif %}
         </td>
-        <td class="shrink">
-          <button type="button" class="ghost small" data-act="steps" data-id="{{ d.id }}">展开步骤</button>
+        <td class="cell-acts">
+          <div class="pipe-acts">
+            <button type="button" class="ghost small" data-act="steps" data-id="{{ d.id }}">展开步骤</button>
+            {# 失败现场最容易做的正确动作就是回滚，但以前要人自己记 id、滚到上面的回滚面板去填。
+               只在「有上一版可回」时出现：没有 previous_release 的回滚必然失败（悬空软链）。 #}
+            {% if d.status == 'failed' and d.previous_release %}
+            <button type="button" class="ghost small danger" data-act="rollback-row" data-id="{{ d.id }}"
+                    title="把 current 指回 {{ d.previous_release }} 并重启；shared/ 里的数据不受影响">回滚到上一版</button>
+            {% endif %}
+          </div>
         </td>
       </tr>
       {% endfor %}
@@ -493,6 +501,37 @@
       btn.textContent = "收起步骤";
     } catch (ex) {
       Fissue.toast("拉取步骤失败", "bad", { detail: ex.message, timeout: 0 });
+    }
+  });
+
+  // -- 失败记录行内回滚 -------------------------------------------------
+  // 失败之后最该做的事就是回到上一版，但原先要人翻到「回滚」面板再手填部署 id——
+  // 恰恰是出问题时最容易填错的东西。这里直接带着 id 回滚，并先说明会发生什么。
+  if (deployRows) deployRows.addEventListener("click", async function (e) {
+    var btn = e.target.closest ? e.target.closest("button[data-act=rollback-row]") : null;
+    if (!btn) return;
+    var id = btn.dataset.id;
+    var ok = await Fissue.confirm(
+      "回滚部署 #" + id + "？",
+      "会把 current 软链指回上一版 release 并重启服务；shared/ 里的数据、虚拟环境、数据库都不受影响。" +
+      "回滚后会重新跑健康探针，探针不通会如实报失败。"
+    );
+    if (!ok) return;
+    var original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "回滚中…";
+    try {
+      var report = await api("/deployments/" + id + "/rollback", { method: "POST" });
+      Fissue.toast(
+        "已回滚：" + (report.release || "上一版") + "（" + report.status + "）",
+        "ok",
+        { timeout: 5000 }
+      );
+      window.location.reload();
+    } catch (ex) {
+      btn.disabled = false;
+      btn.textContent = original;
+      Fissue.toast("回滚失败", "bad", { detail: ex.message, timeout: 0 });
     }
   });
 })();

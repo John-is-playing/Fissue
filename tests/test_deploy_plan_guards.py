@@ -284,3 +284,82 @@ def test_existing_non_root_user_is_kept() -> None:
     normalize_plan(plan, host_user="john", host_address="192.168.2.10")
     assert "User=deploy" in _unit_content(plan)
     assert "User=john" not in _unit_content(plan)
+
+
+# ---------------------------------------------------------------------------
+# docker 权限：按组授予，不是整进程 root
+# ---------------------------------------------------------------------------
+
+
+def _docker_plan(*, unit: str, needs_docker: bool) -> DeployPlan:
+    from fissue.deploy.schema import ExecSpec, WriteFileSpec
+
+    steps = [
+        DeployStep(
+            id="write-unit",
+            kind=StepKind.WRITE_FILE,
+            write=WriteFileSpec(path="deploy/demo.service", content=unit),
+        ),
+        DeployStep(
+            id="install-unit",
+            kind=StepKind.EXEC,
+            exec=ExecSpec(
+                command="sudo -n install -m 644 deploy/demo.service /etc/systemd/system/demo.service"
+            ),
+        ),
+    ]
+    if needs_docker:
+        steps.append(
+            DeployStep(
+                id="docker-check", kind=StepKind.EXEC, exec=ExecSpec(command="docker version")
+            )
+        )
+    return DeployPlan(
+        repo_slug="acme/demo",
+        app=AppSpec(name="demo", service_name="demo", service_sudo=True),
+        steps=steps,
+        health=[ProbeSpec(url="http://192.168.2.10:8000/")],
+    )
+
+
+def test_docker_group_added_when_plan_uses_docker() -> None:
+    """需要 docker 时用 SupplementaryGroups 授予，**并把 User=root 改成部署用户**。
+
+    用户确认过的结论：docker 确实要 root（或 docker 组）权限，但标准做法是
+    只给这个服务一个附加组，不是让整个进程以 root 跑。
+    """
+    plan = _docker_plan(unit="[Service]\nUser=root\nExecStart=/bin/true\n", needs_docker=True)
+    normalize_plan(plan, host_user="john")
+    content = _unit_content(plan)
+    assert "User=john" in content and "User=root" not in content
+    assert "SupplementaryGroups=docker" in content
+
+
+def test_docker_group_not_added_without_docker() -> None:
+    plan = _docker_plan(unit="[Service]\nUser=john\nExecStart=/bin/true\n", needs_docker=False)
+    normalize_plan(plan, host_user="john")
+    assert "SupplementaryGroups" not in _unit_content(plan)
+
+
+def test_existing_supplementary_groups_are_not_overwritten() -> None:
+    """模型可能已经写了别的组，覆盖等于削权限。"""
+    plan = _docker_plan(
+        unit="[Service]\nUser=john\nSupplementaryGroups=video\nExecStart=/bin/true\n",
+        needs_docker=True,
+    )
+    normalize_plan(plan, host_user="john")
+    content = _unit_content(plan)
+    assert "SupplementaryGroups=video" in content
+    assert "docker" not in content.split("ExecStart")[0]
+
+
+def test_uploading_a_docker_directory_does_not_trigger_group_grant() -> None:
+    """上传 `docker/` 目录不代表要连 docker daemon——只看命令与 unit 内容。"""
+    from fissue.deploy.schema import UploadSpec
+
+    plan = _docker_plan(unit="[Service]\nUser=john\nExecStart=/bin/true\n", needs_docker=False)
+    plan.steps.append(
+        DeployStep(id="upload-docker", kind=StepKind.UPLOAD, upload=UploadSpec(src="docker", dst="docker"))
+    )
+    normalize_plan(plan, host_user="john")
+    assert "SupplementaryGroups" not in _unit_content(plan)

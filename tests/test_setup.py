@@ -737,6 +737,9 @@ def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
         "web.trusted_proxies",
         # 流水线页「需要你处理的」默认展开条数（0 = 全部折叠）
         "web.stuck_top_n",
+        # 修复落地方式三档：只出建议 / 草稿 PR / 直接提 PR
+        "auto_fix.pr_strategy.mode",
+        "auto_fix.pr_strategy.draft",
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
         "llm.budget.daily_tokens_per_repo",

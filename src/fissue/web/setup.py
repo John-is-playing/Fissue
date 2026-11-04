@@ -132,6 +132,12 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset(
         "web.auth.secure_cookie",
         "web.auth.login_max_failures",
         "web.trusted_networks",
+        # -- 修复落地方式（三档）--
+        # 只出建议 = patch_only；草稿 PR = fork + draft；直接提 = fork 不提 draft。
+        # 两种"提 PR"都必须走 fork：直推上游（mode: direct）不提供界面入口——
+        # 那等于往别人仓库推分支，属于必须手改配置才能打开的开关。
+        "auto_fix.pr_strategy.mode",
+        "auto_fix.pr_strategy.draft",
         # 反代部署：两层声明都要能在界面上改（只改一层等于没配——另一层在 config.yaml 里
         # 可能仍是默认值，而这两者必须同时成立才生效）。
         "web.trust_proxy",
@@ -463,6 +469,21 @@ def _mask_secret(value: str | None) -> str:
     return f"{value[:4]}{'•' * 6}{value[-4:]}"
 
 
+def _pr_choice(settings: Settings) -> str:
+    """把配置折成页面上的三档：suggest / draft / direct。
+
+    ``patch_only`` → 只出建议；``fork`` + ``draft`` → 草稿 PR；
+    ``fork`` 不带 draft → 直接提 PR。``mode: direct``（直推上游）在界面上**没有对应档位**，
+    归到 direct 一档并标注——它不是这里能打开的开关，只能手改配置。
+    """
+    strategy = settings.auto_fix.pr_strategy
+    if strategy.mode == "patch_only":
+        return "suggest"
+    if strategy.mode == "direct":
+        return "direct-upstream"
+    return "draft" if strategy.draft else "direct"
+
+
 def describe_settings(settings: Settings) -> dict[str, Any]:
     """设置页要显示的：每个可写项的值（密钥掩码）、来源、是否需重启。"""
     import os
@@ -513,6 +534,11 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "read_only": settings.web.read_only,
             "allow_remote_config_write": settings.web.allow_remote_config_write,
             "stuck_top_n": settings.web.stuck_top_n,
+            # 三档修复策略：只出建议 / 草稿 PR / 直接提 PR。
+            # 映射放在后端：页面只回填一个值，避免模板里再写一遍判断（两份必然漂移）。
+            "pr_choice": _pr_choice(settings),
+            "pr_mode": settings.auto_fix.pr_strategy.mode,
+            "pr_draft": settings.auto_fix.pr_strategy.draft,
             # 鉴权（docs/AUTH.md §6）：全部经覆盖层可写。
             "auth_enabled": settings.web.auth.enabled,
             "session_ttl_minutes": settings.web.auth.session_ttl_minutes,

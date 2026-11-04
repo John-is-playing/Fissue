@@ -44,6 +44,10 @@
    单价填错会直接让花费统计与 hard_stop 失真，所以它必须能在这里改。 #}
 {% include "_settings/llm_params.html" %}
 
+{# 修复落地方式：普通用户最关心的一档——"AI 到底会不会直接动我的仓库"。
+   默认沿用配置；三档映射在后端（_pr_choice），页面只回填一个值。 #}
+{% include "_settings/fix_strategy.html" %}
+
 {% include "_settings/platform_tokens.html" %}
 
 {# 入站 webhook 的签名密钥。与上一块（平台 Token）是**两类不同的密钥**：

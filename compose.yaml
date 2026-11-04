@@ -1,0 +1,155 @@
+# ============================================================================
+# Fissue —— 一条命令起服务（不需要在本机装 Python 环境）
+#
+#   cp .env.example .env      # ① 复制环境变量模板
+#   ${EDITOR:-vi} .env        # ② 填 FISSUE_LLM_API_KEY（**可留空**，进界面再填也能起）
+#   docker compose up -d      # ③ 起服务（首次会构建镜像，约 2~4 分钟）
+#
+#   然后打开 http://localhost:8000/login 创建管理员账号：引导口令由服务端打印在日志里
+#   （`docker compose logs fissue`），同时也落在数据卷里的 /data/auth-bootstrap-token。
+#
+# 两个 profile：
+#   （默认，不加参数）   fissue：Web 工作台 + REST API。**不**碰宿主 Docker。
+#   --profile sandbox    额外起 fissue-sandbox-runner：沙盒转发组件，唯一挂
+#                        /var/run/docker.sock 的容器 —— 等于把宿主 Docker 的控制权交出去
+#                        （能起特权容器、能挂任意宿主目录）。默认关闭，仅建议在可信机器上开。
+#
+# 端口 / 卷路径 / 健康检查端点 / 沙盒启停 / 备份与升级：见 docs/COMPOSE.md
+# ============================================================================
+name: fissue
+
+services:
+  # ---------------------------------------------------------------------------
+  # 服务本体：Web 工作台 + REST API（+ 配了 LLM key 时的常驻流水线）
+  # ---------------------------------------------------------------------------
+  fissue:
+    build:
+      context: .
+      dockerfile: docker/runtime/Dockerfile
+      target: runtime
+    image: fissue/fissue:local
+    container_name: fissue
+    restart: unless-stopped
+
+    # 密钥只从 .env 读：这里不写死任何密钥，也没有假占位符（留空就是留空，服务照样起）。
+    # 该文件必须存在（下一步是 `cp .env.example .env`）；不存在时 compose 会直接报错。
+    env_file:
+      - .env
+
+    # 下面几项**覆盖** .env 里的同名项（compose 中 environment 优先于 env_file）。
+    # 为什么要覆盖：.env.example 里那些值是「在本机装 Python」的口径——SQLite 用相对路径
+    # ./data（搬进容器会落到镜像层，重建即丢）、web.host 是 127.0.0.1（容器里绑回环则
+    # 宿主端口映射不到）。容器有自己的正确取值，集中写在这里。
+    environment:
+      FISSUE_WEB_HOST: "0.0.0.0"
+      FISSUE_WEB_PORT: "${FISSUE_WEB_PORT:-8000}"
+      # 四个斜杠 = 绝对路径（sqlite:////data/fissue.db）。落在卷 fissue-data 里，容器重建不丢。
+      # 换 PostgreSQL / MySQL 就改这一行（或注释掉它、在 .env 里写 FISSUE_DATABASE_URL）。
+      FISSUE_DATABASE_URL: "sqlite:////data/fissue.db"
+      # 沙盒转发组件的 unix socket（与镜像内 /app/config.yaml，即
+      # docker/runtime/container.yaml 里的 sandbox.forwarder.socket 一致）。
+      # 没启用 sandbox profile 时这个文件不存在 → 自动退回 inline 模式；而本镜像不含
+      # docker 命令，于是沙盒以「未找到 docker 命令」明确失败，**不会**静默降级成本机执行。
+      FISSUE_SANDBOX_RUNNER_SOCKET: "/run/fissue-sandbox/fissue.sock"
+      # 沙盒工作区。**宿主路径必须与容器内路径完全一致**：容器里的 docker 只认宿主路径，
+      # 而工作副本是本容器建的（Docker-out-of-Docker 的硬要求）。下面的 volumes 里
+      # 同名同路径挂一次，临时目录（TMPDIR）由入口脚本指过来（可写才指）。
+      FISSUE_SANDBOX_WORKSPACE: "${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}"
+      # auto：有 LLM key 就起常驻流水线（serve --with-web），没有就只起界面（web）。
+      # 想固定成某一种就设 FISSUE_MODE=web / serve。
+      FISSUE_MODE: "${FISSUE_MODE:-auto}"
+
+    ports:
+      # 默认对所有网卡开放；身份由会话鉴权把关（web.auth.enabled 默认 true，首次访问要去
+      # /login 用引导口令创建管理员）。只想本机访问就设 FISSUE_BIND_ADDR=127.0.0.1。
+      - "${FISSUE_BIND_ADDR:-0.0.0.0}:${FISSUE_WEB_PORT:-8000}:${FISSUE_WEB_PORT:-8000}"
+
+    volumes:
+      # 唯一的持久化位置：SQLite + 会话签名密钥 + 引导口令 + 补丁/沙盒产物 +
+      # 界面改配置时写下的 .env 与 config.local.yaml。备份就是备份这个卷。
+      - fissue-data:/data
+      # 沙盒工作区（宿主路径 = 容器内路径）。默认 profile 下它只是个临时目录，但必须先
+      # 挂好：启用 sandbox profile 时，两边的路径必须逐字一致，docker 才找得到工作副本。
+      - "${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}:${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}"
+      # 与服务端↔转发组件共享 socket 的目录（没启用 sandbox profile 时是空的）。
+      - fissue-sandbox-sock:/run/fissue-sandbox
+
+    healthcheck:
+      # 打的是公开端点 /api/v1/health（`{"status":"ok","version":...}`，不需要登录）；
+      # healthcheck.py 里还有 /login 兜底，逻辑见 docker/runtime/healthcheck.py。
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # 沙盒转发组件（可选，**默认不启动**）
+  #
+  # 它只做一件事：接收服务端发来的执行请求，用宿主 docker 起一个隔离容器跑验证器 /
+  # 回归门 / 修复代码。因此它需要
+  #   ① 宿主 /var/run/docker.sock        （= 宿主 Docker 的控制权）
+  #   ② docker 命令                      （镜像变体 target: sandbox 才装）
+  #   ③ 与服务端**同一路径**的工作区目录  （下面两处 FISSUE_SANDBOX_WORKSPACE 必须一致）
+  #
+  # 启用（宿主上先有沙盒基础镜像，再带 profile 起）：
+  #   docker build -t fissue/sandbox-base:latest docker/sandbox
+  #   docker compose --profile sandbox up -d
+  #
+  # ⚠️ 风险：拿到 docker.sock 就等于宿主 root。只在你自己的可信机器上开；
+  #    不要用在「别人也能访问这个服务」的部署里。详见 docs/COMPOSE.md。
+  # ---------------------------------------------------------------------------
+  fissue-sandbox-runner:
+    profiles: ["sandbox"]
+    build:
+      context: .
+      dockerfile: docker/runtime/Dockerfile
+      target: sandbox
+    image: fissue/fissue:local-sandbox
+    container_name: fissue-sandbox-runner
+    restart: unless-stopped
+
+    env_file:
+      - .env
+    environment:
+      FISSUE_MODE: "sandbox-runner"
+      FISSUE_SANDBOX_WORKSPACE: "${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}"
+      FISSUE_SANDBOX_RUNNER_SOCKET: "/run/fissue-sandbox/fissue.sock"
+
+    # 容器以 root 启动修正属主、随后降到 uid 1000；要访问宿主 docker.sock 就得在宿主的
+    # docker 组里。取值：`stat -c '%g' /var/run/docker.sock`（常见是 999 或 998），
+    # 填到 .env 的 DOCKER_GID。
+    group_add:
+      - "${DOCKER_GID:-999}"
+
+    volumes:
+      # 这一行就是这个 profile 存在的理由，也是它必须默认关闭的原因。
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}:${FISSUE_SANDBOX_WORKSPACE:-/tmp/fissue-sandbox}"
+      - fissue-sandbox-sock:/run/fissue-sandbox
+      # 只读共享配置：转发组件要用与服务端同一份沙盒参数（镜像、限额、隔离项）。
+      - fissue-data:/data:ro
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  # 数据（备份这个）
+  fissue-data:
+  # 服务端 ↔ 转发组件的 socket 交换目录（不放数据，丢了重建即可）
+  fissue-sandbox-sock:
