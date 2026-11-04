@@ -258,3 +258,47 @@ def test_stuck_top_n_from_env(monkeypatch):
     monkeypatch.setenv("FISSUE_WEB_STUCK_TOP_N", "三条")
     with pytest.raises(ConfigError):
         load_settings(require_llm_key=False)
+
+
+# ---------------------------------------------------------------------------
+# 8. 看板滚动观感：要么不滚，要么滚得好看
+# ---------------------------------------------------------------------------
+
+
+def test_kanban_columns_fit_without_scrolling():
+    """六列必须在正文宽度里排得下——否则每块屏都被迫横向滚。
+
+    算式：6 × 150(列最小宽) + 5 × 8(gap) = 940px；正文内容宽 ≈ 1180 − 64(padding)
+    = 1116px。留了余量，正常屏幕不会出现滚动条。
+    之前是 190px：6 × 190 + 5 × 12 = 1200 > 1116，刚刚好溢出，于是每屏都滚。
+    """
+    css = Path("src/fissue/web/static/app.css").read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    block = "\n".join(re.findall(r"\.pipe-kanban\s*\{([^}]*)\}", css))
+    m = re.search(r"grid-auto-columns:\s*minmax\((\d+)px", block)
+    assert m, "看板列宽不再是 minmax(…px, 1fr)，滚动行为变了"
+    min_width = int(m.group(1))
+    gap = 8  # --sp-2
+    assert 6 * min_width + 5 * gap <= 1116, (
+        f"六列放不下：6×{min_width} + 5×{gap} = {6 * min_width + 5 * gap} > 1116"
+    )
+
+
+def test_scrollbars_are_styled():
+    """滚动条必须两套写法都写：标准属性 + WebKit 伪元素。
+
+    只写一套时另一类浏览器会保留原生样式——深色主题下就是那条又亮又粗的白条。
+    """
+    css = Path("src/fissue/web/static/app.css").read_text(encoding="utf-8")
+    for selector in (".pipe-kanban", ".table-scroll", "html"):
+        assert f"{selector}::-webkit-scrollbar" in css, f"{selector} 缺少 WebKit 滚动条样式"
+    assert "scrollbar-color:" in css
+    assert "scrollbar-width: thin" in css
+
+
+def test_kanban_reserves_room_for_its_scrollbar():
+    """滚动条不能压在卡片下沿上。"""
+    css = Path("src/fissue/web/static/app.css").read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    block = "\n".join(re.findall(r"\.pipe-kanban\s*\{([^}]*)\}", css))
+    assert "padding-bottom" in block

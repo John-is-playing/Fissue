@@ -1387,14 +1387,24 @@ body.login-page {
   /* 单行排布：列数固定（= 流水线阶段数），**不允许换行**。
      用 auto-fit + minmax 时，列宽一不够就把最后一列甩到第二行，
      看着像"明明还有空位却换行了"。这里改为自动列 + 横向滚动兜底：
-     空间够就均分整行，不够就横滚——视觉上永远是一排。 */
+     空间够就均分整行，不够就横滚——视觉上永远是一排。
+
+     150px 这个下限是算出来的，不是随手值：6 列 × 150 + 5 × 8(gap) = 940px，
+     而正文容器上限 1180px——正常屏幕下六列全部排得下，**根本不会出现滚动条**。
+     原先写 190px（6 × 190 + 60 = 1200 > 1180）刚好超出一点点，于是每块屏都
+     被迫横向滚，还压掉最后一列。 */
   display: grid;
   grid-auto-flow: column;
-  grid-auto-columns: minmax(190px, 1fr);
-  gap: var(--sp-3);
+  grid-auto-columns: minmax(150px, 1fr);
+  gap: var(--sp-2);
   align-items: stretch;
   overflow-x: auto;
-  padding-bottom: var(--sp-2);
+  /* 滚动只在本区域内传播，别把整页带着一起左右晃 */
+  overscroll-behavior-x: contain;
+  /* 真放不下时（很窄的窗口）按列停靠，不会停在两列中间 */
+  scroll-snap-type: x proximity;
+  /* 给滚动条留出高度：否则它直接压在卡片下沿上，看着像卡片被切了一刀 */
+  padding-bottom: var(--sp-3);
 }
 
 .pipe-col {
@@ -1406,6 +1416,8 @@ body.login-page {
   border-radius: var(--r-md);
   padding: var(--sp-3);
   min-width: 0;
+  /* 与 .pipe-kanban 的 scroll-snap 配对：真要横向滚时停在整列上 */
+  scroll-snap-align: start;
 }
 
 .pipe-col-head {
@@ -2252,4 +2264,90 @@ tr[data-href]:focus-visible {
 
 .cell-acts .pipe-acts {
   margin: 0;
+}
+
+/* --------------------------------------------------------------------------
+ * 22. 滚动条
+ *
+ * 原生滚动条是这套深色主题里最刺眼的东西：又亮又粗，还会压住容器下沿的内容。
+ * 统一改成"细、低对比、悬停才明显"的一条线——滚动条不该成为视觉焦点。
+ *
+ * 两套写法都要写：`scrollbar-width`/`scrollbar-color` 是标准（Firefox、Chrome 121+），
+ * `::-webkit-scrollbar` 覆盖 Safari 与旧 Chrome。只写一套会有浏览器保持原样。
+ * ------------------------------------------------------------------------ */
+
+.pipe-kanban,
+.table-scroll,
+.j-raw,
+.patch-view,
+.pipe-swim,
+textarea {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.pipe-kanban::-webkit-scrollbar,
+.table-scroll::-webkit-scrollbar,
+.j-raw::-webkit-scrollbar,
+.patch-view::-webkit-scrollbar,
+.pipe-swim::-webkit-scrollbar,
+textarea::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.pipe-kanban::-webkit-scrollbar-track,
+.table-scroll::-webkit-scrollbar-track,
+.j-raw::-webkit-scrollbar-track,
+.patch-view::-webkit-scrollbar-track,
+textarea::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.pipe-kanban::-webkit-scrollbar-thumb,
+.table-scroll::-webkit-scrollbar-thumb,
+.j-raw::-webkit-scrollbar-thumb,
+.patch-view::-webkit-scrollbar-thumb,
+textarea::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-full);
+  /* 用透明边框当内边距，让滑块看起来更细，又不影响可点区域 */
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.pipe-kanban::-webkit-scrollbar-thumb:hover,
+.table-scroll::-webkit-scrollbar-thumb:hover,
+.j-raw::-webkit-scrollbar-thumb:hover,
+.patch-view::-webkit-scrollbar-thumb:hover,
+textarea::-webkit-scrollbar-thumb:hover {
+  background: var(--text-subtle);
+  background-clip: content-box;
+}
+
+/* 页面主滚动条同样处理：整页右边一条亮白滚动条会立刻破坏"纸"的感觉 */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+html::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+html::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+html::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-full);
+  border: 3px solid var(--bg);
+  background-clip: content-box;
+}
+
+html::-webkit-scrollbar-thumb:hover {
+  background: var(--text-subtle);
+  background-clip: content-box;
 }
