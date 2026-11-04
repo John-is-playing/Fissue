@@ -79,11 +79,10 @@ def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
         stuck_items = r.list_items(
             repo_slug=repo_slug, status=_ItemStatus.NEEDS_MANUAL, limit=50
         ) + r.list_items(repo_slug=repo_slug, status=_ItemStatus.FAILED, limit=50)
-        stuck = sorted(
-            (view.item_row(item) for item in stuck_items),
-            key=lambda row: row["updated_at"] or "",
-            reverse=True,
-        )
+        # 只默认展开最靠前的 5 条：一屏能扫完的清单才有用，其余折叠起来，
+        # 并给出「去条目页看全部」的出口。
+        stuck = view.stuck_rows(stuck_items)
+        stuck_top, stuck_rest = stuck[:5], stuck[5:]
 
         return templates.TemplateResponse(
             request,
@@ -94,6 +93,8 @@ def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
                 view=model,
                 rows=rows,
                 stuck=stuck,
+                stuck_top=stuck_top,
+                stuck_rest=stuck_rest,
                 stages=list(view.STAGES),
                 repo_filter=repo_slug or "",
                 **_queue_block(request),

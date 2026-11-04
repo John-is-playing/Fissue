@@ -864,6 +864,16 @@
   };
 
   document.addEventListener("DOMContentLoaded", function () {
+    // `[data-time]`：相对时间占位。
+    //
+    // 模板以前写 `<script>document.write(Fissue.relativeTime(...))</script>`，
+    // 但那段脚本在 content 块里，**比本文件先执行**——那时 window.Fissue 还不存在，
+    // 于是每行一条 "Fissue is not defined"，时间列也永远渲染不出来。
+    // 现在模板只输出 ISO 时间，格式化统一放到这里。
+    Array.prototype.forEach.call(document.querySelectorAll("[data-time]"), function (el) {
+      el.innerHTML = relativeTime(el.getAttribute("data-time"), true);
+    });
+
     startLiveBadge();
     wireSelectAll();
     wireKvLabels();

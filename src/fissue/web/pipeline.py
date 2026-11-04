@@ -321,6 +321,19 @@ def swimlane_rows(items: Sequence[Any], *, limit: int = 60) -> list[dict[str, An
     return rows[:limit]
 
 
+def stuck_rows(items: Sequence[Any], *, limit: int | None = None) -> list[dict[str, Any]]:
+    """「需要你处理的」清单：按**重要性**排，不按时间排。
+
+    这一块的用途是"先干哪件"，不是"最近发生了什么"：tier1（AI 判定高优先级）永远
+    在前，tier2 次之，其余按最近更新。时间只在同档内决定先后——否则一条刚失败的小事
+    会把真正要先修的那条挤到下面去。
+    """
+    rank = {"tier1": 0, "tier2": 1}
+    rows = [item_row(item) for item in items]
+    rows.sort(key=lambda row: (rank.get(row["priority"] or "", 2), _neg(row["updated_at"])))
+    return rows if limit is None else rows[:limit]
+
+
 def _neg(iso: str | None) -> float:
     """把 ISO 时间转成「可升序排列即等价于降序」的键（``None`` 排最后）。"""
     if not iso:

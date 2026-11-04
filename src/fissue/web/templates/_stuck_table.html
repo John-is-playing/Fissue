@@ -1,0 +1,39 @@
+{# 「需要你处理的」表格本体。
+ #
+ # 单独成文件是因为它要渲染两次：前 5 条（默认展开）和其余（折叠在 <details> 里）。
+ # 复制两份 HTML 迟早会漂移——改了一处忘了另一处，折叠区的列就和上面不一样了。
+ #
+ # 入参：rows（视图模型 item_row 的列表）。 #}
+<div class="table-scroll">
+  <table>
+    <thead>
+      <tr>
+        <th scope="col">条目</th>
+        <th scope="col">状态</th>
+        <th scope="col">优先级</th>
+        <th scope="col">更新时间</th>
+        <th scope="col">动作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr>
+        <td>
+          <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
+          <div class="small muted">{{ row.title | truncate(70) }}</div>
+        </td>
+        <td>
+          <span class="tag bad" title="状态：{{ row.status }}">{{ row.status | status_label }}</span>
+          {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
+        </td>
+        <td class="small">{{ row.priority or '—' }}</td>
+        <td class="small muted"><time data-time="{{ row.updated_at }}">—</time></td>
+        <td class="pipe-acts">
+          <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
+          <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>

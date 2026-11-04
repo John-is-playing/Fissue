@@ -61,33 +61,27 @@
    不放进任何视图内部——切换视图不该把最重要的信息切走。 #}
 {% if stuck %}
 <section class="pipe-stuck">
+  {# 这一块回答的是"先干哪件"，所以默认只展开最重要的 5 条（排序在视图模型里：
+     tier1 → tier2 → 其余，同档内按最近更新）。其余折叠——一屏扫不完的清单
+     等于没有清单，需要全部时去条目页筛。 #}
   <h2>需要你处理的 <span class="tag bad">{{ stuck | length }}</span></h2>
-  <div class="table-scroll">
-    <table>
-      <thead>
-        <tr><th scope="col">条目</th><th scope="col">状态</th><th scope="col">优先级</th><th scope="col">更新时间</th><th scope="col">动作</th></tr>
-      </thead>
-      <tbody>
-        {% for row in stuck %}
-        <tr>
-          <td>
-            <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
-            <div class="small muted">{{ row.title | truncate(70) }}</div>
-          </td>
-          <td><span class="tag bad" title="状态：{{ row.status }}">{{ row.status | status_label }}</span>
-            {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
-          </td>
-          <td class="small">{{ row.priority or '—' }}</td>
-          <td class="small muted"><script>document.write(Fissue.relativeTime('{{ row.updated_at }}', true));</script></td>
-          <td class="pipe-acts">
-            <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
-            <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-  </div>
+  {% with rows = stuck_top %}{% include "_stuck_table.html" %}{% endwith %}
+
+  {% if stuck_rest %}
+  <details class="stuck-rest">
+    <summary>其余 {{ stuck_rest | length }} 条（优先级较低，展开查看）</summary>
+    {% with rows = stuck_rest %}{% include "_stuck_table.html" %}{% endwith %}
+  </details>
+  {% endif %}
+
+  <p class="small muted tight-top">
+    {% if stuck_rest %}
+    按重要性排序（tier1 → tier2 → 其余）。要筛选、批量处理或查看更多，
+    {% else %}
+    全都在上面了。要筛选或批量处理，
+    {% endif %}
+    去 <a href="/items?status=needs_manual">条目页</a>。
+  </p>
 </section>
 {% endif %}
 
@@ -138,13 +132,20 @@
         <span class="tag {{ 'bad' if column.key == 'stuck' else '' }}">{{ column.total }}</span>
       </div>
       {% for cell in column.cells %}
-      <div class="pipe-cell {% if cell.count == 0 %}empty{% endif %}">
-        <div class="pipe-cell-lane">{{ cell.lane_label }}</div>
-        <div class="pipe-cell-count">{{ cell.count }}</div>
-        {% if cell.count %}
-        <a class="small" href="/items?lane={{ cell.lane }}&stage={{ column.key }}">看条目</a>
-        {% endif %}
+      {# 整格都是链接：以前只有格子里那行小字「看条目」可点，而 hover 高亮的是整格，
+         于是高亮区域的下半截是"看着能点、点了没反应"的死区；格子内容长短不同，
+         高亮块也会比旁边矮一截。现在格子的视觉边界 = 可点击区域。 #}
+      {% if cell.count %}
+      <a class="pipe-cell" href="/items?lane={{ cell.lane }}&stage={{ column.key }}">
+        <span class="pipe-cell-lane">{{ cell.lane_label }}</span>
+        <span class="pipe-cell-count">{{ cell.count }}</span>
+      </a>
+      {% else %}
+      <div class="pipe-cell empty" aria-disabled="true">
+        <span class="pipe-cell-lane">{{ cell.lane_label }}</span>
+        <span class="pipe-cell-count">0</span>
       </div>
+      {% endif %}
       {% endfor %}
       {% if column.total %}
       <div class="pipe-col-acts">
@@ -189,14 +190,23 @@
       </thead>
       <tbody>
         {% for row in rows %}
-        <tr class="{% if row.stalled %}stalled{% endif %}">
+        {# 整行可点：这一屏的用途是"这条现在卡在哪、点进去处理"，
+           可点区域只有那行小小的 key 链接，等于每行都要瞄准。
+           data-href 由脚本接管；行内的链接/按钮仍然各点各的（见脚本里的排除）。 #}
+        <tr class="{% if row.stalled %}stalled{% endif %}" data-href="/item/{{ row.key | urlencode }}"
+            tabindex="0" title="点击或按 Enter 打开这条的详情">
           <td>
             <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo }}#{{ row.number }}</a>
             <div class="small muted">{{ row.title | truncate(60) }}</div>
           </td>
           {% for state in row.states %}
+          {% set stage_key, stage_label = stages[loop.index0] %}
           <td class="pipe-dot-cell">
-            <span class="pipe-dot {{ state }}" title="{{ state }}">{{ {'done':'●','active':'◐','pending':'○','waiting':'·','unknown':'?'}[state] }}</span>
+            {# 点一个阶段点 = 看"这个阶段上有哪些条目"，和看板格子的行为保持一致 #}
+            <a class="pipe-dot-link" href="/items?stage={{ stage_key }}"
+               title="{{ stage_label }}：{{ {'done':'已完成','active':'进行中','pending':'排队等这一步','waiting':'还没轮到','unknown':'卡住了'}[state] }}（点击看这一阶段的条目）">
+              <span class="pipe-dot {{ state }}">{{ {'done':'●','active':'◐','pending':'○','waiting':'·','unknown':'?'}[state] }}</span>
+            </a>
           </td>
           {% endfor %}
           <td>
@@ -271,9 +281,40 @@
 
   // 作业类动作：evaluate / verify / fix / flush 都走 runJob（有进度、不阻塞页面）。
   function runJob(kind, params) {
-    if (!window.Fissue || !window.Fissue.runJob) return;
+    if (!window.Fissue || !window.Fissue.runJob) {
+      // 别静默 return：按钮点下去毫无反应，用户只会以为"这一页坏了"。
+      // 真正的原因通常是脚本没加载完（缓存/网络中断），刷新即可。
+      if (window.Fissue && window.Fissue.toast) {
+        window.Fissue.toast("页面脚本没有加载完成，请刷新后重试", "bad");
+      } else {
+        window.alert("页面脚本没有加载完成，请刷新后重试");
+      }
+      return;
+    }
     window.Fissue.runJob(kind, params, { autoReload: true });
   }
+
+  // 泳道整行可点：行内真正的链接/按钮仍然各点各的。
+  function openRow(row) {
+    if (!row || !row.dataset || !row.dataset.href) return;
+    window.location.href = row.dataset.href;
+  }
+
+  document.addEventListener("click", function (e) {
+    var row = e.target.closest ? e.target.closest("tr[data-href]") : null;
+    if (!row) return;
+    // 行里已经有点击语义的元素（链接、按钮、表单控件）不要抢
+    if (e.target.closest("a, button, input, select, label, textarea")) return;
+    openRow(row);
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    var row = e.target.closest ? e.target.closest("tr[data-href]") : null;
+    if (!row || e.target !== row) return;
+    e.preventDefault();
+    openRow(row);
+  });
 
   document.addEventListener("click", async function (e) {
     var btn = e.target.closest ? e.target.closest("button[data-act]") : null;

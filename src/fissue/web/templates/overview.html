@@ -256,7 +256,7 @@
     {% for s in scans %}
       <tr>
         <td><code class="small">{{ s.repo_key }}</code></td>
-        <td class="muted small"><script>document.write(Fissue.relativeTime('{{ s.started_at }}', true));</script></td>
+        <td class="muted small"><time data-time="{{ s.started_at }}">—</time></td>
         <td class="num">{{ s.fetched }}</td>
         <td class="num">{{ s.created }}</td>
         <td class="num">{{ s.updated }}</td>
