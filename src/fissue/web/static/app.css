@@ -1484,12 +1484,24 @@ a.pipe-cell:hover {
   margin-right: 4px;
 }
 
-.pipe-stuck,
+/* 动作按钮行：横向排列、自动换行 */
 .pipe-acts {
   display: flex;
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
+}
+
+/* 「需要你处理的」整块必须是**纵向**：标题在上、表格在下。
+   这里曾经和 `.pipe-acts` 共用一条 flex 规则，结果标题被挤到表格左侧并排，
+   表头与数据整体错位——截图里一眼就能看出来，静态断言却抓不到。 */
+.pipe-stuck {
+  display: block;
+  margin-bottom: var(--sp-5);
+}
+
+.pipe-stuck > h2 {
+  margin-bottom: var(--sp-3);
 }
 
 /* --------------------------------------------------------------------------

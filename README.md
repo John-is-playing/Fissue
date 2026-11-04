@@ -149,6 +149,7 @@ docs/            设计、使用、环境变量、鉴权、回归门 + wiki/
 | 配环境 / 查变量 | [docs/USAGE.md](docs/USAGE.md) · [docs/ENV.md](docs/ENV.md) · [docs/AUTH.md](docs/AUTH.md) |
 | 查命令 / 接口 | [docs/wiki/CLI-Reference.md](docs/wiki/CLI-Reference.md) · [docs/wiki/Web-and-API.md](docs/wiki/Web-and-API.md) |
 | 改代码 / 加扩展 | [docs/DESIGN.md](docs/DESIGN.md) · [docs/wiki/Architecture.md](docs/wiki/Architecture.md) · [docs/wiki/Extending.md](docs/wiki/Extending.md) |
+| 改前端 / 验 UI | [docs/UI-CHECK.md](docs/UI-CHECK.md)（真浏览器截图 + 控制台 + 布局断言） |
 | 看可信度 | [BENCHMARK.md](BENCHMARK.md) · [docs/REGRESSION-GATE.md](docs/REGRESSION-GATE.md) |
 | 部署 / 安全 | [docs/wiki/Deployment.md](docs/wiki/Deployment.md) · [SECURITY.md](SECURITY.md) |
 | 参与贡献 | [CONTRIBUTING.md](CONTRIBUTING.md) · [TRIAGE.md](TRIAGE.md) · [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) |

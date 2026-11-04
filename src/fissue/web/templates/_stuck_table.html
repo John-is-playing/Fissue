@@ -27,7 +27,7 @@
           {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
         </td>
         <td class="small">{{ row.priority or '—' }}</td>
-        <td class="small muted"><time data-time="{{ row.updated_at }}">—</time></td>
+        <td class="small muted"><time data-time="{{ row.updated_at or '' }}">—</time></td>
         <td class="cell-acts">
           {# flex 必须包在这一层 div 上：把 display:flex 直接给 <td> 会让它不再作为
              table-cell 参与行高计算（浏览器生成匿名单元格盒子），于是这个格子在行里
