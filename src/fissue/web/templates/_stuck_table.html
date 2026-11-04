@@ -28,9 +28,15 @@
         </td>
         <td class="small">{{ row.priority or '—' }}</td>
         <td class="small muted"><time data-time="{{ row.updated_at }}">—</time></td>
-        <td class="pipe-acts">
-          <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
-          <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
+        <td class="cell-acts">
+          {# flex 必须包在这一层 div 上：把 display:flex 直接给 <td> 会让它不再作为
+             table-cell 参与行高计算（浏览器生成匿名单元格盒子），于是这个格子在行里
+             的高度与整行不一致——鼠标划过时，行高亮的下半截就成了"看着能点、其实
+             不属于任何内容"的死区。 #}
+          <div class="pipe-acts">
+            <a class="small" href="/item/{{ row.key | urlencode }}">看原因</a>
+            <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}">强制修复</button>
+          </div>
         </td>
       </tr>
       {% endfor %}

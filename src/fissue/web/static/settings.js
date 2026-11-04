@@ -105,7 +105,9 @@
         },
         trusted_networks: nets,
         trust_proxy: checked("overlay-trust-proxy"),
-        trusted_proxies: proxies
+        trusted_proxies: proxies,
+        // 流水线页「需要你处理的」默认展开条数；0 = 全部折叠
+        stuck_top_n: intOr("overlay-stuck-top-n", 2)
       },
       // 计费 / 预算 / 生成参数：整组一起交（页面上的值是**生效值**回填，所见即所写）。
       // 边界由服务端的 pydantic 约束兜底，这里不做格式判断——写不合法就 400、文件一字不动。

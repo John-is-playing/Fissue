@@ -79,10 +79,11 @@ def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
         stuck_items = r.list_items(
             repo_slug=repo_slug, status=_ItemStatus.NEEDS_MANUAL, limit=50
         ) + r.list_items(repo_slug=repo_slug, status=_ItemStatus.FAILED, limit=50)
-        # 只默认展开最靠前的 5 条：一屏能扫完的清单才有用，其余折叠起来，
-        # 并给出「去条目页看全部」的出口。
+        # 默认只展开前 N 条（`web.stuck_top_n`，默认 2）：一屏能扫完的清单才有用，
+        # 其余折叠起来，并给出「去条目页看全部」的出口。
         stuck = view.stuck_rows(stuck_items)
-        stuck_top, stuck_rest = stuck[:5], stuck[5:]
+        top_n = max(0, min(int(_settings(request).web.stuck_top_n), len(stuck)))
+        stuck_top, stuck_rest = stuck[:top_n], stuck[top_n:]
 
         return templates.TemplateResponse(
             request,

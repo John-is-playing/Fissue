@@ -148,10 +148,11 @@ def test_run_job_failure_is_not_silent(seeded_client):
 # ---------------------------------------------------------------------------
 
 
-def test_stuck_list_shows_top_five_and_collapses_rest(seeded_client):
+def test_stuck_list_shows_top_n_and_collapses_rest(seeded_client):
+    """默认展开条数由 `web.stuck_top_n` 决定（默认 2）。"""
     html = seeded_client.get("/pipeline").text
     assert "stuck-rest" in html
-    assert "其余 2 条" in html  # 7 条里折叠 2 条
+    assert "其余 5 条" in html  # 7 条里默认展开 2 条、折叠 5 条
 
 
 def test_stuck_list_is_sorted_by_importance(seeded_client):
@@ -174,3 +175,86 @@ def test_no_stuck_means_no_section(settings):
     with TestClient(create_app(settings)) as c:
         html = c.get("/pipeline").text
     assert "需要你处理的" not in html
+
+# ---------------------------------------------------------------------------
+# 6. 表格单元格不能被改成 flex（用户报的"高亮块比旁边矮、下面是无效点击"）
+# ---------------------------------------------------------------------------
+
+
+def test_action_cell_keeps_table_cell_layout(seeded_client):
+    """动作列必须是 `<td class="cell-acts">` + 内层 `div.pipe-acts`。
+
+    把 `display:flex` 直接给 `<td>`，它就不再作为 table-cell 参与行高计算
+    （浏览器生成匿名单元格盒子），于是该格高度与整行不一致——行 hover 高亮的
+    下沿会出现一段"看着能点、其实不属于任何内容"的死区，视觉上还比旁边矮一截。
+    """
+    html = seeded_client.get("/pipeline").text
+    assert 'td class="pipe-acts"' not in html, "td 又被套上 flex 布局类了"
+    assert 'class="cell-acts"' in html
+    # 有 td.cell-acts 就必须有内层 flex 容器承载按钮
+    assert 'class="cell-acts"' in html and '<div class="pipe-acts">' in html
+
+
+# ---------------------------------------------------------------------------
+# 7. 待办展开条数可配置（web.stuck_top_n，默认 2）
+# ---------------------------------------------------------------------------
+
+
+def _rows_before_details(html: str) -> int:
+    """默认展开区里渲染了多少行待办（`<details>` 之前的部分）。"""
+    head = html.split("<details", 1)[0]
+    return head.count('class="mono">acme/web#')
+
+
+def test_stuck_defaults_to_two_rows(seeded_client):
+    """默认只展开 2 条：7 条数据里 5 条折叠。"""
+    html = seeded_client.get("/pipeline").text
+    assert _rows_before_details(html) == 2
+    assert "其余 5 条" in html
+
+
+def test_stuck_top_n_is_configurable(settings):
+    """`web.stuck_top_n` 改大，展开区就跟着变多（排序仍是重要性优先）。"""
+    settings.web.stuck_top_n = 4
+    _seed(settings)
+    with TestClient(create_app(settings)) as c:
+        html = c.get("/pipeline").text
+    assert _rows_before_details(html) == 4
+    assert "其余 3 条" in html
+
+
+def test_stuck_top_n_zero_collapses_everything(settings):
+    """0 = 全部折叠：不留空表格，折叠块默认展开，避免"点了才看到东西"。"""
+    settings.web.stuck_top_n = 0
+    _seed(settings)
+    with TestClient(create_app(settings)) as c:
+        html = c.get("/pipeline").text
+    head = html.split("<details", 1)[0]
+    assert _rows_before_details(html) == 0
+    assert "<table>" not in head, "默认区不该留一张空表"
+    assert "全部 7 条" in html
+    assert "<details class=\"stuck-rest\" open>" in html
+
+
+def test_stuck_top_n_rejects_out_of_range():
+    """范围 0–50：越界在加载期就报错，而不是悄悄夹到边界。"""
+    from pydantic import ValidationError
+
+    from fissue.config import WebConfig
+
+    with pytest.raises(ValidationError):
+        WebConfig(stuck_top_n=51)
+    with pytest.raises(ValidationError):
+        WebConfig(stuck_top_n=-1)
+
+
+def test_stuck_top_n_from_env(monkeypatch):
+    """环境变量能覆盖（`FISSUE_WEB_STUCK_TOP_N`），非法值直接报错。"""
+    from fissue.config import ConfigError, load_settings
+
+    monkeypatch.setenv("FISSUE_WEB_STUCK_TOP_N", "3")
+    assert load_settings(require_llm_key=False).web.stuck_top_n == 3
+
+    monkeypatch.setenv("FISSUE_WEB_STUCK_TOP_N", "三条")
+    with pytest.raises(ConfigError):
+        load_settings(require_llm_key=False)

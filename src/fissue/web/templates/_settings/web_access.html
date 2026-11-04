@@ -80,6 +80,16 @@
       <span class="muted small">连续失败多少次后开始指数退避锁定（<code>web.auth.login_max_failures</code>）。</span>
     </div>
 
+    <div class="k">待办展开</div>
+    <div class="v">
+      <input type="number" id="overlay-stuck-top-n" min="0" max="50" style="width:120px"
+             value="{{ view.effective.stuck_top_n }}">
+      <span class="muted small">
+        条（<code>web.stuck_top_n</code>）。流水线页「需要你处理的」默认展开几条，其余折叠；
+        填 <b>0</b> 表示全部折叠，只留总数与「展开」。范围 0–50。
+      </span>
+    </div>
+
     <div class="k">只读模式</div>
     <div class="v">
       {% if view.effective.read_only %}<span class="tag stale">已开启</span>{% else %}<span class="tag">关闭</span>{% endif %}

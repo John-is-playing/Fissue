@@ -735,6 +735,8 @@ def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
         # 反代部署：开关与代理网段要一起能改（只改一层等于没配）
         "web.trust_proxy",
         "web.trusted_proxies",
+        # 流水线页「需要你处理的」默认展开条数（0 = 全部折叠）
+        "web.stuck_top_n",
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
         "llm.budget.daily_tokens_per_repo",

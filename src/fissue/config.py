@@ -772,6 +772,12 @@ class WebConfig(BaseModel):
     #: 与 `read_only` 的分工：`read_only` 管的是「要不要去平台上打标签/提 PR」，
     #: 这个开关管的是「能不能改本机的配置文件」。两件不同的事，别互相借用语义。
     allow_remote_config_write: bool = False
+    #: 流水线页「需要你处理的」默认展开几条（其余折叠，可展开或去条目页筛）。
+    #:
+    #: 默认 2：这一块回答的是"先干哪件"，一屏能扫完才有用。设 0 表示全部折叠
+    #: （只看得到总数和"展开"）；上限 50 与后端取数上限一致——再大就不是"待办"
+    #: 而是"清单"了，那种场景该去条目页。
+    stuck_top_n: int = Field(default=2, ge=0, le=50)
     # 这里曾有 `allow_repo_management`（文档说它控制「仓库与密钥管理界面」），
     # 但那个界面从未实现、背后没有任何路由，属于「配置写了不生效」，已删除。
     # 真正的写操作闸门是上面的 `read_only`（见 web/app.py 的 _require_writable）。
@@ -1276,6 +1282,14 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
         web["host"] = v
     if (port := port_of("WEB_PORT")) is not None:
         web["port"] = port
+    # 流水线页「需要你处理的」默认展开条数（0 = 全部折叠）
+    if v := env_of("WEB_STUCK_TOP_N"):
+        try:
+            web["stuck_top_n"] = int(v)
+        except ValueError as exc:
+            raise ConfigError(
+                f"环境变量 {ENV_PREFIX}WEB_STUCK_TOP_N 必须是整数，当前为 {v!r}"
+            ) from exc
     # 这里曾有 `FISSUE_API_TOKEN` → `api.token` + 自动翻 `auth_required`。
     # 单一口令的机制已被会话 + API Key 整体替换（docs/AUTH.md §2 决策 3、§6）。
     # 旧口令**仍可**被一次性导入为一条 API Key，但那条路径在 `fissue.web.auth` 里

@@ -126,6 +126,7 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset(
     {
         "repos",
         "web.allow_remote_config_write",
+        "web.stuck_top_n",
         "web.auth.enabled",
         "web.auth.session_ttl_minutes",
         "web.auth.secure_cookie",
@@ -511,6 +512,7 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "web_port": settings.web.port,
             "read_only": settings.web.read_only,
             "allow_remote_config_write": settings.web.allow_remote_config_write,
+            "stuck_top_n": settings.web.stuck_top_n,
             # 鉴权（docs/AUTH.md §6）：全部经覆盖层可写。
             "auth_enabled": settings.web.auth.enabled,
             "session_ttl_minutes": settings.web.auth.session_ttl_minutes,

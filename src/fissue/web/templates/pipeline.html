@@ -65,11 +65,16 @@
      tier1 → tier2 → 其余，同档内按最近更新）。其余折叠——一屏扫不完的清单
      等于没有清单，需要全部时去条目页筛。 #}
   <h2>需要你处理的 <span class="tag bad">{{ stuck | length }}</span></h2>
+  {% if stuck_top %}
   {% with rows = stuck_top %}{% include "_stuck_table.html" %}{% endwith %}
+  {% endif %}
 
   {% if stuck_rest %}
-  <details class="stuck-rest">
-    <summary>其余 {{ stuck_rest | length }} 条（优先级较低，展开查看）</summary>
+  <details class="stuck-rest"{% if not stuck_top %} open{% endif %}>
+    <summary>
+      {% if stuck_top %}其余 {{ stuck_rest | length }} 条（优先级较低，展开查看）
+      {% else %}全部 {{ stuck_rest | length }} 条（按重要性排序，展开查看）{% endif %}
+    </summary>
     {% with rows = stuck_rest %}{% include "_stuck_table.html" %}{% endwith %}
   </details>
   {% endif %}
@@ -213,7 +218,9 @@
             <span class="tag {{ 'bad' if row.stalled else ('stale' if row.status in ('failed','needs_manual') else '') }}" title="状态：{{ row.status }}">{{ row.status | status_label }}</span>
             {% if row.force_fix %}<span class="tag force" title="已标记强制修复">⚡</span>{% endif %}
           </td>
-          <td class="pipe-acts">
+          <td class="cell-acts">
+            {# 同上：flex 只给内层 div，<td> 必须保持 table-cell #}
+            <div class="pipe-acts">
             <a class="small" href="/item/{{ row.key | urlencode }}">详情</a>
             {% if row.stage in ('evaluate', 'stuck') %}
             <button type="button" class="ghost small" data-act="job" data-kind="evaluate" data-keys="{{ row.key }}"
@@ -227,6 +234,7 @@
             <button type="button" class="ghost small" data-act="force" data-key="{{ row.key }}"
                     title="不管评测结论，直接推进修复流程">强制修</button>
             {% endif %}
+            </div>
           </td>
         </tr>
         {% endfor %}

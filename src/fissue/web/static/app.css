@@ -2240,3 +2240,16 @@ tr[data-href]:focus-visible {
 .stuck-rest > summary:hover {
   color: var(--text);
 }
+
+/* 表格里的动作单元格：**只承载内层 flex 盒子**，自己不改成 flex。
+   把 display:flex 直接给 <td> 会让它不再作为 table-cell 参与行高计算
+   （浏览器为它生成匿名单元格盒子），结果这个格子在行内的高度与整行不一致：
+   行 hover 高亮的下沿就成了"看着能点、其实不属于任何内容"的死区。 */
+.cell-acts {
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.cell-acts .pipe-acts {
+  margin: 0;
+}
