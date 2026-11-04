@@ -164,6 +164,18 @@ _NAME_PATTERNS: Final = re.compile(
 #: unit 名兜底正则（schema 已校验，这里防 ``model_construct`` 等绕过路径）。
 _UNIT_NAME_RE: Final = re.compile(r"[A-Za-z0-9_.@-]+")
 
+#: `.env` 的**模板**文件名后缀：里面只有示例值，和 `config.example.yaml` 同类，
+#: 部署计划完全可以（也常常需要）把它传到远端。
+#:
+#: 为什么不能整条放行 `.env.*`：`.env.local` / `.env.production` 里是真值。
+#: 只有这几个公认的"示例"后缀才放行——名字本身就是约定，不需要读内容判断。
+_ENV_TEMPLATE_SUFFIXES: Final = ("example", "sample", "template", "dist")
+
+_ENV_TEMPLATE_FILE: Final = re.compile(
+    "^" + re.escape(_FILE_ENV) + r"\.(?:" + "|".join(_ENV_TEMPLATE_SUFFIXES) + ")$",
+    re.IGNORECASE,
+)
+
 _QUOTES: Final = ("'", '"')
 _SEPARATORS: Final = (";", "\n", "|", "&")
 
@@ -408,6 +420,11 @@ def _check_upload(label: str, spec: UploadSpec) -> None:
     raw = (spec.src or "").strip().rstrip("/\\")
     # 同时认 `\` 与 `/`：本机是 Windows，src 很可能是 `C:\Users\x\<名字>` 形式。
     base = re.split(r"[\\/]", raw)[-1] if raw else ""
+    # 模板文件先放行：`.env.example` / `.env.sample` / `.env.template` / `.env.dist`
+    # 里只有示例值，和 `config.example.yaml` 同类。真机部署时 AI 正是要传它，
+    # 而旧规则把 `.env` + 任意后缀全拦了——计划在校验阶段就被判死，一步都没跑。
+    if base and _ENV_TEMPLATE_FILE.fullmatch(base):
+        return
     if _NAME_PATTERNS.fullmatch(base):
         raise GuardError(
             f"步骤 {label!r}：拒绝上传 {spec.src!r}——本机凭据不得随计划送到远端"

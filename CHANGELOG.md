@@ -58,6 +58,20 @@
 - 用例 29 条：补传幂等/缺文件不补/无源码目录跳过、三种回环写法改写/纯本机不改/
   非监听变量不动、占位符拦截（含 `sk-REPLACE-ME`）/真值放行/必填缺失只警告/可选不吵。
 
+**第二轮真机（2026-11-04 晚，纯 AI 计划一次跑通，deployment #21）**又暴露并修掉三处：
+
+- **`User=root` 不再被放过**：AI 主动写了 `User=root` + `Group=root`（理由"沙盒要 docker
+  权限"），旧归一化只在**缺** `User=` 时注入，于是服务以 root 运行而部署判定是 success。
+  现在 `User=root`/`User=0` 一律改写为部署用户，`Group=root` 删除（回落该用户主组）。
+  真要 docker 权限应用 `SupplementaryGroups=docker`，不是整进程 root。
+- **`.env.example` 不再被误拦**：守卫的敏感文件规则把 `.env` + 任意后缀全拒了，
+  含示例值的模板文件过不了校验、计划一步都不跑。现在放行
+  `.env.example/.sample/.template/.dist`，真 `.env` 与私钥证书仍拒。
+- **前置项可见**：`deploy plan`/`deploy status` 输出「启动前置 N 项（必需 M）」并逐项标
+  已提供/缺/可选，占位符单独高亮；`/ops` 列表显示「缺 N 项前置」「占位符待填」，
+  展开步骤列出清单；`GET /api/v1/deployments/{id}` 新增 `startup_inputs`
+  （占位符只回显掩码，老记录按空结构返回，调用方无需判空）。
+
 ### 新增 —— 真浏览器 UI 检查（`tools/ui_shot.py`）
 
 - **背景**：本机 Edge 的无头模式是坏的，于是前端修复只能靠静态断言守着——

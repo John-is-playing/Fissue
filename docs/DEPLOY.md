@@ -429,3 +429,41 @@ AI 产物里**本来就有**的正确部分：release + `current` 软链 + `shar
   不给源码目录时这条规则整条跳过（宁可不补，也不猜文件是否存在）。
 - `required_inputs` 里声明了但 `app.env` 没给的键只**警告**不拦截：该值很可能已长期
   保存在远端 `shared/.env`，当错误会误伤增量部署。
+
+### 16.6 第二轮真机（2026-11-04 晚）：纯 AI 计划一次跑通
+
+改进落地后，用**未经任何人工修改**的 AI 计划重跑了一次（29 步，deployment #21）：
+
+| 原先的人工补救 | 这一轮的结果 |
+|---|---|
+| 手工补 `README.md` / `LICENSE` 上传 | AI 自己传了（提示词第 10 条生效） |
+| 手工删掉 `sk-REPLACE-ME` | AI 根本没写，改为声明 `required_inputs`（第 11 条生效） |
+| 手工改写监听地址 | AI 自己写 `FISSUE_WEB_HOST=0.0.0.0`（第 7 条） |
+| 手工加 `config.local.yaml` 可信网段 | 仍未自动处理（见下） |
+
+计划里 4 项前置项：`FISSUE_LLM_API_KEY`（必需）+ 端点/模型/GitHub token（可选）。
+`apply` 对必需项只警告（远端 `shared/.env` 已有真值），部署 `success`、证据全绿。
+
+**这一轮又抓到一个真问题**：AI 在 unit 里主动写了 `User=root` + `Group=root`，
+并在 notes 里解释"沙盒 runtime=docker 需要 docker 权限"。旧归一化只在**缺** `User=`
+时注入，看到已有 `User=` 就跳过——于是服务以 root 跑、部署判定却是 `success`，
+证据链里没有"运行身份"这一项，没人会发现。
+
+修复：`normalize` 现在把 `User=root`/`User=0` 改写为部署用户，并删掉 `Group=root`
+（让 systemd 回落到该用户主组）。真要 docker 权限，正确做法是
+`usermod -aG docker` 或 unit 里 `SupplementaryGroups=docker`，不是整进程 root。
+
+复核结果：`ps -o user=` = `john`、unit 里 `User=john`、`0.0.0.0:8000`、`/` 返回 200。
+
+### 16.7 前置项在哪里看
+
+| 位置 | 内容 |
+|---|---|
+| `fissue deploy plan` | 计划末尾列「启动前置 N 项（必需 M）」，逐项标 `已提供 / 缺（必需）/ 未提供（可选）`；占位符单独高亮并说明 apply 会被拒 |
+| `fissue deploy status <id>` | 详情里同样列一份（从存下来的计划重建，老记录解析失败则跳过） |
+| `GET /api/v1/deployments/{id}` | `startup_inputs`：`items[]`（key/reason/required/example/provided）、`placeholders[]`（只回显掩码）、`missing_required[]`、`blocking` |
+| `/ops` 部署列表 | 缺必需项显示「缺 N 项前置」；计划环境里是占位符则显示「占位符待填」 |
+| `/ops` 展开步骤 | 前置项清单 + 占位符警示（`textContent` 渲染，不解析 HTML） |
+
+未在 `plan` 里的老计划（早期记录没有 `health`，过不了当前 schema）按"没有前置项"
+处理——接口始终返回完整空结构，调用方不必判空。

@@ -91,7 +91,9 @@ def normalize_plan(
         if host_user:
             injected = _ensure_unit_user(plan, host_user)
             if injected:
-                changes.append(f"unit 补 User={host_user}（缺了会以 root 运行）")
+                changes.append(
+                    f"unit 运行身份改为 {host_user}（缺 User= 或以 root 运行都会被改写）"
+                )
 
     if host_name and host_address:
         # `health` 与**内联 probe 步骤**都要改：真机验证时只改了 health，
@@ -266,15 +268,20 @@ def _has_remote_probe(plan: DeployPlan) -> bool:
 
 
 def _ensure_unit_user(plan: DeployPlan, user: str) -> bool:
-    """给要装进系统的 unit 补一行 ``User=<部署用户>``。
+    """unit 必须跑在**部署用户**下：缺 ``User=`` 要补，写了 ``User=root`` 要改。
 
-    缺了它 systemd 会以 **root** 跑应用——真机验证时的实际后果：
-    `__pycache__` / SQLite 全归 root，之后普通用户连 release 都删不掉
-    （`destroy` 的 `rm -rf` 一报权限错误），而且一个公网可达的 Flask 应用
-    以 root 运行本身就是安全事故。
+    缺了它 systemd 会以 root 跑应用——真机验证时的实际后果：`__pycache__` /
+    SQLite 全归 root，之后普通用户连 release 都删不掉（`destroy` 的 `rm -rf`
+    一报权限错误），而且一个公网可达的服务以 root 运行本身就是安全事故。
 
-    只改真正的 unit 文件（`write_file` 且路径以 ``.service`` 结尾）；
-    已经写了 ``User=`` 的不动。
+    **写 `User=root` 也要改**：2026-11-04 真机部署 Fissue 自己时，模型主动写了
+    ``User=root`` + ``Group=root``，还在 notes 里解释"沙盒 runtime=docker 需要
+    docker 权限"。旧实现只在缺 ``User=`` 时注入，于是 root 被原样保留、部署判定
+    却是 success——证据链里没有"运行身份"这一项，没人发现。
+
+    真要 docker 权限的正确做法是把用户加进 docker 组（``usermod -aG docker`` 或
+    unit 里 ``SupplementaryGroups=docker``），而不是让整个进程以 root 跑。
+    这里只改运行身份，权限需求交给使用者在 notes 里看到后决定。
     """
     changed = False
     for step in plan.steps:
@@ -282,12 +289,19 @@ def _ensure_unit_user(plan: DeployPlan, user: str) -> bool:
         if not isinstance(spec, WriteFileSpec):
             continue
         content = spec.content or ""
-        if not spec.path.endswith(".service") or "User=" in content:
+        if not spec.path.endswith(".service") or "[Service]" not in content:
             continue
-        if "[Service]" not in content:
-            continue
-        spec.content = content.replace("[Service]", f"[Service]\nUser={user}", 1)
-        changed = True
+
+        updated = re.sub(r"(?im)^User\s*=\s*(?:root|0)\s*$", f"User={user}", content)
+        # `Group=root` 直接删掉：systemd 会回落到该用户的**主组**，
+        # 不假设"存在一个和用户名同名的组"（那是常见情况，但不是保证）。
+        updated = re.sub(r"(?im)^Group\s*=\s*(?:root|0)\s*\n?", "", updated)
+        if not re.search(r"(?im)^User\s*=", updated):
+            updated = updated.replace("[Service]", f"[Service]\nUser={user}", 1)
+
+        if updated != content:
+            spec.content = updated
+            changed = True
     return changed
 
 

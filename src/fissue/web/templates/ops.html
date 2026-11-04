@@ -118,6 +118,11 @@
           {% elif d.status == 'rolled_back' %}<span class="tag stale">已回滚</span>
           {% elif d.status == 'destroyed' %}<span class="tag none">已下线</span>
           {% else %}<span class="tag">{{ d.status }}</span>{% endif %}
+          {% if d.startup_blocking %}
+          <div><span class="tag warn" title="计划的 app.env 里还有占位符：apply 会在连机器之前直接拒绝">占位符待填</span></div>
+          {% elif d.startup_missing %}
+          <div><span class="tag stale" title="计划声明了启动前置项但没有给值；远端 shared/.env 里已有的无需重复提供">缺 {{ d.startup_missing }} 项前置</span></div>
+          {% endif %}
           {% if d.error %}<div class="muted small">{{ d.error[:160] }}</div>{% endif %}
         </td>
         <td class="muted small"><code>{{ d.release or '—' }}</code></td>
@@ -222,6 +227,12 @@
       提交后<b>立刻返回「已受理」</b>：一次部署可能跑几分钟，请求不会等它跑完。
       进度与结果在「部署记录」里看（状态会从 planning → running → success/failed）。
       计划仍会再校验一次，危险动作即使勾了也有「绝对拒绝」清单兜住。
+    </div>
+    <div class="muted small mt">
+      计划里声明的<b>启动前置项</b>（密钥、必填配置）会显示在上面的部署记录里：
+      缺的项在 apply 时只会提示、不会拦；但计划环境里若留着
+      <code class="code-inline">sk-REPLACE-ME</code> 这类占位符，
+      apply 会在连机器之前直接拒绝——那说明计划没拿到真实值。
     </div>
     <div class="row mt">
       <button type="button" class="primary" id="deploy-start"
@@ -440,6 +451,39 @@
           + "[" + ev.level + "] " + ev.message);
       });
       if (!(data.events || []).length) lines.push("（没有审计事件）");
+      var startup = data.startup_inputs || {};
+      var inputItems = startup.items || [];
+      var placeholders = startup.placeholders || [];
+      if (inputItems.length || placeholders.length) {
+        var box = document.createElement("div");
+        box.className = "stack tight-bottom";
+        var title = document.createElement("div");
+        title.className = "small muted";
+        title.textContent = "启动前置（缺的项需要人工提供；远端 shared/.env 里已有的无需重复）";
+        box.appendChild(title);
+        inputItems.forEach(function (item) {
+          var line = document.createElement("div");
+          line.className = "small" + (item.provided ? " muted" : "");
+          var state = item.provided ? "已提供" : (item.required ? "缺（必需）" : "未提供（可选）");
+          line.textContent = "· " + item.key + "：" + state
+            + (item.reason ? " —— " + item.reason : "")
+            + (!item.provided && item.example ? "（形如 " + item.example + "）" : "");
+          box.appendChild(line);
+        });
+        placeholders.forEach(function (ph) {
+          var warn = document.createElement("div");
+          warn.className = "alert bad";
+          var level = document.createElement("span");
+          level.className = "a-level";
+          level.textContent = "占位符";
+          warn.appendChild(level);
+          var text = document.createElement("span");
+          text.textContent = ph.key + "=" + ph.hint + " 还没填真实值，apply 会被直接拒绝";
+          warn.appendChild(text);
+          box.appendChild(warn);
+        });
+        cell.appendChild(box);
+      }
       var pre = document.createElement("pre");
       pre.className = "small";
       pre.textContent = lines.join("\n");  // textContent：远端命令与日志一律当纯文本，不解析 HTML

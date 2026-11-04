@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,7 @@ from ..deploy.planner import PlannerError
 from ..deploy.runner import DeployError, DeploymentRunner
 from ..deploy.schema import AuthMethod, DeployPlan, DeployStatus, HostSpec
 from ..deploy.secretbox import CredentialBox, SecretBoxError
-from ..deploy.service import DeployService
+from ..deploy.service import DeployService, startup_input_status
 from ..errors import FissueError
 from ..store.deploy_repo import DeployRepository
 from ..store.tables import DeployHostRow, DeploymentRow
@@ -297,6 +298,44 @@ def _print_plan(plan: DeployPlan) -> None:
     emit(f"健康探针  {len(plan.health)}")
     for spec in plan.health:
         emit(f"  - {spec.url or f'tcp:{spec.port}'}")
+    _print_startup_inputs(startup_input_status(plan))
+
+
+def _print_startup_inputs(status: dict) -> None:
+    """打印启动前置项：哪些必需、填了没有、会不会挡住 apply。
+
+    放在计划输出里而不是只写进 notes：真机上"缺 LLM key"这件事直到第 20 步探针
+    才以 ConnectError 冒出来，而它其实在生成计划时就已经知道了。
+    """
+    items = status.get("items") or []
+    placeholders = status.get("placeholders") or []
+    if not items and not placeholders:
+        return
+
+    required = [item for item in items if item.get("required")]
+    emit(f"启动前置  {len(items)} 项（必需 {len(required)}）")
+    for item in items:
+        if item.get("provided"):
+            flag = "已提供"
+        elif item.get("required"):
+            flag = "缺（必需）"
+        else:
+            flag = "未提供（可选）"
+        line = f"  - {item['key']}：{flag}"
+        if item.get("reason"):
+            line += f" —— {item['reason']}"
+        emit(line, style="yellow" if flag == "缺（必需）" else None)
+
+    for item in placeholders:
+        emit(
+            f"  ⚠ {item['key']}={item['hint']} 是占位符：apply 会在连机器之前直接拒绝",
+            style="bold red",
+        )
+    if status.get("missing_required") and not placeholders:
+        emit(
+            "  若这些值已长期保存在远端 shared/.env，无需重复提供；"
+            "首次部署请写进 .env 或计划的 app.env。"
+        )
 
 
 @deploy_app.command("plan")
@@ -484,6 +523,11 @@ def deploy_status(
     if view["error"]:
         emit(f"错误   {view['error']}", style="red")
     print_table(steps, ["seq", "step_id", "kind", "status", "exit_code", "error"], title="步骤")
+    # 前置项从**存下来的计划**里重建：老记录可能不合新 schema，坏了也不该让 status 命令失效。
+    if row.plan_json:
+        # 展示用的补充信息：老记录可能不合新 schema，解析失败就跳过
+        with contextlib.suppress(Exception):
+            _print_startup_inputs(startup_input_status(DeployPlan.load(row.plan_json)))
     for line in events:
         emit(line)
 

@@ -290,6 +290,46 @@ _PLACEHOLDER_VALUE = re.compile(
 )
 
 
+def _mask(value: str, keep: int = 6) -> str:
+    """只留前缀。前置项里可能是半填的密钥，整串打到日志或页面上没有意义还有风险。"""
+    text = value.strip()
+    if len(text) <= keep:
+        return "*" * max(len(text), 3)
+    return text[:keep] + "…"
+
+
+def startup_input_status(plan: DeployPlan) -> dict[str, Any]:
+    """前置项与「填了没有」的现状，供 CLI 与 Web 共用（两处各算一套必然漂移）。
+
+    ``blocking`` 为真表示 ``app.env`` 里还有占位符——``apply`` 会在**连机器之前**
+    直接拒绝，所以界面上应该先提示补值，而不是让人点下去再收到一条失败。
+    """
+    items: list[dict[str, Any]] = []
+    for spec in plan.required_inputs:
+        raw = str(plan.app.env.get(spec.key, "") or "")
+        provided = bool(raw.strip()) and not _PLACEHOLDER_VALUE.search(raw)
+        items.append(
+            {
+                "key": spec.key,
+                "reason": spec.reason,
+                "required": spec.required,
+                "example": spec.example,
+                "provided": provided,
+            }
+        )
+    placeholders = [
+        {"key": key, "hint": _mask(str(value))}
+        for key, value in plan.app.env.items()
+        if _PLACEHOLDER_VALUE.search(str(value))
+    ]
+    return {
+        "items": items,
+        "placeholders": placeholders,
+        "missing_required": [item["key"] for item in items if item["required"] and not item["provided"]],
+        "blocking": bool(placeholders),
+    }
+
+
 def _check_startup_inputs(plan: DeployPlan) -> None:
     """连机器**之前**检查「启动就会缺的东西」。
 

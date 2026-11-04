@@ -216,3 +216,71 @@ def test_required_inputs_default_is_empty() -> None:
         repo_slug="a/b", app=AppSpec(name="x"), health=[ProbeSpec(url="http://h:1/")]
     )
     assert plan.required_inputs == []
+
+
+# ---------------------------------------------------------------------------
+# unit 运行身份：缺 User= 要补，写了 User=root 也要改
+# ---------------------------------------------------------------------------
+
+
+def _unit_plan(content: str) -> DeployPlan:
+    from fissue.deploy.schema import WriteFileSpec
+
+    return DeployPlan(
+        repo_slug="acme/demo",
+        app=AppSpec(name="demo", service_name="demo", service_sudo=True),
+        steps=[
+            DeployStep(
+                id="write-unit",
+                kind=StepKind.WRITE_FILE,
+                write=WriteFileSpec(path="deploy/demo.service", content=content),
+            ),
+            DeployStep(
+                id="install-unit",
+                kind=StepKind.EXEC,
+                exec=__import__("fissue.deploy.schema", fromlist=["ExecSpec"]).ExecSpec(
+                    command="sudo -n install -m 644 deploy/demo.service /etc/systemd/system/demo.service"
+                ),
+            ),
+        ],
+        health=[ProbeSpec(url="http://192.168.2.10:8000/")],
+    )
+
+
+def _unit_content(plan: DeployPlan) -> str:
+    return next(
+        step.write.content
+        for step in plan.steps
+        if step.write and step.write.path.endswith(".service")
+    )
+
+
+def test_unit_user_injected_when_missing() -> None:
+    plan = _unit_plan("[Service]\nExecStart=/bin/true\n")
+    normalize_plan(plan, host_user="john", host_address="192.168.2.10")
+    assert "User=john" in _unit_content(plan)
+
+
+def test_unit_user_root_is_rewritten() -> None:
+    """真机事故：模型主动写 `User=root` + `Group=root`，旧实现看到 User= 就不管了，
+    结果一个公网可达的服务以 root 运行，而部署判定是 success。"""
+    plan = _unit_plan("[Service]\nUser=root\nGroup=root\nExecStart=/bin/true\n")
+    normalize_plan(plan, host_user="john", host_address="192.168.2.10")
+    content = _unit_content(plan)
+    assert "User=john" in content
+    assert "User=root" not in content
+    assert "Group=root" not in content, "Group=root 必须去掉，否则仍以 root 组运行"
+
+
+def test_unit_user_zero_is_rewritten() -> None:
+    plan = _unit_plan("[Service]\nUser=0\nExecStart=/bin/true\n")
+    normalize_plan(plan, host_user="john", host_address="192.168.2.10")
+    assert "User=john" in _unit_content(plan)
+
+
+def test_existing_non_root_user_is_kept() -> None:
+    """已经写成具体普通用户就别动：那可能是使用者有意的安排。"""
+    plan = _unit_plan("[Service]\nUser=deploy\nExecStart=/bin/true\n")
+    normalize_plan(plan, host_user="john", host_address="192.168.2.10")
+    assert "User=deploy" in _unit_content(plan)
+    assert "User=john" not in _unit_content(plan)

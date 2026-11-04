@@ -26,8 +26,9 @@ from pydantic import BaseModel, Field
 from ..deploy.guard import GuardError
 from ..deploy.planner import PlannerError
 from ..deploy.runner import DeployError
+from ..deploy.schema import DeployPlan
 from ..deploy.secretbox import CredentialBox
-from ..deploy.service import DeployService
+from ..deploy.service import DeployService, startup_input_status
 from ..deploy.ssh import SSHError
 from ..logging_setup import get_logger
 from ..store.deploy_repo import DeployRepository
@@ -134,6 +135,28 @@ def _host_view(row: Any) -> dict[str, Any]:
     }
 
 
+def _startup_of(row: Any) -> dict[str, Any]:
+    """从存下来的计划算前置项状态；老记录不合新 schema 时返回**空结构**（不抛）。
+
+    为什么是空结构而不是 `{}`：接口一旦出现"有时有 items、有时没有"的形状，
+    调用方（页面 JS / 脚本）就得在两处判空，迟早漏一个。历史记录解析失败
+    （比如早期计划没有 health 探针，过不了当前 schema）按"没有前置项"处理。
+    """
+    empty: dict[str, Any] = {
+        "items": [],
+        "placeholders": [],
+        "missing_required": [],
+        "blocking": False,
+    }
+    raw = getattr(row, "plan_json", None) or {}
+    if not raw:
+        return empty
+    try:
+        return startup_input_status(DeployPlan.load(raw))
+    except Exception:  # noqa: BLE001 - 见 docstring
+        return empty
+
+
 def _deployment_view(row: Any, host_name: str | None) -> dict[str, Any]:
     """部署记录对外视图（列表与详情共用同一套字段，免得两处漂移）。"""
     return {
@@ -152,6 +175,10 @@ def _deployment_view(row: Any, host_name: str | None) -> dict[str, Any]:
         "error": row.error,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+        # 前置项摘要：列表里只给"缺几项/是否有占位符"，详情接口再给完整列表。
+        # 计划原文可能很长，逐行解析一次可接受；坏了也不能让整个列表 500。
+        "startup_missing": len(_startup_of(row).get("missing_required") or []),
+        "startup_blocking": bool(_startup_of(row).get("blocking")),
     }
 
 
@@ -303,6 +330,7 @@ def register_deploy_api(app: FastAPI, prefix: str, auth: Any) -> None:
         host_row = repo.get_host_by_id(int(row.host_id))
         data = _deployment_view(row, host_row.name if host_row else None)
         data["health_json"] = row.health_json or {}
+        data["startup_inputs"] = _startup_of(row)
         data["steps"] = [_step_view(s) for s in repo.steps_of(deployment_id)]
         data["events"] = [_event_view(e) for e in repo.events_of(deployment_id)]
         return data
