@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -163,8 +164,17 @@ class DeployService:
         self.require_enabled()
         self.host(host)
         plan, workspace, _warning = await self._resolve_plan(
-            slug=slug, host=host, ref=ref, platform=platform, plan_file=plan_file, allow_dangerous=allow_dangerous
+            slug=slug,
+            host=host,
+            ref=ref,
+            platform=platform,
+            plan_file=plan_file,
+            allow_dangerous=allow_dangerous,
+            source_dir=source_dir,
         )
+        # 连机器之前就把「启动就会缺的东西」挡下来：真机上部到第 20 步探针才发现
+        # 服务因为缺 LLM key 直接退出，报错离原因隔了 20 步。
+        _check_startup_inputs(plan)
         try:
             return await self.runner.run(
                 host_name=host,
@@ -190,6 +200,7 @@ class DeployService:
         platform: str | None,
         plan_file: str | None,
         allow_dangerous: bool | None,
+        source_dir: Path | None = None,
     ) -> tuple[DeployPlan, Any, str | None]:
         if plan_file:
             plan = load_plan_file(plan_file)
@@ -201,8 +212,15 @@ class DeployService:
         # 归一化：把「模型漏写但计划里能推出来」的细节补上（提权、探针别名）。
         # 放在校验**之前**，否则那些能自动救回来的计划会先被 guard 判死。
         host_row = self.host(host)
+        # 源码目录：克隆出来的工作区优先，其次是调用方显式给的（--source）。
+        # 归一化用它检查「pyproject 引用的文件计划里有没有上传」。
+        source_root = workspace.root if workspace is not None else source_dir
         plan = normalize_plan(
-            plan, host_name=host_row.name, host_address=host_row.address, host_user=host_row.user
+            plan,
+            host_name=host_row.name,
+            host_address=host_row.address,
+            host_user=host_row.user,
+            source_root=source_root,
         )
         warning: str | None = None
         try:
@@ -262,3 +280,52 @@ def load_plan_file(path: str) -> DeployPlan:
 
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return DeployPlan.load(raw)
+
+
+#: 明显的占位符值。写进 app.env 就会让服务启动即退出，而报错要到探针那一步才浮现。
+_PLACEHOLDER_VALUE = re.compile(
+    # 允许前后缀：真机上的写法是 `sk-REPLACE-ME`，只匹配"整段等于 replace-me"会漏。
+    r"(?i)(^\s*<.*>\s*$|^\s*todo\s*$|^\s*x{4,}\s*$|^\s*your[-_ ].*"
+    r"|replace[-_ ]?me|change[-_ ]?me|changeme|placeholder)"
+)
+
+
+def _check_startup_inputs(plan: DeployPlan) -> None:
+    """连机器**之前**检查「启动就会缺的东西」。
+
+    真机部署 Fissue 自己时踩到的顺序问题：计划把 ``FISSUE_LLM_API_KEY=sk-REPLACE-ME``
+    写进环境模板，服务一起来就 ``ConfigError`` 退出，而失败点报在第 20 步的探针上——
+    离真正的原因隔了 20 步、还要去翻 journal。
+
+    两类处理，刻意不同：
+
+    * ``app.env`` 里是**占位符** → 直接失败。那说明计划根本没拿到真实值，
+      继续跑只是在远端制造一次注定失败的部署。
+    * ``required_inputs`` 里声明了、但 ``app.env`` 没给 → 只警告。该值很可能
+      已长期保存在远端 ``shared/.env``（部署是增量覆盖的），把它当错误会误伤。
+    """
+    placeholders = [
+        (key, str(value))
+        for key, value in plan.app.env.items()
+        if _PLACEHOLDER_VALUE.search(str(value))
+    ]
+    if placeholders:
+        reasons = {item.key: item.reason for item in plan.required_inputs}
+        lines = [
+            f"  - {key}={value}" + (f"（{reasons[key]}）" if reasons.get(key) else "")
+            for key, value in placeholders
+        ]
+        raise DeployError(
+            "计划的启动环境里还是占位符，服务起来就会退出。先补真实值再部署：\n"
+            + "\n".join(lines)
+        )
+
+    missing = [
+        item for item in plan.required_inputs if item.required and item.key not in plan.app.env
+    ]
+    if missing:
+        hint = "、".join(f"{item.key}（{item.reason or '必填'}）" for item in missing)
+        plan.notes = (plan.notes + "\n" if plan.notes else "") + f"[前置项] 需要人工提供：{hint}"
+        log.warning(
+            "部署前置项未在计划环境中提供：%s（若远端 shared/.env 已有则无需处理）", hint
+        )

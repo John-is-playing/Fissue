@@ -21,10 +21,21 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+import tomllib
+
 from ..logging_setup import get_logger
-from .schema import DeployPlan, ProbeSpec, ServiceSpec, WriteFileSpec
+from .schema import (
+    DeployPlan,
+    DeployStep,
+    ProbeSpec,
+    ServiceSpec,
+    StepKind,
+    UploadSpec,
+    WriteFileSpec,
+)
 
 log = get_logger(__name__)
 
@@ -34,6 +45,12 @@ SYSTEM_UNIT_DIR = "/etc/systemd/system"
 #: 用户级 unit 目录：装到这里时**不需要** sudo，归一化必须区分开。
 USER_UNIT_HINT = "/.config/systemd/user"
 
+#: 只在本机可达的监听地址。服务绑这些地址时，**控制端**的探针一定连不上。
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1"})
+
+#: 承载「监听地址」的环境变量名（按名字判断，不猜语言/框架）。
+BIND_KEY_HINT = re.compile(r"(HOST|ADDR|ADDRESS|BIND|LISTEN)", re.IGNORECASE)
+
 
 def normalize_plan(
     plan: DeployPlan,
@@ -41,12 +58,25 @@ def normalize_plan(
     host_name: str = "",
     host_address: str = "",
     host_user: str = "",
+    source_root: Path | str | None = None,
 ) -> DeployPlan:
     """就地补正计划，返回同一个对象（便于调用方继续使用）。
 
     幂等：对已经正确的计划再跑一次不会有任何变化。
+
+    ``source_root`` 是**本地源码目录**（计划里的相对路径都相对它）。有它才能检查
+    「pyproject 里 `readme = "README.md"`，计划却只上传了 pyproject」这类缺口；
+    没有它时这条规则整条跳过，不做任何猜测。
     """
     changes: list[str] = []
+
+    # 打包元数据引用到的文件必须一起上传：真机验证时 AI 只传了 pyproject.toml，
+    # hatchling 在生成元数据时 `readme` 直接 OSError，装包那一步才失败。
+    changes.extend(_ensure_packaging_files(plan, source_root))
+
+    # 服务绑回环地址时，**控制端**的探针永远连不上：要么让服务监听外部地址，
+    # 要么这次部署的「独立证据」就永远拿不到。真机上 AI 侥幸写对了，不该靠运气。
+    changes.extend(_ensure_reachable_bind(plan))
 
     if _installs_system_unit(plan) and plan.app.service_name:
         if not plan.app.service_sudo:
@@ -87,6 +117,152 @@ def normalize_plan(
         plan.notes = (plan.notes + "\n" if plan.notes else "") + f"[归一化] {note}"
         log.info("部署计划已归一化：%s", note)
     return plan
+
+
+def _ensure_packaging_files(plan: DeployPlan, source_root: Path | str | None) -> list[str]:
+    """把打包元数据**引用到**的文件补进上传步骤。
+
+    真机验证时 AI 只上传了 ``pyproject.toml`` / ``src`` / ``config.example.yaml``，
+    而 pyproject 里有 ``readme = "README.md"``——hatchling 生成元数据时直接
+    ``OSError``，前面十几步全白跑，报错还是埋在 pip 的构建日志里。
+
+    只补**确实存在**的文件：源码目录里没有的（比如计划本来就只带了一部分），
+    补一个上传步骤只会在执行时以"文件不存在"失败，不如不补。
+    """
+    if not source_root:
+        return []
+    root = Path(source_root)
+    if not root.is_dir():
+        return []
+
+    referenced = _packaging_referenced_files(root)
+    if not referenced:
+        return []
+
+    covered = _uploaded_paths(plan)
+    missing = [rel for rel in referenced if rel not in covered]
+    if not missing:
+        return []
+
+    # 插在最后一个上传步骤之后：保持「先传文件、再写配置、再执行」的自然顺序，
+    # 也避免把上传步骤混进后面的 exec 序列里。
+    insert_at = 0
+    for index, step in enumerate(plan.steps):
+        if isinstance(step.spec, UploadSpec):
+            insert_at = index + 1
+
+    new_steps: list[DeployStep] = []
+    for rel in missing:
+        handle = re.sub(r"[^A-Za-z0-9]+", "-", rel).strip("-").lower()[:40] or "file"
+        step_id = f"upload-{handle}"
+        taken = {s.id for s in plan.steps} | {s.id for s in new_steps}
+        suffix = 2
+        base = step_id
+        while step_id in taken:
+            step_id = f"{base}-{suffix}"
+            suffix += 1
+        new_steps.append(
+            DeployStep(
+                id=step_id,
+                kind=StepKind.UPLOAD,
+                title=f"上传 {rel}（打包元数据引用它，缺了构建会失败）",
+                upload=UploadSpec(src=rel, dst=rel),
+            )
+        )
+    plan.steps[insert_at:insert_at] = new_steps
+    return [f"补上传步骤：{'、'.join(missing)}（pyproject/setup 引用，之前漏了）"]
+
+
+def _packaging_referenced_files(root: Path) -> list[str]:
+    """``pyproject.toml`` 里被引用的文件（readme / license / 动态版本文件）。"""
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return []
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):  # 坏文件交给构建去报错，这里不猜
+        return []
+
+    referenced: list[str] = []
+    project = data.get("project") or {}
+    readme = project.get("readme")
+    if isinstance(readme, str):
+        referenced.append(readme)
+    elif isinstance(readme, dict) and readme.get("file"):
+        referenced.append(str(readme["file"]))
+    license_spec = project.get("license")
+    if isinstance(license_spec, dict) and license_spec.get("file"):
+        referenced.append(str(license_spec["file"]))
+
+    tool = data.get("tool") or {}
+    hatch_version = (tool.get("hatch") or {}).get("version") or {}
+    if isinstance(hatch_version, dict) and hatch_version.get("path"):
+        referenced.append(str(hatch_version["path"]))
+    setuptools_dynamic = ((tool.get("setuptools") or {}).get("dynamic")) or {}
+    if isinstance(setuptools_dynamic, dict):
+        version = setuptools_dynamic.get("version")
+        if isinstance(version, dict) and version.get("file"):
+            referenced.append(str(version["file"]))
+
+    out: list[str] = []
+    for rel in dict.fromkeys(referenced):
+        candidate = Path(rel)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            continue
+        if (root / candidate).is_file():
+            out.append(rel)
+    return out
+
+
+def _uploaded_paths(plan: DeployPlan) -> set[str]:
+    """计划里已经覆盖的上传路径（相对 release 目录）。"""
+    covered: set[str] = set()
+    for step in plan.steps:
+        spec = step.spec
+        if not isinstance(spec, UploadSpec):
+            continue
+        for value in (spec.src, spec.dst):
+            if not value:
+                continue
+            normalised = value.strip("./")
+            covered.add(normalised)
+    return covered
+
+
+def _ensure_reachable_bind(plan: DeployPlan) -> list[str]:
+    """服务不能只听回环：控制端的探针要连得上。
+
+    判据是"计划里存在指向**非回环**主机的探针"——那说明这次部署要的是"外部可访问"。
+    只有在那种情况下才改写监听地址；纯本机服务不动，免得替用户改了语义。
+    """
+    if not _has_remote_probe(plan):
+        return []
+
+    changes: list[str] = []
+    for key, value in list(plan.app.env.items()):
+        if not BIND_KEY_HINT.search(key):
+            continue
+        if str(value).strip().strip("\"'").lower() in LOOPBACK_HOSTS:
+            plan.app.env[key] = "0.0.0.0"
+            changes.append(
+                f"app.env {key}: {value} → 0.0.0.0（探针从控制端发起，回环地址不可达）"
+            )
+    return changes
+
+
+def _has_remote_probe(plan: DeployPlan) -> bool:
+    """计划里是否存在指向非回环地址的探针。"""
+    urls = [spec.url for spec in plan.health if spec.url]
+    urls.extend(
+        step.spec.url
+        for step in plan.steps
+        if isinstance(step.spec, ProbeSpec) and step.spec.url
+    )
+    for url in urls:
+        host = urlsplit(url).hostname
+        if host and host.lower() not in LOOPBACK_HOSTS:
+            return True
+    return False
 
 
 def _ensure_unit_user(plan: DeployPlan, user: str) -> bool:

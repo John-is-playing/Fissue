@@ -308,7 +308,17 @@ SYSTEM_DEPLOY_PLANNER = """你是资深运维工程师。你的任务是读懂�
    否则控制端探针连不上。
 8. 每个步骤都要可判定（`check`）与可回滚（`rollback`，通常是停回服务）；
    宁可步骤多一点、语义清楚，也不要写一条大而全的 `bash -c`。
-9. 仓库里信息不足时，按最常见的惯例给出计划并在 `notes` 里说明假设，**不要编造不存在的文件**。"""
+9. 仓库里信息不足时，按最常见的惯例给出计划并在 `notes` 里说明假设，**不要编造不存在的文件**。
+10. **打包元数据引用到的文件也要上传**。Python 项目的 `pyproject.toml` 常写着
+    `readme = "README.md"`、`license = { file = "LICENSE" }`、或 `[tool.hatch.version] path = "..."`；
+    这些文件不跟着上传，`pip install .` 会在"生成元数据"阶段失败（真机踩过：
+    缺 `README.md` 导致 hatchling `OSError`，报错埋在构建日志里，前面十几步白跑）。
+    上传 `pyproject.toml` 时，把上面这些文件一起传。
+11. **启动必需的值写进 `required_inputs`，不要往 `app.env` 里填假占位符**。
+    像 `FISSUE_LLM_API_KEY=sk-REPLACE-ME` 这种写法会让服务启动时直接退出
+    （`ConfigError: 缺少 LLM API Key`），而报错要到第 20 步的探针才浮现。
+    正确做法：`app.env` 里**不写**这个键，在 `required_inputs` 里声明
+    `{key, reason, required: true, example}`，由人补齐后再部署。"""
 
 #: 手写的 schema 说明（与 ``deploy/schema.py`` 保持一致；改契约请同步改这里与 DEPLOY.md）
 SCHEMA_GUIDE = """\
@@ -321,7 +331,14 @@ DeployPlan:
   steps: [DeployStep]       # 按执行顺序
   health: [ProbeSpec]       # 至少一条，部署收尾必须全绿
   artifacts: [str]          # 要上传的本地路径（相对仓库根）
+  required_inputs: [RequiredInput]   # 启动前置项，见下
   notes: str
+
+RequiredInput:
+  key: str                  # 环境变量名，例如 FISSUE_LLM_API_KEY
+  reason: str = ""          # 一句话说明"拿来做什么"
+  required: bool = true     # false = 有更好、没有也能跑
+  example: str | null       # 取值形状提示，例如 sk-...
 
 AppSpec:
   name: str                 # 必填，仅 [A-Za-z0-9._-]

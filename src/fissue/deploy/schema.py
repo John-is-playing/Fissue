@@ -238,6 +238,27 @@ class DeployStep(BaseModel):
         return self.kind.value
 
 
+class RequiredInput(BaseModel):
+    """启动前置项：应用跑起来**必须**有人先提供的值。
+
+    为什么单独成字段，而不是留在 ``notes`` 里
+    ----------------------------------------
+    真机部署 Fissue 自己时踩到：计划把 ``FISSUE_LLM_API_KEY=sk-REPLACE-ME`` 写进
+    环境模板，服务一起来就 ``ConfigError: 缺少 LLM API Key`` 退出，探针报
+    ``ConnectError``——报错离真正的原因隔了 20 步。把「需要什么」写成结构化字段，
+    就能在执行前检查、在失败时直接点名，而不是让人翻 journal。
+
+    ``key`` 是环境变量名（大写蛇形），``reason`` 用一句话说清"拿来做什么"。
+    """
+
+    key: str = Field(min_length=1, max_length=128)
+    reason: str = ""
+    #: false 表示"有更好、没有也能跑"（例如可选的模型名）。
+    required: bool = True
+    #: 给出取值形状的提示，例如 ``sk-...`` / ``https://api.example.com/v1``。
+    example: str | None = None
+
+
 class AppSpec(BaseModel):
     """计划对「这是个什么应用」的结论。"""
 
@@ -280,6 +301,9 @@ class DeployPlan(BaseModel):
     #: 部署收尾必须全绿的探针（独立证据，见 §1）。
     health: list[ProbeSpec] = Field(default_factory=list)
     artifacts: list[str] = Field(default_factory=list)
+    #: 启动前置项：没有这些值，服务起来就会退出的东西（密钥、必填配置）。
+    #: 由计划显式声明，执行前检查、失败时点名——不再靠翻 journal 猜。
+    required_inputs: list[RequiredInput] = Field(default_factory=list)
     notes: str = ""
     generated_at: Any = Field(default_factory=utcnow)
 

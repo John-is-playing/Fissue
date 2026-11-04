@@ -373,3 +373,59 @@ GET  /ops/guide?repo_slug=&host=         页面
 脚本看着方便，但它把「执行什么」和「谁写的」缝在一起：新手无法判断一段
 看不懂的 shell 是否安全，出错时也没有逐步证据。分步骤 + 固定动作至少保证
 每一步都能停下来、能看懂、能回滚。
+
+## 16. 真机验证记录（2026-11-04，部署 Fissue 自身）
+
+目标：让 AI 读 Fissue 自己的仓库、生成计划，把它部署到树莓派（Ubuntu 24.04 aarch64），
+再用三类独立证据判定。**结论：成功**（delivery #18，24/24 步，证据全绿）。
+
+### 16.1 执行过程
+
+```bash
+# 1. 关掉上一版手工部署（只 stop + disable，代码目录保留）
+ssh john@192.168.2.10 'sudo -n systemctl stop fissue-web && sudo -n systemctl disable fissue-web'
+
+# 2. 让 AI 生成计划（克隆走 clone_mirror，因为控制端直连 github.com 不通）
+fissue deploy plan John-is-playing/Fissue --host rpi --allow-dangerous --json
+
+# 3. 复用计划执行（--plan-file 必须同时给 --source，防止误传当前目录）
+fissue deploy apply John-is-playing/Fissue --host rpi \
+  --plan-file data/deploy-verify/fissue_plan.patched.json --source . --allow-dangerous
+```
+
+### 16.2 这次暴露的四个问题
+
+| # | 现象 | 根因 | 现在的处理 |
+|---|---|---|---|
+| 1 | `install-app` 失败，报错埋在 pip 构建日志里 | `pyproject.toml` 有 `readme = "README.md"`，AI 只上传了 pyproject / src / config.example | `normalize` 读 pyproject 的 `readme` / `license.file` / `hatch.version.path`，自动补上传步骤 |
+| 2 | 服务起来即退出（`ConfigError: 缺少 LLM API Key`），失败点报在第 20 步探针 | AI 写了假占位符 `FISSUE_LLM_API_KEY=sk-REPLACE-ME` | 新增 `required_inputs` 契约；`app.env` 出现占位符时**连机器之前**就失败并点名 |
+| 3 | 控制端探针 `ConnectError` | 服务若监听 `127.0.0.1`，控制端永远连不上 | `normalize` 在存在**非回环探针**时把 `*HOST/*ADDR/*BIND` 的回环值改成 `0.0.0.0` |
+| 4 | 从局域网打开只看到登录页 | 首次部署没有管理员账号，且未声明可信网段 | 计划里加 `config.local.yaml` 覆盖层写 `web.trusted_networks`（示例，按实际网段填） |
+
+问题 1/2 已做成确定性规则与执行前检查，问题 3 已进归一化；问题 4 取决于网络环境，
+写在计划的覆盖层步骤里更合适（不改产品默认值）。
+
+### 16.3 计划质量评价
+
+AI 产物里**本来就有**的正确部分：release + `current` 软链 + `shared/` 布局、unit 由计划
+自己安装、`User=<部署用户>`、`sudo -n` 提权、venv 放 `shared/`、SQLite 放 `shared/data/`、
+健康探针指向真实地址。缺的是**打包元数据文件**与**启动前置项**这两类"仓库外部知识"。
+
+### 16.4 复跑清单（回归时逐条核对）
+
+1. `fissue host list` 里 `rpi` 指纹已钉住（`SHA256:` 开头，不是"未建立"）；
+2. `fissue deploy plan ...` 的 JSON 里：`steps` 含打包元数据上传、`app.env` 无占位符、
+   `health` 的 url 是 `http://<真实地址>:<端口>/`（不是回环、不是别名）；
+3. `fissue deploy apply ...` 末行 `success` 且"证据 全部证据通过"；
+4. 远端三类证据：`systemctl is-active` = `active`、`ss -ltnp | grep :端口` 有监听、
+   控制端 `curl http://<地址>:<端口>/` 返回 200；
+5. `ps -o user= -p <MainPID>` = 部署用户（**不是 root**）；
+6. `readlink -f .../current` 指向最新 release，`releases/` 下历史版本保留；
+7. 失败时状态必须是 `failed` 且**不**留下半成品：`current` 仍指向上一个可用版本。
+
+### 16.5 已知限制
+
+- `--plan-file` 不会克隆仓库，所以 `normalize` 的打包文件规则依赖显式 `--source`；
+  不给源码目录时这条规则整条跳过（宁可不补，也不猜文件是否存在）。
+- `required_inputs` 里声明了但 `app.env` 没给的键只**警告**不拦截：该值很可能已长期
+  保存在远端 `shared/.env`，当错误会误伤增量部署。
