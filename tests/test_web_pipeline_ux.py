@@ -302,3 +302,55 @@ def test_kanban_reserves_room_for_its_scrollbar():
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
     block = "\n".join(re.findall(r"\.pipe-kanban\s*\{([^}]*)\}", css))
     assert "padding-bottom" in block
+
+
+# ---------------------------------------------------------------------------
+# 9. 视图切换（看板/泳道/漏斗）必须能切
+# ---------------------------------------------------------------------------
+
+
+def test_view_switcher_scopes_data_mode_selector(seeded_client):
+    """切换器只能用 `.pipe-modes [data-mode]`，不能用裸 `[data-mode]`。
+
+    base.html 在运行时会给 `<html>` 加 `data-mode="simple|expert"`（界面详略开关）。
+    裸选择器会把它当成按钮并在根节点上注册点击：任何点击冒泡上来都会再执行一次
+    applyMode("simple")，于是刚切到的泳道/漏斗被立刻改回看板——表现就是"切换无效"。
+    """
+    html = seeded_client.get("/pipeline").text
+    # 注意只能禁 `document.` 开头的裸调用：switcher.querySelectorAll(...) 也含同样的子串
+    assert 'document.querySelectorAll("[data-mode]")' not in html, (
+        "又用裸选择器了，会和 html[data-mode] 撞车"
+    )
+    assert 'switcher.querySelectorAll("[data-mode]")' in html
+
+
+def test_view_switcher_confirms_the_collision_exists():
+    """记录撞车的来源：`<html data-mode>` 确实是运行时加上的。
+
+    这条不是在夸代码，是在固定前提——哪天界面详略开关换了属性名，这里会提醒复核。
+    """
+    base = Path("src/fissue/web/templates/base.html").read_text(encoding="utf-8")
+    assert 'setAttribute("data-mode"' in base
+
+
+def test_apply_mode_ignores_unknown_values(seeded_client):
+    """未知视图名只忽略，不硬回退成看板（回退会让切换看起来失效）。"""
+    html = seeded_client.get("/pipeline").text
+    assert "if (MODES.indexOf(mode) < 0) return;" in html
+
+
+def test_saved_mode_is_sanitized_before_first_apply(seeded_client):
+    """localStorage 里的脏值要在首次 apply 前修掉，否则三个视图全 hidden（整页空白）。"""
+    html = seeded_client.get("/pipeline").text
+    assert 'if (MODES.indexOf(saved) < 0) saved = "kanban";' in html
+    # switcher 必须先于 applyMode 的调用被解析，否则初始化时按钮高亮不上
+    assert html.index('var switcher = document.querySelector(".pipe-modes")') < html.index(
+        "applyMode(saved);"
+    )
+
+
+def test_all_three_views_exist_and_start_hidden(seeded_client):
+    html = seeded_client.get("/pipeline").text
+    for mode in ("funnel", "kanban", "swimlane"):
+        assert f'data-view="{mode}"' in html, f"缺少视图 {mode}"
+        assert f'data-mode="{mode}"' in html, f"缺少切换按钮 {mode}"

@@ -254,8 +254,16 @@
   var KEY = "fissue.pipeline.mode";
   var MODES = ["funnel", "kanban", "swimlane"];
 
+  // 切换器必须先取到：applyMode 里要按它找按钮，而且它限定了 `[data-mode]` 的作用域。
+  // 不能用裸 `[data-mode]` 选择器：base.html 会在运行时给 `<html>` 加
+  // `data-mode="simple|expert"`（界面详略开关），裸选择器会把它也当成按钮并注册点击；
+  // 点击冒泡到根节点后又触发一次 applyMode("simple")——不是视图名，于是切什么都会弹回看板。
+  var switcher = document.querySelector(".pipe-modes");
+
   function applyMode(mode) {
-    if (MODES.indexOf(mode) < 0) mode = "kanban";
+    // 未知视图名**直接忽略**，不要回退成看板：
+    // 回退会让"传错一次值"变成"视图被永久拽回看板"，用户看到的就是"点泳道没反应"。
+    if (MODES.indexOf(mode) < 0) return;
     // 简单模式里漏斗按钮是隐藏的：如果用户上次在专家模式存了 funnel，
     // 切回简单模式后视图会停在「按钮没了、但页面还是漏斗」的状态，看着像坏了。
     // 这里显式回退到看板——它才是两种模式下都存在的干活视图。
@@ -265,7 +273,7 @@
     MODES.forEach(function (m) {
       var view = document.querySelector('[data-view="' + m + '"]');
       if (view) view.hidden = (m !== mode);
-      var btn = document.querySelector('[data-mode="' + m + '"]');
+      var btn = switcher ? switcher.querySelector('[data-mode="' + m + '"]') : null;
       if (btn) btn.classList.toggle("on", m === mode);
     });
     try { localStorage.setItem(KEY, mode); } catch (e) { /* 隐私模式下写不了，忽略 */ }
@@ -273,11 +281,16 @@
 
   var saved = "kanban";
   try { saved = localStorage.getItem(KEY) || "kanban"; } catch (e) { /* 同上 */ }
+  // 初始值兜底：applyMode 现在会忽略未知值，所以脏值要在调用前就修掉，
+  // 否则三个视图全 hidden（整页空白），比"弹回看板"更糟。
+  if (MODES.indexOf(saved) < 0) saved = "kanban";
   applyMode(saved);
 
-  document.querySelectorAll("[data-mode]").forEach(function (btn) {
-    btn.addEventListener("click", function () { applyMode(btn.dataset.mode); });
-  });
+  if (switcher) {
+    switcher.querySelectorAll("[data-mode]").forEach(function (btn) {
+      btn.addEventListener("click", function () { applyMode(btn.dataset.mode); });
+    });
+  }
 
   document.getElementById("pipe-refresh").addEventListener("click", function () {
     var btn = this;
