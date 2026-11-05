@@ -97,3 +97,47 @@ npx @playwright/mcp@latest        # 需要 node（本机 v22 已装）
 
 两者可以并存：日常回归用脚本，遇到新问题时用 MCP 现场点两下，再把结论固化成
 脚本里的一条检查。
+
+## 交互 E2E：`tools/ui_e2e.py`
+
+`ui_shot.py` 看的是"页面长成什么样"，`ui_e2e.py` 验的是"点了会发生什么"——两者互补。
+E2E 会自起一个**隔离实例**（临时 SQLite + `demo/textkit` 5 条数据 + 1 条「失败且有上一版」的
+部署记录），然后在真 chromium 里逐步操作。
+
+```bash
+python tools/ui_e2e.py                 # 全场景，产出截图 + report.json
+python tools/ui_e2e.py --keep          # 跑完保持服务，方便自己接着点
+python tools/ui_e2e.py --base-url http://127.0.0.1:8000   # 对着已有实例
+```
+
+五个场景（都对应真实的"以为生效了"陷阱）：
+
+| 场景 | 断言什么 | 为什么必须真点 |
+|---|---|---|
+| 主题三态 | 点两次 `data-theme-pref` 走到 `dark`，刷新后仍是 `dark` | 只改 DOM 不写 localStorage 时，刷新就回到浅色 |
+| 流水线三视图 | 目标视图可见、其余全部 hidden | 属性名撞车那次的症状正是"切完弹回看板" |
+| 三档修复策略 | 切到「草稿 PR」→ 保存 → **覆盖层文件里真有** `mode: fork` / `draft: true` → 刷新仍选中 | 只看选中态会漏掉"保存没写盘" |
+| 失败行回滚 | 点按钮 → 弹确认框 → 确认后**真的发出** `POST /deployments/{id}/rollback`（请求被拦截，不连真机） | 只看按钮存在，等于没测 |
+| 引导三档 | 每档点击后 `localStorage['fissue.guide.mode']` 跟着变 | 切了不记，下次打开又回默认 |
+
+### 三个必须知道的坑（都是这轮 E2E 自己踩出来的）
+
+1. **测"主题持久化"不能注入主题偏好**。`ui_shot._new_page` 默认会往 localStorage 写主题，
+   每次导航都写——于是刷新后看起来"偏好没存住"，其实是测试工具把它改回去了。
+   需要 `set_theme_pref=False`。
+2. **测"保存设置"要把库地址写进 `.env`**。保存会触发配置重载，而 `.env` 优先级高于
+   config/覆盖层；不写它，重载后数据库回落成 `./data/fissue.db`，后面的 `/ops` 看到的是
+   另一个空库，表现为"回滚按钮不存在"。
+3. **覆盖层要在清理临时目录之前读**。自建实例的覆盖层落在临时目录里，先 cleanup 就只剩
+   "未验证"。
+
+## 容器形态的渲染检查
+
+```bash
+FISSUE_WEB_PORT=8012 docker compose up -d
+python tools/ui_shot.py --url http://127.0.0.1:8012 --only /login /settings
+FISSUE_WEB_PORT=8012 docker compose down -v
+```
+
+⚠️ 在 Git Bash 下跑时记得 `export MSYS_NO_PATHCONV=1`：否则 `/login` 会被改写成
+`C:/Program Files/Git/login`，Playwright 报 `Cannot navigate to invalid URL`。

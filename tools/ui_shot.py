@@ -186,20 +186,33 @@ class Report:
 # ---------------------------------------------------------------------------
 
 
-def _new_page(browser: Any, *, width: int, theme: str, report: Report, page_path: str) -> Any:
+def _new_page(
+    browser: Any,
+    *,
+    width: int,
+    theme: str,
+    report: Report,
+    page_path: str,
+    set_theme_pref: bool = True,
+) -> Any:
     """开一个页面，并挂上控制台/JS 异常采集。
 
     `pageerror` 与 `console.error` 都要收：前者是未捕获异常（比如
     `Fissue is not defined`），后者是应用自己的报错，两者都不会让页面变白，
     但都说明有东西在坏。
+
+    ``set_theme_pref=False`` 时不注入主题偏好——测「主题切换后刷新是否保持」
+    必须让页面用它自己写进 localStorage 的值，否则初始化脚本每次导航都把偏好
+    改回指定值，看起来就像"偏好没存住"（假失败）。
     """
     ctx = browser.new_context(viewport={"width": width, "height": 900}, locale="zh-CN")
     page = ctx.new_page()
     # 主题偏好存在 localStorage：在文档脚本执行前注入，避免先白后黑
-    page.add_init_script(
-        f"try {{ localStorage.setItem('fissue.ui.theme', {json.dumps(theme)}); "
-        f"localStorage.setItem('fissue.pipeline.mode', 'kanban'); }} catch (e) {{}}"
-    )
+    init = "try { localStorage.setItem('fissue.pipeline.mode', 'kanban'); "
+    if set_theme_pref:
+        init += f"localStorage.setItem('fissue.ui.theme', {json.dumps(theme)}); "
+    init += "} catch (e) {}"
+    page.add_init_script(init)
     page.on(
         "console",
         lambda msg: (
