@@ -17,6 +17,8 @@ CLI 与 REST API 仍应输出英文原值（脚本要能稳定解析 ``needs_man
 
 from __future__ import annotations
 
+from typing import Any
+
 #: 条目在流水线中的状态。
 STATUS_LABELS: dict[str, str] = {
     "new": "新建",
@@ -81,6 +83,25 @@ PLATFORM_STATE_LABELS: dict[str, str] = {
     "merged": "已合并",
     "draft": "草稿",
 }
+
+
+def money(amount_usd: Any, rate: float = 0.0) -> str:
+    """美元金额 → 人话。
+
+    ``$0.0352`` 对多数人没有直觉、``约 ¥0.25`` 才有——这是"成本人话化"的全部意义。
+    汇率只影响**展示**（库里 `cost_usd` 始终是美元），``rate <= 0`` 时就只显示美元。
+
+    小额保留 4 位：一次评测可能只花 $0.0001，四舍五入到分全是 ¥0.00，等于没显示。
+    """
+    try:
+        usd = float(amount_usd or 0.0)
+    except (TypeError, ValueError):
+        return "—"
+    digits = 4 if abs(usd) < 1 else 2
+    text = f"${usd:.{digits}f}"
+    if rate and rate > 0:
+        text += f"（约 ¥{usd * rate:.2f}）"
+    return text
 
 
 def _label(mapping: dict[str, str], value: object) -> str:

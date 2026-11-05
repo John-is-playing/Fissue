@@ -19,6 +19,13 @@
              value="{{ view.effective.llm_tunables.pricing_output_per_1k }}">
       <span class="muted small">美元 / 1K 输出 token（<code>llm.pricing.output_per_1k</code>）</span>
     </div>
+    <div class="k">汇率</div>
+    <div class="v">
+      <input type="number" step="0.01" min="0" style="width:150px" id="overlay-llm-usd-cny"
+             value="{{ view.effective.llm_tunables.usd_to_cny }}">
+      <span class="muted small">1 美元 ≈ ? 人民币（<code>llm.pricing.usd_to_cny</code>），
+        只影响<b>展示</b>：库里存的始终是美元。<b>0 = 只显示美元</b></span>
+    </div>
     <div class="k">日 token 上限</div>
     <div class="v">
       <input type="number" min="0" style="width:170px" id="overlay-llm-budget-tokens"

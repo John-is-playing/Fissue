@@ -145,6 +145,7 @@ OVERLAY_WRITABLE: frozenset[str] = frozenset(
         # -- LLM 计费与预算 --
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
+        "llm.pricing.usd_to_cny",
         "llm.budget.daily_tokens_per_repo",
         "llm.budget.daily_usd_per_repo",
         "llm.budget.hard_stop",
@@ -559,6 +560,7 @@ def describe_settings(settings: Settings) -> dict[str, Any]:
             "llm_tunables": {
                 "pricing_input_per_1k": settings.llm.pricing.input_per_1k,
                 "pricing_output_per_1k": settings.llm.pricing.output_per_1k,
+                "usd_to_cny": settings.llm.pricing.usd_to_cny,
                 "budget_tokens": settings.llm.budget.daily_tokens_per_repo,
                 "budget_usd": settings.llm.budget.daily_usd_per_repo,
                 "budget_hard_stop": settings.llm.budget.hard_stop,

@@ -224,6 +224,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .labels import (
         action_label,
         fix_outcome_label,
+        money,
         platform_state_label,
         status_label,
         verdict_label,
@@ -236,6 +237,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     templates.env.filters["fix_outcome_label"] = fix_outcome_label
     templates.env.filters["verifier_kind_label"] = verifier_kind_label
     templates.env.filters["platform_state_label"] = platform_state_label
+    templates.env.filters["money"] = money
     application.state.templates = templates
     # 进程启动时刻：状态页显示「已运行多久」。放在这里而不是 lifespan 里，是因为
     # `_ensure_state` 那条兜底路径（测试用 TestClient 不做上下文管理器）不会跑 lifespan，

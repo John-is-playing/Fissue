@@ -319,7 +319,7 @@
     <div class="k">输入 / 输出 token</div>
     <div class="v"><span class="num">{{ cost.prompt_tokens | int }}</span> / <span class="num">{{ cost.completion_tokens | int }}</span></div>
     <div class="k">累计成本</div>
-    <div class="v num">${{ '%.4f' | format(cost.cost_usd) }}</div>
+    <div class="v num">{{ cost.cost_usd | money(usd_to_cny) }}</div>
   </div>
   <div class="muted small mt">
     含评测、验证器生成与修复的调用；<b>失败调用也算</b>——模型被调用了就产生费用，

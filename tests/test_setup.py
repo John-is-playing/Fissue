@@ -742,6 +742,8 @@ def test_settings_view_lists_sources(settings: Settings, client: Any) -> None:
         "auto_fix.pr_strategy.draft",
         "llm.pricing.input_per_1k",
         "llm.pricing.output_per_1k",
+        # 汇率：只影响展示（美元 → 人民币估算）
+        "llm.pricing.usd_to_cny",
         "llm.budget.daily_tokens_per_repo",
         "llm.budget.daily_usd_per_repo",
         "llm.budget.hard_stop",

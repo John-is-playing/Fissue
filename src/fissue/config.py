@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import difflib
 import ipaddress
 import logging
@@ -156,6 +157,11 @@ class PricingConfig(BaseModel):
 
     input_per_1k: float = Field(default=0.00014, ge=0)
     output_per_1k: float = Field(default=0.00028, ge=0)
+    #: 美元 → 人民币的换算汇率，只影响**展示**（库里 `cost_usd` 始终是美元）。
+    #:
+    #: 为什么要有它：`$0.0352` 对多数人没有直觉，`约 ¥0.25` 才有。默认按 1:7.2 粗算；
+    #: 填 0 = 只显示美元（不想看到估算汇率的人用）。
+    usd_to_cny: float = Field(default=7.2, ge=0)
 
     def cost(self, prompt_tokens: int, completion_tokens: int) -> float:
         return (
@@ -671,6 +677,11 @@ class NotifyConfig(BaseModel):
     enabled: bool = True
     channels: list[NotifyChannel] = Field(default_factory=list)
     events: list[str] = Field(default_factory=list)
+    #: 常驻服务是否每轮尝试发一次**日报**（靠通知去重保证一天只发一条）。
+    #:
+    #: 默认关闭：升级后突然开始每天推消息，对已经在用的人是打扰。
+    #: 另外 ``events`` 非空时必须把 ``digest`` 加进去，否则会被事件过滤挡掉。
+    digest_enabled: bool = False
 
 
 def _clean_cidr_list(value: list[str], field: str) -> list[str]:
@@ -1196,7 +1207,12 @@ def _apply_env_overrides(data: dict[str, Any], env: dict[str, str]) -> dict[str,
     ``FISSUE_LLM_MODEL=xxx fissue eval`` 覆盖一次最符合直觉；
     而 .env 是「长期默认值」，不该压住当场显式指定的值。
     """
-    merged = dict(data)
+    # **深拷贝**，不是浅拷贝：下面全是 `merged.setdefault("llm", {})[...] = v` 这种原地写入，
+    # 浅拷贝时嵌套 dict 仍与调用方共享——等于把 .env 里的密钥写回人家的字典里。
+    # 真实后果：设置页保存时 `_validate_candidate` 会先把 `body.overlay` 喂进来，
+    # 于是 `llm.api_key/base_url/model` 被原地塞进请求体，`apply_overlay` 的白名单
+    # 随即拒绝这次保存（400「不允许改写 llm.api_key」）——用户什么都没填错却存不上。
+    merged = copy.deepcopy(dict(data))
 
     def env_of(name: str) -> str | None:
         key = ENV_PREFIX + name

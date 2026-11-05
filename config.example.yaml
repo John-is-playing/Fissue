@@ -38,9 +38,13 @@ llm:
     daily_tokens_per_repo: 2000000      # 单仓库每日 token 上限，超出暂停该仓库
     daily_usd_per_repo: 5.0             # 单仓库每日花费上限（按 price 表估算）
     hard_stop: true                     # true=超预算即停；false=仅告警
+    per_item_usd: 0                     # **单条**累计成本上限（美元）；0=不限。
+                                        # 管的是"某一条反复修十几轮"——按仓库/按天的预算
+                                        # 管不住这个，一条难 issue 能吃掉整天额度
   pricing:                              # 用于成本估算（美元 / 1K token）
     input_per_1k: 0.00014
     output_per_1k: 0.00028
+    usd_to_cny: 7.2                     # 只影响**展示**（$0.0352 → 约 ¥0.25）；0=只显示美元
 
 # ---------------------------------------------------------------------------
 # EdgeJev / Jev System One（可选旁路打分器）
@@ -322,6 +326,10 @@ notify:
     - type: console
       enabled: true
   events: [scan_done, eval_done, verify_done, fix_done, pr_created, budget_exceeded, needs_manual]
+  # 常驻服务是否每天发一条日报（今日产出/花费/还卡着什么）。靠通知去重保证一天一条。
+  # 默认关闭：升级后突然每天推消息，对已经在用的人是打扰。
+  # 打开时记得把 digest 加进上面的 events，否则会被事件过滤挡掉。
+  digest_enabled: false
 
 # ---------------------------------------------------------------------------
 # Web / REST API（Q14: 只读 + 操作）

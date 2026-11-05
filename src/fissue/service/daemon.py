@@ -168,8 +168,35 @@ class FissueService:
             # 5) 自动修复（仅 tier1/tier2，受策略与预算限制）
             result["fix"] = await self._run_fixes(ctx, notifier)
 
+            # 6) 日报：每轮尝试一次，靠通知去重（dedup 按天）保证一天只发一条。
+            #    不另存"上次发送日期"：去重表已经提供了这个能力，多存一份状态
+            #    就多一个会不同步的地方。
+            await self._maybe_send_digest(ctx, notifier)
+
             log.info("单轮完成：%s", result)
             return result
+
+    async def _maybe_send_digest(self, ctx: Any, notifier: Any) -> None:
+        """``notify.digest_enabled`` 打开时发一份当日摘要（一天一条）。"""
+        if not getattr(self.settings.notify, "digest_enabled", False):
+            return
+        from .digest import build_digest, render_markdown
+        from .notify import Notification
+
+        try:
+            data = build_digest(ctx.repo)
+            note = Notification(
+                event="digest",
+                title="Fissue 日报",
+                body=render_markdown(
+                    data, usd_to_cny=self.settings.llm.pricing.usd_to_cny
+                ),
+                level="info",
+                dedup_scope=data.since.strftime("%Y-%m-%d"),
+            )
+            await notifier.notify(note)
+        except Exception:  # noqa: BLE001 - 日报失败不该让整轮扫描算失败
+            log.exception("日报生成/发送失败（不影响本轮结果）")
 
     async def run_forever(self) -> None:
         """常驻运行，直到收到停止信号。"""

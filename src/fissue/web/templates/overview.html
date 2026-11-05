@@ -123,7 +123,9 @@
       <div class="k">调用</div><div class="v mono">{{ usage.calls }} 次</div>
       <div class="k">tokens</div>
       <div class="v mono">{{ usage.total_tokens }}（入 {{ usage.prompt_tokens }} / 出 {{ usage.completion_tokens }}）</div>
-      <div class="k">花费</div><div class="v mono">${{ '%.4f' % usage.cost_usd }}</div>
+      <div class="k">花费</div><div class="v mono">{{ usage.cost_usd | money(usd_to_cny) }}</div>
+      <div class="k">本月预计</div>
+      <div class="v mono">{{ month.forecast_usd | money(usd_to_cny) }} <span class="muted small">（本月已花 {{ month.cost_usd | money(usd_to_cny) }}，按前 {{ month.days_elapsed | int }} 天推算）</span></div>
       <div class="k">日预算</div>
       <div class="v mono">${{ budget.daily_usd_per_repo }} / 仓库 · {{ '{:,}'.format(budget.daily_tokens_per_repo) }} tokens</div>
     </div>

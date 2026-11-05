@@ -140,7 +140,9 @@
       concurrency: intOr("overlay-llm-concurrency", 4),
       pricing: {
         input_per_1k: numOr("overlay-llm-price-in", 0.00014),
-        output_per_1k: numOr("overlay-llm-price-out", 0.00028)
+        output_per_1k: numOr("overlay-llm-price-out", 0.00028),
+        // 只影响展示（美元 → 人民币估算），0 = 只显示美元
+        usd_to_cny: numOr("overlay-llm-usd-cny", 7.2)
       },
       budget: {
         daily_tokens_per_repo: intOr("overlay-llm-budget-tokens", 2000000),

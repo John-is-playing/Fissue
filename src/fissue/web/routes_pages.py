@@ -133,6 +133,9 @@ def _register_web_overview(app: FastAPI, templates: Jinja2Templates) -> None:
                 summary=snapshot["summary"],
                 queues=snapshot["queues"],
                 usage=snapshot["llm"]["today"],
+                # 本月累计 + 已过天数：页面据此给「本月预计」，不必各自再算月份长度
+                month=r.usage_month(),
+                usd_to_cny=st.llm.pricing.usd_to_cny,
                 budget=st.llm.budget,
                 jobs=snapshot["jobs"],
                 scans=snapshot["scans"],
@@ -599,6 +602,7 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
                 # 只在详情页查一次、默认折叠展示：列表页每条都聚合一次会把首页拖慢，
                 # 而"这条值不值"是看详情时才关心的事。
                 cost=r.usage_for_item(key),
+                usd_to_cny=_settings(request).llm.pricing.usd_to_cny,
                 # 与 fixes 逐项对齐（下标一致）：模板里用 loop.index0 取。
                 # 单独传一份而不是塞进 FixAttempt：那是 pydantic 模型，加字段要动 schema，
                 # 而这份正文只在渲染这一页时有意义。

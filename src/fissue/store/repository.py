@@ -1806,6 +1806,40 @@ class Repository:
             "calls": float(calls),
         }
 
+    def usage_month(self, *, repo_key: str | None = None) -> dict[str, float]:
+        """UTC **自然月**累计用量，附带「已过几天 / 本月几天」。
+
+        为什么带天数：要回答"这个月大概会花多少"，只能用「本月已花 ÷ 已过天数 ×
+        当月天数」估算。把天数一起返回，页面/日报就不必各自再算一遍月份长度
+        （各算一遍必然会有一处忘了闰年或月末）。
+        """
+        import calendar
+
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        stmt = select(
+            func.coalesce(func.sum(LLMUsageRow.prompt_tokens), 0),
+            func.coalesce(func.sum(LLMUsageRow.completion_tokens), 0),
+            func.coalesce(func.sum(LLMUsageRow.cost_usd), 0.0),
+            func.count(),
+        ).where(LLMUsageRow.created_at >= start)
+        if repo_key:
+            stmt = stmt.where(LLMUsageRow.repo_key == repo_key)
+        with self.db.session() as s:
+            prompt, completion, cost, calls = s.execute(stmt).one()
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        # 预估口径只放在这里：页面与日报各算一遍，必然会有一处忘了月末/闰年。
+        forecast = (float(cost) / now.day * days_in_month) if now.day else 0.0
+        return {
+            "prompt_tokens": float(prompt),
+            "completion_tokens": float(completion),
+            "cost_usd": float(cost),
+            "calls": float(calls),
+            "days_elapsed": float(now.day),
+            "days_in_month": float(days_in_month),
+            "forecast_usd": float(forecast),
+        }
+
     @staticmethod
     def _day_start(now: datetime | None = None) -> datetime:
         """UTC 当日零点——`usage_today` 的窗口起点。"""

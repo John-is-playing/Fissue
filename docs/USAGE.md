@@ -664,6 +664,69 @@ llm:
 不开 `--deep` · `verifier.max_rounds: 2` · `auto_fix.agent_max_rounds: 8` · 收紧 `fix_policy.tier2`。
 增量抓取天然省钱：指纹没变就不重复评测。
 
+### 成本怎么读：人话化
+
+页面与 CLI 里的金额都会附人民币估算（库里存的**始终是美元**，汇率只影响展示）：
+
+```yaml
+llm:
+  pricing:
+    usd_to_cny: 7.2        # 填 0 = 只显示美元
+```
+
+概览页的「本月预计」= 本月已花 ÷ 已过天数 × 当月天数（口径只在一处：`Repository.usage_month`）。
+想说清单条修了多少钱：条目详情页有折叠的「这条花了多少钱」（评测 + 验证 + 修复，
+**失败调用也算**）。
+
+想要"单条烧太多就停手"（按仓库/按天的预算管不住反复重试的难 issue）：
+
+```yaml
+llm:
+  budget:
+    per_item_usd: 0.5      # 单条累计上限（美元）；0 = 不限（默认）
+```
+
+超限时该条转 `needs_manual` 并记 `block_reason=budget`，详情页会告诉你下一步。
+
+### 日报：每天一条摘要
+
+```bash
+fissue digest                 # 今天的：产出 / 花费 / 还卡着什么
+fissue digest --days 7        # 最近 7 天
+fissue digest --format json   # 给脚本消费
+fissue digest --send          # 发到已配置的通知渠道（notify.channels）
+```
+
+日报内容：新增/评测/验证数、修复成功与转人工数、**合并了多少 PR**（真正修好的）、
+本窗口花费与本月预计、按原因分组的「需要你处理」。
+
+**自动发送**有两种方式，选一种即可：
+
+```yaml
+# 方式一：常驻服务里发（fissue serve 每轮尝试一次，去重保证一天一条）
+notify:
+  digest_enabled: true
+  events: ["digest"]        # events 非空时必须包含 digest，否则会被事件过滤挡掉
+```
+
+```bash
+# 方式二：本地 cron（不跑常驻服务时）
+0 9 * * *  cd /path/to/fissue && fissue digest --send >> data/digest.log 2>&1
+```
+
+```ini
+# 方式二':systemd timer（/etc/systemd/system/fissue-digest.timer）
+[Unit]
+Description=Fissue 日报
+[Timer]
+OnCalendar=*-*-* 09:00:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+```
+
+去重是**按天**的：同一天重复跑 `--send` 不会重复推送，隔天自然重发。
+
 ---
 
 ## 11. 故障排查

@@ -201,6 +201,93 @@ def _resolve_repos_safe(settings, repo: list[str], platform: str | None):
 # ---------------------------------------------------------------------------
 
 
+@app.command("digest")
+def digest(
+    days: int = typer.Option(1, "--days", "-d", help="统计最近几天（默认 1 = 今天）"),
+    send: bool = typer.Option(False, "--send", help="发送到已配置的通知渠道"),
+    fmt: str = typer.Option("markdown", "--format", "-f", help="markdown | json"),
+    out: str | None = typer.Option(None, "--out", "-o", help="输出文件路径（默认打印）"),
+    config: str | None = CONFIG_OPT,
+    env: str | None = ENV_OPT,
+    verbose: bool = VERBOSE_OPT,
+) -> None:
+    """生成日报：今天修好了什么、花了多少钱、还剩什么卡着。
+
+    默认只打印。``--send`` 走已配置的通知渠道（``notify.channels``），
+    ``--out`` 落到文件。想每天自动发：用 cron 或 systemd timer 调
+    ``fissue digest --send``（见 docs/USAGE.md）。
+    """
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    from ..service.digest import build_digest, render_markdown
+    from ..store.db import build_database
+    from ..store.repository import Repository
+
+    settings = load_cfg(config, env, verbose=verbose)
+    database = build_database(settings)
+    database.ensure_schema()          # 只读命令也要保证表存在（空库时输出空日报）
+    repository = Repository(database)
+
+    since = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    data = build_digest(repository, since=since)
+    markdown = render_markdown(data, usd_to_cny=settings.llm.pricing.usd_to_cny)
+
+    if fmt.lower() == "json":
+        payload = {
+            "since": data.since.isoformat(),
+            "until": data.until.isoformat(),
+            "new_items": data.new_items,
+            "evaluated": data.evaluated,
+            "verified": data.verified,
+            "fix_success": data.fix_success,
+            "fix_needs_manual": data.fix_needs_manual,
+            "fix_failed": data.fix_failed,
+            "merged": data.merged,
+            "merged_items": [{"key": key, "title": name} for key, name in data.merged_items],
+            "needs_manual": data.needs_manual,
+            "blocked": [{"reason": reason, "count": count} for reason, count in data.blocked],
+            "cost_usd": data.cost_usd,
+            "month_cost_usd": data.month_cost_usd,
+            "month_forecast_usd": data.month_forecast_usd,
+        }
+        if out:
+            Path(out).write_text(
+                _json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            emit(f"✅ 已写入 {out}", style="green")
+        else:
+            emit_json(payload)
+    elif out:
+        Path(out).write_text(markdown, encoding="utf-8")
+        emit(f"✅ 已写入 {out}", style="green")
+    else:
+        print(markdown)
+
+    if not send:
+        return
+
+    from ..service.notify import Notification, Notifier
+
+    notifier = Notifier(settings.notify, settings, repository)
+    if not notifier.enabled:
+        fail("没有启用的通知渠道：先在 config.yaml 的 notify.channels 配一个，或用 --out 落地")
+    note = Notification(
+        event="digest",
+        title="Fissue 日报",
+        body=markdown,
+        level="info",
+        # 去重窗口按"这天的起点"：同一天重复跑不会重复推，隔天自然重发
+        dedup_scope=data.since.strftime("%Y-%m-%d"),
+    )
+    results = run_async(notifier.notify(note))
+    sent = [kind for kind, ok in results.items() if ok]
+    if sent:
+        emit(f"✅ 已发送：{'、'.join(sent)}", style="green")
+    else:
+        fail(f"没有渠道发送成功（结果：{results}），详见日志")
+
+
 @app.command("report")
 def report(
     repo: list[str] = REPO_OPT,
