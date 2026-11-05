@@ -64,10 +64,18 @@ class HookEvent:
     item_type: ItemType = ItemType.ISSUE
     action: str = ""
     reason: str = ""
+    #: PR 关闭类事件里的"是否被合并"：``True`` 合并、``False`` 放弃、``None`` 不是关闭事件。
+    #: 之前只有 action 字符串（`closed`），合并与放弃都是 `closed`——分开记才能判断"修好了没有"。
+    merged: bool | None = None
 
     @property
     def usable(self) -> bool:
         return not self.reason and bool(self.repo_slug) and self.number is not None
+
+    @property
+    def is_pr_closure(self) -> bool:
+        """是否是"PR 关闭"类事件（合入或放弃）。是的话要回写条目状态。"""
+        return self.item_type is ItemType.PR and self.merged is not None
 
 
 def _header(headers: Mapping[str, Any], name: str) -> str:
@@ -179,6 +187,34 @@ def parse_event(platform: Platform, payload: Any) -> HookEvent:
             reason="事件体里没有仓库标识",
         )
 
+    # PR 关闭事件要区分「合并」与「放弃」：两者在平台上都是 action=closed。
+    # GitHub 在 `pull_request.merged` 里给布尔值；GitLab 的 `object_attributes.state`
+    # 直接是 merged/closed。
+    #
+    # **必须先确认这是关闭类事件**：GitHub 的 `pull_request.opened` 里 `merged` 也是
+    # `false`，只看那个字段会把"刚开的 PR"误判成"关闭未合并"，进而把条目打成
+    # needs_manual——每有人开 PR 就误伤一条。
+    merged: bool | None = None
+    if item_type is ItemType.PR:
+        action_l = (action or "").strip().lower()
+        state = _dig(payload, "object_attributes", "state")
+        state_l = state.strip().lower() if isinstance(state, str) else ""
+        is_closure = action_l in {"closed", "close", "merge", "merged"} or state_l in {
+            "merged",
+            "closed",
+        }
+        if is_closure:
+            raw_merged = _dig(payload, "pull_request", "merged")
+            if isinstance(raw_merged, bool):
+                merged = raw_merged
+            elif state_l in {"merged", "closed"}:
+                merged = state_l == "merged"
+
     return HookEvent(
-        platform=platform, repo_slug=slug, number=number, item_type=item_type, action=action
+        platform=platform,
+        repo_slug=slug,
+        number=number,
+        item_type=item_type,
+        action=action,
+        merged=merged,
     )

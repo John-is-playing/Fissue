@@ -26,9 +26,11 @@ from pathlib import Path
 from typing import Any
 
 from ..ai import prompts
+from ..ai.attribution import attribute_to
 from ..config import RepoConfig
 from ..logging_setup import get_logger
 from ..models import (
+    BlockReason,
     FixAttempt,
     FixOutcome,
     ItemStatus,
@@ -493,9 +495,27 @@ class AutoFixer:
         if (reason := self._policy_gate(item)) is not None:
             return self._skip(item, reason)
 
+        # 单条成本上限：按仓库/按天的预算管不住"某一条反复修十几轮"——一条卡住的
+        # 难 issue 能吃掉整天额度，而那些本来能修好的条目连机会都没有。
+        # 超限转 `needs_manual` 并记原因，由人决定值不值得继续，而不是继续烧。
+        per_item_limit = float(getattr(self.settings.llm.budget, "per_item_usd", 0.0) or 0.0)
+        if per_item_limit > 0:
+            spent = float(self.ctx.repo.usage_for_item(item.key)["cost_usd"])
+            if spent >= per_item_limit:
+                self.ctx.repo.set_item_status(
+                    item.key,
+                    ItemStatus.NEEDS_MANUAL,
+                    block_reason=BlockReason.BUDGET.value,
+                )
+                return self._skip(
+                    item,
+                    f"单条成本已达上限（已花 ${spent:.4f} ≥ 上限 ${per_item_limit:.4f}），"
+                    "转人工判断是否继续",
+                )
+
         verifier = self.ctx.repo.latest_verifier(item.key)
         if verifier is None:
-            return self._skip(item, "缺少验证器，无法验证修复")
+            return self._skip(item, "缺少验证器，无法验证修复", block_reason=BlockReason.MISSING_TEST)
         verifier_id, spec = verifier
         # 清单型不再是死胡同：修完后 LLM 在修复工作区上逐条重判
         # （见 :meth:`_judge_checklist_on_fix`），过没过同样能判定。
@@ -511,15 +531,16 @@ class AutoFixer:
             # 1) Agent 循环修复。之后三条关：
             #    * 完整 F2P / 既有测试回归门失败 → 带反馈重跑（`auto_fix.regression_retries`）
             #    * 自动评审给出 critical/major → 带评审意见重跑（`auto_fix.review_rounds`）
-            attempt, trace, final = await self._repair_loop(
-                item=item,
-                workspace=workspace,
-                spec=spec,
-                repo_cfg=repo_cfg,
-                verifier_id=verifier_id,
-                repo_context=repo_context,
-                max_rounds=max_rounds,
-            )
+            with attribute_to(item.key):
+                attempt, trace, final = await self._repair_loop(
+                    item=item,
+                    workspace=workspace,
+                    spec=spec,
+                    repo_cfg=repo_cfg,
+                    verifier_id=verifier_id,
+                    repo_context=repo_context,
+                    max_rounds=max_rounds,
+                )
             if attempt.outcome is not FixOutcome.SUCCESS:
                 return attempt
 
@@ -740,6 +761,13 @@ class AutoFixer:
 
         # report_manual：生成「人工复核报告」（discard 已在上方返回）
         attempt.outcome = FixOutcome.NEEDS_MANUAL
+        # 失败原因分类：回归门挂了就是"修不好"，其余留给 unknown——
+        # 猜错原因比不猜更糟（用户会照着错误的建议去改配置）。
+        lowered = regression_note.lower()
+        if "回归" in regression_note or "regression" in lowered:
+            self.ctx.repo.set_item_status(
+                item.key, ItemStatus.NEEDS_MANUAL, block_reason=BlockReason.REGRESSION.value
+            )
         try:
             path = self._write_manual_report(
                 item, attempt, trace, spec, regression_note=regression_note
@@ -1023,8 +1051,19 @@ class AutoFixer:
             return "已存在修复尝试，跳过以免重复提 PR"
         return None
 
-    def _skip(self, item: RawItem, reason: str) -> FixAttempt:
+    def _skip(
+        self, item: RawItem, reason: str, *, block_reason: BlockReason | None = None
+    ) -> FixAttempt:
+        """跳过这一条。``block_reason`` 非空时同时把条目转「需人工」并记下原因。
+
+        只记 SKIPPED 而不落状态时，用户看到的是"这条没动"——不知道该改什么。
+        带原因的跳过才会在详情页出现「为什么卡住 + 下一步」。
+        """
         log.info("跳过自动修复 %s：%s", item.key, reason)
+        if block_reason is not None:
+            self.ctx.repo.set_item_status(
+                item.key, ItemStatus.NEEDS_MANUAL, block_reason=block_reason.value
+            )
         attempt = FixAttempt(item_key=item.key, outcome=FixOutcome.SKIPPED, error=reason)
         return attempt
 

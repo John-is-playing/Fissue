@@ -335,7 +335,11 @@ def test_statuses_of_stage_covers_all_states_in_that_stage() -> None:
     assert set(statuses_of_stage("judge")) == {ItemStatus.QUEUED, ItemStatus.VERIFIED}
     assert set(statuses_of_stage("fix")) == {ItemStatus.FIX_QUEUED, ItemStatus.FIXING}
     assert set(statuses_of_stage("pr")) == {ItemStatus.PR_CREATED}
-    assert set(statuses_of_stage(DONE)) == {ItemStatus.LABELED, ItemStatus.SKIPPED}
+    assert set(statuses_of_stage(DONE)) == {
+        ItemStatus.LABELED,
+        ItemStatus.SKIPPED,
+        ItemStatus.MERGED,
+    }
     assert set(statuses_of_stage(STUCK)) == {ItemStatus.NEEDS_MANUAL, ItemStatus.FAILED}
 
 

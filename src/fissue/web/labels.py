@@ -30,6 +30,7 @@ STATUS_LABELS: dict[str, str] = {
     "fix_queued": "待修复",
     "fixing": "修复中",
     "pr_created": "已提 PR",
+    "merged": "已合并",
     "needs_manual": "需人工",
     "skipped": "已跳过",
     "failed": "失败",

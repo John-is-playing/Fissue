@@ -139,6 +139,12 @@ class BudgetConfig(BaseModel):
     daily_tokens_per_repo: int = Field(default=2_000_000, ge=0)
     daily_usd_per_repo: float = Field(default=5.0, ge=0)
     hard_stop: bool = True
+    #: **单条**条目的累计成本上限（美元）。0 = 不限。
+    #:
+    #: 为什么需要它：按仓库/按天的预算管的是总量，管不住"某一条反复修十几轮"——
+    #: 一条卡住的难 issue 能吃掉整天的额度，而那些本来能修好的条目连机会都没有。
+    #: 超过上限时该条转 `needs_manual` 并记 `block_reason=budget`，由人决定值不值得继续。
+    per_item_usd: float = Field(default=0.0, ge=0)
 
 
 class PricingConfig(BaseModel):

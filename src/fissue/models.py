@@ -75,6 +75,60 @@ class QueueName(str, Enum):
     FIX_FEATURE = "fix_feature"    # PR-FEATURE：合并 + 功能验证队列
 
 
+class BlockReason(str, Enum):
+    """条目卡在 ``needs_manual`` 的**原因**。
+
+    只记状态不记原因时，用户看到"需人工"只能自己去翻日志与 journal 猜。
+    每个取值都要能对应一句"下一步做什么"，否则不如不加。
+    """
+
+    MISSING_TEST = "missing_test"          # 找不到可执行的测试/验证方式
+    ENV_UNAVAILABLE = "env_unavailable"    # 沙盒、依赖或运行时不可用
+    PERMISSION = "permission"              # 令牌/权限不足（平台侧或远端）
+    MODEL_REFUSED = "model_refused"        # 模型拒答或输出反复不合约定
+    REGRESSION = "regression"              # 改了之后回归失败（修不好）
+    BUDGET = "budget"                      # 单条成本超上限，主动停手
+    PR_CLOSED = "pr_closed"                # PR 被关闭但未合并（人不想合）
+    UNKNOWN = "unknown"
+
+
+#: 卡住原因的展示文案与「下一步」。键与 :class:`BlockReason` 一一对应。
+BLOCK_REASON_TEXT: dict[str, tuple[str, str]] = {
+    BlockReason.MISSING_TEST.value: (
+        "缺少可执行的验证",
+        "在仓库配置里补 test_hint（例如 pytest tests/），或把这条设成清单型验证",
+    ),
+    BlockReason.ENV_UNAVAILABLE.value: (
+        "验证环境不可用",
+        "检查沙盒：`fissue sandbox check`；没有沙盒时先 `fissue sandbox serve`",
+    ),
+    BlockReason.PERMISSION.value: (
+        "权限不足",
+        "去「设置」页补平台令牌，或确认远端部署用户对目标目录有写权限",
+    ),
+    BlockReason.MODEL_REFUSED.value: (
+        "模型未给出可用结果",
+        "重跑一次；仍失败则检查模型端点与额度（详情页可看这次花了多少）",
+    ),
+    BlockReason.REGRESSION.value: (
+        "修复无法通过回归",
+        "看修复 diff 后手工改，或降低这条的优先级",
+    ),
+    BlockReason.BUDGET.value: (
+        "单条成本达到上限",
+        "在设置页调高 llm.budget.per_item_usd，或先人工判断值不值得继续",
+    ),
+    BlockReason.PR_CLOSED.value: (
+        "PR 被关闭（未合并）",
+        "人工决定：确认不再需要就跳过，或重开一轮修复",
+    ),
+    BlockReason.UNKNOWN.value: (
+        "原因未分类",
+        "看任务日志定位；若反复出现，把这一步的报错反馈出来",
+    ),
+}
+
+
 class ItemStatus(str, Enum):
     """条目在流水线中的状态。"""
 
@@ -89,6 +143,10 @@ class ItemStatus(str, Enum):
     FIX_QUEUED = "fix_queued"
     FIXING = "fixing"
     PR_CREATED = "pr_created"
+    #: PR 被**合并**：这是产品价值的落点（"真的修好了多少条"）。
+    #: 与 `pr_created` 分开而不是只加时间戳，是因为按状态筛选/统计是最常用的动作，
+    #: 每次都要多带一个条件的话，漏一处就会把"提了但没合"算成"修好了"。
+    MERGED = "merged"
     NEEDS_MANUAL = "needs_manual"
     SKIPPED = "skipped"
     FAILED = "failed"

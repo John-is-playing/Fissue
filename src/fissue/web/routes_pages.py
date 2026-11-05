@@ -17,7 +17,14 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from ..models import Category, ItemStatus, ItemType, Platform, Priority
+from ..models import (
+    BLOCK_REASON_TEXT,
+    Category,
+    ItemStatus,
+    ItemType,
+    Platform,
+    Priority,
+)
 from .app import (
     _aggregates_of,
     _enum_param,
@@ -488,6 +495,21 @@ def _register_web_config(app: FastAPI, templates: Jinja2Templates) -> None:
         )
 
 
+def _block_view(row: Any) -> dict[str, str] | None:
+    """把 ``items.block_reason`` 折成页面要的两行字（原因 + 下一步）。
+
+    取值不认识时落到 ``unknown`` 而不是报错：库里的历史数据、或将来新增的枚举值，
+    都不该让详情页 500。
+    """
+    if row is None:
+        return None
+    reason = getattr(row, "block_reason", None)
+    if not reason:
+        return None
+    title, next_step = BLOCK_REASON_TEXT.get(reason, BLOCK_REASON_TEXT["unknown"])
+    return {"reason": reason, "title": title, "next": next_step}
+
+
 def _patch_text(attempt: Any, data_dir: Any) -> str | None:
     """取这次修复的补丁正文，取不到就返回 None。
 
@@ -573,9 +595,15 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
                     runs, mode=_settings(request).verifier.regression_gate
                 ),
                 fixes=fixes,
+                # 这条累计花掉的 token / 美元（评测 + 验证 + 修复，含失败调用）。
+                # 只在详情页查一次、默认折叠展示：列表页每条都聚合一次会把首页拖慢，
+                # 而"这条值不值"是看详情时才关心的事。
+                cost=r.usage_for_item(key),
                 # 与 fixes 逐项对齐（下标一致）：模板里用 loop.index0 取。
                 # 单独传一份而不是塞进 FixAttempt：那是 pydantic 模型，加字段要动 schema，
                 # 而这份正文只在渲染这一页时有意义。
                 fix_patches=[_patch_text(f, data_dir) for f in fixes],
+                # 卡住原因 + 下一步：只给状态不给原因时，用户看到"需人工"只能自己去翻日志
+                block=_block_view(r.get_item_row(key)),
             ),
         )

@@ -36,6 +36,7 @@ from ..models import (
 )
 from ..store.repository import Repository
 from . import prompts
+from .attribution import attribute_to, item_key_now
 from .client import LLMClient, Usage, clamp01, clamp_score
 from .system_one import EdgeJevAdvisor
 
@@ -134,6 +135,7 @@ def _make_edgejev_usage_sink(repo: Repository):
         repo.record_usage(
             repo_key=repo_slug,
             purpose=kind or "edgejev",
+            item_key=item_key_now(),
             model=usage.model,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
@@ -572,11 +574,14 @@ class Evaluator:
             f"\n参考阈值：重要性 ≥ {self.cfg.thresholds.importance_high} 视为高；"
             f"难度 ≤ {self.cfg.thresholds.difficulty_low} 视为低。"
         )
-        data, usage = await self.client.chat_json(
-            prompts.evaluation_prompt(item, threshold_hint=threshold_hint, similar_issues=similar),
-            purpose=f"evaluate:{item.repo}",
-            default={},
-        )
+        with attribute_to(item.key):
+            data, usage = await self.client.chat_json(
+                prompts.evaluation_prompt(
+                    item, threshold_hint=threshold_hint, similar_issues=similar
+                ),
+                purpose=f"evaluate:{item.repo}",
+                default={},
+            )
 
         evaluation = parse_evaluation(data, model=usage.model, usage=usage)
         evaluation.category = category  # 以分类阶段结论为准
@@ -584,7 +589,8 @@ class Evaluator:
         evaluation.spam = backfill_duplicate_of(evaluation.spam, exclude=item.number)
         # 旁路打分必须在算优先级**之前**：weighted / replace 会改可行性、难度，
         # 而这两项直接决定 tier1/tier2。放在后面等于融合白做。
-        await self._apply_edgejev(item, evaluation)
+        with attribute_to(item.key):
+            await self._apply_edgejev(item, evaluation)
         evaluation.priority = compute_priority(
             evaluation,
             category=category,

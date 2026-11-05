@@ -110,6 +110,65 @@ def llm_usage_estimated_migration(dialect: str) -> tuple[str | None, str]:
     )
 
 
+def items_merged_at_migration(dialect: str) -> tuple[str | None, str]:
+    """``items.merged_at`` 补列：PR 被合并的时间。
+
+    与其它补列同一套口径。类型按方言分开写：SQLite 没有真正的时区类型，
+    PostgreSQL 用 ``TIMESTAMP WITH TIME ZONE``（与 ORM 侧 ``DateTime(timezone=True)`` 一致），
+    MySQL 用 ``DATETIME``。
+    """
+    if dialect == "postgresql":
+        return None, "ALTER TABLE items ADD COLUMN IF NOT EXISTS merged_at TIMESTAMP WITH TIME ZONE"
+    if dialect == "mysql":
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'items'",
+            "ALTER TABLE items ADD COLUMN merged_at DATETIME NULL",
+        )
+    return (
+        "SELECT name FROM pragma_table_info('items')",
+        "ALTER TABLE items ADD COLUMN merged_at TIMESTAMP NULL",
+    )
+
+
+def items_block_reason_migration(dialect: str) -> tuple[str | None, str]:
+    """``items.block_reason`` 补列：卡住的原因（取值见 ``models.BlockReason``）。"""
+    if dialect == "postgresql":
+        return None, "ALTER TABLE items ADD COLUMN IF NOT EXISTS block_reason VARCHAR(32)"
+    if dialect == "mysql":
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'items'",
+            "ALTER TABLE items ADD COLUMN block_reason VARCHAR(32) NULL",
+        )
+    return (
+        "SELECT name FROM pragma_table_info('items')",
+        "ALTER TABLE items ADD COLUMN block_reason VARCHAR(32) NULL",
+    )
+
+
+def llm_usage_item_key_migration(dialect: str) -> tuple[str | None, str]:
+    """``llm_usage.item_key`` 补列：把用量归到具体条目（"这条花了多少钱"）。
+
+    ``NOT NULL DEFAULT ''`` 而不是可空：老数据没有条目维度，空串就是"没有归属"，
+    查询侧不必到处判 NULL（``WHERE item_key = ?`` 天然排除它们）。
+    """
+    if dialect == "postgresql":
+        return None, (
+            "ALTER TABLE llm_usage ADD COLUMN IF NOT EXISTS item_key VARCHAR(640) NOT NULL DEFAULT ''"
+        )
+    if dialect == "mysql":
+        return (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() AND table_name = 'llm_usage'",
+            "ALTER TABLE llm_usage ADD COLUMN item_key VARCHAR(640) NOT NULL DEFAULT ''",
+        )
+    return (
+        "SELECT name FROM pragma_table_info('llm_usage')",
+        "ALTER TABLE llm_usage ADD COLUMN item_key VARCHAR(640) NOT NULL DEFAULT ''",
+    )
+
+
 class ColumnMigration(NamedTuple):
     """一次「补列」迁移的登记项。
 
@@ -135,6 +194,9 @@ MIGRATIONS: tuple[ColumnMigration, ...] = (
     ColumnMigration(1, "items.force_fix", "force_fix", force_fix_migration),
     ColumnMigration(2, "llm_usage.estimated", "estimated", llm_usage_estimated_migration),
     ColumnMigration(3, "evaluations.extras", "extras", evaluation_extras_migration),
+    ColumnMigration(4, "items.merged_at", "merged_at", items_merged_at_migration),
+    ColumnMigration(5, "items.block_reason", "block_reason", items_block_reason_migration),
+    ColumnMigration(6, "llm_usage.item_key", "item_key", llm_usage_item_key_migration),
 )
 
 #: 当前 schema 版本 = 最后一条迁移的版本号（空表时为 0）。

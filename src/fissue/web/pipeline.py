@@ -110,6 +110,9 @@ _STAGE_OF: dict[ItemStatus, str] = {
     ItemStatus.FIX_QUEUED: "fix",
     ItemStatus.FIXING: "fix",
     ItemStatus.PR_CREATED: "pr",
+    #: 已合并在看板里归「已完成」：它在等的是人，不是流水线——
+    #: 放进 `pr` 列会让"提 PR"这一列长期挂着一堆已经不用管的东西。
+    ItemStatus.MERGED: DONE,
     ItemStatus.LABELED: DONE,
     ItemStatus.SKIPPED: DONE,
     ItemStatus.NEEDS_MANUAL: STUCK,

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from ..ai.attribution import item_key_now
 from ..ai.client import BudgetGuard, LLMClient, Usage
 from ..ai.evaluator import Evaluator
 from ..config import RepoConfig, Settings, load_settings
@@ -287,6 +288,7 @@ def _make_usage_sink(repo: Repository):
         repo.record_usage(
             repo_key=repo_slug,
             purpose=kind or "unknown",
+            item_key=item_key_now(),
             model=usage.model,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,

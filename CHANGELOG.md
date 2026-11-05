@@ -38,6 +38,42 @@
 - 顺带修掉两类隐藏问题：`.expert-only`（简单/专家模式的显隐）与状态分布条
   `status-bar-*` 的配色此前没有样式定义，切换模式与分布条其实一直没生效。
 
+### 变更 —— 三处闭环：PR 合并回写、成本归因、卡住原因
+
+这三件事都不新增大功能面，而是把已有数据的价值释放出来。前两条是此前评估出的
+"半截功能"：
+
+- **PR 合并/关闭回写条目状态**：状态机原先停在 `pr_created`——PR 合了还是被关了，
+  条目都不变，于是"真的修好了多少条"永远算不出来。
+  - webhook 现在按 action 分派：`closed` + merged → 新增状态 `merged`（记 `merged_at`）；
+    `closed` 未合并 → `needs_manual` + `block_reason=pr_closed`（不自动回 `verified`：
+    没合并通常意味着人不想合，回队列只会反复烧钱）。
+  - 反查靠 `fix_attempts.pr_number`——事件里的编号是 PR 的，条目是按 issue 建的；
+    查不到说明这个 PR 不是我们提的（别人的 PR 关闭也会推），此时什么都不动。
+  - `merged` 在看板里归「已完成」，不再占用「提 PR」那一列。
+  - 修掉一个解析缺陷：GitHub 的 `pull_request.opened` 里 `merged` 也是 `false`，
+    只看该字段会把"刚开的 PR"误判成"关闭未合并"，每有人开 PR 就误伤一条条目。
+- **成本归因到条目**：`llm_usage` 原先只有 `repo_key`，回答不了"这条 PR 花了多少钱"。
+  - 新增 `llm_usage.item_key`（空串 = 无归属，部署规划/批量定论这类跨条目调用）；
+  - 归因用 `ContextVar` 在"每次处理一条"的入口设一次，所有下游调用（含将来新增的）
+    自动继承——给每个 `chat` 调用点加参数的话，漏一处就悄悄丢进空桶且不报错；
+  - 详情页新增**默认折叠**的「这条花了多少钱」（调用次数 / token / 美元），列表页不查
+    （每条聚合一次会把首页拖慢，而"这条值不值"是看详情时才关心的事）；
+  - **单条成本上限** `llm.budget.per_item_usd`（默认 0 = 不限）：超限转 `needs_manual` +
+    `block_reason=budget`。按仓库/按天的预算管不住"某一条反复修十几轮"，一条难 issue
+    能吃掉整天额度，本来能修好的条目连机会都没有。
+- **卡住原因结构化**：`needs_manual` 之前只是一个状态，用户只能自己去翻日志猜。
+  - 新增 `items.block_reason` 与 `BlockReason` 枚举（缺测试/环境不可用/权限/模型拒绝/
+    回归失败/预算/PR 未合并关闭/未分类），每个取值配一句「下一步做什么」；
+  - 埋点：缺验证器 → `missing_test`、回归失败 → `regression`、超预算 → `budget`、
+    PR 未合并关闭 → `pr_closed`；
+  - 详情页新增「为什么卡住」区块，带两个最稳的动作：重跑验证、去设置页。
+
+迁移 v4/v5/v6 新增三列（`items.merged_at`、`items.block_reason`、`llm_usage.item_key`），
+SQLite/PG 走 `ADD COLUMN IF NOT EXISTS`、MySQL 走 `information_schema`——与既有迁移同一套口径。
+
+用例 +23（PR 回写 9 / 成本与原因 9 / 既有回归同步 5），全量通过。
+
 ### 新增 —— 面向普通用户的六项改进
 
 这一轮的目标是"让不懂运维的人也能用起来"，每项都对应一个具体流失点：

@@ -150,6 +150,12 @@ class ItemRow(Base):
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: PR 被合并的时间。有了它才能回答"修好这条花了多久"——只用状态看不到时长。
+    #: 旧库由 `db.MIGRATIONS` 的 v4 补列。
+    merged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: 卡住的**原因**（取值见 `fissue.models.BlockReason`）。
+    #: 只记状态不记原因时，用户看到"需人工"只能自己去翻日志。
+    block_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     raw: Mapped[dict] = _json_col()
@@ -323,6 +329,13 @@ class LLMUsageRow(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     repo_key: Mapped[str] = mapped_column(String(KEY_LEN), index=True, default="")
+    #: 这条用量属于**哪一条条目**（"这条 PR 花了多少钱"的唯一依据）。
+    #: 空串表示"没有具体条目"（部署规划、批量定论这类跨条目调用）。
+    #: ``server_default`` 不能省：裸 SQL 的 INSERT（迁移脚本/测试/排障手写）不会带这一列，
+    #: 只有 Python 侧 ``default`` 的话会直接撞 NOT NULL——``estimated`` 列当初就踩过。
+    item_key: Mapped[str] = mapped_column(
+        String(KEY_LEN), index=True, default="", server_default=text("''")
+    )
     purpose: Mapped[str] = mapped_column(String(48), index=True, default="")   # classify|evaluate|verifier|batch|fix|agent
     model: Mapped[str] = mapped_column(String(128), default="")
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)

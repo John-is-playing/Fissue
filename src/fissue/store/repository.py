@@ -21,6 +21,7 @@ from ..models import (
     STALE_KEY,
     AuthorKind,
     BatchConclusion,
+    BlockReason,
     Category,
     Comment,
     Evaluation,
@@ -501,6 +502,7 @@ class Repository:
         *,
         category: Category | None = None,
         priority: Priority | None = None,
+        block_reason: str | None = None,
     ) -> None:
         with self.db.session() as s:
             values: dict[str, Any] = {"status": status.value}
@@ -508,6 +510,9 @@ class Repository:
                 values["category"] = category.value
             if priority is not None:
                 values["priority"] = priority.value
+            # None = 不动这一列（默认），空串 = 显式清除——两种情况语义不同，不能混
+            if block_reason is not None:
+                values["block_reason"] = block_reason
             s.execute(update(ItemRow).where(ItemRow.key == key).values(**values))
 
     def set_force_fix(self, key: str, value: bool) -> RawItem | None:
@@ -864,6 +869,40 @@ class Repository:
 
             s.flush()
             return int(row.id)
+
+    def apply_pr_outcome(self, *, repo_slug: str, pr_number: int, merged: bool) -> str | None:
+        """把平台上的 PR 合并/关闭结果回写到条目，返回被更新的 item_key（没对上则 None）。
+
+        为什么要反查：webhook 事件里的 ``number`` 是 **PR 的编号**，而条目是按 issue
+        编号建的；两者唯一的关联是 :class:`FixAttemptRow.pr_number`。查不到说明这个 PR
+        不是我们提的——别人的 PR 关闭事件也会推过来，此时**什么都不该动**。
+
+        * 合并 → ``merged`` + ``merged_at``（产品价值的落点：真的修好了多少条）
+        * 关闭但未合并 → ``needs_manual`` + ``block_reason=pr_closed``
+          （不自动回 ``verified``：没合并通常意味着人不想合，回队列只会反复烧钱）
+        """
+        with self.db.session() as s:
+            attempts = list(
+                s.scalars(
+                    select(FixAttemptRow)
+                    .where(FixAttemptRow.pr_number == pr_number)
+                    .order_by(FixAttemptRow.id.desc())
+                )
+            )
+            for attempt in attempts:
+                item = s.scalar(select(ItemRow).where(ItemRow.key == attempt.item_key))
+                if item is None or item.repo_slug != repo_slug:
+                    continue
+                if merged:
+                    item.status = ItemStatus.MERGED.value
+                    item.merged_at = _now()
+                    item.block_reason = None
+                else:
+                    item.status = ItemStatus.NEEDS_MANUAL.value
+                    item.block_reason = BlockReason.PR_CLOSED.value
+                s.flush()
+                return item.key
+        return None
 
     def latest_evaluation(self, item_key: str) -> Evaluation | None:
         with self.db.session() as s:
@@ -1723,6 +1762,7 @@ class Repository:
         *,
         repo_key: str,
         purpose: str,
+        item_key: str = "",
         model: str,
         prompt_tokens: int,
         completion_tokens: int,
@@ -1735,6 +1775,7 @@ class Repository:
                 LLMUsageRow(
                     repo_key=repo_key,
                     purpose=purpose,
+                    item_key=item_key,
                     model=model,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
@@ -1743,6 +1784,27 @@ class Repository:
                     estimated=estimated,
                 )
             )
+
+    def usage_for_item(self, item_key: str) -> dict[str, float]:
+        """这条条目累计花了多少（评测 + 验证 + 修复 + 裁决，含失败调用）。
+
+        失败调用也算钱：模型被调用了就产生费用，把失败排除会让"最贵的那条"看起来最便宜。
+        """
+        with self.db.session() as s:
+            prompt, completion, usd, calls = s.execute(
+                select(
+                    func.coalesce(func.sum(LLMUsageRow.prompt_tokens), 0),
+                    func.coalesce(func.sum(LLMUsageRow.completion_tokens), 0),
+                    func.coalesce(func.sum(LLMUsageRow.cost_usd), 0.0),
+                    func.count(LLMUsageRow.id),
+                ).where(LLMUsageRow.item_key == item_key)
+            ).one()
+        return {
+            "prompt_tokens": float(prompt),
+            "completion_tokens": float(completion),
+            "cost_usd": float(usd),
+            "calls": float(calls),
+        }
 
     @staticmethod
     def _day_start(now: datetime | None = None) -> datetime:

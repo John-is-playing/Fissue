@@ -108,6 +108,25 @@
 </div>
 {% endif %}
 
+{# 卡住原因：只显示状态（"需人工"）而不说原因时，用户只能自己去翻日志。
+   这里给一句"下一步"，并放两个最稳的动作——重跑验证（不用重新评测）与去设置页。 #}
+{% if block %}
+<div class="panel">
+  <h2>为什么卡住</h2>
+  <div class="alert warn">
+    <span class="a-level">{{ block.title }}</span>
+    <div>
+      <div>{{ block.next }}</div>
+      <div class="muted small">原因分类：<code class="code-inline">{{ block.reason }}</code></div>
+    </div>
+  </div>
+  <div class="pipe-acts">
+    <button type="button" class="ghost small" onclick="reVerify()">重跑验证</button>
+    <a class="small" href="/settings">去设置页</a>
+  </div>
+</div>
+{% endif %}
+
 <div class="panel">
   <h2>基本信息</h2>
   <div class="kv">
@@ -289,6 +308,25 @@
   <div class="muted small">置信度 {{ '%.2f' % conclusion.confidence }}</div>
 </details>
 {% endif %}
+
+{# 成本：默认折叠。放在这里而不是列表页——列表页每条聚合一次会把首页拖慢，
+   而"这条值不值"是看详情时才关心的事，也避免用户被一堆金额吓到。 #}
+<details class="panel collapsible">
+  <summary>这条花了多少钱</summary>
+  <div class="kv">
+    <div class="k">累计调用</div>
+    <div class="v">{{ cost.calls | int }} 次</div>
+    <div class="k">输入 / 输出 token</div>
+    <div class="v"><span class="num">{{ cost.prompt_tokens | int }}</span> / <span class="num">{{ cost.completion_tokens | int }}</span></div>
+    <div class="k">累计成本</div>
+    <div class="v num">${{ '%.4f' | format(cost.cost_usd) }}</div>
+  </div>
+  <div class="muted small mt">
+    含评测、验证器生成与修复的调用；<b>失败调用也算</b>——模型被调用了就产生费用，
+    把它排除会让"最贵的那条"看起来最便宜。
+    {% if not cost.calls %}这条还没有模型调用记录（可能是纯规则处理的）。{% endif %}
+  </div>
+</details>
 
 {% if verifier or runs or regression or fixes %}
 <details class="panel collapsible section-group expert-only">

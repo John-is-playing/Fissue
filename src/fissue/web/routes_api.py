@@ -593,6 +593,29 @@ def _register_api_webhooks(app: FastAPI, prefix: str, auth: Any) -> None:
             return {"accepted": False, "reason": f"仓库未登记或未启用：{event.repo_slug}"}
 
         # 立刻回 202，重活交给后台：平台对回调有超时与重试，不能让它们等着我们跑完一轮。
+        # PR 被合并/关闭：先把结果回写到条目（这是"真的修好了多少条"的唯一来源），
+        # 再触发一轮抓取。回写是同步的一次查询+更新，很快；查不到说明这个 PR 不是我们提的，
+        # 别人的 PR 关闭事件也会推过来，此时什么都不该动。
+        applied: dict[str, Any] | None = None
+        if event.is_pr_closure:
+            raw_number = event.number
+            pr_number = (
+                int(str(raw_number))
+                if raw_number is not None and str(raw_number).isdigit()
+                else None
+            )
+            if pr_number is not None:
+                item_key = _repo(request).apply_pr_outcome(
+                    repo_slug=event.repo_slug, pr_number=pr_number, merged=bool(event.merged)
+                )
+                if item_key:
+                    applied = {"item": item_key, "merged": bool(event.merged)}
+                    log.info(
+                        "webhook 回写：%s → %s",
+                        item_key,
+                        "merged" if event.merged else "needs_manual（PR 未合并关闭）",
+                    )
+
         background.add_task(_run_round_after_hook, settings)
         log.info(
             "webhook（%s）%s %s#%s 已接受，后台触发一轮",
@@ -604,6 +627,7 @@ def _register_api_webhooks(app: FastAPI, prefix: str, auth: Any) -> None:
             "number": event.number,
             "item_type": event.item_type.value,
             "action": event.action,
+            "applied": applied,
             "note": "已在后台触发一轮（抓取 → 评测 → 验证 → flush → 修复）",
         }
 
