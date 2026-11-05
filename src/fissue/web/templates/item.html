@@ -450,6 +450,26 @@
            不再让人为了看一眼改了什么去文件系统里翻。 #}
         <td class="small">
           {% set patch = fix_patches[loop.index0] if (fix_patches is defined and fix_patches | length > loop.index0) else none %}
+          {# 改动概览 + 风险：diff 本身是几十行加减号，非工程用户看不出哪一行危险。
+             真正该被指出来的是「删断言 / 只改测试 / 动 CI / 改动面过大」这几类信号，
+             由后端按文本判定（稳定可复现，不依赖模型）。 #}
+          {% set impact = fix_impacts[loop.index0] if (fix_impacts is defined and fix_impacts | length > loop.index0) else none %}
+          {% if impact and (impact.files or impact.added or impact.removed) %}
+          <div class="inline tight-bottom">
+            <span class="tag {{ impact.risk_class }}" title="风险基于 diff 文本判定：删断言 / 只改测试 / 动 CI / 改动面">{{ impact.risk_label }}</span>
+            <span class="muted small">
+              {{ impact.files }} 个文件
+              · <span class="ok">+{{ impact.added }}</span> / <span class="bad">−{{ impact.removed }}</span>
+              {% if impact.test_files %}· 测试 {{ impact.test_files }} 个{% endif %}
+            </span>
+          </div>
+          <details class="mt">
+            <summary class="small">为什么是这个风险</summary>
+            <ul class="muted small">
+              {% for reason in impact.reasons %}<li>{{ reason }}</li>{% endfor %}
+            </ul>
+          </details>
+          {% endif %}
           {% if f.patch_path %}<div><code>{{ f.patch_path }}</code><button type="button" class="copy-btn" data-copy="{{ f.patch_path }}" title="复制补丁路径">复制</button></div>{% endif %}
           {% if f.changed_files %}
           <ul class="muted">{% for path in f.changed_files %}<li><code>{{ path }}</code></li>{% endfor %}</ul>

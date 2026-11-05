@@ -47,6 +47,8 @@ class Digest:
     fix_needs_manual: int = 0
     fix_failed: int = 0
     merged: int = 0
+    #: 当前处于「已提 PR 等评审」的条数（不看窗口：它回答"现在有几件在等我点头"）
+    pr_created: int = 0
     needs_manual: int = 0
     #: 卡住原因 → 条数（降序）
     blocked: list[tuple[str, int]] = field(default_factory=list)
@@ -124,6 +126,14 @@ def build_digest(
             ).all()
         ]
 
+        pr_created = int(
+            session.scalar(
+                select(func.count())
+                .select_from(ItemRow)
+                .where(ItemRow.status == "pr_created")
+            )
+            or 0
+        )
         blocked = [
             (str(reason or "unknown"), int(count))
             for reason, count in session.execute(
@@ -154,6 +164,7 @@ def build_digest(
         fix_needs_manual=int(outcomes.get("needs_manual", 0)),
         fix_failed=int(outcomes.get("failed", 0)),
         merged=merged,
+        pr_created=pr_created,
         needs_manual=sum(count for _, count in blocked),
         blocked=blocked,
         cost_usd=cost,

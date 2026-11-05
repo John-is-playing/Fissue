@@ -77,6 +77,9 @@
        「现在有没有卡住」这个主题淹掉；它自己带筛选与分页。
        「队列」并进了流水线看板（判定就在那一屏做决定），旧地址 `/queues` 保留重定向。 #}
     <nav class="nav">
+      {# 业务视图放第一项：它是给"只关心修好没有、花了多少"的人的第一入口。
+         工程细节仍在流水线/条目两页，不混在一起。 #}
+      <a href="/biz" class="{{ 'on' if nav == 'biz' }}">业务</a>
       <a href="/pipeline" class="{{ 'on' if nav == 'pipeline' }}">流水线</a>
       <a href="/items" class="{{ 'on' if nav == 'items' }}">条目</a>
       <a href="/jobs" class="{{ 'on' if nav == 'jobs' }}">任务</a>

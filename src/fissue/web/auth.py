@@ -1076,6 +1076,8 @@ def _register_api_keys_page(app: FastAPI) -> None:
 
 #: 需要身份的页面路径（前缀匹配）。`/login` 与 `/static` 不在其列。
 PAGE_PREFIXES = (
+    # 业务视图：页面上有仓库名、条目标题与"需要你处理"的清单，与总览同级
+    "/biz",
     "/items",
     "/status",
     "/queues",

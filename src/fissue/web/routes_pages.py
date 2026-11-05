@@ -10,12 +10,14 @@ app.py（它们同时被 REST API 与后台缓存使用）。
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 
 from ..models import (
     BLOCK_REASON_TEXT,
@@ -46,6 +48,7 @@ def register_web(app: FastAPI, settings: Any, templates: Jinja2Templates) -> Non
     """
     _register_web_pipeline(app, templates)
     _register_web_overview(app, templates)
+    _register_web_biz(app, templates)
     _register_web_items(app, templates)
     _register_web_status(app, templates)
     _register_web_jobs(app, templates)
@@ -106,6 +109,80 @@ def _register_web_pipeline(app: FastAPI, templates: Jinja2Templates) -> None:
                 stages=list(view.STAGES),
                 repo_filter=repo_slug or "",
                 **_queue_block(request),
+            ),
+        )
+
+
+def _register_web_biz(app: FastAPI, templates: Jinja2Templates) -> None:
+    """业务视图：只回答三个问题——修好了多少、花了多少、需要你点几件事。
+
+    与「总览」的分工：总览是**操作台**（队列、评分、告警、控制面板）；
+    这一页是**给不做工程的人看的**，刻意不出现"验证器/回归门/优先级"这类词。
+    多一个页面而不是切换开关，是因为受众不同：让工程页面同时讨好两类人，
+    最后两边都不好用。
+    """
+
+    @app.get("/biz", response_class=HTMLResponse)
+    async def biz_page(request: Request) -> HTMLResponse:
+        from ..service.digest import build_digest
+        from ..store.tables import ItemRow
+
+        repo = _repo(request)
+        settings = _settings(request)
+        window_days = 7
+        digest = build_digest(
+            repo, since=datetime.now(timezone.utc) - timedelta(days=window_days)
+        )
+
+        blocked: list[dict[str, Any]] = []
+        merged_items: list[dict[str, Any]] = []
+        with repo.db.session() as session:
+            rows = session.scalars(
+                select(ItemRow)
+                .where(ItemRow.status == ItemStatus.NEEDS_MANUAL.value)
+                .order_by(ItemRow.updated_at.desc())
+                .limit(20)
+            )
+            for row in rows:
+                label, next_step = BLOCK_REASON_TEXT.get(
+                    row.block_reason or "unknown", BLOCK_REASON_TEXT["unknown"]
+                )
+                blocked.append(
+                    {
+                        "key": row.key,
+                        "title": row.title,
+                        "repo_slug": row.repo_slug,
+                        "reason": label,
+                        "next_step": next_step,
+                    }
+                )
+            merged_rows = session.scalars(
+                select(ItemRow)
+                .where(ItemRow.status == ItemStatus.MERGED.value)
+                .order_by(ItemRow.merged_at.desc())
+                .limit(10)
+            )
+            for row in merged_rows:
+                merged_items.append(
+                    {
+                        "key": row.key,
+                        "title": row.title,
+                        "repo_slug": row.repo_slug,
+                        "merged_at": row.merged_at,
+                    }
+                )
+
+        return templates.TemplateResponse(
+            request,
+            "biz.html",
+            _page_context(
+                request,
+                nav="biz",
+                digest=digest,
+                window_days=window_days,
+                blocked=blocked,
+                merged_items=merged_items,
+                usd_to_cny=settings.llm.pricing.usd_to_cny,
             ),
         )
 
@@ -513,6 +590,13 @@ def _block_view(row: Any) -> dict[str, str] | None:
     return {"reason": reason, "title": title, "next": next_step}
 
 
+def _impact_of(fix: Any) -> Any:
+    """一次修复的改动概览与风险判定（diff 文本分析，见 ``fixer/impact.py``）。"""
+    from ..fixer.impact import analyze
+
+    return analyze(fix.diff or "", changed_files=list(fix.changed_files or []))
+
+
 def _patch_text(attempt: Any, data_dir: Any) -> str | None:
     """取这次修复的补丁正文，取不到就返回 None。
 
@@ -607,6 +691,9 @@ def _register_web_item_detail(app: FastAPI, templates: Jinja2Templates) -> None:
                 # 单独传一份而不是塞进 FixAttempt：那是 pydantic 模型，加字段要动 schema，
                 # 而这份正文只在渲染这一页时有意义。
                 fix_patches=[_patch_text(f, data_dir) for f in fixes],
+                # 改动概览与风险：与 fixes 逐项对齐（下标一致）。判定纯基于 diff 文本，
+                # 不调模型——风险提示必须稳定可复现。
+                fix_impacts=[_impact_of(f) for f in fixes],
                 # 卡住原因 + 下一步：只给状态不给原因时，用户看到"需人工"只能自己去翻日志
                 block=_block_view(r.get_item_row(key)),
             ),

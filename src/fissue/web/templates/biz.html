@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}业务总览 · Fissue{% endblock %}
+{% block heading %}业务总览{% endblock %}
+{% block subtitle %}最近 {{ window_days }} 天：修好了多少、花了多少、还剩几件事要你点头。这一页刻意不谈工程细节。{% endblock %}
+
+{% block content %}
+
+{# 一句话结论放在最上面：不做工程的人只想知道"现在要不要我管"。
+   下面所有数字都是这句话的展开。 #}
+<div class="panel hero">
+  <div class="hero-title">
+    {% if digest.merged %}
+    最近 {{ window_days }} 天，AI 修好了 {{ digest.merged }} 个问题并已合入。
+    {% elif digest.pr_created %}
+    最近 {{ window_days }} 天，AI 提了 {{ digest.pr_created }} 个修复等你评审。
+    {% else %}
+    最近 {{ window_days }} 天还没有修好的问题。
+    {% endif %}
+  </div>
+  <div class="hero-text">
+    花费约 {{ digest.cost_usd | money(usd_to_cny) }}，
+    {% if digest.needs_manual %}
+    还有 <b>{{ digest.needs_manual }}</b> 件事需要你处理。
+    {% else %}
+    没有需要你处理的事。
+    {% endif %}
+  </div>
+</div>
+
+<div class="stat-grid">
+  <div class="stat {{ 'is-ok' if digest.merged else '' }}">
+    <span class="stat-label">修好并合入</span>
+    <span class="stat-value">{{ digest.merged }}</span>
+  </div>
+  <div class="stat {{ 'is-warn' if digest.pr_created else '' }}">
+    <span class="stat-label">等你评审</span>
+    <span class="stat-value">{{ digest.pr_created }}</span>
+  </div>
+  <div class="stat {{ 'is-bad' if digest.needs_manual else '' }}">
+    <span class="stat-label">需要你处理</span>
+    <span class="stat-value">{{ digest.needs_manual }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">{{ window_days }} 天花费</span>
+    <span class="stat-value">{{ digest.cost_usd | money(usd_to_cny) }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">本月预计</span>
+    <span class="stat-value">{{ digest.month_forecast_usd | money(usd_to_cny) }}</span>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>需要你点一下的：{{ blocked | length }} 件{% if digest.needs_manual > blocked | length %}（另有 {{ digest.needs_manual - blocked | length }} 件）{% endif %}</h2>
+  {% if blocked %}
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th scope="col">问题</th><th scope="col">为什么卡住</th><th scope="col">下一步</th><th scope="col">动作</th></tr>
+      </thead>
+      <tbody>
+        {% for row in blocked %}
+        <tr>
+          <td>
+            <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo_slug }}</a>
+            <div class="small muted">{{ row.title | truncate(70) }}</div>
+          </td>
+          <td><span class="tag warn">{{ row.reason }}</span></td>
+          <td class="small muted">{{ row.next_step }}</td>
+          <td><a class="small" href="/item/{{ row.key | urlencode }}">去看看</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">没有卡住的问题——不用你处理。</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>最近修好的</h2>
+  {% if merged_items %}
+  <div class="stack">
+    {% for row in merged_items %}
+    <div class="row">
+      <a href="/item/{{ row.key | urlencode }}" class="mono">{{ row.repo_slug }}</a>
+      <span class="muted small">{{ row.title | truncate(70) }}</span>
+      <span class="spacer"></span>
+      <span class="tag ok">已合入</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p class="empty">还没有已合入的修复。</p>
+  {% endif %}
+</div>
+
+<div class="panel">
+  <h2>这一页是什么</h2>
+  <p class="muted small">
+    它只回答三件事：修好了多少、花了多少、需要你点几件事。所有工程细节都在
+    「流水线」与「条目」两页——这一页刻意不提，否则不做工程的人又得先读一遍术语。
+    「修好并合入」只统计 PR 真的被合并的条目——提了 PR 但没人合并，不算修好。
+  </p>
+</div>
+
+{% endblock %}
