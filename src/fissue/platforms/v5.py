@@ -580,21 +580,75 @@ class V5Adapter(PlatformAdapter):
             """
             return await self.find_open_pr(upstream, head=head)
 
-        data = await self._post(
-            f"{self._repo_api(upstream)}/pulls",
-            {"title": title, "head": head_ref, "base": base, "body": body, "draft": draft},
-            probe=_probe,
-        )
+        try:
+            data = await self._post(
+                f"{self._repo_api(upstream)}/pulls",
+                {"title": title, "head": head_ref, "base": base, "body": body, "draft": draft},
+                probe=_probe,
+            )
+        except PlatformError as exc:
+            # 同一个 head 上已经有 open PR 时，AtomGit 回 409（实测报文：
+            # `Another open merge request already exists for this source branch: !3`）。
+            # **这不是失败**——目标状态已经达成。不处理的话调用方会把「其实已成功」
+            # 记成失败：条目转 needs_manual 并反复重试同一个分支，而那个 PR 一直开着。
+            # 复用而不是重复创建，也正好符合「同一 head 不重复建 PR」的既定约定。
+            if not self._is_pr_exists_error(exc):
+                raise
+            existing = await _probe()
+            if not isinstance(existing, dict) or not existing.get("number"):
+                raise
+            log.info(
+                "[%s] 同一分支已有 PR #%s，复用它（不重复创建）",
+                self.platform.value, existing.get("number"),
+            )
+            return self._pr_result(upstream, existing.get("number"), existing.get("url"))
         if not isinstance(data, dict):
             raise PlatformError(f"创建 PR 返回异常：{data}")
-        return {
-            "number": data.get("number") or data.get("id"),
-            "url": data.get("html_url") or data.get("url"),
-        }
+        return self._pr_result(
+            upstream,
+            data.get("number") or data.get("id"),
+            data.get("html_url") or data.get("url"),
+        )
+
+    #: 各平台表达「同一 head 已有 open PR」的说法（409 / 业务错误码都靠这句认）。
+    _PR_EXISTS_HINTS = (
+        "already exists",
+        "already been taken",
+        "already open",
+        "another open merge request",
+        "已存在",
+    )
+
+    @classmethod
+    def _is_pr_exists_error(cls, exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(hint in text for hint in cls._PR_EXISTS_HINTS)
+
+    def _pr_result(
+        self, upstream: RepoRef, number: Any, url: str | None
+    ) -> dict[str, Any]:
+        """统一的 PR 返回：编号 + 链接，平台不给链接时按**网页段**拼一条。"""
+        if not url and number:
+            # AtomGit 的 `POST /pulls` 响应里**没有** `html_url`/`url`，只有一个
+            # `web_url`——而且那个 `web_url` 是**列表页**（`…/merge_requests`，不带编号），
+            # 直接拿来当 PR 链接会把人送到列表。GET 单个 PR 才给 `html_url`。
+            # 所以按网页段自己拼一条：比返回 None 好——None 会让条目详情页的 PR 链接
+            # 变成空的，用户点不到自己刚提的那个 PR。
+            try:
+                url = self.item_url(upstream, number, ItemType.PR)
+            except Exception:  # noqa: BLE001 - 拼不出来就退回 None，不影响建 PR 成功
+                url = None
+        return {"number": number, "url": url}
 
     def item_url(self, repo: RepoRef, number: int | str, item_type: ItemType) -> str:
-        seg = self.issue_segment if item_type is ItemType.ISSUE else self.pr_segment
+        seg = self.issue_segment if item_type is ItemType.ISSUE else self.pr_web_segment
         return f"https://{self.web_host}/{repo.owner}/{repo.name}/{seg}/{number}"
 
     issue_segment: str = "issues"
+    #: **API** 端点的段名（`/repos/{owner}/{repo}/{pr_segment}/{n}`）。
     pr_segment: str = "pulls"
+    #: **网页**链接的段名，默认与 API 相同。
+    #:
+    #: 为什么必须分开：AtomGit 的 API 是 `/pulls`，网页却是 `/merge_requests`——两者
+    #: 混用会让条目页上的 PR 链接 404（实测 `…/pulls/2` 打不开，`…/merge_requests/2` 才行）。
+    pr_web_segment: str = "pulls"

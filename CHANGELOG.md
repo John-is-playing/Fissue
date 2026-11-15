@@ -15,6 +15,29 @@
 
 > **未发布**：`v1.3.1` 之后的变更。
 
+### 修复 —— AtomGit 提 PR：链接缺失与 409 不复用
+
+在真实仓库上实测（探针 `qiaoen_python/fissue-platform-probe`，PR #1/#2/#3 全部建成功），
+暴露三处问题，都已修：
+
+- **`create_pr` 返回 `url: None`**：AtomGit 的 `POST /pulls` 响应里**没有** `html_url`/`url`，
+  只有一个 `web_url`，而它还是**列表页**（`…/merge_requests`，不带编号）。后果是条目详情页
+  的 PR 链接空着，用户点不到自己刚提的那个 PR。改为按网页段拼一条。
+- **PR 网页段与 API 段不同**：AtomGit 网页是 `/merge_requests/{n}`、API 是 `/pulls/{n}`，
+  而 `item_url` 此前复用同一个 `pr_segment` 拼网页，产出 `…/pulls/2`——实测打不开。
+  拆出 `pr_web_segment`（默认等于 `pr_segment`，AtomGit 覆写为 `merge_requests`）。
+- **同一分支重复提 PR 的 409 被当失败**：平台报文是 `Another open merge request already
+  exists for this source branch: !3`。这不是失败——目标状态已经达成，但原实现直接抛错，
+  会让条目转 `needs_manual` 并反复重试同一个分支。改为识别「已存在」类错误后复用
+  `find_open_pr` 的结果；**其他原因的 409（分支保护等）照原样抛**，不吞。
+
+**能力矩阵补上「提 PR」一栏**——此前这一栏根本不存在，而它恰恰是 Fissue 的核心产出。
+GitHub / AtomGit 记 `True`（实测通过），Gitee / GitLab 留 `None`（未测过，不拿别人的
+结论外推）。
+
+用例 +7（网页段分离、Gitee 不受影响、链接回退、409 复用、无关 409 仍抛、错误话术识别、
+能力矩阵断言）。
+
 ### 变更 —— Web UI 全面重做（纸感极简 + 浅色/深色）
 
 - **视觉方向**：Notion / Craft 式的「纸」——米白底、极细分割线、几乎无装饰，

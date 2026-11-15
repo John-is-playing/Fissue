@@ -26,6 +26,9 @@ class AtomGitAdapter(V5Adapter):
     web_host = "atomgit.com"
     api_version_header = "2023-02-21"
     pr_segment = "pulls"
+    #: **网页**链接段：AtomGit 的 PR 页面是 `/merge_requests/{n}`，而 API 是 `/pulls/{n}`。
+    #: 混用会让条目页上的 PR 链接 404（实测：`…/pulls/2` 打不开，`…/merge_requests/2` 才行）。
+    pr_web_segment = "merge_requests"
 
     # -- 标签写接口：形状与 Gitee 不同（实测，别照 v5 默认写）------------------
     #

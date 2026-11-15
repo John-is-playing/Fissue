@@ -38,6 +38,9 @@ class PlatformCapabilities(NamedTuple):
     #: 真有一天要提 Issue，结论已经在这儿了。
     create_issue: bool | None
     update_issue: bool | None
+    #: 提 PR —— Fissue 的**核心产出**。此前这一栏根本不存在，于是「这个平台能不能提 PR」
+    #: 只能靠读代码或真跑一遍才知道。填 True 只在实测通过之后。
+    create_pr: bool | None = None
     #: 一句话说明「已知做不到的那部分」；空串表示没有已知限制。
     known_limit: str = ""
 
@@ -46,32 +49,37 @@ class PlatformCapabilities(NamedTuple):
 CAPABILITIES: dict[Platform, PlatformCapabilities] = {
     Platform.GITHUB: PlatformCapabilities(
         read=True, clone=True, write_labels=True, write_comments=True,
-        push_branch=True, create_issue=True, update_issue=True,
+        push_branch=True, create_issue=True, update_issue=True, create_pr=True,
     ),
     Platform.GITEE: PlatformCapabilities(
         read=True, clone=True, write_labels=True, write_comments=True,
-        push_branch=True, create_issue=False, update_issue=False,
+        push_branch=True, create_issue=False, update_issue=False, create_pr=None,
         known_limit=(
             "建/改 Issue 返回 404：已排除令牌类型、仓库可见性与 Bearer 通道，"
             "待企业版空间复核（BENCHMARK §4.16）"
         ),
     ),
-    # AtomGit / GitLab 的写（打标签、评论、推分支）已验证；建/改 Issue 没试过，
-    # 因此留 None 而不是跟着 GitHub 一起写 True。
+    # AtomGit 的提 PR **已实测通过**（2026-11-15，探针仓库 qiaoen_python/fissue-platform-probe：
+    # 建 PR #1/#2/#3 成功、同分支重复提交回 409 后复用已有 PR）。
+    # 但实测同时暴露两处适配缺陷，已一并修掉：POST 响应不给 `html_url`（链接要自己拼）、
+    # PR 网页段是 `/merge_requests` 而 API 段是 `/pulls`。
+    # 建/改 Issue 仍然没试过，留 None。
     Platform.ATOMGIT: PlatformCapabilities(
         read=True, clone=True, write_labels=True, write_comments=True,
-        push_branch=True, create_issue=None, update_issue=None,
+        push_branch=True, create_issue=None, update_issue=None, create_pr=True,
     ),
+    # GitLab 的提 PR（Merge Request）**仍未实测**：它的适配器是独立实现，与 v5 不同源，
+    # 不能拿 AtomGit 的结论外推。
     Platform.GITLAB: PlatformCapabilities(
         read=True, clone=True, write_labels=True, write_comments=True,
-        push_branch=True, create_issue=None, update_issue=None,
+        push_branch=True, create_issue=None, update_issue=None, create_pr=None,
     ),
 }
 
 #: 未登记平台的兜底：全部「未测量」。
 UNKNOWN = PlatformCapabilities(
     read=None, clone=None, write_labels=None, write_comments=None,
-    push_branch=None, create_issue=None, update_issue=None,
+    push_branch=None, create_issue=None, update_issue=None, create_pr=None,
 )
 
 #: 能力字段 → 界面用的人话。README 与 doctor 共用同一套叫法，免得两处各起一个名字。
@@ -83,6 +91,7 @@ CAPABILITY_LABELS: tuple[tuple[str, str], ...] = (
     ("push_branch", "推分支"),
     ("create_issue", "建 Issue"),
     ("update_issue", "改 Issue"),
+    ("create_pr", "提 PR"),
 )
 
 
