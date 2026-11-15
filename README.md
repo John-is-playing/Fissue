@@ -92,6 +92,7 @@ docker compose up -d      # 首次构建镜像约 2~4 分钟
 | `fissue report` · `export` | Markdown/JSON 报告 · 全量导出 |
 | `fissue status` | 条目统计、队列、模型用量、沙盒可用性 |
 | `fissue platforms doctor` | 平台能力体检：只读/克隆/打标签/评论/推分支（写探测需显式开启） |
+| `tools/platform_probe.py` | 在**真实仓库**上把七条链路跑一遍（含提 PR 与同分支重复提 PR），打印 ✅/❌ 表 |
 | `fissue doctor` | 全栈自检：配置、数据库、模型、沙盒、Web 端口、磁盘、时区；每项给一句下一步 |
 | `fissue demo up \| kits` | 用内置夹具起只读演示实例（不需要 token / 模型），一条命令看到完整流水线 |
 | `fissue serve` | 常驻：增量扫描 + 调度 + 验证 + 通知（`--with-web` 同进程带 Web） |
@@ -154,7 +155,12 @@ docs/            设计、使用、环境变量、鉴权、回归门 + wiki/
   同一分支重复提交回 409 后复用已有 PR）。实测同时暴露并修掉两处适配缺陷：
   `POST /pulls` 响应不给链接（要按网页段自己拼）、PR **网页段是 `/merge_requests` 而 API 段是 `/pulls`**
   （混用会让条目页链接 404）；
-- ⚠️ GitLab 的 Merge Request **仍未实测**：它的适配器与 v5 不同源，不能拿 AtomGit 的结论外推；
+- ⚠️ GitLab 的 Merge Request **仍未在真实仓库上实测**：适配器与 v5 不同源，不能拿 AtomGit
+  的结论外推。代码已按同一套教训加固（「同一 source_branch 已有 open MR」在 GitLab 回
+  **400**、AtomGit 回 409，两者报文同源；链接缺失也走回退），但**跑通与否以探针为准**——
+  `python tools/platform_probe.py --platform gitlab --create`；
+- ⚠️ Gitee / GitLab 的**提 PR** 在能力矩阵里仍是「未测量」：本次验证时两枚令牌都已失效
+  （Gitee 回 `token expired`、GitLab 回 401）。更新 `.env` 后跑同一条探针命令即可补上结论；
 - ⚠️ tier 标定是阈值边界抖动而非稳定清单；功能后果为零（tier1/tier2 都进修复队列，只差标签）。
 
 我们宁可把这些写出来，也不给一份「全部通过」的漂亮表格。

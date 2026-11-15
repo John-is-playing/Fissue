@@ -15,6 +15,31 @@
 
 > **未发布**：`v1.3.1` 之后的变更。
 
+### 新增 —— 平台能力探针脚本 `tools/platform_probe.py`
+
+把「AtomGit 提 PR 全链路」那次手工验证固化成一条命令，以后验证任何平台都不用再拼 curl：
+
+```bash
+python tools/platform_probe.py --platform gitlab --create     # 自动建私有探针仓库并跑全链路
+python tools/platform_probe.py --platform gitee --owner <账号>
+```
+
+依次实测：令牌有效性 →（可选）建私有仓库 → 克隆/推初始 main → 只读 → 建标签 → 打标签
+→ 评论 → 推分支 → 提 PR → **同分支重复提 PR（必须复用而不是报错）**，最后打印一张
+带 ✅/❌ 的表。**任一项失败都不中断后面的项**——一次把所有问题暴露出来，而不是修一个
+再撞下一个。令牌只走环境/内存，不打印、不进命令行。
+
+同时按 AtomGit 的同源教训加固了 GitLab：`create_pr` 增加「同一 source_branch 已有 open
+MR」的复用（GitLab 对这一情形回 **400**，AtomGit 回 409，报文同源），以及平台不给
+`web_url` 时的链接回退。识别逻辑与链接回退已上提到基类，AtomGit/GitLab 共用一份，
+避免两处各写一份改漏。
+
+**Gitee / GitLab 的 `create_pr` 在能力矩阵里仍是 `None`（未实测）**：本次运行环境里两枚
+令牌都已失效（Gitee 明确回 `token expired`、GitLab 回 401），探针只能验证到「令牌无效」
+这一层。等令牌更新后跑上面那条命令即可补上实测结论——不拿 AtomGit 的结果外推。
+
+用例 +4（GitLab 400 复用、链接回退、无关 400 仍抛、`/-/merge_requests` 链接形状）。
+
 ### 修复 —— AtomGit 提 PR：链接缺失与 409 不复用
 
 在真实仓库上实测（探针 `qiaoen_python/fissue-platform-probe`，PR #1/#2/#3 全部建成功），

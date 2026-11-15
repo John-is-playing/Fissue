@@ -123,3 +123,74 @@ def test_capabilities_record_create_pr() -> None:
     assert CAPABILITIES[Platform.ATOMGIT].create_pr is True
     assert CAPABILITIES[Platform.GITEE].create_pr is None
     assert CAPABILITIES[Platform.GITLAB].create_pr is None
+
+
+# ---------------------------------------------------------------------------
+# GitLab：同一 source_branch 重复建 MR 回 **400**（不是 409），文案与 AtomGit 同源
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def gitlab(settings):
+    return build_adapter(settings, platform=Platform.GITLAB, token="t")
+
+
+@pytest.mark.asyncio
+async def test_gitlab_create_mr_reuses_existing_on_400(gitlab, monkeypatch) -> None:
+    """GitLab 对「已有 open MR」回 400——这不是失败，要复用而不是记成失败。"""
+    gl_ref = RepoRef(platform=Platform.GITLAB, owner="acme", name="web")
+
+    async def boom(method, url, **kwargs):
+        raise PlatformError(
+            "GitLab API 错误 400：POST …/merge_requests -> "
+            '{"message":["Another open merge request already exists '
+            'for this source branch: !5"]}'
+        )
+
+    async def fake_find(upstream, *, head):
+        return {"number": 5, "url": None}
+
+    monkeypatch.setattr(gitlab, "_request", boom)
+    monkeypatch.setattr(gitlab, "find_open_pr", fake_find)
+
+    result = await gitlab.create_pr(
+        gl_ref, head="fissue/fix-1", base="main", title="t", body="b"
+    )
+    assert result["number"] == 5
+    assert result["url"] == "https://gitlab.com/acme/web/-/merge_requests/5"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_create_mr_returns_url_fallback(gitlab, monkeypatch) -> None:
+    """平台没给 web_url 时也要有链接（否则条目页 PR 链接是空的）。"""
+    gl_ref = RepoRef(platform=Platform.GITLAB, owner="acme", name="web")
+
+    async def fake_request(method, url, **kwargs):
+        return {"iid": 9, "id": 4321}
+
+    monkeypatch.setattr(gitlab, "_request", fake_request)
+    result = await gitlab.create_pr(
+        gl_ref, head="fissue/fix-9", base="main", title="t", body="b"
+    )
+    assert result["number"] == 9
+    assert result["url"] == "https://gitlab.com/acme/web/-/merge_requests/9"
+
+
+@pytest.mark.asyncio
+async def test_gitlab_create_mr_still_raises_on_other_400(gitlab, monkeypatch) -> None:
+    gl_ref = RepoRef(platform=Platform.GITLAB, owner="acme", name="web")
+
+    async def boom(method, url, **kwargs):
+        raise PlatformError("GitLab API 错误 400：source branch does not exist")
+
+    monkeypatch.setattr(gitlab, "_request", boom)
+    with pytest.raises(PlatformError):
+        await gitlab.create_pr(gl_ref, head="b", base="main", title="t", body="b")
+
+
+def test_gitlab_item_url_uses_merge_requests(gitlab) -> None:
+    gl_ref = RepoRef(platform=Platform.GITLAB, owner="acme", name="web")
+    assert gitlab.item_url(gl_ref, 5, ItemType.PR) == (
+        "https://gitlab.com/acme/web/-/merge_requests/5"
+    )
+    assert gitlab.item_url(gl_ref, 5, ItemType.ISSUE) == "https://gitlab.com/acme/web/-/issues/5"

@@ -347,6 +347,44 @@ class PlatformAdapter(ABC):
         """向上游提 PR，返回 ``{"number":…, "url":…}``。"""
         raise PlatformError(f"{self.platform.display} 适配器未实现创建 PR")
 
+    # -- 提 PR 的公共细节（子类共用，不必各写一遍） -------------------------
+
+    #: 各平台表达「同一 head 已有 open PR/MR」的文案。
+    #:
+    #: 这不是失败——目标状态已经达成。不认它的话，调用方会把「其实已成功」记成失败：
+    #: 条目转 ``needs_manual`` 并反复重试同一个分支，而那个 PR 一直开着。
+    #: 措辞来自实测：AtomGit 回 409、GitLab 回 400，两者报文都用
+    #: ``Another open merge request already exists for this source branch``。
+    _PR_EXISTS_HINTS = (
+        "already exists",
+        "already been taken",
+        "already open",
+        "another open merge request",
+        "已存在",
+    )
+
+    @classmethod
+    def _is_pr_exists_error(cls, exc: Exception) -> bool:
+        """这个异常是不是「同一 head 已有 open PR/MR」。"""
+        text = str(exc).lower()
+        return any(hint in text for hint in cls._PR_EXISTS_HINTS)
+
+    def _pr_result(
+        self, upstream: RepoRef, number: Any, url: str | None
+    ) -> dict[str, Any]:
+        """统一的 PR 返回：编号 + 链接；平台不给链接时按条目网页地址拼一条。
+
+        为什么不能偷懒返回 ``None``：条目详情页直接把这个 ``url`` 渲染成「PR 链接」，
+        ``None`` 意味着用户点不到自己刚提的那个 PR。AtomGit 的 ``POST /pulls`` 就
+        只回一个**列表页** ``web_url``（不带编号），正是这种情形。
+        """
+        if not url and number:
+            try:
+                url = self.item_url(upstream, number, ItemType.PR)
+            except Exception:  # noqa: BLE001 - 拼不出来就退回 None，不影响建 PR 成功
+                url = None
+        return {"number": number, "url": url}
+
     # -- Git 远端 URL（克隆 / 推送，供自动修复使用） ----------------------
 
     web_host: str = ""          # 例：github.com
