@@ -34,6 +34,7 @@ import pathlib
 import sys
 import tempfile
 import traceback
+from urllib.parse import quote
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
 
@@ -130,6 +131,62 @@ def _create_repo(platform: Platform, token: str, name: str, api_base: str) -> Re
     return RepoRef(platform=platform, owner=owner_part or owner, name=name_part or name)
 
 
+class _ProbeItem:
+    """``fetch_items`` 的最小替身：只提供打标签/评论需要的那两个字段。"""
+
+    def __init__(self, number: int) -> None:
+        self.number = number
+        self.item_type = ItemType.ISSUE
+
+
+def _create_issue_via_api(
+    platform: Platform, token: str, ref: RepoRef, api_base: str
+) -> int:
+    """在探针仓库里建一条 Issue，返回编号。
+
+    适配器**刻意没有** ``create_issue``（Fissue 自己不提 Issue，见 capabilities 注释），
+    所以这里直接打平台 API。Gitee 的建 Issue 是已知的 404（BENCHMARK §4.16）——
+    测出来就是当场复现那条结论，调用方会据此记 SKIP 而不是 FAIL。
+    """
+    import httpx
+
+    from fissue.net import httpx_verify
+
+    verify = httpx_verify()  # 守卫要求：显式传 verify（详见 fissue/net.py）
+    title = "探针 Issue（可删）"
+    body = "由 tools/platform_probe.py 创建，用于验证打标签/评论链路。"
+
+    if platform is Platform.GITEE:
+        resp = httpx.post(
+            f"{api_base}/repos/{ref.owner}/{ref.name}/issues",
+            params={"access_token": token},
+            data={"title": title, "body": body},
+            timeout=30,
+            verify=verify,
+        )
+    elif platform is Platform.GITLAB:
+        project = quote(f"{ref.owner}/{ref.name}", safe="")
+        resp = httpx.post(
+            f"{api_base}/projects/{project}/issues",
+            headers={"PRIVATE-TOKEN": token},
+            data={"title": title, "description": body},
+            timeout=30,
+            verify=verify,
+        )
+    else:  # ATOMGIT：与 Gitee 同形（access_token 走查询参数）
+        resp = httpx.post(
+            f"{api_base}/repos/{ref.owner}/{ref.name}/issues",
+            params={"access_token": token},
+            data={"title": title, "body": body},
+            timeout=30,
+            verify=verify,
+        )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"{resp.status_code}: {resp.text[:160]}")
+    data = resp.json()
+    return int(data.get("number") or data.get("iid") or data.get("id") or 0)
+
+
 async def probe_platform(args: argparse.Namespace) -> int:
     platform = PLATFORMS[args.platform]
     overrides = {}
@@ -212,6 +269,25 @@ async def probe_platform(args: argparse.Namespace) -> int:
     with contextlib.suppress(Exception):
         async for it in adapter.fetch_items(ref, limit=5):
             items.append(it)
+    if not items:
+        # 空仓库里没有可打标签/评论的对象，后面两项就只能 SKIP——重跑也拿不到结论。
+        # 探针仓库本来就是用来留记录的，所以直接建一条 Issue：既让标签/评论有对象，
+        # 又顺便把 create_issue 这一栏实测了（适配器刻意不实现它，见 capabilities 注释）。
+        from fissue.platforms.capabilities import describe
+
+        try:
+            issue_no = await asyncio.to_thread(
+                _create_issue_via_api, platform, token, ref, adapter.api_base
+            )
+            report.ok("建 Issue", f"#{issue_no}（探针 Issue，可删）")
+            items = [_ProbeItem(issue_no)]
+        except Exception as exc:  # noqa: BLE001
+            caps = describe(platform)
+            if caps.create_issue is False:
+                # 已知限制当场复现：记 SKIP 并点明与结论一致，不让探针因此恒红
+                report.skip("建 Issue", f"已知限制（与 capabilities 一致）：{exc}")
+            else:
+                report.fail("建 Issue", f"{type(exc).__name__}: {exc}")
     if items:
         number = getattr(items[0], "number", None)
         item_type = getattr(items[0], "item_type", ItemType.ISSUE)
