@@ -371,12 +371,21 @@ def _capability_rows(ref: RepoRef) -> list[dict[str, Any]]:
                 }
             )
         else:
+            # 光说「尚未测量」，用户不知道下一步该干什么。**提 PR** 尤其如此：
+            # doctor 的写探测刻意不碰它（会在仓库里留下一条公开记录），所以只能靠
+            # 探针脚本——把命令直接写在这里，比让人翻文档快一步。
+            detail = "尚未测量（不代表不可用）"
+            if label == "提 PR":
+                detail = (
+                    "尚未测量（不代表不可用）；"
+                    "用 python tools/platform_probe.py --platform <平台> 实测"
+                )
             rows.append(
                 {
                     "repo": repo,
                     "probe": f"已知限制/{label}",
                     "result": "－",
-                    "detail": "尚未测量（不代表不可用）",
+                    "detail": detail,
                 }
             )
     return rows
