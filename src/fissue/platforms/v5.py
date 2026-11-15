@@ -625,4 +625,9 @@ class V5Adapter(PlatformAdapter):
     #:
     #: 为什么必须分开：AtomGit 的 API 是 `/pulls`，网页却是 `/merge_requests`——两者
     #: 混用会让条目页上的 PR 链接 404（实测 `…/pulls/2` 打不开，`…/merge_requests/2` 才行）。
+    #:
+    #: Gitee 两边**都是** `/pulls`，保持默认即可。依据：Gitee 官方 WebHook 文档的
+    #: Pull Request 样例里 `"html_url": "https://gitee.com/oschina/giteeb/pulls/1"`，
+    #: 真实仓库推送后的提示也是 `https://gitee.com/XmacsLabs/mogan/pulls/45`；
+    #: 另一方向的交叉验证：`…/pull_requests` 段返回 404（Gitee 上不存在这个路径）。
     pr_web_segment: str = "pulls"

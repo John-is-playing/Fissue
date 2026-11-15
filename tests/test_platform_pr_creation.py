@@ -45,7 +45,14 @@ def test_atomgit_pr_web_segment_is_merge_requests(atomgit) -> None:
 
 
 def test_gitee_pr_web_segment_unchanged(gitee) -> None:
-    """回归：别把「网页段独立」这件事顺手套到 Gitee 上——它的网页就是 `/pulls/n`。"""
+    """回归：别把「网页段独立」这件事顺手套到 Gitee 上——它的网页就是 `/pulls/n`。
+
+    依据（不是猜的）：Gitee 官方 WebHook 文档的 Pull Request 样例写着
+    ``"html_url": "https://gitee.com/oschina/giteeb/pulls/1"``；真实仓库推送后的
+    提示同样是 ``https://gitee.com/XmacsLabs/mogan/pulls/45``；交叉验证——
+    ``…/pull_requests`` 段在 Gitee 上返回 404。所以这里**不该**像 AtomGit 那样改成
+    merge_requests。
+    """
     ref = RepoRef(platform=Platform.GITEE, owner="o", name="n")
     assert gitee.pr_web_segment == "pulls"
     assert gitee.item_url(ref, 2, ItemType.PR) == "https://gitee.com/o/n/pulls/2"
